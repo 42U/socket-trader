@@ -530,14 +530,15 @@ async def prompt_account():
     # Try to auto-detect accounts from NinjaTrader ATI
     accounts = query_nt_accounts(nt_port)
     if accounts:
-        print(Fore.CYAN + "\n┌─ CHANGE ACCOUNT (auto-detected) ─────────────────┐" + Style.RESET_ALL)
+        print(Fore.CYAN + "\n┌─ CHANGE ACCOUNT ─────────────────────────────────┐" + Style.RESET_ALL)
         for i, a in enumerate(accounts, 1):
             marker = " ◀" if a["name"] == active_account else ""
             line = f"{i}. {a['name']}  (${a['cash']:,.2f}){marker}"
             print(Fore.CYAN + f"│  {line.ljust(49)}│" + Style.RESET_ALL)
+        print(Fore.CYAN + "│  Enter # to select, or type a name manually.     │" + Style.RESET_ALL)
         print(Fore.CYAN + "│  Press ENTER to keep current.                     │" + Style.RESET_ALL)
         print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
-        sys.stdout.write(Fore.WHITE + "  SELECT # ▸ " + Style.RESET_ALL)
+        sys.stdout.write(Fore.WHITE + "  ACCOUNT ▸ " + Style.RESET_ALL)
         sys.stdout.flush()
         raw = await asyncio.to_thread(read_line_raw)
         if raw == "":
@@ -548,8 +549,12 @@ async def prompt_account():
             cfg["account"] = active_account
             save_config(cfg)
             print(Fore.GREEN + f"  ✔  Account set → {active_account}" + Style.RESET_ALL)
-        else:
-            print(Fore.YELLOW + f"  ⚠  Invalid choice. Keeping current account." + Style.RESET_ALL)
+        elif raw.strip():
+            active_account = raw.strip()
+            cfg = load_config()
+            cfg["account"] = active_account
+            save_config(cfg)
+            print(Fore.GREEN + f"  ✔  Account set → {active_account}" + Style.RESET_ALL)
     else:
         print(Fore.CYAN + "\n┌─ CHANGE ACCOUNT ─────────────────────────────────┐" + Style.RESET_ALL)
         print(Fore.CYAN + "│  Enter new NinjaTrader account name.              │" + Style.RESET_ALL)

@@ -123,15 +123,19 @@ On first run you'll be prompted for:
 | **Account** | Auto-detected from NinjaTrader ATI, or manually entered |
 | **Directory** | Auto-detected on Windows, manually entered on Linux |
 
-If NinjaTrader is running, accounts are auto-detected with balances displayed:
+If NinjaTrader is running, accounts are auto-detected via ATI with live balances:
 
 ```
-┌─ NINJATRADER ACCOUNTS (auto-detected) ────────────────┐
-│  1. Sim101  ($28,857.02)                              │
-│  2. MyLiveAccount  ($50,000.00)                       │
-└───────────────────────────────────────────────────────┘
-  SELECT # ▸
+┌─ CHANGE ACCOUNT ─────────────────────────────────┐
+│  1. Sim101  ($28,857.02)                ◀        │
+│  2. MyLiveAccount  ($50,000.00)                  │
+│  Enter # to select, or type a name manually.     │
+│  Press ENTER to keep current.                     │
+└───────────────────────────────────────────────────┘
+  ACCOUNT ▸
 ```
+
+Enter a number to pick from the list, or type any account name manually. If NinjaTrader isn't running, you'll be prompted to type the account name directly.
 
 All settings are saved and loaded automatically on subsequent runs.
 
@@ -148,7 +152,7 @@ All settings are saved and loaded automatically on subsequent runs.
 | Key | Action |
 |:---:|--------|
 | `P` | Pause / resume signal output |
-| `A` | Switch NinjaTrader account (queries ATI for live account list) |
+| `A` | Switch NinjaTrader account (pick from ATI list or type manually) |
 | `S` | Change ATM strategy template |
 | `D` | Change output directory |
 | `T` | Set session target and stop limits |
@@ -160,22 +164,43 @@ All settings are saved and loaded automatically on subsequent runs.
 
 ## Risk Management
 
-SocketTrader includes built-in risk controls that monitor your account balance in real time via the NinjaTrader ATI. Both are **optional** — configure them with `T` or leave them at `0` (disabled).
+SocketTrader includes built-in risk controls that monitor your account balance in real time via the NinjaTrader ATI. Press `T` to configure, or leave both at their default of `0` to disable.
+
+> **Both target and stop are completely optional.** Set either to `0` to disable that side independently. By default, both are `0` (off) — SocketTrader will not interfere with your trading unless you explicitly configure limits.
+
+### How It Works
+
+1. On connect, SocketTrader snapshots your account balance from NinjaTrader ATI
+2. Every 30 seconds, it polls your current balance and calculates session P&L
+3. If P&L crosses your configured threshold, the appropriate action fires
 
 ### Session Target (Soft Stop)
 
-A **profit target** for the session. When your session P&L reaches this amount, signals are automatically **paused**.
+| | |
+|---|---|
+| **What** | A profit goal for the session (positive dollar amount) |
+| **Trigger** | Session P&L **reaches or exceeds** the target |
+| **Action** | Signals are automatically **paused** |
+| **Recovery** | Press `P` to resume trading |
+| **Disable** | Set to `0` |
 
-- You can resume trading by pressing `P`
-- Useful for locking in a daily goal
+Useful for locking in a daily profit goal and preventing overtrading.
 
 ### Session Stop (Hard Stop)
 
-A **maximum loss** for the session. When your session P&L drops to this level:
+| | |
+|---|---|
+| **What** | A maximum loss limit for the session (negative dollar amount) |
+| **Trigger** | Session P&L **drops to or below** the stop |
+| **Action** | All open positions are **closed** via `CLOSEPOSITION` commands, signals are **locked** |
+| **Recovery** | Cannot resume — press `C` to exit |
+| **Disable** | Set to `0` |
 
-1. All open positions are **automatically closed** via `CLOSEPOSITION` commands
-2. Signals are **paused and locked** — cannot be resumed with `P`
-3. Press `C` to exit
+When a hard stop fires, SocketTrader writes a `CLOSEPOSITION;{account};{contract};;;;;;;;;;` file to the `incoming/` folder for every instrument traded during the session. This tells NinjaTrader to flatten all positions immediately.
+
+### Configuring Limits
+
+Press `T` during a session:
 
 ```
 ┌─ SESSION LIMITS (Sim101) ────────────────────────┐
@@ -184,15 +209,20 @@ A **maximum loss** for the session. When your session P&L drops to this level:
 │  Stop = hard stop (closes positions + pauses)     │
 │  Enter 0 to disable. ENTER to keep current.       │
 └───────────────────────────────────────────────────────┘
-  TARGET $ (current: +500.00) ▸
-  STOP $ (current: -300.00) ▸
+  TARGET $ (current: +500.00) ▸ 500
+  STOP $ (current: -300.00) ▸ -300
 ```
 
-Limits are saved **per account** in your config file and persist across sessions. Balances are checked every 30 seconds.
+- Enter a **positive number** for target (e.g. `500` = pause at +$500 profit)
+- Enter a **negative number** for stop (e.g. `-300` = hard stop at -$300 loss)
+- Enter `0` to **disable** either side
+- Press **ENTER** to keep the current value
+
+Limits are saved **per account** in your config file and persist across sessions. You can set different limits for different accounts.
 
 ### Session Summary
 
-On exit, SocketTrader displays your session P&L:
+On exit, SocketTrader displays your session results including final P&L:
 
 ```
   ┌─ SESSION SUMMARY ───────────────────────────┐
