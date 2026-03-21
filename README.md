@@ -91,6 +91,18 @@ SocketTrader requires ATM and Stop strategy templates to be installed in NinjaTr
 
 This happens automatically — no manual copying needed. If the files already exist, they are not overwritten.
 
+### ATM Strategy Selection
+
+The signal sent to NinjaTrader includes an **ATM Strategy template name** that controls how stops, targets, and trailing behavior are managed for each order. By default, SocketTrader uses `NQ_Med`.
+
+If you want to use a different ATM strategy:
+
+1. Create your custom ATM strategy template in NinjaTrader 8 (via the ATM Strategy selector on a chart or SuperDOM)
+2. Press `S` in SocketTrader to set the strategy name to match your template
+3. The new name is saved to config and applied to all future signals
+
+> The ATM strategy name in the signal **must match** an existing template in your NinjaTrader `templates/AtmStrategy/` folder, or the order will be rejected.
+
 ---
 
 ## Usage
@@ -114,15 +126,16 @@ All settings are saved and loaded automatically on subsequent runs.
 ## Keyboard Controls
 
 ```
-╔═══════════════════════════════════════════════════════════════════════╗
-║  P = PAUSE  A = ACCOUNT  D = DIR  O = PORT  R = RECONNECT  C = CLOSE  ║
-╚═══════════════════════════════════════════════════════════════════════╝
+╔════════════════════════════════════════════════════════════════════════╗
+║  P=PAUSE  A=ACCT  S=STRAT  D=DIR  O=PORT  R=RECONN  C=CLOSE          ║
+╚════════════════════════════════════════════════════════════════════════╝
 ```
 
 | Key | Action |
 |:---:|--------|
 | `P` | Pause / resume signal output |
 | `A` | Switch NinjaTrader account |
+| `S` | Change ATM strategy template |
 | `D` | Change output directory |
 | `O` | Change NinjaTrader AT Interface port |
 | `R` | Force immediate reconnect (resets backoff) |
@@ -138,6 +151,7 @@ Settings persist in `~/.voidorigin_config.json`:
 {
   "token": "your_connection_token",
   "account": "YourNTAccount",
+  "atm_strategy": "NQ_Med",
   "output_directory": "C:\\Users\\you\\Documents\\NinjaTrader 8\\incoming",
   "nt_port": 36973
 }

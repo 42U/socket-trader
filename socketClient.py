@@ -30,6 +30,7 @@ shutdown = asyncio.Event()
 signal_count = 0
 output_directory = None
 active_account = None          # Current NinjaTrader account name
+atm_strategy = "NQ_Med"        # ATM strategy template name
 nt_port = 36973                # NinjaTrader AT Interface port (default 36973)
 awaiting_directory_input = False
 awaiting_user_input = False  # Block key handler during any input prompt
@@ -274,7 +275,7 @@ def row(text, width, pad="║"):
 def build_header():
     width = term_width()
     subtitle = "LINK ESTABLISHED  ·  SIGNAL BUS ACTIVE  ·  NODE AUTHORIZED"
-    commands = "P = PAUSE  A = ACCOUNT  D = DIR  O = PORT  R = RECONNECT  C = CLOSE"
+    commands = "P=PAUSE A=ACCT S=STRAT D=DIR O=PORT R=RECONN C=CLOSE"
 
     lines = [
         hline(width, "╔", "═", "╗"),
@@ -490,6 +491,36 @@ async def prompt_port():
     awaiting_user_input = False
 
 
+# ---------- ATM Strategy prompt ----------
+async def prompt_strategy():
+    global atm_strategy, awaiting_user_input
+    awaiting_user_input = True
+    show_cursor()
+    print(Fore.CYAN + "\n┌─ ATM STRATEGY TEMPLATE ───────────────────────────┐" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Enter the ATM strategy template name to use.     │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  This must match a template in NinjaTrader.       │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Press ENTER to keep current.                     │" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  Current: {atm_strategy[:57].ljust(57)} │" + Style.RESET_ALL)
+    print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
+    sys.stdout.write(Fore.WHITE + "  STRATEGY ▸ " + Style.RESET_ALL)
+    sys.stdout.flush()
+    raw = await asyncio.to_thread(read_line_raw)
+
+    if raw == "":
+        print(Fore.YELLOW + "  ↩  No change — keeping current strategy." + Style.RESET_ALL)
+    else:
+        atm_strategy = raw.strip()
+        cfg = load_config()
+        cfg["atm_strategy"] = atm_strategy
+        save_config(cfg)
+        print(Fore.GREEN + f"  ✔  ATM Strategy set → {atm_strategy}" + Style.RESET_ALL)
+
+    print()
+    print(status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS"))
+    print()
+    awaiting_user_input = False
+
+
 # ---------- Keyboard loop ----------
 reconnect_event = asyncio.Event()
 
@@ -510,6 +541,8 @@ async def keyboard_loop():
             await prompt_account()
         elif key.lower() == "d":
             await prompt_directory()
+        elif key.lower() == "s":
+            await prompt_strategy()
         elif key.lower() == "o":
             await prompt_port()
         elif key.lower() == "r":
@@ -539,22 +572,28 @@ def format_signal(signal_text: str, idx: int):
 
 
 # ---------- File output ----------
-def extract_signal_string(msg: str, account: str) -> tuple[str | None, int | None]:
+def extract_signal_string(msg: str, account: str, atm: str) -> tuple[str | None, int | None]:
     """Parse JSON message and extract the raw signal string + server timestamp.
 
-    Expected format: {"signal": "PLACE;SimAccount;NQ 06-26;BUY;1;MARKET;;;DAY;;;TAG;VALUE", "ts": 1234567890123}
-    The account is always the second semicolon-delimited field (index 1).
-    Returns (signal_with_account_replaced, server_timestamp_ms) or (None, None).
+    Signal format: PLACE;Account;Instrument;Action;Qty;OrderType;;;TIF;;;AtmStrategy;Value
+    Index:           0      1        2        3     4      5     678  9  10 11    11     12
+    - Field 1 (account) is replaced with the user's real account.
+    - Field 11 (ATM strategy) is replaced with the user's chosen strategy.
+    Returns (processed_signal, server_timestamp_ms) or (None, None).
     """
     try:
         data = json.loads(msg)
         if isinstance(data, dict) and "signal" in data:
             raw = data["signal"]
             ts = data.get("ts")
-            # Replace the second field (sim account) with real account
-            first_semi = raw.index(";")
-            second_semi = raw.index(";", first_semi + 1)
-            return f"{raw[:first_semi + 1]}{account}{raw[second_semi:]}", ts
+            parts = raw.split(";")
+            # Replace account (field 1)
+            if len(parts) >= 2:
+                parts[1] = account
+            # Replace ATM strategy (field 11)
+            if len(parts) >= 12:
+                parts[11] = atm
+            return ";".join(parts), ts
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
     return None, None
@@ -634,7 +673,7 @@ async def listen(token: str):
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=1)
                         if not paused:
-                            raw_signal, server_ts = extract_signal_string(msg, active_account)
+                            raw_signal, server_ts = extract_signal_string(msg, active_account, atm_strategy)
                             if raw_signal:
                                 write_signal_to_file(raw_signal)
                                 await signal_pulse("SIGNAL RECEIVED")
@@ -803,10 +842,11 @@ def setup() -> tuple[str, dict]:
 
 # ---------- Main ----------
 async def main():
-    global output_directory, active_account, nt_port
+    global output_directory, active_account, atm_strategy, nt_port
 
     token, cfg = setup()
     active_account = cfg.get("account", "")
+    atm_strategy = cfg.get("atm_strategy", "NQ_Med")
     nt_port = cfg.get("nt_port", 36973)
 
     if cfg.get("output_directory"):
