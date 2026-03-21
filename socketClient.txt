@@ -25,6 +25,7 @@ except ImportError:
 init()
 
 # ---------- Config persistence ----------
+IS_WINDOWS = platform.system() == "Windows"
 CONFIG_FILE = Path.home() / ".voidorigin_config.json"
 WS_HOST = "ws://ec2-16-59-44-39.us-east-2.compute.amazonaws.com:8420/ws"
 
@@ -40,10 +41,11 @@ awaiting_user_input = False  # Block key handler during any input prompt
 
 # ---------- Risk management ----------
 session_start_balances: dict[str, float] = {}   # account -> starting balance
+session_current_balances: dict[str, float] = {}  # account -> latest polled balance
 session_contracts: set[str] = set()              # instruments traded this session
 soft_stopped = False                              # True if soft stop triggered
 hard_stopped = False                              # True if hard stop triggered
-BALANCE_POLL_INTERVAL = 30                        # seconds between balance checks
+BALANCE_POLL_INTERVAL = 3                         # seconds between balance checks
 
 # ---------- Logging ----------
 LOG_FILE = Path.home() / ".voidorigin_signals.log"
@@ -321,6 +323,10 @@ def term_width():
     return max(shutil.get_terminal_size().columns, 60)
 
 
+def term_height():
+    return max(shutil.get_terminal_size().lines, 10)
+
+
 def clear():
     sys.stdout.write("\033[2J\033[H")
     sys.stdout.flush()
@@ -338,6 +344,80 @@ def hide_cursor():
 
 def show_cursor():
     sys.stdout.write("\033[?25h")
+    sys.stdout.flush()
+
+
+# ---------- Pinned controls bar ----------
+_controls_pinned = False
+CONTROLS_TEXT = "P=PAUSE  A=ACCT  B=BAL  S=STRAT  D=DIR  T=LIMITS  O=PORT  R=RECONN  C=CLOSE"
+
+
+def _build_controls_line():
+    """Build the controls bar text with account info on the right."""
+    left = f"  {CONTROLS_TEXT}"
+    # Build account info
+    acct_info = ""
+    if active_account:
+        start = session_start_balances.get(active_account)
+        current = session_current_balances.get(active_account)
+        if start is not None and current is not None:
+            pnl = current - start
+            pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
+            acct_info = f"{active_account}: ${current:,.2f} (" + pnl_color + f"${pnl:+,.2f}" + Fore.CYAN + Style.DIM + ")  "
+        elif current is not None:
+            acct_info = f"{active_account}: ${current:,.2f}  "
+        elif start is not None:
+            acct_info = f"{active_account}: ${start:,.2f}  "
+        else:
+            acct_info = f"{active_account}  "
+    if not acct_info:
+        return f"{Fore.CYAN}{Style.DIM}{left}{Style.RESET_ALL}"
+    # Pad between controls and account info
+    width = term_width()
+    visible_left = len(left)
+    visible_right = len(_ANSI_ESCAPE.sub('', acct_info))
+    gap = max(2, width - visible_left - visible_right)
+    return f"{Fore.CYAN}{Style.DIM}{left}{' ' * gap}{acct_info}{Style.RESET_ALL}"
+
+
+def pin_controls():
+    """Pin the controls bar to the bottom of the terminal using scroll regions."""
+    global _controls_pinned
+    rows = term_height()
+    # Set scroll region to all rows except the last
+    sys.stdout.write(f"\033[1;{rows - 1}r")
+    # Move to last row and draw controls
+    sys.stdout.write(f"\033[{rows};1H")
+    sys.stdout.write(f"\033[K{_build_controls_line()}")
+    # Move cursor back into the scroll region
+    sys.stdout.write(f"\033[{rows - 1};1H")
+    sys.stdout.flush()
+    _controls_pinned = True
+
+
+def unpin_controls():
+    """Remove the pinned controls bar and restore normal scrolling."""
+    global _controls_pinned
+    # Reset scroll region to full terminal
+    sys.stdout.write("\033[r")
+    sys.stdout.flush()
+    _controls_pinned = False
+
+
+def refresh_controls():
+    """Redraw the pinned controls bar (call after terminal resize or output)."""
+    if not _controls_pinned:
+        return
+    rows = term_height()
+    # Save cursor position
+    sys.stdout.write("\033[s")
+    # Update scroll region in case terminal resized
+    sys.stdout.write(f"\033[1;{rows - 1}r")
+    # Move to last row and redraw
+    sys.stdout.write(f"\033[{rows};1H")
+    sys.stdout.write(f"\033[K{_build_controls_line()}")
+    # Restore cursor position
+    sys.stdout.write("\033[u")
     sys.stdout.flush()
 
 
@@ -372,14 +452,11 @@ def row(text, width, pad="║"):
 def build_header():
     width = term_width()
     subtitle = "LINK ESTABLISHED  ·  SIGNAL BUS ACTIVE  ·  NODE AUTHORIZED"
-    commands = "P=PAUSE A=ACCT S=STRAT D=DIR T=LIMITS O=PORT R=RECONN C=CLOSE"
 
     lines = [
         hline(width, "╔", "═", "╗"),
         row("SOCKET TRADER", width),
         row(subtitle, width),
-        hline(width, "╠", "═", "╣"),
-        row(commands, width),
         hline(width, "╚", "═", "╝"),
     ]
     return "\n".join(lines)
@@ -420,6 +497,8 @@ def glitch_line(text, intensity=0.15):
 async def boot_sequence():
     hide_cursor()
     clear()
+    # Pin controls bar to bottom before drawing anything
+    pin_controls()
     banner_lines = build_banner().splitlines()
     for line in banner_lines:
         sys.stdout.write(Fore.GREEN + Style.DIM + glitch_line(line, 0.25) + "\n" + Style.RESET_ALL)
@@ -646,6 +725,42 @@ async def prompt_strategy():
     awaiting_user_input = False
 
 
+# ---------- Balances display ----------
+def show_balances():
+    """Display all NinjaTrader account balances with session P&L."""
+    accounts = query_nt_accounts(nt_port)
+    if not accounts:
+        sys.stdout.write("\r\033[K")
+        print(Fore.YELLOW + "  ⚠  Could not reach NinjaTrader ATI." + Style.RESET_ALL)
+        return
+
+    # Find longest account name for formatting
+    max_name = max(len(a["name"]) for a in accounts)
+    box_inner = max(max_name + 35, 50)
+
+    sys.stdout.write("\r\033[K")
+    print(Fore.CYAN + f"\r\033[K  ╭─ BALANCES {'─' * (box_inner - 11)}╮" + Style.RESET_ALL)
+    for a in accounts:
+        name = a["name"]
+        cash = a["cash"]
+        marker = " ◀" if name == active_account else ""
+        start = session_start_balances.get(name)
+        if start is not None:
+            pnl = cash - start
+            pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
+            line = f"{name.ljust(max_name)}  ${cash:>12,.2f}  "
+            pnl_str = f"P&L: ${pnl:+,.2f}{marker}"
+            # Print with color for P&L portion
+            pad = box_inner - len(line) - len(pnl_str.replace(marker, "")) - len(marker)
+            print(f"\r\033[K" + Fore.CYAN + f"  │  {line}" + pnl_color + f"{pnl_str}" + " " * max(0, pad) + Fore.CYAN + "│" + Style.RESET_ALL)
+        else:
+            line = f"{name.ljust(max_name)}  ${cash:>12,.2f}{marker}"
+            print(f"\r\033[K" + Fore.CYAN + f"  │  {line.ljust(box_inner)}│" + Style.RESET_ALL)
+    print(f"\r\033[K" + Fore.CYAN + f"  ╰{'─' * (box_inner + 2)}╯" + Style.RESET_ALL)
+    sys.stdout.write("\r\033[K")
+    sys.stdout.flush()
+
+
 # ---------- Keyboard loop ----------
 reconnect_event = asyncio.Event()
 
@@ -667,6 +782,8 @@ async def keyboard_loop():
                 sys.stdout.write("\r\033[K")
                 sys.stdout.flush()
                 print(Fore.GREEN + "▶  SIGNAL OUTPUT RESUMED" + Style.RESET_ALL)
+        elif key.lower() == "b":
+            show_balances()
         elif key.lower() == "a":
             await prompt_account()
         elif key.lower() == "d":
@@ -865,15 +982,21 @@ async def balance_monitor():
         if not active_account or hard_stopped:
             continue
 
+        # Always poll balances for status bar display
+        all_accounts = query_nt_accounts(nt_port)
+        for a in all_accounts:
+            session_current_balances[a["name"]] = a["cash"]
+        refresh_controls()
+
         if active_account not in session_start_balances:
+            continue
+
+        current = session_current_balances.get(active_account)
+        if current is None:
             continue
 
         limits = get_account_limits(active_account)
         if limits["target"] == 0 and limits["stop"] == 0:
-            continue
-
-        current = query_nt_balance(active_account)
-        if current is None:
             continue
 
         start = session_start_balances[active_account]
@@ -980,21 +1103,21 @@ async def prompt_limits():
         sys.stdout.write(Fore.WHITE + f"  TARGET MODE (current: {limits['target_mode']}) [soft/hard] ▸ " + Style.RESET_ALL)
         sys.stdout.flush()
         raw_tm = await asyncio.to_thread(read_line_raw)
-        if raw_tm.strip().lower() in ("soft", "hard"):
-            target_mode = raw_tm.strip().lower()
-        elif raw_tm.strip():
+        tm_input = raw_tm.strip().lower()
+        if tm_input in ("soft", "s"):
+            target_mode = "soft"
+        elif tm_input in ("hard", "h"):
+            target_mode = "hard"
+        elif tm_input:
             print(Fore.YELLOW + f"  ⚠  Invalid mode — keeping {target_mode}." + Style.RESET_ALL)
 
-    # Stop (loss)
+    # Stop
     sys.stdout.write(Fore.WHITE + f"  STOP $ (current: {limits['stop']:+,.2f}) ▸ " + Style.RESET_ALL)
     sys.stdout.flush()
     raw_s = await asyncio.to_thread(read_line_raw)
     if raw_s.strip():
         try:
             stop = float(raw_s.strip())
-            if stop > 0:
-                print(Fore.YELLOW + "  ⚠  Stop should be negative (it's a loss limit). Converting to negative." + Style.RESET_ALL)
-                stop = -abs(stop)
         except ValueError:
             print(Fore.YELLOW + "  ⚠  Invalid number — keeping current stop." + Style.RESET_ALL)
             stop = limits["stop"]
@@ -1007,9 +1130,12 @@ async def prompt_limits():
         sys.stdout.write(Fore.WHITE + f"  STOP MODE (current: {limits['stop_mode']}) [soft/hard] ▸ " + Style.RESET_ALL)
         sys.stdout.flush()
         raw_sm = await asyncio.to_thread(read_line_raw)
-        if raw_sm.strip().lower() in ("soft", "hard"):
-            stop_mode = raw_sm.strip().lower()
-        elif raw_sm.strip():
+        sm_input = raw_sm.strip().lower()
+        if sm_input in ("soft", "s"):
+            stop_mode = "soft"
+        elif sm_input in ("hard", "h"):
+            stop_mode = "hard"
+        elif sm_input:
             print(Fore.YELLOW + f"  ⚠  Invalid mode — keeping {stop_mode}." + Style.RESET_ALL)
 
     set_account_limits(active_account, target, target_mode, stop, stop_mode)
@@ -1061,6 +1187,7 @@ async def listen(token: str):
                 for a in nt_accounts:
                     if a["name"] not in session_start_balances:
                         session_start_balances[a["name"]] = a["cash"]
+                    session_current_balances[a["name"]] = a["cash"]
 
                 # Context-aware welcome message
                 missing = []
@@ -1345,10 +1472,15 @@ async def main():
 
 
 def print_exit_summary():
+    unpin_controls()
     show_cursor()
     sys.stdout.write("\r\033[K")
-    print(f"\r\033[K" + Fore.CYAN + "\n\r\033[K  ┌─ SESSION SUMMARY ───────────────────────────┐" + Style.RESET_ALL)
-    print(f"\r\033[K" + Fore.CYAN + f"  │  Signals received: {str(signal_count).ljust(25)}│" + Style.RESET_ALL)
+    log_str = str(LOG_FILE)
+    # Box width adapts to fit the log path
+    content_width = max(45, len(log_str) + 9)  # "  Log: " + path + "  "
+    inner = content_width - 4  # inside │  ...  │
+    print(f"\r\033[K" + Fore.CYAN + f"\n\r\033[K  ┌─ SESSION SUMMARY {'─' * (content_width - 20)}┐" + Style.RESET_ALL)
+    print(f"\r\033[K" + Fore.CYAN + f"  │  Signals received: {str(signal_count).ljust(inner - 20)}│" + Style.RESET_ALL)
     # Show final P&L if we have balance data
     if active_account and active_account in session_start_balances:
         final_bal = query_nt_balance(active_account)
@@ -1357,9 +1489,10 @@ def print_exit_summary():
             pnl_str = f"${pnl:+,.2f}"
             pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
             pnl_line = f"Session P&L: {pnl_str}"
-            print(f"\r\033[K" + Fore.CYAN + f"  │  " + pnl_color + f"{pnl_line.ljust(41)}" + Fore.CYAN + f"│" + Style.RESET_ALL)
-    print(f"\r\033[K" + Fore.CYAN + f"  │  Log: {str(LOG_FILE)[:38].ljust(38)}│" + Style.RESET_ALL)
-    print(f"\r\033[K" + Fore.CYAN + "  └─────────────────────────────────────────────┘" + Style.RESET_ALL)
+            print(f"\r\033[K" + Fore.CYAN + f"  │  " + pnl_color + f"{pnl_line.ljust(inner)}" + Fore.CYAN + f"│" + Style.RESET_ALL)
+    log_line = f"Log: {log_str}"
+    print(f"\r\033[K" + Fore.CYAN + f"  │  {log_line.ljust(inner)}│" + Style.RESET_ALL)
+    print(f"\r\033[K" + Fore.CYAN + f"  └{'─' * content_width}┘" + Style.RESET_ALL)
     logger.info(f"SESSION END  signals={signal_count}")
 
 

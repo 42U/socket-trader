@@ -12,6 +12,7 @@
   <a href="#usage">Usage</a> &nbsp;·&nbsp;
   <a href="#keyboard-controls">Controls</a> &nbsp;·&nbsp;
   <a href="#risk-management">Risk</a> &nbsp;·&nbsp;
+  <a href="#signal-latency">Latency</a> &nbsp;·&nbsp;
   <a href="#configuration">Config</a>
 </p>
 
@@ -43,15 +44,16 @@ The sim account is automatically swapped with your real NinjaTrader account name
 | | |
 |---|---|
 | **Cross-platform** | Windows and Linux support |
-| **Auto-detect accounts** | Queries NinjaTrader ATI for connected accounts with balances |
+| **ATI integration** | Auto-detect accounts, live balances, and position closing via NinjaTrader ATI |
 | **Auto-detect directory** | Finds NinjaTrader 8 `incoming/` folder on Windows automatically |
 | **Persistent config** | Token, account, limits, and directory saved to `~/.voidorigin_config.json` |
 | **Smart reconnect** | Fibonacci backoff: 1m → 1m → 2m → 3m → 5m → 8m → ... → 30m max |
 | **Auth handling** | Invalid token triggers re-prompt instead of infinite retry |
-| **Latency monitoring** | Displays signal delivery time with color-coded thresholds |
-| **Risk management** | Per-account session target (soft stop) and loss limit (hard stop) |
+| **Latency monitoring** | Color-coded signal delivery time relative to baseline |
+| **Risk management** | Per-account target and stop with independent soft/hard modes |
+| **Live balances** | Press `B` for real-time account balances and session P&L |
 | **Duplicate detection** | Prevents the same signal from firing twice |
-| **Terminal UI** | Animated boot sequence, styled server messages, signal pulses, live status bar |
+| **Terminal UI** | Animated boot, styled server messages, pinned controls bar |
 
 ---
 
@@ -143,22 +145,40 @@ All settings are saved and loaded automatically on subsequent runs.
 
 ## Keyboard Controls
 
+The controls bar is **pinned to the bottom** of the terminal at all times:
+
 ```
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  P=PAUSE  A=ACCT  S=STRAT  D=DIR  T=LIMITS  O=PORT  R=RECONN  C=CLOSE    ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+  P=PAUSE  A=ACCT  B=BAL  S=STRAT  D=DIR  T=LIMITS  O=PORT  R=RECONN  C=CLOSE
 ```
 
 | Key | Action |
 |:---:|--------|
 | `P` | Pause / resume signal output |
 | `A` | Switch NinjaTrader account (pick from ATI list or type manually) |
+| `B` | Show live balances and session P&L for all accounts |
 | `S` | Change ATM strategy template |
 | `D` | Change output directory |
 | `T` | Set session target and stop limits |
 | `O` | Change NinjaTrader AT Interface port |
 | `R` | Force immediate reconnect (resets backoff) |
 | `C` | Close connection and exit |
+
+---
+
+## Live Balances
+
+Press `B` at any time to see all NinjaTrader accounts with real-time balances and session P&L:
+
+```
+  ╭─ BALANCES ─────────────────────────────────╮
+  │  Sim101      $28,857.02  P&L: +$247.50 ◀  │
+  │  SimXFAFK     $3,939.48  P&L: -$60.52     │
+  ╰────────────────────────────────────────────╯
+```
+
+- Balances are queried live from NinjaTrader ATI
+- Session P&L is calculated from the balance snapshot taken on connect
+- `◀` marks the currently active account
 
 ---
 
@@ -175,16 +195,19 @@ SocketTrader includes built-in risk controls that monitor your account balance i
 ### How It Works
 
 1. On connect, SocketTrader snapshots your account balance from NinjaTrader ATI
-2. Every 30 seconds, it polls your current balance and calculates session P&L
+2. Every 3 seconds, it polls your current balance and calculates session P&L
 3. If P&L crosses your configured threshold, the appropriate action fires
+
+### Session Stop
+
+A **floor** for your session P&L. Triggers when P&L drops to or below this value. Set to `0` to disable.
+
+- **Negative value** (e.g. `-300`): classic loss limit — stop out if you lose $300
+- **Positive value** (e.g. `200`): profit protection — if you're up $500 and set stop to `200`, it triggers if P&L drops back to $200, locking in at least $200 of profit
 
 ### Session Target
 
 A **profit goal** for the session (positive dollar amount). Triggers when session P&L reaches or exceeds this value. Set to `0` to disable.
-
-### Session Stop
-
-A **maximum loss limit** for the session (negative dollar amount). Triggers when session P&L drops to or below this value. Set to `0` to disable.
 
 ### Soft vs Hard Mode
 
@@ -225,7 +248,7 @@ Press `T` during a session:
 ```
 
 - Enter a **positive number** for target (e.g. `500` = trigger at +$500 profit)
-- Enter a **negative number** for stop (e.g. `-300` = trigger at -$300 loss)
+- Enter a **negative or positive number** for stop (e.g. `-300` = loss limit, `200` = protect profit)
 - Choose **soft** or **hard** mode for each limit
 - Enter `0` to **disable** either side (mode prompt is skipped)
 - Press **ENTER** to keep the current value
@@ -237,11 +260,33 @@ Limits and modes are saved **per account** in your config file and persist acros
 On exit, SocketTrader displays your session results including final P&L:
 
 ```
-  ┌─ SESSION SUMMARY ───────────────────────────┐
-  │  Signals received: 12                       │
-  │  Session P&L: +$247.50                      │
-  │  Log: ~/.voidorigin_signals.log             │
-  └─────────────────────────────────────────────┘
+  ┌─ SESSION SUMMARY ───────────────────────────────────────────┐
+  │  Signals received: 12                                      │
+  │  Session P&L: +$247.50                                     │
+  │  Log: C:\Users\trader\.voidorigin_signals.log              │
+  └─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Signal Latency
+
+Each signal displays delivery time from server to client. The first signal on each connection sets the **baseline** latency, and subsequent signals are color-coded relative to it:
+
+| Color | Meaning |
+|:-----:|---------|
+| Green | Faster than baseline |
+| Yellow | Within 250ms of baseline |
+| Red | More than 250ms slower than baseline |
+
+```
+[14:32:05] ▸  PLACE;MyAccount;NQ 06-26;BUY;1;MARKET;;;DAY;;;NQ_Med;1020
+   ├─ latency: 47ms
+   └─ saved → C:\Users\...\NinjaTrader 8\incoming
+
+[14:33:12] ▸  PLACE;MyAccount;NQ 06-26;SELL;1;MARKET;;;DAY;;;NQ_Med;1020
+   ├─ latency: 312ms (+265ms)     ← red: 265ms slower than baseline
+   └─ saved → C:\Users\...\NinjaTrader 8\incoming
 ```
 
 ---
@@ -265,28 +310,6 @@ Settings persist in `~/.voidorigin_config.json`:
 ```
 
 > This file contains your authentication token and is excluded from version control via `.gitignore`.
-
----
-
-## Signal Latency
-
-Each signal displays delivery time from server to client. The first signal on each connection sets the **baseline** latency, and subsequent signals are color-coded relative to it:
-
-| Color | Meaning |
-|:-----:|---------|
-| Green | Faster than baseline |
-| Yellow | Within 250ms of baseline |
-| Red | More than 250ms slower than baseline |
-
-```
-[14:32:05] ▸  PLACE;MyAccount;NQ 06-26;BUY;1;MARKET;;;DAY;;;NQ_Med;1020
-   ├─ latency: 47ms
-   └─ saved → C:\Users\...\NinjaTrader 8\incoming
-
-[14:33:12] ▸  PLACE;MyAccount;NQ 06-26;SELL;1;MARKET;;;DAY;;;NQ_Med;1020
-   ├─ latency: 312ms (+265ms)     ← red: 265ms slower than baseline
-   └─ saved → C:\Users\...\NinjaTrader 8\incoming
-```
 
 ---
 
