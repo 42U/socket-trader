@@ -1,4 +1,5 @@
 .voidorigin_config.json
+.voidorigin_signals.log
 socketServer*
 __pycache__/
 *.pyc

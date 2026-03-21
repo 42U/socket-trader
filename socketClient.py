@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import websockets
 import json
+import logging
 import shutil
 import sys
 import time
@@ -10,6 +11,7 @@ import random
 import os
 import re
 import platform
+from collections import deque
 from pathlib import Path
 from colorama import init, Fore, Style
 
@@ -34,6 +36,18 @@ atm_strategy = "NQ_Med"        # ATM strategy template name
 nt_port = 36973                # NinjaTrader AT Interface port (default 36973)
 awaiting_directory_input = False
 awaiting_user_input = False  # Block key handler during any input prompt
+
+# ---------- Logging ----------
+LOG_FILE = Path.home() / ".voidorigin_signals.log"
+logger = logging.getLogger("sockettrader")
+logger.setLevel(logging.INFO)
+_log_handler = logging.FileHandler(str(LOG_FILE), encoding="utf-8")
+_log_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+logger.addHandler(_log_handler)
+
+# ---------- Duplicate detection ----------
+# Track recent signal IDs (the unique number at the end of each signal)
+_recent_signal_ids: deque[str] = deque(maxlen=100)
 
 
 def load_config() -> dict:
@@ -572,14 +586,15 @@ def format_signal(signal_text: str, idx: int):
 
 
 # ---------- File output ----------
-def extract_signal_string(msg: str, account: str, atm: str) -> tuple[str | None, int | None]:
-    """Parse JSON message and extract the raw signal string + server timestamp.
+def extract_signal_string(msg: str, account: str, atm: str) -> tuple[str | None, int | None, str | None]:
+    """Parse JSON message and extract the raw signal string, server timestamp, and signal ID.
 
-    Signal format: PLACE;Account;Instrument;Action;Qty;OrderType;;;TIF;;;AtmStrategy;Value
-    Index:           0      1        2        3     4      5     678  9  10 11    11     12
+    Signal format: PLACE;Account;Instrument;Action;Qty;OrderType;;;TIF;;;AtmStrategy;SignalID
+    Index:           0      1        2        3     4      5     678  9  10 11          12
     - Field 1 (account) is replaced with the user's real account.
     - Field 11 (ATM strategy) is replaced with the user's chosen strategy.
-    Returns (processed_signal, server_timestamp_ms) or (None, None).
+    - Field 12 (last field) is the unique signal ID used for dedup.
+    Returns (processed_signal, server_timestamp_ms, signal_id) or (None, None, None).
     """
     try:
         data = json.loads(msg)
@@ -587,16 +602,18 @@ def extract_signal_string(msg: str, account: str, atm: str) -> tuple[str | None,
             raw = data["signal"]
             ts = data.get("ts")
             parts = raw.split(";")
+            # Extract signal ID (last non-empty field)
+            signal_id = parts[-1] if parts else None
             # Replace account (field 1)
             if len(parts) >= 2:
                 parts[1] = account
             # Replace ATM strategy (field 11)
             if len(parts) >= 12:
                 parts[11] = atm
-            return ";".join(parts), ts
+            return ";".join(parts), ts, signal_id
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
-    return None, None
+    return None, None, None
 
 
 def write_signal_to_file(signal_text: str):
@@ -659,6 +676,7 @@ async def listen(token: str):
                 else:
                     sys.stdout.write("\r\033[K")
                     print(Fore.GREEN + f"✔  Connected  ·  Account: {active_account}  ·  Baseline: {baseline_latency}ms" + Style.RESET_ALL)
+                    logger.info(f"CONNECTED  account={active_account}  baseline={baseline_latency}ms  strategy={atm_strategy}")
                 sys.stdout.write("\r\033[K")
                 sys.stdout.flush()
                 reconnect_event.clear()
@@ -675,12 +693,22 @@ async def listen(token: str):
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=1)
                         if not paused:
-                            raw_signal, server_ts = extract_signal_string(msg, active_account, atm_strategy)
+                            raw_signal, server_ts, sig_id = extract_signal_string(msg, active_account, atm_strategy)
                             if raw_signal:
+                                # Duplicate detection by signal ID
+                                if sig_id and sig_id in _recent_signal_ids:
+                                    sys.stdout.write("\r\033[K")
+                                    print(Fore.YELLOW + Style.DIM + f"  ⚠  Duplicate signal ignored (ID: {sig_id})" + Style.RESET_ALL)
+                                    logger.info(f"DUPLICATE IGNORED  id={sig_id}  signal={raw_signal}")
+                                    continue
+                                if sig_id:
+                                    _recent_signal_ids.append(sig_id)
+
                                 write_signal_to_file(raw_signal)
                                 await signal_pulse("SIGNAL RECEIVED")
                                 sys.stdout.write("\r\033[K")
                                 print(format_signal(raw_signal, signal_count))
+                                logger.info(f"SIGNAL #{signal_count}  {raw_signal}")
                                 # Latency display (compared to connection baseline)
                                 if server_ts:
                                     latency_ms = int(time.time() * 1000) - server_ts
@@ -698,6 +726,7 @@ async def listen(token: str):
                                     diff_str = f" (+{diff}ms)" if diff > 0 else f" ({diff}ms)" if diff < 0 else ""
                                     sys.stdout.write("\r\033[K" + lat_color + Style.DIM + f"   ├─ latency: {lat_str}{diff_str}\n" + Style.RESET_ALL)
                                     sys.stdout.flush()
+                                    logger.info(f"  latency={latency_ms}ms  diff={diff}ms  baseline={baseline_latency}ms")
                                 if output_directory:
                                     sys.stdout.write("\r\033[K" + Fore.GREEN + Style.DIM + f"   └─ saved → {output_directory}\n" + Style.RESET_ALL)
                                     sys.stdout.flush()
@@ -733,18 +762,22 @@ async def listen(token: str):
 
             if http_status is not None and int(http_status) in (401, 403):
                 print(Fore.RED + f"⛔  AUTHENTICATION FAILED (HTTP {http_status})" + Style.RESET_ALL)
+                logger.warning(f"AUTH FAILED  http={http_status}")
                 return "auth_failed"
             elif ws_code == 1008:
                 print(Fore.RED + "⛔  AUTHENTICATION FAILED (invalid token)" + Style.RESET_ALL)
+                logger.warning("AUTH FAILED  ws_code=1008")
                 return "auth_failed"
             elif http_status is not None:
                 print(Fore.RED + f"⛔  CONNECTION ERROR (HTTP {http_status})  ·  Retrying in {fmt_wait(fib_curr)}..." + Style.RESET_ALL)
+                logger.warning(f"CONNECTION ERROR  http={http_status}  retry={fmt_wait(fib_curr)}")
             elif shutdown.is_set():
                 break
             else:
                 print(Fore.RED + f"⛔  CONNECTION LOST  ·  {e}" + Style.RESET_ALL)
                 sys.stdout.write("\r\033[K")
                 print(Fore.YELLOW + f"  ↻  Reconnecting in {fmt_wait(fib_curr)}..." + Style.RESET_ALL)
+                logger.warning(f"CONNECTION LOST  error={e}  retry={fmt_wait(fib_curr)}")
 
         if shutdown.is_set():
             break
@@ -906,9 +939,21 @@ async def main():
             break
 
 
+def print_exit_summary():
+    show_cursor()
+    sys.stdout.write("\r\033[K")
+    print(Fore.CYAN + f"\n  ┌─ SESSION SUMMARY ─────────────────────────┐" + Style.RESET_ALL)
+    print(Fore.CYAN + f"  │  Signals received: {str(signal_count).ljust(24)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"  │  Log: {str(LOG_FILE)[:38].ljust(38)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"  └─────────────────────────────────────────────┘" + Style.RESET_ALL)
+    logger.info(f"SESSION END  signals={signal_count}")
+
+
 if __name__ == "__main__":
+    logger.info("SESSION START")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        show_cursor()
-        print(Fore.RED + "\nFORCED EXIT" + Style.RESET_ALL)
+        pass
+    finally:
+        print_exit_summary()
