@@ -643,6 +643,7 @@ async def listen(token: str):
         try:
             async with websockets.connect(uri) as ws:
                 fib_prev, fib_curr = 60, 60  # Reset on successful connection
+                baseline_latency = None       # First signal sets the baseline
 
                 # Context-aware welcome message
                 missing = []
@@ -679,15 +680,24 @@ async def listen(token: str):
                                 await signal_pulse("SIGNAL RECEIVED")
                                 sys.stdout.write("\r\033[K")
                                 print(format_signal(raw_signal, signal_count))
-                                # Latency display
+                                # Latency display (relative to baseline)
                                 if server_ts:
                                     latency_ms = int(time.time() * 1000) - server_ts
+                                    if baseline_latency is None:
+                                        baseline_latency = latency_ms
                                     if latency_ms < 1000:
                                         lat_str = f"{latency_ms}ms"
                                     else:
                                         lat_str = f"{latency_ms / 1000:.1f}s"
-                                    lat_color = Fore.GREEN if latency_ms < 200 else Fore.YELLOW if latency_ms < 1000 else Fore.RED
-                                    sys.stdout.write("\r\033[K" + lat_color + Style.DIM + f"   ├─ latency: {lat_str}\n" + Style.RESET_ALL)
+                                    diff = latency_ms - baseline_latency
+                                    if diff < 0:
+                                        lat_color = Fore.GREEN   # Faster than baseline
+                                    elif diff <= 250:
+                                        lat_color = Fore.YELLOW  # Within 250ms of baseline
+                                    else:
+                                        lat_color = Fore.RED     # >250ms slower than baseline
+                                    diff_str = f" (+{diff}ms)" if diff > 0 else f" ({diff}ms)" if diff < 0 else ""
+                                    sys.stdout.write("\r\033[K" + lat_color + Style.DIM + f"   ├─ latency: {lat_str}{diff_str}\n" + Style.RESET_ALL)
                                     sys.stdout.flush()
                                 if output_directory:
                                     sys.stdout.write("\r\033[K" + Fore.GREEN + Style.DIM + f"   └─ saved → {output_directory}\n" + Style.RESET_ALL)

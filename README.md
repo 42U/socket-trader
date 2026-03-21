@@ -163,17 +163,21 @@ Settings persist in `~/.voidorigin_config.json`:
 
 ## Signal Latency
 
-Each signal displays delivery time from server to client, color-coded:
+Each signal displays delivery time from server to client. The first signal on each connection sets the **baseline** latency, and subsequent signals are color-coded relative to it:
 
-| Color | Threshold |
-|:-----:|-----------|
-| Green | < 200ms |
-| Yellow | < 1s |
-| Red | > 1s |
+| Color | Meaning |
+|:-----:|---------|
+| Green | Faster than baseline |
+| Yellow | Within 250ms of baseline |
+| Red | More than 250ms slower than baseline |
 
 ```
 [14:32:05] ▸  PLACE;MyAccount;NQ 06-26;BUY;1;MARKET;;;DAY;;;NQ_Med;1020
    ├─ latency: 47ms
+   └─ saved → C:\Users\...\NinjaTrader 8\incoming
+
+[14:33:12] ▸  PLACE;MyAccount;NQ 06-26;SELL;1;MARKET;;;DAY;;;NQ_Med;1020
+   ├─ latency: 312ms (+265ms)     ← red: 265ms slower than baseline
    └─ saved → C:\Users\...\NinjaTrader 8\incoming
 ```
 
