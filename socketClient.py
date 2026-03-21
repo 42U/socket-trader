@@ -632,17 +632,25 @@ async def listen(password: str):
             return "shutdown"
 
         except Exception as e:
-            # Handle HTTP rejection (auth failure or other status codes)
-            # Works with both old (InvalidStatusCode) and new (InvalidStatus) websockets
-            status = getattr(e, "status_code", None) or getattr(e, "status", None)
             sys.stdout.write("\r\033[K")
-            if status is not None:
-                status = int(status)
-                if status in (401, 403):
-                    print(Fore.RED + "⛔  AUTHENTICATION FAILED (HTTP {status})" + Style.RESET_ALL)
-                    return "auth_failed"
-                else:
-                    print(Fore.RED + f"⛔  CONNECTION ERROR (HTTP {status})  ·  Retrying in {fmt_wait(fib_curr)}..." + Style.RESET_ALL)
+
+            # Check for HTTP status rejection (old and new websockets lib)
+            http_status = getattr(e, "status_code", None) or getattr(e, "status", None)
+
+            # Check for websocket close code 1008 (policy violation = bad token)
+            ws_code = getattr(e, "code", None) or getattr(e, "rcvd", None)
+            if ws_code is not None and not isinstance(ws_code, int):
+                # newer websockets lib: rcvd is a Close frame
+                ws_code = getattr(ws_code, "code", None)
+
+            if http_status is not None and int(http_status) in (401, 403):
+                print(Fore.RED + f"⛔  AUTHENTICATION FAILED (HTTP {http_status})" + Style.RESET_ALL)
+                return "auth_failed"
+            elif ws_code == 1008:
+                print(Fore.RED + "⛔  AUTHENTICATION FAILED (invalid token)" + Style.RESET_ALL)
+                return "auth_failed"
+            elif http_status is not None:
+                print(Fore.RED + f"⛔  CONNECTION ERROR (HTTP {http_status})  ·  Retrying in {fmt_wait(fib_curr)}..." + Style.RESET_ALL)
             elif shutdown.is_set():
                 break
             else:
