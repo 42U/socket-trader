@@ -474,10 +474,12 @@ async def keyboard_loop():
         elif key.lower() == "d":
             await prompt_directory()
         elif key.lower() == "r":
-            print(Fore.YELLOW + "\n🔄  MANUAL RECONNECT REQUESTED" + Style.RESET_ALL)
+            sys.stdout.write("\r\033[K")
+            print(Fore.YELLOW + "🔄  MANUAL RECONNECT REQUESTED" + Style.RESET_ALL)
             reconnect_event.set()
         elif key.lower() == "c":
-            print(Fore.RED + "\n⛔  DISCONNECT REQUESTED  ·  TERMINATING SESSION" + Style.RESET_ALL)
+            sys.stdout.write("\r\033[K")
+            print(Fore.RED + "⛔  DISCONNECT REQUESTED  ·  TERMINATING SESSION" + Style.RESET_ALL)
             shutdown.set()
             break
 
@@ -531,7 +533,8 @@ def write_signal_to_file(signal_text: str):
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(signal_text)
     except Exception as exc:
-        print(Fore.RED + f"\n  ✖  File write error: {exc}" + Style.RESET_ALL)
+        sys.stdout.write("\r\033[K")
+        print(Fore.RED + f"  ✖  File write error: {exc}" + Style.RESET_ALL)
 
 
 # ---------- WebSocket listener with reconnection ----------
@@ -571,9 +574,11 @@ async def listen(password: str):
                     missing.append("D = set output directory")
 
                 if missing:
-                    print(Fore.YELLOW + f"\n⚠  Connected, but setup incomplete: {', '.join(missing)}" + Style.RESET_ALL)
+                    sys.stdout.write("\r\033[K")
+                    print(Fore.YELLOW + f"⚠  Connected, but setup incomplete: {', '.join(missing)}" + Style.RESET_ALL)
                 else:
-                    print(Fore.GREEN + f"\n✔  Connected  ·  Account: {active_account}  ·  Signals will arrive shortly" + Style.RESET_ALL)
+                    sys.stdout.write("\r\033[K")
+                    print(Fore.GREEN + f"✔  Connected  ·  Account: {active_account}  ·  Signals will arrive shortly" + Style.RESET_ALL)
                 sys.stdout.write("\r\033[K")
                 sys.stdout.flush()
                 reconnect_event.clear()
@@ -583,6 +588,7 @@ async def listen(password: str):
                     if reconnect_event.is_set():
                         reconnect_event.clear()
                         fib_prev, fib_curr = 60, 60  # Reset backoff on manual reconnect
+                        sys.stdout.write("\r\033[K")
                         print(Fore.YELLOW + "  🔄  Dropping connection for reconnect..." + Style.RESET_ALL)
                         break
 
@@ -621,24 +627,27 @@ async def listen(password: str):
                         continue
 
         except websockets.exceptions.InvalidURI:
-            print(Fore.RED + "\n⛔  INVALID SERVER URI" + Style.RESET_ALL)
+            sys.stdout.write("\r\033[K")
+            print(Fore.RED + "⛔  INVALID SERVER URI" + Style.RESET_ALL)
             return "shutdown"
 
         except Exception as e:
             # Handle HTTP rejection (auth failure or other status codes)
             # Works with both old (InvalidStatusCode) and new (InvalidStatus) websockets
             status = getattr(e, "status_code", None) or getattr(e, "status", None)
+            sys.stdout.write("\r\033[K")
             if status is not None:
                 status = int(status)
                 if status in (401, 403):
-                    print(Fore.RED + f"\n⛔  AUTHENTICATION FAILED (HTTP {status})" + Style.RESET_ALL)
+                    print(Fore.RED + "⛔  AUTHENTICATION FAILED (HTTP {status})" + Style.RESET_ALL)
                     return "auth_failed"
                 else:
-                    print(Fore.RED + f"\n⛔  CONNECTION ERROR (HTTP {status})  ·  Retrying in {fmt_wait(fib_curr)}..." + Style.RESET_ALL)
+                    print(Fore.RED + f"⛔  CONNECTION ERROR (HTTP {status})  ·  Retrying in {fmt_wait(fib_curr)}..." + Style.RESET_ALL)
             elif shutdown.is_set():
                 break
             else:
-                print(Fore.RED + f"\n⛔  CONNECTION LOST  ·  {e}" + Style.RESET_ALL)
+                print(Fore.RED + f"⛔  CONNECTION LOST  ·  {e}" + Style.RESET_ALL)
+                sys.stdout.write("\r\033[K")
                 print(Fore.YELLOW + f"  ↻  Reconnecting in {fmt_wait(fib_curr)}..." + Style.RESET_ALL)
 
         if shutdown.is_set():
