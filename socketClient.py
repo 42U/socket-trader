@@ -618,10 +618,10 @@ async def listen(token: str):
                                 # Non-signal message (server info, heartbeat, etc.)
                                 try:
                                     data = json.loads(msg)
-                                    # Skip server welcome — client handles its own greeting
-                                    if "welcome" not in data:
-                                        print(Fore.CYAN + Style.DIM + f"  [server] {data}" + Style.RESET_ALL)
+                                    sys.stdout.write("\r\033[K")
+                                    print(Fore.CYAN + Style.DIM + f"  [server] {data}" + Style.RESET_ALL)
                                 except json.JSONDecodeError:
+                                    sys.stdout.write("\r\033[K")
                                     print(Fore.CYAN + Style.DIM + f"  [server] {msg}" + Style.RESET_ALL)
                     except asyncio.TimeoutError:
                         continue
