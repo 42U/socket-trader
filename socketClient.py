@@ -641,9 +641,10 @@ async def listen(token: str):
 
     while not shutdown.is_set():
         try:
+            connect_start = time.time()
             async with websockets.connect(uri) as ws:
+                baseline_latency = int((time.time() - connect_start) * 1000)
                 fib_prev, fib_curr = 60, 60  # Reset on successful connection
-                baseline_latency = None       # First signal sets the baseline
 
                 # Context-aware welcome message
                 missing = []
@@ -657,7 +658,7 @@ async def listen(token: str):
                     print(Fore.YELLOW + f"⚠  Connected, but setup incomplete: {', '.join(missing)}" + Style.RESET_ALL)
                 else:
                     sys.stdout.write("\r\033[K")
-                    print(Fore.GREEN + f"✔  Connected  ·  Account: {active_account}  ·  Signals will arrive shortly" + Style.RESET_ALL)
+                    print(Fore.GREEN + f"✔  Connected  ·  Account: {active_account}  ·  Baseline: {baseline_latency}ms" + Style.RESET_ALL)
                 sys.stdout.write("\r\033[K")
                 sys.stdout.flush()
                 reconnect_event.clear()
@@ -680,22 +681,20 @@ async def listen(token: str):
                                 await signal_pulse("SIGNAL RECEIVED")
                                 sys.stdout.write("\r\033[K")
                                 print(format_signal(raw_signal, signal_count))
-                                # Latency display (relative to baseline)
+                                # Latency display (compared to connection baseline)
                                 if server_ts:
                                     latency_ms = int(time.time() * 1000) - server_ts
-                                    if baseline_latency is None:
-                                        baseline_latency = latency_ms
                                     if latency_ms < 1000:
                                         lat_str = f"{latency_ms}ms"
                                     else:
                                         lat_str = f"{latency_ms / 1000:.1f}s"
                                     diff = latency_ms - baseline_latency
                                     if diff < 0:
-                                        lat_color = Fore.GREEN   # Faster than baseline
+                                        lat_color = Fore.GREEN   # Faster than connect time
                                     elif diff <= 250:
-                                        lat_color = Fore.YELLOW  # Within 250ms of baseline
+                                        lat_color = Fore.YELLOW  # Within 250ms of connect time
                                     else:
-                                        lat_color = Fore.RED     # >250ms slower than baseline
+                                        lat_color = Fore.RED     # >250ms slower than connect time
                                     diff_str = f" (+{diff}ms)" if diff > 0 else f" ({diff}ms)" if diff < 0 else ""
                                     sys.stdout.write("\r\033[K" + lat_color + Style.DIM + f"   ├─ latency: {lat_str}{diff_str}\n" + Style.RESET_ALL)
                                     sys.stdout.flush()
