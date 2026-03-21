@@ -739,7 +739,13 @@ async def listen(token: str):
                                 try:
                                     data = json.loads(msg)
                                     sys.stdout.write("\r\033[K")
-                                    print(Fore.CYAN + Style.DIM + f"  [server] {data}" + Style.RESET_ALL)
+                                    # Show welcome latency if server included a timestamp
+                                    if "welcome" in data and "ts" in data:
+                                        welcome_lat = int(time.time() * 1000) - data["ts"]
+                                        print(Fore.CYAN + Style.DIM + f"  [server] {data['welcome']}  ·  message latency: {welcome_lat}ms" + Style.RESET_ALL)
+                                        logger.info(f"WELCOME  latency={welcome_lat}ms  handshake={connect_latency}ms")
+                                    else:
+                                        print(Fore.CYAN + Style.DIM + f"  [server] {data}" + Style.RESET_ALL)
                                 except json.JSONDecodeError:
                                     sys.stdout.write("\r\033[K")
                                     print(Fore.CYAN + Style.DIM + f"  [server] {msg}" + Style.RESET_ALL)
