@@ -154,24 +154,24 @@ def ask_account(cfg: dict) -> str:
         print(Fore.YELLOW + "  ⚠  Account cannot be empty." + Style.RESET_ALL)
 
 
-def ask_password(cfg: dict, force: bool = False) -> str:
-    """Get password from config or prompt user."""
-    saved = cfg.get("password")
+def ask_token(cfg: dict, force: bool = False) -> str:
+    """Get connection token from config or prompt user."""
+    saved = cfg.get("token")
     if saved and not force:
         return saved
 
     if force:
-        print(Fore.YELLOW + "\n  ⚠  Authentication failed. Please re-enter password." + Style.RESET_ALL)
+        print(Fore.YELLOW + "\n  ⚠  Authentication failed. Please re-enter token." + Style.RESET_ALL)
     else:
         print(Fore.CYAN + "\n┌─ AUTHENTICATION ─────────────────────────────────────┐" + Style.RESET_ALL)
-        print(Fore.CYAN + "│  Enter your connection password.                     │" + Style.RESET_ALL)
+        print(Fore.CYAN + "│  Enter your connection token.                        │" + Style.RESET_ALL)
         print(Fore.CYAN + "└──────────────────────────────────────────────────────┘" + Style.RESET_ALL)
 
     while True:
-        pw = input(Fore.WHITE + "  PASSWORD ▸ " + Style.RESET_ALL).strip()
-        if pw:
-            return pw
-        print(Fore.YELLOW + "  ⚠  Password cannot be empty." + Style.RESET_ALL)
+        tk = input(Fore.WHITE + "  TOKEN ▸ " + Style.RESET_ALL).strip()
+        if tk:
+            return tk
+        print(Fore.YELLOW + "  ⚠  Token cannot be empty." + Style.RESET_ALL)
 
 
 # ---------- Cross-platform keyboard helpers ----------
@@ -554,9 +554,9 @@ def fmt_wait(seconds: int) -> str:
     return f"{seconds}s"
 
 
-async def listen(password: str):
+async def listen(token: str):
     global signal_count
-    uri = f"{WS_HOST}?token={password}"
+    uri = f"{WS_HOST}?token={token}"
     fib_prev, fib_curr = 60, 60  # Start at 1m, 1m → 2m → 3m → 5m → ...
 
     await boot_sequence()
@@ -675,7 +675,7 @@ async def listen(password: str):
 
 # ---------- Setup (runs before async loop) ----------
 def setup() -> tuple[str, dict]:
-    """Run first-time or repeat setup. Returns (password, config)."""
+    """Run first-time or repeat setup. Returns (token, config)."""
     cfg = load_config()
 
     print(Fore.GREEN + Style.BRIGHT)
@@ -684,16 +684,16 @@ def setup() -> tuple[str, dict]:
     print("  ╚══════════════════════════════════════════╝")
     print(Style.RESET_ALL)
 
-    if cfg.get("password") and cfg.get("account") and cfg.get("output_directory") and Path(cfg["output_directory"]).is_dir():
+    if cfg.get("token") and cfg.get("account") and cfg.get("output_directory") and Path(cfg["output_directory"]).is_dir():
         print(Fore.GREEN + f"  ✔  Config loaded from {CONFIG_FILE}" + Style.RESET_ALL)
         print(Fore.GREEN + f"  ✔  Account: {cfg['account']}" + Style.RESET_ALL)
         print(Fore.GREEN + f"  ✔  Output: {cfg['output_directory']}" + Style.RESET_ALL)
-        print(Fore.GREEN + f"  ✔  Password: {'*' * len(cfg['password'])}" + Style.RESET_ALL)
+        print(Fore.GREEN + f"  ✔  Token: {'*' * len(cfg['token'])}" + Style.RESET_ALL)
         print()
-        return cfg["password"], cfg
+        return cfg["token"], cfg
 
-    # Password
-    password = ask_password(cfg)
+    # Token
+    token = ask_token(cfg)
 
     # Account
     account = ask_account(cfg)
@@ -703,7 +703,7 @@ def setup() -> tuple[str, dict]:
     output_directory = detect_or_ask_directory(cfg)
 
     # Save config
-    cfg["password"] = password
+    cfg["token"] = token
     cfg["account"] = account
     if output_directory:
         cfg["output_directory"] = output_directory
@@ -711,14 +711,14 @@ def setup() -> tuple[str, dict]:
 
     print(Fore.GREEN + f"\n  ✔  Config saved to {CONFIG_FILE}" + Style.RESET_ALL)
     print()
-    return password, cfg
+    return token, cfg
 
 
 # ---------- Main ----------
 async def main():
     global output_directory, active_account
 
-    password, cfg = setup()
+    token, cfg = setup()
     active_account = cfg.get("account", "")
 
     if cfg.get("output_directory"):
@@ -731,7 +731,7 @@ async def main():
         reconnect_event.clear()
 
         tasks = [
-            asyncio.create_task(listen(password)),
+            asyncio.create_task(listen(token)),
             asyncio.create_task(keyboard_loop()),
             asyncio.create_task(pause_indicator()),
         ]
@@ -757,13 +757,13 @@ async def main():
                 pass
 
         if result == "auth_failed":
-            # Re-prompt for password — stdin is now free
+            # Re-prompt for token — stdin is now free
             show_cursor()
             cfg = load_config()
-            password = ask_password(cfg, force=True)
-            cfg["password"] = password
+            token = ask_token(cfg, force=True)
+            cfg["token"] = token
             save_config(cfg)
-            print(Fore.GREEN + "  ✔  Password updated. Reconnecting..." + Style.RESET_ALL)
+            print(Fore.GREEN + "  ✔  Token updated. Reconnecting..." + Style.RESET_ALL)
             continue
         else:
             break
