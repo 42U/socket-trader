@@ -22,10 +22,23 @@ try:
 except ImportError:
     pyfiglet = None
 
-init()
+IS_WINDOWS = platform.system() == "Windows"
+
+if IS_WINDOWS:
+    # Windows 10+ handles ANSI natively — skip colorama conversion
+    # so cursor-positioning sequences (\033[H, \033[s/u, \033[r) pass through
+    init(convert=False)
+    # Enable virtual terminal processing on Windows 10+
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+    except Exception:
+        pass
+else:
+    init()
 
 # ---------- Config persistence ----------
-IS_WINDOWS = platform.system() == "Windows"
 CONFIG_FILE = Path.home() / ".voidorigin_config.json"
 WS_HOST = "ws://ec2-16-59-44-39.us-east-2.compute.amazonaws.com:8420/ws"
 
@@ -121,9 +134,7 @@ def detect_or_ask_directory(cfg: dict) -> str | None:
     if saved and Path(saved).is_dir():
         return saved
 
-    is_windows = platform.system() == "Windows"
-
-    if is_windows:
+    if IS_WINDOWS:
         print(Fore.CYAN + "\n  🔍  Searching for NinjaTrader 8 incoming folder..." + Style.RESET_ALL)
         found = find_ninjatrader_incoming_windows()
         if found:
@@ -135,7 +146,7 @@ def detect_or_ask_directory(cfg: dict) -> str | None:
             print(Fore.YELLOW + "  ⚠  Could not auto-detect NinjaTrader 8 incoming folder." + Style.RESET_ALL)
 
     # Linux or Windows fallback: ask the user
-    if not is_windows:
+    if not IS_WINDOWS:
         print(Fore.CYAN + "\n┌─ LINUX DETECTED ─────────────────────────────────────┐" + Style.RESET_ALL)
         print(Fore.CYAN + "│  Enter the path to your signal output folder.        │" + Style.RESET_ALL)
         print(Fore.CYAN + "│  (NinjaTrader incoming folder or any target dir)      │" + Style.RESET_ALL)
@@ -349,6 +360,7 @@ def show_cursor():
 
 # ---------- Pinned controls bar ----------
 _controls_pinned = False
+_header_lines = 0  # Number of lines the pinned header occupies
 CONTROLS_TEXT = "P=PAUSE  A=ACCT  B=BAL  S=STRAT  D=DIR  T=LIMITS  O=PORT  R=RECONN  C=CLOSE"
 
 
@@ -371,7 +383,7 @@ def _build_controls_line():
         else:
             acct_info = f"{active_account}  "
     if not acct_info:
-        return f"{Fore.CYAN}{Style.DIM}{left}{Style.RESET_ALL}"
+        acct_info = "NO ACCOUNT SET  "
     # Pad between controls and account info
     width = term_width()
     visible_left = len(left)
@@ -380,40 +392,75 @@ def _build_controls_line():
     return f"{Fore.CYAN}{Style.DIM}{left}{' ' * gap}{acct_info}{Style.RESET_ALL}"
 
 
-def pin_controls():
-    """Pin the controls bar to the bottom of the terminal using scroll regions."""
-    global _controls_pinned
+def pin_layout():
+    """Pin header at top and controls bar at bottom using scroll regions."""
+    global _controls_pinned, _header_lines
     rows = term_height()
-    # Set scroll region to all rows except the last
-    sys.stdout.write(f"\033[1;{rows - 1}r")
-    # Move to last row and draw controls
+
+    # Draw header at the top (rows 1 through _header_lines)
+    # Header content: compact banner + header box + blank + status_bar
+    width = term_width()
+    if pyfiglet:
+        # Use compact font for pinned header to save vertical space
+        for font in ["small", "standard", "big"]:
+            try:
+                art = pyfiglet.figlet_format("VOIDORIGIN", font=font)
+                if max(len(l) for l in art.splitlines()) <= width:
+                    break
+            except Exception:
+                continue
+        else:
+            art = "V O I D O R I G I N"
+        banner_text = "\n".join(line.center(width) for line in art.rstrip("\n").splitlines())
+    else:
+        banner_text = "V O I D O R I G I N".center(width)
+    header_text = build_header()
+    sb = status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS")
+    header_content = banner_text + "\n" + header_text + "\n\n" + sb
+
+    header_parts = header_content.splitlines()
+    _header_lines = len(header_parts) + 1  # +1 for blank line after
+
+    # Draw header
+    sys.stdout.write("\033[1;1H")  # Move to top
+    for i, line in enumerate(header_parts):
+        sys.stdout.write(f"\033[{i + 1};1H\033[K{Fore.GREEN}{line}{Style.RESET_ALL}")
+
+    # Set scroll region: after header, before footer
+    scroll_top = _header_lines + 1
+    scroll_bottom = rows - 1
+    sys.stdout.write(f"\033[{scroll_top};{scroll_bottom}r")
+
+    # Draw controls bar on last row
     sys.stdout.write(f"\033[{rows};1H")
     sys.stdout.write(f"\033[K{_build_controls_line()}")
-    # Move cursor back into the scroll region
-    sys.stdout.write(f"\033[{rows - 1};1H")
+
+    # Move cursor to start of scroll region
+    sys.stdout.write(f"\033[{scroll_top};1H")
     sys.stdout.flush()
     _controls_pinned = True
 
 
-def unpin_controls():
-    """Remove the pinned controls bar and restore normal scrolling."""
+def unpin_layout():
+    """Remove pinned header/footer and restore normal scrolling."""
     global _controls_pinned
-    # Reset scroll region to full terminal
     sys.stdout.write("\033[r")
     sys.stdout.flush()
     _controls_pinned = False
 
 
 def refresh_controls():
-    """Redraw the pinned controls bar (call after terminal resize or output)."""
+    """Redraw the pinned controls bar and maintain scroll region."""
     if not _controls_pinned:
         return
     rows = term_height()
+    scroll_top = _header_lines + 1
+    scroll_bottom = rows - 1
     # Save cursor position
     sys.stdout.write("\033[s")
     # Update scroll region in case terminal resized
-    sys.stdout.write(f"\033[1;{rows - 1}r")
-    # Move to last row and redraw
+    sys.stdout.write(f"\033[{scroll_top};{scroll_bottom}r")
+    # Move to last row and redraw controls
     sys.stdout.write(f"\033[{rows};1H")
     sys.stdout.write(f"\033[K{_build_controls_line()}")
     # Restore cursor position
@@ -497,19 +544,16 @@ def glitch_line(text, intensity=0.15):
 async def boot_sequence():
     hide_cursor()
     clear()
-    # Pin controls bar to bottom before drawing anything
-    pin_controls()
+    # Animated banner
     banner_lines = build_banner().splitlines()
     for line in banner_lines:
         sys.stdout.write(Fore.GREEN + Style.DIM + glitch_line(line, 0.25) + "\n" + Style.RESET_ALL)
         sys.stdout.flush()
         await asyncio.sleep(0.06)
     await asyncio.sleep(0.5)
-    for line in build_header().splitlines():
-        print(Fore.GREEN + line + Style.RESET_ALL)
-    print()
-    print(status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS"))
-    print()
+    # Clear and pin the full layout (header + scroll region + footer)
+    clear()
+    pin_layout()
     # Reset cursor to column 0 — Windows terminals can drift after centered text
     sys.stdout.write("\r\033[K")
     sys.stdout.flush()
@@ -561,7 +605,7 @@ async def prompt_directory():
     print(Fore.CYAN + "│  Paste the directory path where files will go.  │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  Press ENTER to keep current.                    │" + Style.RESET_ALL)
     if output_directory:
-        print(Fore.CYAN + f"│  Current: {output_directory[:57].ljust(57)} │" + Style.RESET_ALL)
+        print(Fore.CYAN + f"│  Current: {output_directory[:39].ljust(39)}│" + Style.RESET_ALL)
     print(Fore.CYAN + "└─────────────────────────────────────────────────┘" + Style.RESET_ALL)
     sys.stdout.write(Fore.WHITE + "  PATH ▸ " + Style.RESET_ALL)
     sys.stdout.flush()
@@ -607,7 +651,7 @@ async def prompt_account():
     awaiting_user_input = True
     show_cursor()
     # Try to auto-detect accounts from NinjaTrader ATI
-    accounts = query_nt_accounts(nt_port)
+    accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
     if accounts:
         print(Fore.CYAN + "\n┌─ CHANGE ACCOUNT ─────────────────────────────────┐" + Style.RESET_ALL)
         for i, a in enumerate(accounts, 1):
@@ -667,7 +711,7 @@ async def prompt_port():
     print(Fore.CYAN + "\n┌─ NINJATRADER AT INTERFACE PORT ───────────────────┐" + Style.RESET_ALL)
     print(Fore.CYAN + "│  Enter NinjaTrader AT Interface server port.      │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  Press ENTER to keep current.                     │" + Style.RESET_ALL)
-    print(Fore.CYAN + f"│  Current: {str(nt_port).ljust(57)} │" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  Current: {str(nt_port).ljust(39)}│" + Style.RESET_ALL)
     print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
     sys.stdout.write(Fore.WHITE + "  PORT ▸ " + Style.RESET_ALL)
     sys.stdout.flush()
@@ -704,7 +748,7 @@ async def prompt_strategy():
     print(Fore.CYAN + "│  Enter the ATM strategy template name to use.     │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  This must match a template in NinjaTrader.       │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  Press ENTER to keep current.                     │" + Style.RESET_ALL)
-    print(Fore.CYAN + f"│  Current: {atm_strategy[:57].ljust(57)} │" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  Current: {atm_strategy[:39].ljust(39)}│" + Style.RESET_ALL)
     print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
     sys.stdout.write(Fore.WHITE + "  STRATEGY ▸ " + Style.RESET_ALL)
     sys.stdout.flush()
@@ -726,9 +770,9 @@ async def prompt_strategy():
 
 
 # ---------- Balances display ----------
-def show_balances():
+async def show_balances():
     """Display all NinjaTrader account balances with session P&L."""
-    accounts = query_nt_accounts(nt_port)
+    accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
     if not accounts:
         sys.stdout.write("\r\033[K")
         print(Fore.YELLOW + "  ⚠  Could not reach NinjaTrader ATI." + Style.RESET_ALL)
@@ -783,7 +827,7 @@ async def keyboard_loop():
                 sys.stdout.flush()
                 print(Fore.GREEN + "▶  SIGNAL OUTPUT RESUMED" + Style.RESET_ALL)
         elif key.lower() == "b":
-            show_balances()
+            await show_balances()
         elif key.lower() == "a":
             await prompt_account()
         elif key.lower() == "d":
@@ -799,8 +843,8 @@ async def keyboard_loop():
             print(Fore.YELLOW + "🔄  MANUAL RECONNECT REQUESTED" + Style.RESET_ALL)
             reconnect_event.set()
         elif key.lower() == "c":
-            sys.stdout.write("\r\033[K")
-            print(Fore.RED + "⛔  DISCONNECT REQUESTED  ·  TERMINATING SESSION" + Style.RESET_ALL)
+            unpin_layout()
+            clear()
             shutdown.set()
             break
 
@@ -982,8 +1026,8 @@ async def balance_monitor():
         if not active_account or hard_stopped:
             continue
 
-        # Always poll balances for status bar display
-        all_accounts = query_nt_accounts(nt_port)
+        # Always poll balances for status bar display (non-blocking)
+        all_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
         for a in all_accounts:
             session_current_balances[a["name"]] = a["cash"]
         refresh_controls()
@@ -1066,7 +1110,7 @@ async def prompt_limits():
     show_cursor()
     limits = get_account_limits(active_account)
     start_bal = session_start_balances.get(active_account)
-    current_bal = query_nt_balance(active_account)
+    current_bal = await asyncio.to_thread(query_nt_balance, active_account)
 
     print(Fore.CYAN + f"\n\r\033[K┌─ SESSION LIMITS ({active_account}) ────────────────────────┐" + Style.RESET_ALL)
     if start_bal is not None and current_bal is not None:
@@ -1183,7 +1227,7 @@ async def listen(token: str):
                 fib_prev, fib_curr = 60, 60  # Reset on successful connection
 
                 # Snapshot account balances for risk management
-                nt_accounts = query_nt_accounts(nt_port)
+                nt_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
                 for a in nt_accounts:
                     if a["name"] not in session_start_balances:
                         session_start_balances[a["name"]] = a["cash"]
@@ -1472,9 +1516,9 @@ async def main():
 
 
 def print_exit_summary():
-    unpin_controls()
+    unpin_layout()
+    clear()
     show_cursor()
-    sys.stdout.write("\r\033[K")
     log_str = str(LOG_FILE)
     # Box width adapts to fit the log path
     content_width = max(45, len(log_str) + 9)  # "  Log: " + path + "  "
