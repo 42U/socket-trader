@@ -576,6 +576,7 @@ async def listen(password: str):
                     # Check for manual reconnect request
                     if reconnect_event.is_set():
                         reconnect_event.clear()
+                        fib_prev, fib_curr = 60, 60  # Reset backoff on manual reconnect
                         print(Fore.YELLOW + "  🔄  Dropping connection for reconnect..." + Style.RESET_ALL)
                         break
 
