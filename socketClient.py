@@ -332,6 +332,9 @@ async def boot_sequence():
     print()
     print(status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS"))
     print()
+    # Reset cursor to column 0 — Windows terminals can drift after centered text
+    sys.stdout.write("\r\033[K")
+    sys.stdout.flush()
     show_cursor()
 
 
@@ -570,6 +573,8 @@ async def listen(password: str):
                     print(Fore.YELLOW + f"\n⚠  Connected, but setup incomplete: {', '.join(missing)}" + Style.RESET_ALL)
                 else:
                     print(Fore.GREEN + f"\n✔  Connected  ·  Account: {active_account}  ·  Signals will arrive shortly" + Style.RESET_ALL)
+                sys.stdout.write("\r\033[K")
+                sys.stdout.flush()
                 reconnect_event.clear()
 
                 while not shutdown.is_set():
