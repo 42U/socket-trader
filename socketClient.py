@@ -531,20 +531,33 @@ def write_signal_to_file(signal_text: str):
 
 
 # ---------- WebSocket listener with reconnection ----------
-MAX_BACKOFF = 60  # seconds
+MAX_BACKOFF = 1800  # 30 minutes in seconds
+
+
+def fib_backoff(prev: int, curr: int) -> tuple[int, int]:
+    """Advance fibonacci sequence, clamped between 60s and MAX_BACKOFF."""
+    nxt = prev + curr
+    return curr, min(nxt, MAX_BACKOFF)
+
+
+def fmt_wait(seconds: int) -> str:
+    """Format seconds as a human-readable wait time."""
+    if seconds >= 60:
+        return f"{seconds // 60}m {seconds % 60}s" if seconds % 60 else f"{seconds // 60}m"
+    return f"{seconds}s"
 
 
 async def listen(password: str):
     global signal_count
     uri = f"{WS_HOST}?token={password}"
-    backoff = 1
+    fib_prev, fib_curr = 60, 60  # Start at 1m, 1m → 2m → 3m → 5m → ...
 
     await boot_sequence()
 
     while not shutdown.is_set():
         try:
             async with websockets.connect(uri) as ws:
-                backoff = 1  # Reset on successful connection
+                fib_prev, fib_curr = 60, 60  # Reset on successful connection
 
                 # Context-aware welcome message
                 missing = []
@@ -604,24 +617,24 @@ async def listen(password: str):
                     print(Fore.RED + f"\n⛔  AUTHENTICATION FAILED (HTTP {status})" + Style.RESET_ALL)
                     return "auth_failed"
                 else:
-                    print(Fore.RED + f"\n⛔  CONNECTION ERROR (HTTP {status})  ·  Retrying in {backoff}s..." + Style.RESET_ALL)
+                    print(Fore.RED + f"\n⛔  CONNECTION ERROR (HTTP {status})  ·  Retrying in {fmt_wait(fib_curr)}..." + Style.RESET_ALL)
             elif shutdown.is_set():
                 break
             else:
                 print(Fore.RED + f"\n⛔  CONNECTION LOST  ·  {e}" + Style.RESET_ALL)
-                print(Fore.YELLOW + f"  ↻  Reconnecting in {backoff}s..." + Style.RESET_ALL)
+                print(Fore.YELLOW + f"  ↻  Reconnecting in {fmt_wait(fib_curr)}..." + Style.RESET_ALL)
 
         if shutdown.is_set():
             break
 
-        # Exponential backoff wait (interruptible by shutdown)
+        # Fibonacci backoff wait (interruptible by shutdown or manual reconnect)
         try:
-            await asyncio.wait_for(shutdown.wait(), timeout=backoff)
+            await asyncio.wait_for(shutdown.wait(), timeout=fib_curr)
             break  # shutdown was set
         except asyncio.TimeoutError:
             pass  # timeout expired, retry
 
-        backoff = min(backoff * 2, MAX_BACKOFF)
+        fib_prev, fib_curr = fib_backoff(fib_prev, fib_curr)
 
     return "shutdown"
 
