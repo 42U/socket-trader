@@ -24,7 +24,7 @@ SocketTrader connects to a remote signal server over WebSocket, receives trading
 
 ```
 ┌──────────┐      WebSocket      ┌──────────────┐      File I/O      ┌──────────────┐
-│  Signal  │ ──────────────────▸ │ socketClient  │ ──────────────────▸ │ NinjaTrader  │
+│  Signal  │ ──────────────────▸ │ SocketTrader  │ ──────────────────▸ │ NinjaTrader  │
 │  Server  │    JSON signals     │     .py       │   raw order text   │  8 incoming/  │
 └──────────┘                     └──────────────┘                     └──────────────┘
 ```
@@ -116,7 +116,7 @@ If you want to use a different ATM strategy:
 ## Usage
 
 ```bash
-python socketClient.py
+python SocketTrader.py
 ```
 
 On first run you'll be prompted for:
