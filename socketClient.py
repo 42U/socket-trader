@@ -341,10 +341,10 @@ PULSE_FRAMES = ["·", "•", "●", "◉", "●", "•", "·", " "]
 
 async def signal_pulse(label="SIGNAL RECEIVED"):
     for frame in PULSE_FRAMES:
-        sys.stdout.write(f"\r{Fore.GREEN}{frame} {label}{Style.RESET_ALL}  ")
+        sys.stdout.write(f"\r\033[K{Fore.GREEN}{frame} {label}{Style.RESET_ALL}")
         sys.stdout.flush()
         await asyncio.sleep(0.05)
-    sys.stdout.write("\r")
+    sys.stdout.write("\r\033[K")
     sys.stdout.flush()
 
 
@@ -361,7 +361,7 @@ async def pause_indicator():
     i = 0
     while not shutdown.is_set():
         if paused:
-            sys.stdout.write(Fore.YELLOW + "\r" + PAUSE_FRAMES[i % len(PAUSE_FRAMES)] + Style.RESET_ALL)
+            sys.stdout.write(Fore.YELLOW + "\r\033[K" + PAUSE_FRAMES[i % len(PAUSE_FRAMES)] + Style.RESET_ALL)
             sys.stdout.flush()
             i += 1
             await asyncio.sleep(0.35)
@@ -463,7 +463,7 @@ async def keyboard_loop():
         if key.lower() == "p":
             paused = not paused
             if not paused:
-                sys.stdout.write("\r" + " " * term_width() + "\r")
+                sys.stdout.write("\r\033[K")
                 sys.stdout.flush()
                 print(Fore.GREEN + "▶  SIGNAL OUTPUT RESUMED" + Style.RESET_ALL)
         elif key.lower() == "a":
