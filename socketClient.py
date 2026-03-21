@@ -1520,11 +1520,10 @@ def print_exit_summary():
     clear()
     show_cursor()
     log_str = str(LOG_FILE)
-    # Box width adapts to fit the log path
-    content_width = max(45, len(log_str) + 9)  # "  Log: " + path + "  "
-    inner = content_width - 4  # inside │  ...  │
-    print(f"\r\033[K" + Fore.CYAN + f"\n\r\033[K  ┌─ SESSION SUMMARY {'─' * (content_width - 20)}┐" + Style.RESET_ALL)
-    print(f"\r\033[K" + Fore.CYAN + f"  │  Signals received: {str(signal_count).ljust(inner - 18)}│" + Style.RESET_ALL)
+    inner = 41  # fixed box inner width (45 total - 4 for │  ...│)
+    print(f"\r\033[K" + Fore.CYAN + f"\n\r\033[K  ┌─ SESSION SUMMARY ─────────────────────────┐" + Style.RESET_ALL)
+    sig_text = f"Signals received: {signal_count}"[:inner]
+    print(f"\r\033[K" + Fore.CYAN + f"  │  {sig_text.ljust(inner)}│" + Style.RESET_ALL)
     # Show final P&L if we have balance data
     if active_account and active_account in session_start_balances:
         final_bal = query_nt_balance(active_account)
@@ -1532,11 +1531,11 @@ def print_exit_summary():
             pnl = final_bal - session_start_balances[active_account]
             pnl_str = f"${pnl:+,.2f}"
             pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
-            pnl_line = f"Session P&L: {pnl_str}"
+            pnl_line = f"Session P&L: {pnl_str}"[:inner]
             print(f"\r\033[K" + Fore.CYAN + f"  │  " + pnl_color + f"{pnl_line.ljust(inner)}" + Fore.CYAN + f"│" + Style.RESET_ALL)
-    log_line = f"Log: {log_str}"
+    log_line = f"Log: {log_str}"[:inner]
     print(f"\r\033[K" + Fore.CYAN + f"  │  {log_line.ljust(inner)}│" + Style.RESET_ALL)
-    print(f"\r\033[K" + Fore.CYAN + f"  └{'─' * (content_width - 2)}┘" + Style.RESET_ALL)
+    print(f"\r\033[K" + Fore.CYAN + f"  └───────────────────────────────────────────┘" + Style.RESET_ALL)
     logger.info(f"SESSION END  signals={signal_count}")
 
 
