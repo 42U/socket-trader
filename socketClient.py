@@ -585,6 +585,55 @@ def format_signal(signal_text: str, idx: int):
     return f"{colour}[{ts}] ▸  {body}{Style.RESET_ALL}"
 
 
+# ---------- Server message display ----------
+WELCOME_FRAMES = ["◇", "◆", "◇", "◆", "●"]
+HEARTBEAT_FRAMES = ["♡", "♥", "♡", "♥"]
+
+
+async def display_server_message(data: dict, connect_latency: int):
+    """Parse and display server messages with styled output."""
+    sys.stdout.write("\r\033[K")
+
+    if "welcome" in data:
+        # Animated welcome
+        server_name = data.get("server", "SocketTrader")
+        hb_interval = data.get("heartbeat_interval")
+        ts = data.get("ts")
+
+        for frame in WELCOME_FRAMES:
+            sys.stdout.write(f"\r\033[K{Fore.CYAN}{frame} Connecting to {server_name}...{Style.RESET_ALL}")
+            sys.stdout.flush()
+            await asyncio.sleep(0.15)
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+
+        print(Fore.CYAN + f"  ╭─ SERVER ──────────────────────────────────────╮" + Style.RESET_ALL)
+        print(Fore.CYAN + f"  │  {server_name[:46].ljust(46)}│" + Style.RESET_ALL)
+        if ts:
+            welcome_lat = int(time.time() * 1000) - ts
+            print(Fore.CYAN + f"  │  Message latency: {str(welcome_lat).ljust(5)}ms  ·  Handshake: {str(connect_latency).ljust(5)}ms │" + Style.RESET_ALL)
+            logger.info(f"WELCOME  latency={welcome_lat}ms  handshake={connect_latency}ms")
+        if hb_interval:
+            mins = hb_interval // 60
+            print(Fore.CYAN + f"  │  Heartbeat every {str(mins).ljust(3)}min                       │" + Style.RESET_ALL)
+        print(Fore.CYAN + f"  ╰────────────────────────────────────────────────╯" + Style.RESET_ALL)
+
+    elif data.get("type") == "heartbeat":
+        # Animated heartbeat pulse — subtle, single line
+        for frame in HEARTBEAT_FRAMES:
+            sys.stdout.write(f"\r\033[K{Fore.RED}{Style.DIM}  {frame}{Style.RESET_ALL}")
+            sys.stdout.flush()
+            await asyncio.sleep(0.2)
+        ts = time.strftime("%H:%M:%S")
+        sys.stdout.write(f"\r\033[K{Fore.RED}{Style.DIM}  ♥  [{ts}] heartbeat{Style.RESET_ALL}\n")
+        sys.stdout.flush()
+        logger.info("HEARTBEAT")
+
+    else:
+        # Unknown server message — log it, don't clutter terminal
+        logger.info(f"SERVER  {data}")
+
+
 # ---------- File output ----------
 def extract_signal_string(msg: str, account: str, atm: str) -> tuple[str | None, int | None, str | None]:
     """Parse JSON message and extract the raw signal string, server timestamp, and signal ID.
@@ -738,17 +787,9 @@ async def listen(token: str):
                                 # Non-signal message (server info, heartbeat, etc.)
                                 try:
                                     data = json.loads(msg)
-                                    sys.stdout.write("\r\033[K")
-                                    # Show welcome latency if server included a timestamp
-                                    if "welcome" in data and "ts" in data:
-                                        welcome_lat = int(time.time() * 1000) - data["ts"]
-                                        print(Fore.CYAN + Style.DIM + f"  [server] {data['welcome']}  ·  message latency: {welcome_lat}ms" + Style.RESET_ALL)
-                                        logger.info(f"WELCOME  latency={welcome_lat}ms  handshake={connect_latency}ms")
-                                    else:
-                                        print(Fore.CYAN + Style.DIM + f"  [server] {data}" + Style.RESET_ALL)
+                                    await display_server_message(data, connect_latency)
                                 except json.JSONDecodeError:
-                                    sys.stdout.write("\r\033[K")
-                                    print(Fore.CYAN + Style.DIM + f"  [server] {msg}" + Style.RESET_ALL)
+                                    logger.info(f"SERVER RAW  {msg}")
                     except asyncio.TimeoutError:
                         continue
 
