@@ -108,7 +108,102 @@ BALANCE_POLL_INTERVAL = 3                         # seconds between balance chec
 ET = timezone(timedelta(hours=-5))  # Eastern Time (EST; no DST handling needed — close is 4:20 either way)
 SESSION_RESET_HOUR = 16
 SESSION_RESET_MINUTE = 20
-_last_auto_reset_date: str | None = None  # tracks which date we already reset on
+# If launching after the reset time, mark today as already reset so we don't
+# fire retroactively — only trigger when the app is running across the boundary.
+_now_et = datetime.now(ET)
+_past_reset_on_start = ((_now_et.hour == 16 and _now_et.minute >= 20) or _now_et.hour > 16)
+_last_auto_reset_date: str | None = _now_et.strftime("%Y-%m-%d") if _past_reset_on_start else None
+SESSION_SAVE_INTERVAL = 10  # save session state every N balance polls (~30s)
+_balance_poll_count = 0
+
+
+def get_session_id(now_et: datetime | None = None) -> str | None:
+    """Return the session close-date for the current active CME futures session.
+
+    Schedule (all times ET):
+      Sun 6 PM → Mon 4:20 PM   (session ID = Monday's date)
+      Mon 6 PM → Tue 4:20 PM   (session ID = Tuesday's date)
+      ...
+      Thu 6 PM → Fri 4:20 PM   (session ID = Friday's date)
+      Fri 4:20 PM → Sun 6 PM   = weekend, no active session
+      Daily 4:20 PM – 6:00 PM  = maintenance gap (Mon–Thu)
+
+    Returns None if outside active session hours.
+    """
+    if now_et is None:
+        now_et = datetime.now(ET)
+    wd = now_et.weekday()  # Mon=0 … Sun=6
+    h, m = now_et.hour, now_et.minute
+
+    past_close = (h > SESSION_RESET_HOUR or
+                  (h == SESSION_RESET_HOUR and m >= SESSION_RESET_MINUTE))
+    before_open = h < 18
+
+    # Weekend: Fri 4:20 PM → Sun 6 PM
+    if wd == 4 and past_close:          # Friday after close
+        return None
+    if wd == 5:                          # Saturday
+        return None
+    if wd == 6 and before_open:          # Sunday before 6 PM
+        return None
+
+    # Daily maintenance gap 4:20 PM – 6 PM (Mon–Thu)
+    if past_close and before_open:
+        return None
+
+    # Active session — ID is the date of the session close
+    if h >= 18:
+        close_date = (now_et + timedelta(days=1)).date()
+    else:
+        close_date = now_et.date()
+    return close_date.strftime("%Y-%m-%d")
+
+
+def save_session_state():
+    """Persist session P&L data to config for crash recovery."""
+    session_id = get_session_id()
+    if not session_id or not session_start_balances:
+        return
+    cfg = load_config()
+    cfg["session"] = {
+        "id": session_id,
+        "start_balances": dict(session_start_balances),
+        "contracts": list(session_contracts),
+        "signal_count": signal_count,
+    }
+    save_config(cfg)
+
+
+def clear_saved_session():
+    """Remove persisted session data from config."""
+    cfg = load_config()
+    if "session" in cfg:
+        del cfg["session"]
+        save_config(cfg)
+
+
+def restore_session_state() -> bool:
+    """Restore session state from config if still in the same active session.
+
+    Returns True if session was restored.
+    """
+    cfg = load_config()
+    saved = cfg.get("session")
+    if not saved:
+        return False
+
+    current_session = get_session_id()
+    if current_session and saved.get("id") == current_session:
+        global signal_count
+        for name, bal in saved.get("start_balances", {}).items():
+            session_start_balances[name] = bal
+        session_contracts.update(saved.get("contracts", []))
+        signal_count = saved.get("signal_count", 0)
+        return True
+
+    # Different session or outside hours — clear stale data
+    clear_saved_session()
+    return False
 
 
 def reset_session_pnl():
@@ -122,6 +217,7 @@ def reset_session_pnl():
     hard_stopped = False
     signal_count = 0
     set_session_state("ready")
+    clear_saved_session()
 
 # ---------- Signal confirmation ----------
 # After a signal fires, we snapshot positions for that instrument and verify
@@ -1472,7 +1568,7 @@ async def balance_monitor():
             refresh_controls()
 
             # Auto-reset P&L at 4:20 PM ET (futures session boundary)
-            global _last_auto_reset_date
+            global _last_auto_reset_date, _balance_poll_count
             now_et = datetime.now(ET)
             today_str = now_et.strftime("%Y-%m-%d")
             past_reset = ((now_et.hour == SESSION_RESET_HOUR and now_et.minute >= SESSION_RESET_MINUTE)
@@ -1483,6 +1579,12 @@ async def balance_monitor():
                 sys.stdout.write("\r\033[K")
                 print(Fore.CYAN + Style.BRIGHT + "  🔄  Session P&L auto-reset (4:20 PM ET)" + Style.RESET_ALL)
                 logger.info("AUTO RESET  session P&L reset at 4:20 PM ET")
+
+            # Periodically persist session state for crash recovery
+            _balance_poll_count += 1
+            if _balance_poll_count >= SESSION_SAVE_INTERVAL:
+                _balance_poll_count = 0
+                save_session_state()
 
             if hard_stopped:
                 continue
@@ -1704,12 +1806,27 @@ async def listen(token: str):
                 baseline_latency = None  # First signal sets the baseline
                 fib_prev, fib_curr = 60, 60  # Reset on successful connection
 
+                # Restore persisted session if still in the same trading session
+                restored = restore_session_state()
+
                 # Snapshot account balances for risk management
                 nt_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
                 for a in nt_accounts:
                     if a["name"] not in session_start_balances:
                         session_start_balances[a["name"]] = a["cash"]
                     session_current_balances[a["name"]] = a["cash"]
+
+                if restored:
+                    pnl_parts = []
+                    for name in session_start_balances:
+                        cur = session_current_balances.get(name)
+                        if cur is not None:
+                            pnl_parts.append(f"{name}: ${cur - session_start_balances[name]:+,.2f}")
+                    sys.stdout.write("\r\033[K")
+                    print(Fore.CYAN + Style.BRIGHT +
+                          f"  🔄  Session P&L restored ({', '.join(pnl_parts) if pnl_parts else 'no data'})"
+                          + Style.RESET_ALL)
+                    logger.info(f"SESSION RESTORED  id={get_session_id()}  accounts={list(session_start_balances.keys())}")
 
                 # Context-aware welcome message
                 missing = []
