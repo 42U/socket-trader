@@ -638,8 +638,9 @@ async def prompt_directory():
         cfg["output_directory"] = output_directory
         save_config(cfg)
 
-    print()
-    print(status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS"))
+    if not output_directory or not active_account:
+        print()
+        print(status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS"))
     print()
     awaiting_directory_input = False
     awaiting_user_input = False
@@ -697,8 +698,9 @@ async def prompt_account():
             save_config(cfg)
             print(Fore.GREEN + f"  ✔  Account set → {active_account}" + Style.RESET_ALL)
 
-    print()
-    print(status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS"))
+    if not output_directory or not active_account:
+        print()
+        print(status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS"))
     print()
     awaiting_user_input = False
 
@@ -734,8 +736,6 @@ async def prompt_port():
             print(Fore.RED + "  ✖  Invalid port number." + Style.RESET_ALL)
 
     print()
-    print(status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS"))
-    print()
     awaiting_user_input = False
 
 
@@ -763,8 +763,6 @@ async def prompt_strategy():
         save_config(cfg)
         print(Fore.GREEN + f"  ✔  ATM Strategy set → {atm_strategy}" + Style.RESET_ALL)
 
-    print()
-    print(status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS"))
     print()
     awaiting_user_input = False
 
@@ -1188,8 +1186,6 @@ async def prompt_limits():
     s_label = f"${stop:+,.2f} ({stop_mode})" if stop else "off"
     print(Fore.GREEN + f"  ✔  {active_account} → Target: {t_label}  ·  Stop: {s_label}" + Style.RESET_ALL)
 
-    print()
-    print(status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS"))
     print()
     awaiting_user_input = False
 
