@@ -52,8 +52,10 @@ The sim account is automatically swapped with your real NinjaTrader account name
 | **Latency monitoring** | Color-coded signal delivery time relative to baseline |
 | **Risk management** | Per-account target and stop with independent soft/hard modes |
 | **Live balances** | Press `B` for real-time account balances and session P&L |
+| **Signal confirmation** | Verifies trade execution via ATI position tracking per instrument |
+| **Trade readiness gate** | Blocks signals when account, directory, or strategy is missing |
 | **Duplicate detection** | Prevents the same signal from firing twice |
-| **Terminal UI** | Animated boot, styled server messages, pinned controls bar |
+| **Terminal UI** | Animated boot, color-coded session states, pinned header and controls bar |
 
 ---
 
@@ -65,7 +67,7 @@ cd socket-trader
 pip install -r requirements.txt
 ```
 
-**Requirements:** Python 3.7+ &nbsp;·&nbsp; NinjaTrader 8 (Windows) or any target directory (Linux)
+**Requirements:** Python 3.10+ &nbsp;·&nbsp; NinjaTrader 8 (Windows) or any target directory (Linux)
 
 ---
 
@@ -74,7 +76,7 @@ pip install -r requirements.txt
 Before SocketTrader can send orders, you must enable the **Automated Trading Interface** in NinjaTrader 8:
 
 1. Open **NinjaTrader 8**
-2. Go to **Tools** → **Options**
+2. Go to **Tools** → **Settings**
 3. Select **Automated trading interface** from the left panel
 4. Check the **AT Interface** checkbox to enable it
 5. Note the **Server port** (default: `36973`) — if you change it, press `O` in SocketTrader to update
@@ -203,7 +205,7 @@ SocketTrader includes built-in risk controls that monitor your account balance i
 A **floor** for your session P&L. Triggers when P&L drops to or below this value. Set to `0` to disable.
 
 - **Negative value** (e.g. `-300`): classic loss limit — stop out if you lose $300
-- **Positive value** (e.g. `200`): profit protection — if you're up $500 and set stop to `200`, it triggers if P&L drops back to $200, locking in at least $200 of profit
+- **Positive value** (e.g. `200`): profit protection — if you're up $500 and set stop to `200`, it triggers if P&L drops back to $200, locking in at least $200 of profit. Capped at 90% of current P&L to prevent accidental instant triggers
 
 ### Session Target
 
@@ -215,8 +217,8 @@ Each limit (target and stop) can independently be set to **soft** or **hard** mo
 
 | Mode | Action | Recovery |
 |------|--------|----------|
-| **Soft** | Pauses signals | Press `P` to resume trading |
-| **Hard** | Closes all open positions + locks signals | Cannot resume — press `C` to exit |
+| **Soft** | Pauses signals · press `P` to resume | Resume any time with `P` |
+| **Hard** | Flattens all positions · signals off for the session | Press `C` to exit — cannot resume |
 
 When a **hard** limit fires, SocketTrader writes a `CLOSEPOSITION;{account};{contract};;;;;;;;;;` file to the `incoming/` folder for every instrument traded during the session. This tells NinjaTrader to flatten all positions immediately.
 
@@ -237,10 +239,11 @@ Press `T` during a session:
 ┌─ SESSION LIMITS (Sim101) ────────────────────────┐
 │  Balance: $28,857.02  ·  Session P&L: +$0.00     │
 │  Target: +500.00 (soft)  ·  Stop: -300.00 (hard)  │
-│  soft = pause signals (press P to resume)         │
-│  hard = close all positions + lock signals        │
+│  When a limit is hit, the lockout mode decides:   │
+│  soft = pause signals · resumable with P          │
+│  hard = flatten all positions · signals off    │
 │  Enter 0 to disable. ENTER to keep current.       │
-└───────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────┘
   TARGET $ (current: +500.00) ▸ 500
   TARGET MODE (current: soft) [soft/hard] ▸ soft
   STOP $ (current: -300.00) ▸ -300
@@ -248,7 +251,7 @@ Press `T` during a session:
 ```
 
 - Enter a **positive number** for target (e.g. `500` = trigger at +$500 profit)
-- Enter a **negative or positive number** for stop (e.g. `-300` = loss limit, `200` = protect profit)
+- Enter a **negative or positive number** for stop (e.g. `-300` = loss limit, `200` = protect profit). Positive values are capped at 90% of current session P&L
 - Choose **soft** or **hard** mode for each limit
 - Enter `0` to **disable** either side (mode prompt is skipped)
 - Press **ENTER** to keep the current value

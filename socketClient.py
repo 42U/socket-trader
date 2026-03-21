@@ -113,7 +113,7 @@ _confirms_lock = __import__("threading").Lock()
 # ---------- Logging ----------
 LOG_FILE = Path.home() / ".voidorigin_signals.log"
 logger = logging.getLogger("sockettrader")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 _log_handler = logging.FileHandler(str(LOG_FILE), encoding="utf-8")
 _log_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 logger.addHandler(_log_handler)
@@ -989,44 +989,47 @@ reconnect_event = asyncio.Event()
 async def keyboard_loop():
     global paused, soft_stopped
     while not shutdown.is_set():
-        key = await asyncio.to_thread(get_key)
-        if awaiting_directory_input or awaiting_user_input:
-            continue
-        if key.lower() == "p":
-            if hard_stopped:
-                sys.stdout.write("\r\033[K")
-                print(Fore.RED + "  ⛔  Hard stop active — cannot resume. Press C to exit." + Style.RESET_ALL)
+        try:
+            key = await asyncio.to_thread(get_key)
+            if awaiting_directory_input or awaiting_user_input:
                 continue
-            paused = not paused
-            soft_stopped = False  # Reset soft stop on manual resume
-            if paused:
-                set_session_state("paused")
-            else:
-                set_session_state("ready")
+            if key.lower() == "p":
+                if hard_stopped:
+                    sys.stdout.write("\r\033[K")
+                    print(Fore.RED + "  ⛔  Hard stop active — cannot resume. Press C to exit." + Style.RESET_ALL)
+                    continue
+                paused = not paused
+                soft_stopped = False  # Reset soft stop on manual resume
+                if paused:
+                    set_session_state("paused")
+                else:
+                    set_session_state("ready")
+                    sys.stdout.write("\r\033[K")
+                    sys.stdout.flush()
+                    print(Fore.GREEN + "▶  SIGNAL OUTPUT RESUMED" + Style.RESET_ALL)
+            elif key.lower() == "b":
+                await show_balances()
+            elif key.lower() == "a":
+                await prompt_account()
+            elif key.lower() == "d":
+                await prompt_directory()
+            elif key.lower() == "s":
+                await prompt_strategy()
+            elif key.lower() == "t":
+                await prompt_limits()
+            elif key.lower() == "o":
+                await prompt_port()
+            elif key.lower() == "r":
                 sys.stdout.write("\r\033[K")
-                sys.stdout.flush()
-                print(Fore.GREEN + "▶  SIGNAL OUTPUT RESUMED" + Style.RESET_ALL)
-        elif key.lower() == "b":
-            await show_balances()
-        elif key.lower() == "a":
-            await prompt_account()
-        elif key.lower() == "d":
-            await prompt_directory()
-        elif key.lower() == "s":
-            await prompt_strategy()
-        elif key.lower() == "t":
-            await prompt_limits()
-        elif key.lower() == "o":
-            await prompt_port()
-        elif key.lower() == "r":
-            sys.stdout.write("\r\033[K")
-            print(Fore.YELLOW + "🔄  MANUAL RECONNECT REQUESTED" + Style.RESET_ALL)
-            reconnect_event.set()
-        elif key.lower() == "c":
-            unpin_layout()
-            clear()
-            shutdown.set()
-            break
+                print(Fore.YELLOW + "🔄  MANUAL RECONNECT REQUESTED" + Style.RESET_ALL)
+                reconnect_event.set()
+            elif key.lower() == "c":
+                unpin_layout()
+                clear()
+                shutdown.set()
+                break
+        except Exception as e:
+            logger.error(f"keyboard_loop error: {e}")
 
 
 # ---------- Signal formatting ----------
@@ -1262,89 +1265,95 @@ async def balance_monitor():
     global paused, soft_stopped, hard_stopped
 
     while not shutdown.is_set():
-        await asyncio.sleep(BALANCE_POLL_INTERVAL)
+        try:
+            await asyncio.sleep(BALANCE_POLL_INTERVAL)
+        except asyncio.CancelledError:
+            return
 
-        if not active_account or hard_stopped:
-            continue
+        try:
+            if not active_account or hard_stopped:
+                continue
 
-        # Always poll balances for status bar display (non-blocking)
-        all_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
-        for a in all_accounts:
-            session_current_balances[a["name"]] = a["cash"]
-        refresh_controls()
+            # Always poll balances for status bar display (non-blocking)
+            all_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
+            for a in all_accounts:
+                session_current_balances[a["name"]] = a["cash"]
+            refresh_controls()
 
-        # Check if pending signals were filled
-        if _pending_confirms:
-            await asyncio.to_thread(check_pending_confirms)
+            # Check if pending signals were filled
+            if _pending_confirms:
+                await asyncio.to_thread(check_pending_confirms)
 
-        if active_account not in session_start_balances:
-            continue
+            if active_account not in session_start_balances:
+                continue
 
-        current = session_current_balances.get(active_account)
-        if current is None:
-            continue
+            current = session_current_balances.get(active_account)
+            if current is None:
+                continue
 
-        limits = get_account_limits(active_account)
-        if limits["target"] == 0 and limits["stop"] == 0:
-            continue
+            limits = get_account_limits(active_account)
+            if limits["target"] == 0 and limits["stop"] == 0:
+                continue
 
-        start = session_start_balances[active_account]
-        pnl = current - start
+            start = session_start_balances[active_account]
+            pnl = current - start
 
-        # Check stop (loss limit)
-        if limits["stop"] != 0 and pnl <= limits["stop"]:
-            if limits["stop_mode"] == "hard":
-                hard_stopped = True
-                paused = True
-                set_session_state("hard_stop")
-                sys.stdout.write("\r\033[K")
-                print(Fore.RED + Style.BRIGHT + f"  ⛔  HARD STOP HIT  ·  P&L: ${pnl:+,.2f}  ·  Limit: ${limits['stop']:+,.2f}" + Style.RESET_ALL)
-                sys.stdout.write("\r\033[K")
-                print(Fore.RED + "  ⛔  CLOSING ALL POSITIONS..." + Style.RESET_ALL)
-                for contract in session_contracts:
-                    fire_close_position(active_account, contract)
+            # Check stop (loss limit)
+            if limits["stop"] != 0 and pnl <= limits["stop"]:
+                if limits["stop_mode"] == "hard":
+                    hard_stopped = True
+                    paused = True
+                    set_session_state("hard_stop")
                     sys.stdout.write("\r\033[K")
-                    print(Fore.RED + f"  ⛔  CLOSEPOSITION → {contract}" + Style.RESET_ALL)
-                sys.stdout.write("\r\033[K")
-                print(Fore.RED + "  ⛔  Signals LOCKED — hard stop active. Press C to exit." + Style.RESET_ALL)
-                logger.info(f"HARD STOP  pnl={pnl:.2f}  limit={limits['stop']}  contracts={list(session_contracts)}")
-            elif not soft_stopped:
-                soft_stopped = True
-                paused = True
-                set_session_state("soft_stop")
-                sys.stdout.write("\r\033[K")
-                print(Fore.RED + Style.BRIGHT + f"  ⛔  STOP LIMIT HIT  ·  P&L: ${pnl:+,.2f}  ·  Limit: ${limits['stop']:+,.2f}" + Style.RESET_ALL)
-                sys.stdout.write("\r\033[K")
-                print(Fore.YELLOW + "  ⏸  Signals PAUSED — stop reached. Press P to resume." + Style.RESET_ALL)
-                logger.info(f"SOFT STOP (LOSS)  pnl={pnl:.2f}  stop={limits['stop']}")
-            continue
-
-        # Check target (profit goal)
-        if limits["target"] != 0 and pnl >= limits["target"]:
-            if limits["target_mode"] == "hard":
-                hard_stopped = True
-                paused = True
-                set_session_state("hard_target")
-                sys.stdout.write("\r\033[K")
-                print(Fore.GREEN + Style.BRIGHT + f"  🎯  TARGET HIT (HARD)  ·  P&L: ${pnl:+,.2f}  ·  Target: ${limits['target']:+,.2f}" + Style.RESET_ALL)
-                sys.stdout.write("\r\033[K")
-                print(Fore.RED + "  ⛔  CLOSING ALL POSITIONS..." + Style.RESET_ALL)
-                for contract in session_contracts:
-                    fire_close_position(active_account, contract)
+                    print(Fore.RED + Style.BRIGHT + f"  ⛔  HARD STOP HIT  ·  P&L: ${pnl:+,.2f}  ·  Limit: ${limits['stop']:+,.2f}" + Style.RESET_ALL)
                     sys.stdout.write("\r\033[K")
-                    print(Fore.RED + f"  ⛔  CLOSEPOSITION → {contract}" + Style.RESET_ALL)
-                sys.stdout.write("\r\033[K")
-                print(Fore.RED + "  ⛔  Signals LOCKED — target hard stop active. Press C to exit." + Style.RESET_ALL)
-                logger.info(f"HARD STOP (TARGET)  pnl={pnl:.2f}  target={limits['target']}  contracts={list(session_contracts)}")
-            elif not soft_stopped:
-                soft_stopped = True
-                paused = True
-                set_session_state("soft_target")
-                sys.stdout.write("\r\033[K")
-                print(Fore.GREEN + Style.BRIGHT + f"  🎯  SESSION TARGET HIT  ·  P&L: ${pnl:+,.2f}  ·  Target: ${limits['target']:+,.2f}" + Style.RESET_ALL)
-                sys.stdout.write("\r\033[K")
-                print(Fore.YELLOW + "  ⏸  Signals PAUSED — target reached. Press P to resume." + Style.RESET_ALL)
-                logger.info(f"SOFT STOP (TARGET)  pnl={pnl:.2f}  target={limits['target']}")
+                    print(Fore.RED + "  ⛔  CLOSING ALL POSITIONS..." + Style.RESET_ALL)
+                    for contract in session_contracts:
+                        fire_close_position(active_account, contract)
+                        sys.stdout.write("\r\033[K")
+                        print(Fore.RED + f"  ⛔  CLOSEPOSITION → {contract}" + Style.RESET_ALL)
+                    sys.stdout.write("\r\033[K")
+                    print(Fore.RED + "  ⛔  Signals LOCKED — hard stop active. Press C to exit." + Style.RESET_ALL)
+                    logger.info(f"HARD STOP  pnl={pnl:.2f}  limit={limits['stop']}  contracts={list(session_contracts)}")
+                elif not soft_stopped:
+                    soft_stopped = True
+                    paused = True
+                    set_session_state("soft_stop")
+                    sys.stdout.write("\r\033[K")
+                    print(Fore.RED + Style.BRIGHT + f"  ⛔  STOP LIMIT HIT  ·  P&L: ${pnl:+,.2f}  ·  Limit: ${limits['stop']:+,.2f}" + Style.RESET_ALL)
+                    sys.stdout.write("\r\033[K")
+                    print(Fore.YELLOW + "  ⏸  Signals PAUSED — stop reached. Press P to resume." + Style.RESET_ALL)
+                    logger.info(f"SOFT STOP (LOSS)  pnl={pnl:.2f}  stop={limits['stop']}")
+                continue
+
+            # Check target (profit goal)
+            if limits["target"] != 0 and pnl >= limits["target"]:
+                if limits["target_mode"] == "hard":
+                    hard_stopped = True
+                    paused = True
+                    set_session_state("hard_target")
+                    sys.stdout.write("\r\033[K")
+                    print(Fore.GREEN + Style.BRIGHT + f"  🎯  TARGET HIT (HARD)  ·  P&L: ${pnl:+,.2f}  ·  Target: ${limits['target']:+,.2f}" + Style.RESET_ALL)
+                    sys.stdout.write("\r\033[K")
+                    print(Fore.RED + "  ⛔  CLOSING ALL POSITIONS..." + Style.RESET_ALL)
+                    for contract in session_contracts:
+                        fire_close_position(active_account, contract)
+                        sys.stdout.write("\r\033[K")
+                        print(Fore.RED + f"  ⛔  CLOSEPOSITION → {contract}" + Style.RESET_ALL)
+                    sys.stdout.write("\r\033[K")
+                    print(Fore.RED + "  ⛔  Signals LOCKED — target hard stop active. Press C to exit." + Style.RESET_ALL)
+                    logger.info(f"HARD STOP (TARGET)  pnl={pnl:.2f}  target={limits['target']}  contracts={list(session_contracts)}")
+                elif not soft_stopped:
+                    soft_stopped = True
+                    paused = True
+                    set_session_state("soft_target")
+                    sys.stdout.write("\r\033[K")
+                    print(Fore.GREEN + Style.BRIGHT + f"  🎯  SESSION TARGET HIT  ·  P&L: ${pnl:+,.2f}  ·  Target: ${limits['target']:+,.2f}" + Style.RESET_ALL)
+                    sys.stdout.write("\r\033[K")
+                    print(Fore.YELLOW + "  ⏸  Signals PAUSED — target reached. Press P to resume." + Style.RESET_ALL)
+                    logger.info(f"SOFT STOP (TARGET)  pnl={pnl:.2f}  target={limits['target']}")
+        except Exception as e:
+            logger.error(f"balance_monitor error: {e}")
 
 
 async def prompt_limits():
@@ -1373,8 +1382,8 @@ async def prompt_limits():
         cur = f"Target: ${limits['target']:+,.2f} ({limits['target_mode']})  ·  Stop: ${limits['stop']:+,.2f} ({limits['stop_mode']})"
         print(Fore.CYAN + f"\r\033[K│  {cur.ljust(_lim_inner)}│" + Style.RESET_ALL)
     print(Fore.CYAN + f"\r\033[K│  {'When a limit is hit, the lockout mode decides:'.ljust(_lim_inner)}│" + Style.RESET_ALL)
-    print(Fore.CYAN + f"\r\033[K│  {'soft = pause signals · resumable with P'.ljust(_lim_inner)}│" + Style.RESET_ALL)
-    print(Fore.CYAN + f"\r\033[K│  {'hard = flatten all positions · session locked'.ljust(_lim_inner)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"\r\033[K│  {'soft = pause signals · press P to resume'.ljust(_lim_inner)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"\r\033[K│  {'hard = flatten all positions · signals off'.ljust(_lim_inner)}│" + Style.RESET_ALL)
     print(Fore.CYAN + f"\r\033[K│  {'Enter 0 to disable. ENTER to keep current.'.ljust(_lim_inner)}│" + Style.RESET_ALL)
     print(Fore.CYAN + f"\r\033[K└{'─' * (_lim_inner + 2)}┘" + Style.RESET_ALL)
 

@@ -1,3 +1,3 @@
-websockets
-colorama
-pyfiglet
+websockets>=14.0,<17
+colorama>=0.4.6,<0.5
+pyfiglet>=1.0.0,<2
