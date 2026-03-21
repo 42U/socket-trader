@@ -545,7 +545,18 @@ async def listen(password: str):
         try:
             async with websockets.connect(uri) as ws:
                 backoff = 1  # Reset on successful connection
-                print(Fore.YELLOW + "\n⏳ Waiting for signals..." + Style.RESET_ALL)
+
+                # Context-aware welcome message
+                missing = []
+                if not active_account:
+                    missing.append("A = set account")
+                if not output_directory:
+                    missing.append("D = set output directory")
+
+                if missing:
+                    print(Fore.YELLOW + f"\n⚠  Connected, but setup incomplete: {', '.join(missing)}" + Style.RESET_ALL)
+                else:
+                    print(Fore.GREEN + f"\n✔  Connected  ·  Account: {active_account}  ·  Signals will arrive shortly" + Style.RESET_ALL)
                 reconnect_event.clear()
 
                 while not shutdown.is_set():
