@@ -30,6 +30,7 @@ shutdown = asyncio.Event()
 signal_count = 0
 output_directory = None
 active_account = None          # Current NinjaTrader account name
+nt_port = 36973                # NinjaTrader AT Interface port (default 36973)
 awaiting_directory_input = False
 awaiting_user_input = False  # Block key handler during any input prompt
 
@@ -273,7 +274,7 @@ def row(text, width, pad="║"):
 def build_header():
     width = term_width()
     subtitle = "LINK ESTABLISHED  ·  SIGNAL BUS ACTIVE  ·  NODE AUTHORIZED"
-    commands = "P = PAUSE   A = ACCOUNT   D = DIR   R = RECONNECT   C = CLOSE"
+    commands = "P = PAUSE  A = ACCOUNT  D = DIR  O = PORT  R = RECONNECT  C = CLOSE"
 
     lines = [
         hline(width, "╔", "═", "╗"),
@@ -453,6 +454,42 @@ async def prompt_account():
     awaiting_user_input = False
 
 
+# ---------- Port prompt ----------
+async def prompt_port():
+    global nt_port, awaiting_user_input
+    awaiting_user_input = True
+    show_cursor()
+    print(Fore.CYAN + "\n┌─ NINJATRADER AT INTERFACE PORT ───────────────────┐" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Enter NinjaTrader AT Interface server port.      │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Press ENTER to keep current.                     │" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  Current: {str(nt_port).ljust(57)} │" + Style.RESET_ALL)
+    print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
+    sys.stdout.write(Fore.WHITE + "  PORT ▸ " + Style.RESET_ALL)
+    sys.stdout.flush()
+    raw = await asyncio.to_thread(read_line_raw)
+
+    if raw == "":
+        print(Fore.YELLOW + "  ↩  No change — keeping current port." + Style.RESET_ALL)
+    else:
+        try:
+            port = int(raw.strip())
+            if 1 <= port <= 65535:
+                nt_port = port
+                cfg = load_config()
+                cfg["nt_port"] = nt_port
+                save_config(cfg)
+                print(Fore.GREEN + f"  ✔  Port set → {nt_port}" + Style.RESET_ALL)
+            else:
+                print(Fore.RED + "  ✖  Port must be between 1 and 65535." + Style.RESET_ALL)
+        except ValueError:
+            print(Fore.RED + "  ✖  Invalid port number." + Style.RESET_ALL)
+
+    print()
+    print(status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS"))
+    print()
+    awaiting_user_input = False
+
+
 # ---------- Keyboard loop ----------
 reconnect_event = asyncio.Event()
 
@@ -473,6 +510,8 @@ async def keyboard_loop():
             await prompt_account()
         elif key.lower() == "d":
             await prompt_directory()
+        elif key.lower() == "o":
+            await prompt_port()
         elif key.lower() == "r":
             sys.stdout.write("\r\033[K")
             print(Fore.YELLOW + "🔄  MANUAL RECONNECT REQUESTED" + Style.RESET_ALL)
@@ -717,10 +756,11 @@ def setup() -> tuple[str, dict]:
 
 # ---------- Main ----------
 async def main():
-    global output_directory, active_account
+    global output_directory, active_account, nt_port
 
     token, cfg = setup()
     active_account = cfg.get("account", "")
+    nt_port = cfg.get("nt_port", 36973)
 
     if cfg.get("output_directory"):
         output_directory = cfg["output_directory"]

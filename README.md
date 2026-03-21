@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo/socket-traderLOGO.png" alt="SocketTrader" width="600">
+  <img src="images/socket-traderLOGO.png" alt="SocketTrader" width="600">
 </p>
 
 <p align="center">
@@ -8,6 +8,7 @@
 
 <p align="center">
   <a href="#installation">Installation</a> &nbsp;·&nbsp;
+  <a href="#ninjatrader-setup">NinjaTrader Setup</a> &nbsp;·&nbsp;
   <a href="#usage">Usage</a> &nbsp;·&nbsp;
   <a href="#keyboard-controls">Controls</a> &nbsp;·&nbsp;
   <a href="#configuration">Config</a>
@@ -62,6 +63,25 @@ pip install -r requirements.txt
 
 ---
 
+## NinjaTrader Setup
+
+Before SocketTrader can send orders, you must enable the **Automated Trading Interface** in NinjaTrader 8:
+
+1. Open **NinjaTrader 8**
+2. Go to **Tools** → **Options**
+3. Select **Automated trading interface** from the left panel
+4. Check the **AT Interface** checkbox to enable it
+5. Note the **Server port** (default: `36973`) — if you change it, press `O` in SocketTrader to update
+6. Click **OK**
+
+<p align="center">
+  <img src="images/ninjatrader_conf.PNG" alt="NinjaTrader AT Interface Settings" width="500">
+</p>
+
+> **Important:** NinjaTrader must be running with the AT Interface enabled for signals to be processed from the `incoming/` folder.
+
+---
+
 ## Usage
 
 ```bash
@@ -83,9 +103,9 @@ All settings are saved and loaded automatically on subsequent runs.
 ## Keyboard Controls
 
 ```
-╔══════════════════════════════════════════════════════════════╗
-║  P = PAUSE   A = ACCOUNT   D = DIR   R = RECONNECT   C = CLOSE  ║
-╚══════════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════════════════╗
+║  P = PAUSE  A = ACCOUNT  D = DIR  O = PORT  R = RECONNECT  C = CLOSE  ║
+╚═══════════════════════════════════════════════════════════════════════╝
 ```
 
 | Key | Action |
@@ -93,6 +113,7 @@ All settings are saved and loaded automatically on subsequent runs.
 | `P` | Pause / resume signal output |
 | `A` | Switch NinjaTrader account |
 | `D` | Change output directory |
+| `O` | Change NinjaTrader AT Interface port |
 | `R` | Force immediate reconnect (resets backoff) |
 | `C` | Close connection and exit |
 
@@ -106,7 +127,8 @@ Settings persist in `~/.voidorigin_config.json`:
 {
   "token": "your_connection_token",
   "account": "YourNTAccount",
-  "output_directory": "C:\\Users\\you\\Documents\\NinjaTrader 8\\incoming"
+  "output_directory": "C:\\Users\\you\\Documents\\NinjaTrader 8\\incoming",
+  "nt_port": 36973
 }
 ```
 
