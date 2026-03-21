@@ -666,7 +666,7 @@ PAUSE_FRAMES = [
 async def pause_indicator():
     i = 0
     while not shutdown.is_set():
-        if paused:
+        if paused and not awaiting_user_input:
             sys.stdout.write(Fore.YELLOW + "\r\033[K" + PAUSE_FRAMES[i % len(PAUSE_FRAMES)] + Style.RESET_ALL)
             sys.stdout.flush()
             i += 1
