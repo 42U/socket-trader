@@ -714,6 +714,45 @@ async def listen(token: str):
 
 
 # ---------- Setup (runs before async loop) ----------
+# ---------- Strategy template installer ----------
+SCRIPT_DIR = Path(__file__).resolve().parent
+STRATEGY_FILES = {
+    "AtmStrategy": "NQ_Med.xml",
+    "StopStrategy": "algoNQmed.xml",
+}
+
+
+def install_strategy_templates(nt_base: Path):
+    """Copy ATM and Stop strategy templates into NinjaTrader 8 template dirs.
+
+    nt_base is the NinjaTrader 8 root (parent of incoming/).
+    """
+    source_dir = SCRIPT_DIR / "strategy"
+    if not source_dir.is_dir():
+        print(Fore.YELLOW + "  ⚠  strategy/ folder not found — skipping template install." + Style.RESET_ALL)
+        return
+
+    for subdir, filename in STRATEGY_FILES.items():
+        src = source_dir / filename
+        dest_dir = nt_base / "templates" / subdir
+        dest = dest_dir / filename
+
+        if not src.exists():
+            print(Fore.YELLOW + f"  ⚠  {filename} not found in strategy/ — skipping." + Style.RESET_ALL)
+            continue
+
+        if dest.exists():
+            # Already installed
+            continue
+
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(dest))
+            print(Fore.GREEN + f"  ✔  Installed {filename} → {dest}" + Style.RESET_ALL)
+        except OSError as exc:
+            print(Fore.RED + f"  ✖  Could not install {filename}: {exc}" + Style.RESET_ALL)
+
+
 def setup() -> tuple[str, dict]:
     """Run first-time or repeat setup. Returns (token, config)."""
     cfg = load_config()
@@ -729,6 +768,9 @@ def setup() -> tuple[str, dict]:
         print(Fore.GREEN + f"  ✔  Account: {cfg['account']}" + Style.RESET_ALL)
         print(Fore.GREEN + f"  ✔  Output: {cfg['output_directory']}" + Style.RESET_ALL)
         print(Fore.GREEN + f"  ✔  Token: {'*' * len(cfg['token'])}" + Style.RESET_ALL)
+        # Install strategy templates if needed
+        nt_base = Path(cfg["output_directory"]).parent
+        install_strategy_templates(nt_base)
         print()
         return cfg["token"], cfg
 
@@ -748,6 +790,11 @@ def setup() -> tuple[str, dict]:
     if output_directory:
         cfg["output_directory"] = output_directory
     save_config(cfg)
+
+    # Install strategy templates if output directory is under NinjaTrader 8
+    if output_directory:
+        nt_base = Path(output_directory).parent
+        install_strategy_templates(nt_base)
 
     print(Fore.GREEN + f"\n  ✔  Config saved to {CONFIG_FILE}" + Style.RESET_ALL)
     print()

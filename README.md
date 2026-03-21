@@ -80,6 +80,17 @@ Before SocketTrader can send orders, you must enable the **Automated Trading Int
 
 > **Important:** After clicking OK/Apply, you must **restart NinjaTrader 8** for the AT Interface changes to take effect. NinjaTrader must be running with the AT Interface enabled for signals to be processed from the `incoming/` folder.
 
+### Strategy Templates
+
+SocketTrader requires ATM and Stop strategy templates to be installed in NinjaTrader. On first run, the client **automatically copies** these into the correct directories:
+
+| File | Source | Destination |
+|------|--------|-------------|
+| `NQ_Med.xml` | `strategy/` | `NinjaTrader 8/templates/AtmStrategy/` |
+| `algoNQmed.xml` | `strategy/` | `NinjaTrader 8/templates/StopStrategy/` |
+
+This happens automatically — no manual copying needed. If the files already exist, they are not overwritten.
+
 ---
 
 ## Usage
