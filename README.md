@@ -178,29 +178,33 @@ SocketTrader includes built-in risk controls that monitor your account balance i
 2. Every 30 seconds, it polls your current balance and calculates session P&L
 3. If P&L crosses your configured threshold, the appropriate action fires
 
-### Session Target (Soft Stop)
+### Session Target
 
-| | |
-|---|---|
-| **What** | A profit goal for the session (positive dollar amount) |
-| **Trigger** | Session P&L **reaches or exceeds** the target |
-| **Action** | Signals are automatically **paused** |
-| **Recovery** | Press `P` to resume trading |
-| **Disable** | Set to `0` |
+A **profit goal** for the session (positive dollar amount). Triggers when session P&L reaches or exceeds this value. Set to `0` to disable.
 
-Useful for locking in a daily profit goal and preventing overtrading.
+### Session Stop
 
-### Session Stop (Hard Stop)
+A **maximum loss limit** for the session (negative dollar amount). Triggers when session P&L drops to or below this value. Set to `0` to disable.
 
-| | |
-|---|---|
-| **What** | A maximum loss limit for the session (negative dollar amount) |
-| **Trigger** | Session P&L **drops to or below** the stop |
-| **Action** | All open positions are **closed** via `CLOSEPOSITION` commands, signals are **locked** |
-| **Recovery** | Cannot resume — press `C` to exit |
-| **Disable** | Set to `0` |
+### Soft vs Hard Mode
 
-When a hard stop fires, SocketTrader writes a `CLOSEPOSITION;{account};{contract};;;;;;;;;;` file to the `incoming/` folder for every instrument traded during the session. This tells NinjaTrader to flatten all positions immediately.
+Each limit (target and stop) can independently be set to **soft** or **hard** mode:
+
+| Mode | Action | Recovery |
+|------|--------|----------|
+| **Soft** | Pauses signals | Press `P` to resume trading |
+| **Hard** | Closes all open positions + locks signals | Cannot resume — press `C` to exit |
+
+When a **hard** limit fires, SocketTrader writes a `CLOSEPOSITION;{account};{contract};;;;;;;;;;` file to the `incoming/` folder for every instrument traded during the session. This tells NinjaTrader to flatten all positions immediately.
+
+**Defaults:** Target defaults to **soft**, stop defaults to **hard** — but you can set any combination:
+
+| Example | Use case |
+|---------|----------|
+| Target: soft, Stop: hard | Lock in profits (resumable), auto-flatten on loss |
+| Target: hard, Stop: hard | Walk away — both sides close everything |
+| Target: soft, Stop: soft | Gentle nudge on both sides, always resumable |
+| Target: off, Stop: hard | No profit cap, hard loss protection only |
 
 ### Configuring Limits
 
@@ -209,20 +213,24 @@ Press `T` during a session:
 ```
 ┌─ SESSION LIMITS (Sim101) ────────────────────────┐
 │  Balance: $28,857.02  ·  Session P&L: +$0.00     │
-│  Target = soft stop (pauses signals)              │
-│  Stop = hard stop (closes positions + pauses)     │
+│  Target: +500.00 (soft)  ·  Stop: -300.00 (hard)  │
+│  soft = pause signals (press P to resume)         │
+│  hard = close all positions + lock signals        │
 │  Enter 0 to disable. ENTER to keep current.       │
 └───────────────────────────────────────────────────────┘
   TARGET $ (current: +500.00) ▸ 500
+  TARGET MODE (current: soft) [soft/hard] ▸ soft
   STOP $ (current: -300.00) ▸ -300
+  STOP MODE (current: hard) [soft/hard] ▸ hard
 ```
 
-- Enter a **positive number** for target (e.g. `500` = pause at +$500 profit)
-- Enter a **negative number** for stop (e.g. `-300` = hard stop at -$300 loss)
-- Enter `0` to **disable** either side
+- Enter a **positive number** for target (e.g. `500` = trigger at +$500 profit)
+- Enter a **negative number** for stop (e.g. `-300` = trigger at -$300 loss)
+- Choose **soft** or **hard** mode for each limit
+- Enter `0` to **disable** either side (mode prompt is skipped)
 - Press **ENTER** to keep the current value
 
-Limits are saved **per account** in your config file and persist across sessions. You can set different limits for different accounts.
+Limits and modes are saved **per account** in your config file and persist across sessions.
 
 ### Session Summary
 
@@ -250,8 +258,8 @@ Settings persist in `~/.voidorigin_config.json`:
   "output_directory": "C:\\Users\\you\\Documents\\NinjaTrader 8\\incoming",
   "nt_port": 36973,
   "account_limits": {
-    "Sim101": { "target": 500, "stop": -300 },
-    "MyLiveAccount": { "target": 1000, "stop": -500 }
+    "Sim101": { "target": 500, "target_mode": "soft", "stop": -300, "stop_mode": "hard" },
+    "MyLiveAccount": { "target": 1000, "target_mode": "hard", "stop": -500, "stop_mode": "hard" }
   }
 }
 ```
