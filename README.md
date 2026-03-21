@@ -164,9 +164,13 @@ All settings are saved and loaded automatically on subsequent runs.
 
 ## Risk Management
 
-SocketTrader includes built-in risk controls that monitor your account balance in real time via the NinjaTrader ATI. Press `T` to configure, or leave both at their default of `0` to disable.
+SocketTrader includes built-in risk controls that monitor your account balance in real time via the NinjaTrader ATI. Press `T` to configure.
 
-> **Both target and stop are completely optional.** Set either to `0` to disable that side independently. By default, both are `0` (off) — SocketTrader will not interfere with your trading unless you explicitly configure limits.
+> **There is no separate on/off toggle.** The dollar amount *is* the switch:
+> - **Set a value** (e.g. `500` or `-300`) → that limit is **active**
+> - **Set to `0`** → that limit is **disabled**
+>
+> By default both are `0` — SocketTrader will not interfere with your trading unless you explicitly set a limit. Target and stop are independent — you can use one, both, or neither.
 
 ### How It Works
 
