@@ -104,10 +104,10 @@ hard_stopped = False                              # True if hard stop triggered
 BALANCE_POLL_INTERVAL = 3                         # seconds between balance checks
 
 # ---------- Signal confirmation ----------
-# After a signal fires, we track it here and verify NinjaTrader processed it
-# by checking if the account balance moves within the confirmation window.
-CONFIRM_TIMEOUT = 9  # seconds to wait for balance movement after signal
-_pending_confirms: list[dict] = []  # [{signal, ts, pre_balance, instrument, id}]
+# After a signal fires, we snapshot positions for that instrument and verify
+# NinjaTrader processed it by checking if the position changed.
+CONFIRM_TIMEOUT = 9  # seconds to wait for position change after signal
+_pending_confirms: list[dict] = []  # [{signal, ts, pre_pos, instrument, id, action}]
 
 # ---------- Logging ----------
 LOG_FILE = Path.home() / ".voidorigin_signals.log"
@@ -275,16 +275,13 @@ def _nt_host() -> str:
     return "127.0.0.1"
 
 
-def query_nt_accounts(port: int = 36973, timeout: float = 3.0) -> list[dict]:
-    """Query NinjaTrader ATI for connected accounts with balances.
-
-    Returns list of dicts: [{"name": "Sim101", "cash": 28857.02}, ...]
-    """
+def _query_ati(command: str, port: int = 36973, timeout: float = 3.0) -> str:
+    """Send a command to NinjaTrader ATI and return the raw response text."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         s.connect((_nt_host(), port))
-        s.sendall(b"ACCOUNTS\n")
+        s.sendall(f"{command}\n".encode())
         parts = []
         while True:
             try:
@@ -295,22 +292,74 @@ def query_nt_accounts(port: int = 36973, timeout: float = 3.0) -> list[dict]:
             except socket.timeout:
                 break
         s.close()
-        text = b"".join(parts).decode("utf-8", errors="ignore")
-        # Parse accounts from CashValue|AccountName\x00Value pattern
-        accounts = {}
-        for m in re.finditer(r"CashValue\|([^\x00]+)\x00([^\x00]+)", text):
-            name, val = m.group(1), m.group(2)
-            try:
-                float(name)  # skip bare value (no account name)
-            except ValueError:
-                try:
-                    accounts[name] = float(val)
-                except ValueError:
-                    accounts[name] = 0.0
-        return [{"name": n, "cash": v} for n, v in accounts.items()]
+        return b"".join(parts).decode("utf-8", errors="ignore")
     except Exception:
-        pass
-    return []
+        return ""
+
+
+def query_nt_accounts(port: int = 36973, timeout: float = 3.0) -> list[dict]:
+    """Query NinjaTrader ATI for connected accounts with balances.
+
+    Returns list of dicts: [{"name": "Sim101", "cash": 28857.02}, ...]
+    """
+    text = _query_ati("ACCOUNTS", port, timeout)
+    if not text:
+        return []
+    accounts = {}
+    for m in re.finditer(r"CashValue\|([^\x00]+)\x00([^\x00]+)", text):
+        name, val = m.group(1), m.group(2)
+        try:
+            float(name)  # skip bare value (no account name)
+        except ValueError:
+            try:
+                accounts[name] = float(val)
+            except ValueError:
+                accounts[name] = 0.0
+    return [{"name": n, "cash": v} for n, v in accounts.items()]
+
+
+def query_nt_positions(account: str, port: int = 36973) -> dict[str, int]:
+    """Query NinjaTrader ATI for open positions on an account.
+
+    Returns dict of instrument -> market position quantity.
+    Positive = long, negative = short, 0 = flat.
+    e.g. {"NQ 06-26": 1, "ES 06-26": -2}
+    """
+    text = _query_ati("POSITIONS", port)
+    if not text:
+        return {}
+    # ATI POSITIONS response contains MarketPosition|Account\x00Value
+    # and Quantity|Account\x00Value patterns per instrument
+    positions = {}
+    # Find all instrument sections with market position for our account
+    # Pattern: instrument data comes in blocks separated by \x00
+    # Look for MarketPosition and Quantity entries for the account
+    for m in re.finditer(r"MarketPosition\|([^\x00]+)\x00([^\x00]+)", text):
+        key, val = m.group(1), m.group(2)
+        if account in key:
+            # key format varies: could be "Account InstrumentName" or just "InstrumentName"
+            instrument = key.replace(account, "").strip()
+            if instrument:
+                # val is typically "Long", "Short", or "Flat"
+                positions[instrument] = val
+    # Also look for Quantity to get actual position size
+    quantities = {}
+    for m in re.finditer(r"Quantity\|([^\x00]+)\x00([^\x00]+)", text):
+        key, val = m.group(1), m.group(2)
+        if account in key:
+            instrument = key.replace(account, "").strip()
+            if instrument:
+                try:
+                    qty = int(float(val))
+                    direction = positions.get(instrument, "")
+                    if "Short" in direction:
+                        qty = -qty
+                    elif "Flat" in direction:
+                        qty = 0
+                    quantities[instrument] = qty
+                except ValueError:
+                    pass
+    return quantities
 
 
 def ask_account(cfg: dict) -> str:
@@ -1138,50 +1187,57 @@ def fire_close_position(account: str, contract: str):
         print(Fore.RED + f"  ✖  Close position write error: {exc}" + Style.RESET_ALL)
 
 
-def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str):
-    """Register a signal for post-trade confirmation."""
-    pre_bal = session_current_balances.get(active_account)
+def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, action: str):
+    """Register a signal for post-trade confirmation via position check."""
+    # Snapshot current position for this specific instrument
+    positions = query_nt_positions(active_account, nt_port)
+    pre_pos = positions.get(instrument, 0)
     _pending_confirms.append({
         "signal": signal_text,
         "id": sig_id,
         "instrument": instrument,
+        "action": action,  # BUY or SELL
         "ts": time.time(),
-        "pre_balance": pre_bal,
+        "pre_pos": pre_pos,
     })
 
 
 def check_pending_confirms():
-    """Check pending signals for confirmation via balance movement.
+    """Check pending signals for confirmation via position change.
 
-    Called every balance poll cycle. If balance changed since the signal
-    fired, the trade is confirmed. If the confirmation window expires
-    with no movement, warn the user.
+    Called every balance poll cycle. Queries ATI for current positions
+    and checks if the position changed for the specific instrument
+    that was traded. This works even with other positions open.
     """
     if not _pending_confirms or not active_account:
         return
 
-    current_bal = session_current_balances.get(active_account)
+    positions = query_nt_positions(active_account, nt_port)
     now = time.time()
     still_pending = []
 
     for entry in _pending_confirms:
         elapsed = now - entry["ts"]
-        pre_bal = entry["pre_balance"]
+        instrument = entry["instrument"]
+        pre_pos = entry["pre_pos"]
+        cur_pos = positions.get(instrument, 0)
 
-        if pre_bal is not None and current_bal is not None and pre_bal != current_bal:
-            # Balance moved — trade confirmed
-            logger.info(f"CONFIRMED  id={entry['id']}  instrument={entry['instrument']}  "
-                        f"elapsed={elapsed:.1f}s  bal_change={current_bal - pre_bal:+.2f}")
+        if cur_pos != pre_pos:
+            # Position changed on this instrument — trade confirmed
+            logger.info(f"CONFIRMED  id={entry['id']}  {instrument}  "
+                        f"{entry['action']}  pos: {pre_pos} → {cur_pos}  "
+                        f"elapsed={elapsed:.1f}s")
             continue  # drop from pending
 
         if elapsed >= CONFIRM_TIMEOUT:
-            # Timed out — no balance movement detected
+            # Timed out — position did not change for this instrument
             sys.stdout.write("\r\033[K")
             print(Fore.YELLOW + Style.DIM +
-                  f"  ⚠  No fill detected for {entry['instrument']} after {CONFIRM_TIMEOUT}s "
+                  f"  ⚠  No fill detected for {instrument} after {CONFIRM_TIMEOUT}s "
                   f"(ID: {entry['id']})" + Style.RESET_ALL)
-            logger.warning(f"UNCONFIRMED  id={entry['id']}  instrument={entry['instrument']}  "
-                           f"elapsed={elapsed:.1f}s  pre_bal={pre_bal}  cur_bal={current_bal}")
+            logger.warning(f"UNCONFIRMED  id={entry['id']}  {instrument}  "
+                           f"{entry['action']}  pos unchanged at {pre_pos}  "
+                           f"elapsed={elapsed:.1f}s")
             continue  # drop from pending
 
         still_pending.append(entry)
@@ -1207,7 +1263,8 @@ async def balance_monitor():
         refresh_controls()
 
         # Check if pending signals were filled
-        check_pending_confirms()
+        if _pending_confirms:
+            await asyncio.to_thread(check_pending_confirms)
 
         if active_account not in session_start_balances:
             continue
@@ -1482,7 +1539,8 @@ async def listen(token: str):
                             write_signal_to_file(raw_signal)
                             # Register for fill confirmation
                             instrument = sig_parts[2] if len(sig_parts) >= 3 else ""
-                            add_pending_confirm(raw_signal, sig_id, instrument)
+                            action = sig_parts[3] if len(sig_parts) >= 4 else ""
+                            await asyncio.to_thread(add_pending_confirm, raw_signal, sig_id, instrument, action)
                             await signal_pulse("SIGNAL RECEIVED")
                             sys.stdout.write("\r\033[K")
                             print(format_signal(raw_signal, signal_count))
