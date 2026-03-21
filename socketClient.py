@@ -1524,7 +1524,7 @@ def print_exit_summary():
     content_width = max(45, len(log_str) + 9)  # "  Log: " + path + "  "
     inner = content_width - 4  # inside │  ...  │
     print(f"\r\033[K" + Fore.CYAN + f"\n\r\033[K  ┌─ SESSION SUMMARY {'─' * (content_width - 20)}┐" + Style.RESET_ALL)
-    print(f"\r\033[K" + Fore.CYAN + f"  │  Signals received: {str(signal_count).ljust(inner - 20)}│" + Style.RESET_ALL)
+    print(f"\r\033[K" + Fore.CYAN + f"  │  Signals received: {str(signal_count).ljust(inner - 18)}│" + Style.RESET_ALL)
     # Show final P&L if we have balance data
     if active_account and active_account in session_start_balances:
         final_bal = query_nt_balance(active_account)
@@ -1536,7 +1536,7 @@ def print_exit_summary():
             print(f"\r\033[K" + Fore.CYAN + f"  │  " + pnl_color + f"{pnl_line.ljust(inner)}" + Fore.CYAN + f"│" + Style.RESET_ALL)
     log_line = f"Log: {log_str}"
     print(f"\r\033[K" + Fore.CYAN + f"  │  {log_line.ljust(inner)}│" + Style.RESET_ALL)
-    print(f"\r\033[K" + Fore.CYAN + f"  └{'─' * content_width}┘" + Style.RESET_ALL)
+    print(f"\r\033[K" + Fore.CYAN + f"  └{'─' * (content_width - 2)}┘" + Style.RESET_ALL)
     logger.info(f"SESSION END  signals={signal_count}")
 
 
