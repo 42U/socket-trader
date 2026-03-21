@@ -5,6 +5,7 @@ import websockets
 import json
 import logging
 import shutil
+import socket
 import sys
 import time
 import random
@@ -36,6 +37,13 @@ atm_strategy = "NQ_Med"        # ATM strategy template name
 nt_port = 36973                # NinjaTrader AT Interface port (default 36973)
 awaiting_directory_input = False
 awaiting_user_input = False  # Block key handler during any input prompt
+
+# ---------- Risk management ----------
+session_start_balances: dict[str, float] = {}   # account -> starting balance
+session_contracts: set[str] = set()              # instruments traded this session
+soft_stopped = False                              # True if soft stop triggered
+hard_stopped = False                              # True if hard stop triggered
+BALANCE_POLL_INTERVAL = 30                        # seconds between balance checks
 
 # ---------- Logging ----------
 LOG_FILE = Path.home() / ".voidorigin_signals.log"
@@ -152,12 +160,87 @@ def detect_or_ask_directory(cfg: dict) -> str | None:
             print(Fore.YELLOW + "  Try again or press ENTER to skip." + Style.RESET_ALL)
 
 
+def _nt_host() -> str:
+    """Return the correct host for NinjaTrader ATI (handles WSL)."""
+    if IS_WINDOWS:
+        return "127.0.0.1"
+    # WSL: NinjaTrader runs on the Windows host
+    try:
+        with open("/etc/resolv.conf") as f:
+            for line in f:
+                if line.strip().startswith("nameserver"):
+                    return line.split()[1]
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
+def query_nt_accounts(port: int = 36973, timeout: float = 3.0) -> list[dict]:
+    """Query NinjaTrader ATI for connected accounts with balances.
+
+    Returns list of dicts: [{"name": "Sim101", "cash": 28857.02}, ...]
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((_nt_host(), port))
+        s.sendall(b"ACCOUNTS\n")
+        parts = []
+        while True:
+            try:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                parts.append(chunk)
+            except socket.timeout:
+                break
+        s.close()
+        text = b"".join(parts).decode("utf-8", errors="ignore")
+        # Parse accounts from CashValue|AccountName\x00Value pattern
+        accounts = {}
+        for m in re.finditer(r"CashValue\|([^\x00]+)\x00([^\x00]+)", text):
+            name, val = m.group(1), m.group(2)
+            try:
+                float(name)  # skip bare value (no account name)
+            except ValueError:
+                try:
+                    accounts[name] = float(val)
+                except ValueError:
+                    accounts[name] = 0.0
+        return [{"name": n, "cash": v} for n, v in accounts.items()]
+    except Exception:
+        pass
+    return []
+
+
 def ask_account(cfg: dict) -> str:
-    """Get NinjaTrader account name from config or prompt user."""
+    """Get NinjaTrader account name from config or prompt user.
+
+    On first run, queries ATI for accounts or prompts manually.
+    Saves choice to config and reuses it on subsequent runs.
+    """
     saved = cfg.get("account")
     if saved:
         return saved
 
+    # First run — try to auto-detect accounts from NinjaTrader ATI
+    accounts = query_nt_accounts(nt_port)
+    if accounts:
+        print(Fore.CYAN + "\n┌─ NINJATRADER ACCOUNTS (auto-detected) ────────────────┐" + Style.RESET_ALL)
+        for i, a in enumerate(accounts, 1):
+            line = f"{i}. {a['name']}  (${a['cash']:,.2f})"
+            print(Fore.CYAN + f"│  {line.ljust(54)}│" + Style.RESET_ALL)
+        print(Fore.CYAN + "└───────────────────────────────────────────────────────┘" + Style.RESET_ALL)
+        if len(accounts) == 1:
+            print(Fore.GREEN + f"  ✔  Auto-selected: {accounts[0]['name']}" + Style.RESET_ALL)
+            return accounts[0]["name"]
+        while True:
+            choice = input(Fore.WHITE + "  SELECT # ▸ " + Style.RESET_ALL).strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(accounts):
+                return accounts[int(choice) - 1]["name"]
+            print(Fore.YELLOW + f"  ⚠  Enter 1-{len(accounts)}." + Style.RESET_ALL)
+
+    # ATI not available — manual entry
     print(Fore.CYAN + "\n┌─ NINJATRADER ACCOUNT ─────────────────────────────────┐" + Style.RESET_ALL)
     print(Fore.CYAN + "│  Enter your NinjaTrader account name.                 │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  This replaces the Sim account in incoming signals.   │" + Style.RESET_ALL)
@@ -289,11 +372,11 @@ def row(text, width, pad="║"):
 def build_header():
     width = term_width()
     subtitle = "LINK ESTABLISHED  ·  SIGNAL BUS ACTIVE  ·  NODE AUTHORIZED"
-    commands = "P=PAUSE A=ACCT S=STRAT D=DIR O=PORT R=RECONN C=CLOSE"
+    commands = "P=PAUSE A=ACCT S=STRAT D=DIR T=LIMITS O=PORT R=RECONN C=CLOSE"
 
     lines = [
         hline(width, "╔", "═", "╗"),
-        row("SIGNAL NODE", width),
+        row("SOCKET TRADER", width),
         row(subtitle, width),
         hline(width, "╠", "═", "╣"),
         row(commands, width),
@@ -313,7 +396,7 @@ def visible_len(s: str) -> int:
 def status_bar(text):
     width = term_width()
     inner = width - 2
-    dir_indicator = Fore.GREEN + "● DIR SET" + Fore.CYAN if output_directory else Fore.RED + "● DIR NOT SET" + Fore.CYAN
+    dir_indicator = Fore.GREEN + "● TRADE READY" + Fore.CYAN if output_directory else Fore.RED + "● NOT READY" + Fore.CYAN
     content = f"{text}  ·  {dir_indicator}"
     vis = visible_len(content)
     total_pad = max(0, inner - vis)
@@ -444,24 +527,47 @@ async def prompt_account():
     global active_account, awaiting_user_input
     awaiting_user_input = True
     show_cursor()
-    print(Fore.CYAN + "\n┌─ CHANGE ACCOUNT ─────────────────────────────────┐" + Style.RESET_ALL)
-    print(Fore.CYAN + "│  Enter new NinjaTrader account name.              │" + Style.RESET_ALL)
-    print(Fore.CYAN + "│  Press ENTER to keep current.                     │" + Style.RESET_ALL)
-    if active_account:
-        print(Fore.CYAN + f"│  Current: {active_account[:57].ljust(57)} │" + Style.RESET_ALL)
-    print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
-    sys.stdout.write(Fore.WHITE + "  ACCOUNT ▸ " + Style.RESET_ALL)
-    sys.stdout.flush()
-    raw = await asyncio.to_thread(read_line_raw)
-
-    if raw == "":
-        print(Fore.YELLOW + "  ↩  No change — keeping current account." + Style.RESET_ALL)
+    # Try to auto-detect accounts from NinjaTrader ATI
+    accounts = query_nt_accounts(nt_port)
+    if accounts:
+        print(Fore.CYAN + "\n┌─ CHANGE ACCOUNT (auto-detected) ─────────────────┐" + Style.RESET_ALL)
+        for i, a in enumerate(accounts, 1):
+            marker = " ◀" if a["name"] == active_account else ""
+            line = f"{i}. {a['name']}  (${a['cash']:,.2f}){marker}"
+            print(Fore.CYAN + f"│  {line.ljust(49)}│" + Style.RESET_ALL)
+        print(Fore.CYAN + "│  Press ENTER to keep current.                     │" + Style.RESET_ALL)
+        print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
+        sys.stdout.write(Fore.WHITE + "  SELECT # ▸ " + Style.RESET_ALL)
+        sys.stdout.flush()
+        raw = await asyncio.to_thread(read_line_raw)
+        if raw == "":
+            print(Fore.YELLOW + "  ↩  No change — keeping current account." + Style.RESET_ALL)
+        elif raw.strip().isdigit() and 1 <= int(raw.strip()) <= len(accounts):
+            active_account = accounts[int(raw.strip()) - 1]["name"]
+            cfg = load_config()
+            cfg["account"] = active_account
+            save_config(cfg)
+            print(Fore.GREEN + f"  ✔  Account set → {active_account}" + Style.RESET_ALL)
+        else:
+            print(Fore.YELLOW + f"  ⚠  Invalid choice. Keeping current account." + Style.RESET_ALL)
     else:
-        active_account = raw.strip()
-        cfg = load_config()
-        cfg["account"] = active_account
-        save_config(cfg)
-        print(Fore.GREEN + f"  ✔  Account set → {active_account}" + Style.RESET_ALL)
+        print(Fore.CYAN + "\n┌─ CHANGE ACCOUNT ─────────────────────────────────┐" + Style.RESET_ALL)
+        print(Fore.CYAN + "│  Enter new NinjaTrader account name.              │" + Style.RESET_ALL)
+        print(Fore.CYAN + "│  Press ENTER to keep current.                     │" + Style.RESET_ALL)
+        if active_account:
+            print(Fore.CYAN + f"│  Current: {active_account[:38].ljust(38)}│" + Style.RESET_ALL)
+        print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
+        sys.stdout.write(Fore.WHITE + "  ACCOUNT ▸ " + Style.RESET_ALL)
+        sys.stdout.flush()
+        raw = await asyncio.to_thread(read_line_raw)
+        if raw == "":
+            print(Fore.YELLOW + "  ↩  No change — keeping current account." + Style.RESET_ALL)
+        else:
+            active_account = raw.strip()
+            cfg = load_config()
+            cfg["account"] = active_account
+            save_config(cfg)
+            print(Fore.GREEN + f"  ✔  Account set → {active_account}" + Style.RESET_ALL)
 
     print()
     print(status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS"))
@@ -540,13 +646,18 @@ reconnect_event = asyncio.Event()
 
 
 async def keyboard_loop():
-    global paused
+    global paused, soft_stopped
     while not shutdown.is_set():
         key = await asyncio.to_thread(get_key)
         if awaiting_directory_input or awaiting_user_input:
             continue
         if key.lower() == "p":
+            if hard_stopped:
+                sys.stdout.write("\r\033[K")
+                print(Fore.RED + "  ⛔  Hard stop active — cannot resume. Press C to exit." + Style.RESET_ALL)
+                continue
             paused = not paused
+            soft_stopped = False  # Reset soft stop on manual resume
             if not paused:
                 sys.stdout.write("\r\033[K")
                 sys.stdout.flush()
@@ -557,6 +668,8 @@ async def keyboard_loop():
             await prompt_directory()
         elif key.lower() == "s":
             await prompt_strategy()
+        elif key.lower() == "t":
+            await prompt_limits()
         elif key.lower() == "o":
             await prompt_port()
         elif key.lower() == "r":
@@ -619,6 +732,8 @@ async def display_server_message(data: dict, connect_latency: int):
             hb_line = f"Heartbeat every {mins} min"
             print(f"\r\033[K" + Fore.CYAN + f"  │  {hb_line.ljust(46)}│" + Style.RESET_ALL)
         print(f"\r\033[K" + Fore.CYAN + "  ╰────────────────────────────────────────────────╯" + Style.RESET_ALL)
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
 
     elif data.get("type") == "heartbeat":
         # Animated heartbeat pulse — subtle, single line
@@ -683,6 +798,172 @@ def write_signal_to_file(signal_text: str):
         print(Fore.RED + f"  ✖  File write error: {exc}" + Style.RESET_ALL)
 
 
+# ---------- Risk management ----------
+def get_account_limits(account: str) -> dict:
+    """Get target/stop for an account from config."""
+    cfg = load_config()
+    limits = cfg.get("account_limits", {}).get(account, {})
+    return {"target": limits.get("target", 0), "stop": limits.get("stop", 0)}
+
+
+def set_account_limits(account: str, target: float, stop: float):
+    """Save target/stop for an account to config."""
+    cfg = load_config()
+    if "account_limits" not in cfg:
+        cfg["account_limits"] = {}
+    cfg["account_limits"][account] = {"target": target, "stop": stop}
+    save_config(cfg)
+
+
+def query_nt_balance(account: str) -> float | None:
+    """Query current cash balance for a specific account from ATI."""
+    accounts = query_nt_accounts(nt_port)
+    for a in accounts:
+        if a["name"] == account:
+            return a["cash"]
+    return None
+
+
+def fire_close_position(account: str, contract: str):
+    """Write a CLOSEPOSITION command to the incoming folder."""
+    if not output_directory:
+        return
+    cmd = f"CLOSEPOSITION;{account};{contract};;;;;;;;;;"
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    ms = int((time.time() % 1) * 1000)
+    filename = f"close_{ts}_{ms:03d}.txt"
+    filepath = os.path.join(output_directory, filename)
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(cmd)
+        logger.info(f"CLOSEPOSITION  account={account}  contract={contract}  file={filename}")
+    except Exception as exc:
+        sys.stdout.write("\r\033[K")
+        print(Fore.RED + f"  ✖  Close position write error: {exc}" + Style.RESET_ALL)
+
+
+async def balance_monitor():
+    """Periodically check account balance and enforce target/stop."""
+    global paused, soft_stopped, hard_stopped
+
+    while not shutdown.is_set():
+        await asyncio.sleep(BALANCE_POLL_INTERVAL)
+
+        if not active_account or hard_stopped:
+            continue
+
+        if active_account not in session_start_balances:
+            continue
+
+        limits = get_account_limits(active_account)
+        if limits["target"] == 0 and limits["stop"] == 0:
+            continue
+
+        current = query_nt_balance(active_account)
+        if current is None:
+            continue
+
+        start = session_start_balances[active_account]
+        pnl = current - start
+
+        # Hard stop — close all positions and pause
+        if limits["stop"] != 0 and pnl <= limits["stop"]:
+            hard_stopped = True
+            paused = True
+            sys.stdout.write("\r\033[K")
+            print(Fore.RED + Style.BRIGHT + f"  ⛔  HARD STOP HIT  ·  P&L: ${pnl:+,.2f}  ·  Limit: ${limits['stop']:+,.2f}" + Style.RESET_ALL)
+            sys.stdout.write("\r\033[K")
+            print(Fore.RED + "  ⛔  CLOSING ALL POSITIONS..." + Style.RESET_ALL)
+            for contract in session_contracts:
+                fire_close_position(active_account, contract)
+                sys.stdout.write("\r\033[K")
+                print(Fore.RED + f"  ⛔  CLOSEPOSITION → {contract}" + Style.RESET_ALL)
+            sys.stdout.write("\r\033[K")
+            print(Fore.RED + "  ⛔  Signals PAUSED — hard stop active. Press C to exit." + Style.RESET_ALL)
+            logger.info(f"HARD STOP  pnl={pnl:.2f}  limit={limits['stop']}  contracts={list(session_contracts)}")
+            continue
+
+        # Soft stop (target) — pause signals
+        if limits["target"] != 0 and pnl >= limits["target"]:
+            if not soft_stopped:
+                soft_stopped = True
+                paused = True
+                sys.stdout.write("\r\033[K")
+                print(Fore.GREEN + Style.BRIGHT + f"  🎯  SESSION TARGET HIT  ·  P&L: ${pnl:+,.2f}  ·  Target: ${limits['target']:+,.2f}" + Style.RESET_ALL)
+                sys.stdout.write("\r\033[K")
+                print(Fore.YELLOW + "  ⏸  Signals PAUSED — target reached. Press P to resume." + Style.RESET_ALL)
+                logger.info(f"SOFT STOP (TARGET)  pnl={pnl:.2f}  target={limits['target']}")
+
+
+async def prompt_limits():
+    """Prompt user to set session target and stop for the active account."""
+    global awaiting_user_input, soft_stopped
+    if not active_account:
+        sys.stdout.write("\r\033[K")
+        print(Fore.YELLOW + "  ⚠  Set an account first (press A)." + Style.RESET_ALL)
+        return
+
+    awaiting_user_input = True
+    show_cursor()
+    limits = get_account_limits(active_account)
+    start_bal = session_start_balances.get(active_account)
+    current_bal = query_nt_balance(active_account)
+
+    print(Fore.CYAN + f"\n\r\033[K┌─ SESSION LIMITS ({active_account}) ────────────────────────┐" + Style.RESET_ALL)
+    if start_bal is not None and current_bal is not None:
+        pnl = current_bal - start_bal
+        info = f"Balance: ${current_bal:,.2f}  ·  Session P&L: ${pnl:+,.2f}"
+        print(Fore.CYAN + f"\r\033[K│  {info.ljust(52)}│" + Style.RESET_ALL)
+    if limits["target"] or limits["stop"]:
+        cur = f"Target: ${limits['target']:+,.2f}  ·  Stop: ${limits['stop']:+,.2f}"
+        print(Fore.CYAN + f"\r\033[K│  Current → {cur.ljust(41)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"\r\033[K│  Target = soft stop (pauses signals)              │" + Style.RESET_ALL)
+    print(Fore.CYAN + f"\r\033[K│  Stop = hard stop (closes positions + pauses)     │" + Style.RESET_ALL)
+    print(Fore.CYAN + f"\r\033[K│  Enter 0 to disable. ENTER to keep current.       │" + Style.RESET_ALL)
+    print(Fore.CYAN + f"\r\033[K└───────────────────────────────────────────────────────┘" + Style.RESET_ALL)
+
+    # Target (profit)
+    sys.stdout.write(Fore.WHITE + f"  TARGET $ (current: {limits['target']:+,.2f}) ▸ " + Style.RESET_ALL)
+    sys.stdout.flush()
+    raw_t = await asyncio.to_thread(read_line_raw)
+    if raw_t.strip():
+        try:
+            target = float(raw_t.strip())
+            if target < 0:
+                print(Fore.YELLOW + "  ⚠  Target must be positive (it's a profit goal). Using absolute value." + Style.RESET_ALL)
+                target = abs(target)
+        except ValueError:
+            print(Fore.YELLOW + "  ⚠  Invalid number — keeping current target." + Style.RESET_ALL)
+            target = limits["target"]
+    else:
+        target = limits["target"]
+
+    # Stop (loss)
+    sys.stdout.write(Fore.WHITE + f"  STOP $ (current: {limits['stop']:+,.2f}) ▸ " + Style.RESET_ALL)
+    sys.stdout.flush()
+    raw_s = await asyncio.to_thread(read_line_raw)
+    if raw_s.strip():
+        try:
+            stop = float(raw_s.strip())
+            if stop > 0:
+                print(Fore.YELLOW + "  ⚠  Stop should be negative (it's a loss limit). Converting to negative." + Style.RESET_ALL)
+                stop = -abs(stop)
+        except ValueError:
+            print(Fore.YELLOW + "  ⚠  Invalid number — keeping current stop." + Style.RESET_ALL)
+            stop = limits["stop"]
+    else:
+        stop = limits["stop"]
+
+    set_account_limits(active_account, target, stop)
+    soft_stopped = False  # Reset soft stop when limits change
+    print(Fore.GREEN + f"  ✔  {active_account} → Target: ${target:+,.2f}  ·  Stop: ${stop:+,.2f}" + Style.RESET_ALL)
+
+    print()
+    print(status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS"))
+    print()
+    awaiting_user_input = False
+
+
 # ---------- WebSocket listener with reconnection ----------
 MAX_BACKOFF = 1800  # 30 minutes in seconds
 
@@ -714,6 +995,12 @@ async def listen(token: str):
                 connect_latency = int((time.time() - connect_start) * 1000)
                 baseline_latency = None  # First signal sets the baseline
                 fib_prev, fib_curr = 60, 60  # Reset on successful connection
+
+                # Snapshot account balances for risk management
+                nt_accounts = query_nt_accounts(nt_port)
+                for a in nt_accounts:
+                    if a["name"] not in session_start_balances:
+                        session_start_balances[a["name"]] = a["cash"]
 
                 # Context-aware welcome message
                 missing = []
@@ -755,6 +1042,11 @@ async def listen(token: str):
                                     continue
                                 if sig_id:
                                     _recent_signal_ids.append(sig_id)
+
+                                # Track traded contracts for hard stop
+                                sig_parts = raw_signal.split(";")
+                                if len(sig_parts) >= 3 and sig_parts[2]:
+                                    session_contracts.add(sig_parts[2])
 
                                 write_signal_to_file(raw_signal)
                                 await signal_pulse("SIGNAL RECEIVED")
@@ -892,7 +1184,7 @@ def setup() -> tuple[str, dict]:
 
     print(Fore.GREEN + Style.BRIGHT)
     print("  ╔══════════════════════════════════════════╗")
-    print("  ║         VOIDORIGIN  ·  SIGNAL NODE       ║")
+    print("  ║       VOIDORIGIN  ·  SOCKET TRADER       ║")
     print("  ╚══════════════════════════════════════════╝")
     print(Style.RESET_ALL)
 
@@ -956,6 +1248,7 @@ async def main():
             asyncio.create_task(listen(token)),
             asyncio.create_task(keyboard_loop()),
             asyncio.create_task(pause_indicator()),
+            asyncio.create_task(balance_monitor()),
         ]
 
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -994,10 +1287,19 @@ async def main():
 def print_exit_summary():
     show_cursor()
     sys.stdout.write("\r\033[K")
-    print(Fore.CYAN + f"\n  ┌─ SESSION SUMMARY ─────────────────────────┐" + Style.RESET_ALL)
-    print(Fore.CYAN + f"  │  Signals received: {str(signal_count).ljust(24)}│" + Style.RESET_ALL)
-    print(Fore.CYAN + f"  │  Log: {str(LOG_FILE)[:38].ljust(38)}│" + Style.RESET_ALL)
-    print(Fore.CYAN + f"  └─────────────────────────────────────────────┘" + Style.RESET_ALL)
+    print(f"\r\033[K" + Fore.CYAN + "\n\r\033[K  ┌─ SESSION SUMMARY ───────────────────────────┐" + Style.RESET_ALL)
+    print(f"\r\033[K" + Fore.CYAN + f"  │  Signals received: {str(signal_count).ljust(25)}│" + Style.RESET_ALL)
+    # Show final P&L if we have balance data
+    if active_account and active_account in session_start_balances:
+        final_bal = query_nt_balance(active_account)
+        if final_bal is not None:
+            pnl = final_bal - session_start_balances[active_account]
+            pnl_str = f"${pnl:+,.2f}"
+            pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
+            pnl_line = f"Session P&L: {pnl_str}"
+            print(f"\r\033[K" + Fore.CYAN + f"  │  " + pnl_color + f"{pnl_line.ljust(41)}" + Fore.CYAN + f"│" + Style.RESET_ALL)
+    print(f"\r\033[K" + Fore.CYAN + f"  │  Log: {str(LOG_FILE)[:38].ljust(38)}│" + Style.RESET_ALL)
+    print(f"\r\033[K" + Fore.CYAN + "  └─────────────────────────────────────────────┘" + Style.RESET_ALL)
     logger.info(f"SESSION END  signals={signal_count}")
 
 
