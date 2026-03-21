@@ -599,6 +599,7 @@ async def listen(token: str):
                             if raw_signal:
                                 write_signal_to_file(raw_signal)
                                 await signal_pulse("SIGNAL RECEIVED")
+                                sys.stdout.write("\r\033[K")
                                 print(format_signal(raw_signal, signal_count))
                                 # Latency display
                                 if server_ts:
@@ -608,10 +609,10 @@ async def listen(token: str):
                                     else:
                                         lat_str = f"{latency_ms / 1000:.1f}s"
                                     lat_color = Fore.GREEN if latency_ms < 200 else Fore.YELLOW if latency_ms < 1000 else Fore.RED
-                                    sys.stdout.write(lat_color + Style.DIM + f"   ├─ latency: {lat_str}\n" + Style.RESET_ALL)
+                                    sys.stdout.write("\r\033[K" + lat_color + Style.DIM + f"   ├─ latency: {lat_str}\n" + Style.RESET_ALL)
                                     sys.stdout.flush()
                                 if output_directory:
-                                    sys.stdout.write(Fore.GREEN + Style.DIM + f"   └─ saved → {output_directory}\n" + Style.RESET_ALL)
+                                    sys.stdout.write("\r\033[K" + Fore.GREEN + Style.DIM + f"   └─ saved → {output_directory}\n" + Style.RESET_ALL)
                                     sys.stdout.flush()
                                 signal_count += 1
                             else:
