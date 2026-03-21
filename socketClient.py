@@ -108,6 +108,7 @@ BALANCE_POLL_INTERVAL = 3                         # seconds between balance chec
 # NinjaTrader processed it by checking if the position changed.
 CONFIRM_TIMEOUT = 9  # seconds to wait for position change after signal
 _pending_confirms: list[dict] = []  # [{signal, ts, pre_pos, instrument, id, action}]
+_confirms_lock = __import__("threading").Lock()
 
 # ---------- Logging ----------
 LOG_FILE = Path.home() / ".voidorigin_signals.log"
@@ -277,8 +278,8 @@ def _nt_host() -> str:
 
 def _query_ati(command: str, port: int = 36973, timeout: float = 3.0) -> str:
     """Send a command to NinjaTrader ATI and return the raw response text."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         s.connect((_nt_host(), port))
         s.sendall(f"{command}\n".encode())
@@ -291,10 +292,11 @@ def _query_ati(command: str, port: int = 36973, timeout: float = 3.0) -> str:
                 parts.append(chunk)
             except socket.timeout:
                 break
-        s.close()
         return b"".join(parts).decode("utf-8", errors="ignore")
     except Exception:
         return ""
+    finally:
+        s.close()
 
 
 def query_nt_accounts(port: int = 36973, timeout: float = 3.0) -> list[dict]:
@@ -445,17 +447,21 @@ if os.name == "nt":  # Windows
 else:  # POSIX
     import termios
     import tty
+    import select
 
     def get_key():
-        if _kb_stop:
-            return ""
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            return sys.stdin.read(1)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        while not _kb_stop:
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                # Poll with timeout so _kb_stop can be checked
+                ready, _, _ = select.select([fd], [], [], 0.1)
+                if ready:
+                    return sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        return ""
 
     def read_line_raw():
         fd = sys.stdin.fileno()
@@ -954,7 +960,7 @@ async def show_balances():
     box_inner = max(max_name + 35, 50)
 
     sys.stdout.write("\r\033[K")
-    print(Fore.CYAN + f"\r\033[K  ╭─ BALANCES {'─' * (box_inner - 11)}╮" + Style.RESET_ALL)
+    print(Fore.CYAN + f"\r\033[K  ╭─ BALANCES {'─' * (box_inner - 9)}╮" + Style.RESET_ALL)
     for a in accounts:
         name = a["name"]
         cash = a["cash"]
@@ -1195,14 +1201,15 @@ def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, a
     # Snapshot current position for this specific instrument
     positions = query_nt_positions(active_account, nt_port)
     pre_pos = positions.get(instrument, 0)
-    _pending_confirms.append({
-        "signal": signal_text,
-        "id": sig_id,
-        "instrument": instrument,
-        "action": action,  # BUY or SELL
-        "ts": time.time(),
-        "pre_pos": pre_pos,
-    })
+    with _confirms_lock:
+        _pending_confirms.append({
+            "signal": signal_text,
+            "id": sig_id,
+            "instrument": instrument,
+            "action": action,
+            "ts": time.time(),
+            "pre_pos": pre_pos,
+        })
 
 
 def check_pending_confirms():
@@ -1219,34 +1226,35 @@ def check_pending_confirms():
     now = time.time()
     still_pending = []
 
-    for entry in _pending_confirms:
-        elapsed = now - entry["ts"]
-        instrument = entry["instrument"]
-        pre_pos = entry["pre_pos"]
-        cur_pos = positions.get(instrument, 0)
+    with _confirms_lock:
+        for entry in _pending_confirms:
+            elapsed = now - entry["ts"]
+            instrument = entry["instrument"]
+            pre_pos = entry["pre_pos"]
+            cur_pos = positions.get(instrument, 0)
 
-        if cur_pos != pre_pos:
-            # Position changed on this instrument — trade confirmed
-            logger.info(f"CONFIRMED  id={entry['id']}  {instrument}  "
-                        f"{entry['action']}  pos: {pre_pos} → {cur_pos}  "
-                        f"elapsed={elapsed:.1f}s")
-            continue  # drop from pending
+            if cur_pos != pre_pos:
+                # Position changed on this instrument — trade confirmed
+                logger.info(f"CONFIRMED  id={entry['id']}  {instrument}  "
+                            f"{entry['action']}  pos: {pre_pos} → {cur_pos}  "
+                            f"elapsed={elapsed:.1f}s")
+                continue  # drop from pending
 
-        if elapsed >= CONFIRM_TIMEOUT:
-            # Timed out — position did not change for this instrument
-            sys.stdout.write("\r\033[K")
-            print(Fore.YELLOW + Style.DIM +
-                  f"  ⚠  No fill detected for {instrument} after {CONFIRM_TIMEOUT}s "
-                  f"(ID: {entry['id']})" + Style.RESET_ALL)
-            logger.warning(f"UNCONFIRMED  id={entry['id']}  {instrument}  "
-                           f"{entry['action']}  pos unchanged at {pre_pos}  "
-                           f"elapsed={elapsed:.1f}s")
-            continue  # drop from pending
+            if elapsed >= CONFIRM_TIMEOUT:
+                # Timed out — position did not change for this instrument
+                sys.stdout.write("\r\033[K")
+                print(Fore.YELLOW + Style.DIM +
+                      f"  ⚠  No fill detected for {instrument} after {CONFIRM_TIMEOUT}s "
+                      f"(ID: {entry['id']})" + Style.RESET_ALL)
+                logger.warning(f"UNCONFIRMED  id={entry['id']}  {instrument}  "
+                               f"{entry['action']}  pos unchanged at {pre_pos}  "
+                               f"elapsed={elapsed:.1f}s")
+                continue  # drop from pending
 
-        still_pending.append(entry)
+            still_pending.append(entry)
 
-    _pending_confirms.clear()
-    _pending_confirms.extend(still_pending)
+        _pending_confirms.clear()
+        _pending_confirms.extend(still_pending)
 
 
 async def balance_monitor():
@@ -1353,19 +1361,22 @@ async def prompt_limits():
     start_bal = session_start_balances.get(active_account)
     current_bal = await asyncio.to_thread(query_nt_balance, active_account)
 
-    print(Fore.CYAN + f"\n\r\033[K┌─ SESSION LIMITS ({active_account}) ────────────────────────┐" + Style.RESET_ALL)
+    _lim_inner = 52
+    _lim_title = f"─ SESSION LIMITS ({active_account}) "
+    _lim_top_dashes = _lim_inner - len(_lim_title)
+    print(Fore.CYAN + f"\n\r\033[K┌{_lim_title}{'─' * _lim_top_dashes}┐" + Style.RESET_ALL)
     if start_bal is not None and current_bal is not None:
         pnl = current_bal - start_bal
         info = f"Balance: ${current_bal:,.2f}  ·  Session P&L: ${pnl:+,.2f}"
-        print(Fore.CYAN + f"\r\033[K│  {info.ljust(52)}│" + Style.RESET_ALL)
+        print(Fore.CYAN + f"\r\033[K│  {info.ljust(_lim_inner)}│" + Style.RESET_ALL)
     if limits["target"] or limits["stop"]:
         cur = f"Target: ${limits['target']:+,.2f} ({limits['target_mode']})  ·  Stop: ${limits['stop']:+,.2f} ({limits['stop_mode']})"
-        print(Fore.CYAN + f"\r\033[K│  {cur.ljust(52)}│" + Style.RESET_ALL)
-    print(Fore.CYAN + f"\r\033[K│  When a limit is hit, the lockout mode decides:   │" + Style.RESET_ALL)
-    print(Fore.CYAN + f"\r\033[K│  soft = pause signals · resumable with P          │" + Style.RESET_ALL)
-    print(Fore.CYAN + f"\r\033[K│  hard = flatten all positions · session locked     │" + Style.RESET_ALL)
-    print(Fore.CYAN + f"\r\033[K│  Enter 0 to disable. ENTER to keep current.       │" + Style.RESET_ALL)
-    print(Fore.CYAN + f"\r\033[K└───────────────────────────────────────────────────────┘" + Style.RESET_ALL)
+        print(Fore.CYAN + f"\r\033[K│  {cur.ljust(_lim_inner)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"\r\033[K│  {'When a limit is hit, the lockout mode decides:'.ljust(_lim_inner)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"\r\033[K│  {'soft = pause signals · resumable with P'.ljust(_lim_inner)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"\r\033[K│  {'hard = flatten all positions · session locked'.ljust(_lim_inner)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"\r\033[K│  {'Enter 0 to disable. ENTER to keep current.'.ljust(_lim_inner)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"\r\033[K└{'─' * (_lim_inner + 2)}┘" + Style.RESET_ALL)
 
     # Target (profit)
     sys.stdout.write(Fore.WHITE + f"  TARGET $ (current: {limits['target']:+,.2f}) ▸ " + Style.RESET_ALL)
@@ -1534,6 +1545,13 @@ async def listen(token: str):
                                 logger.info(f"SIGNAL #{signal_count} (PAUSED)  {raw_signal}")
                                 continue
 
+                            if not is_trade_ready():
+                                # System not ready — log but don't trade
+                                sys.stdout.write("\r\033[K")
+                                print(Fore.RED + f"  ✖  Signal blocked — system NOT READY" + Style.RESET_ALL)
+                                logger.warning(f"SIGNAL #{signal_count} (NOT READY)  {raw_signal}")
+                                continue
+
                             # Track traded contracts for hard stop
                             sig_parts = raw_signal.split(";")
                             if len(sig_parts) >= 3 and sig_parts[2]:
@@ -1622,11 +1640,17 @@ async def listen(token: str):
             break
 
         # Fibonacci backoff wait (interruptible by shutdown or manual reconnect)
-        try:
-            await asyncio.wait_for(shutdown.wait(), timeout=fib_curr)
-            break  # shutdown was set
-        except asyncio.TimeoutError:
-            pass  # timeout expired, retry
+        wait_end = time.time() + fib_curr
+        while time.time() < wait_end:
+            if shutdown.is_set():
+                return "shutdown"
+            if reconnect_event.is_set():
+                reconnect_event.clear()
+                fib_prev, fib_curr = 60, 60
+                sys.stdout.write("\r\033[K")
+                print(Fore.YELLOW + "  🔄  Manual reconnect — resetting backoff." + Style.RESET_ALL)
+                break
+            await asyncio.sleep(0.5)
 
         fib_prev, fib_curr = fib_backoff(fib_prev, fib_curr)
 
