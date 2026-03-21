@@ -1218,6 +1218,17 @@ async def prompt_limits():
     if raw_s.strip():
         try:
             stop = float(raw_s.strip())
+            # Positive stop = profit protection — cap at 90% of current P&L
+            if stop > 0 and start_bal is not None and current_bal is not None:
+                pnl = current_bal - start_bal
+                if pnl <= 0:
+                    print(Fore.YELLOW + f"  ⚠  Positive stop requires profit. Current P&L: ${pnl:+,.2f}. Use a negative value for loss limit." + Style.RESET_ALL)
+                    stop = limits["stop"]
+                else:
+                    max_stop = round(pnl * 0.9, 2)
+                    if stop > max_stop:
+                        print(Fore.YELLOW + f"  ⚠  Positive stop capped at 90% of P&L (${max_stop:+,.2f})." + Style.RESET_ALL)
+                        stop = max_stop
         except ValueError:
             print(Fore.YELLOW + "  ⚠  Invalid number — keeping current stop." + Style.RESET_ALL)
             stop = limits["stop"]
