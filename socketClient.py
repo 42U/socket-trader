@@ -103,6 +103,12 @@ soft_stopped = False                              # True if soft stop triggered
 hard_stopped = False                              # True if hard stop triggered
 BALANCE_POLL_INTERVAL = 3                         # seconds between balance checks
 
+# ---------- Signal confirmation ----------
+# After a signal fires, we track it here and verify NinjaTrader processed it
+# by checking if the account balance moves within the confirmation window.
+CONFIRM_TIMEOUT = 9  # seconds to wait for balance movement after signal
+_pending_confirms: list[dict] = []  # [{signal, ts, pre_balance, instrument, id}]
+
 # ---------- Logging ----------
 LOG_FILE = Path.home() / ".voidorigin_signals.log"
 logger = logging.getLogger("sockettrader")
@@ -1132,6 +1138,58 @@ def fire_close_position(account: str, contract: str):
         print(Fore.RED + f"  ✖  Close position write error: {exc}" + Style.RESET_ALL)
 
 
+def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str):
+    """Register a signal for post-trade confirmation."""
+    pre_bal = session_current_balances.get(active_account)
+    _pending_confirms.append({
+        "signal": signal_text,
+        "id": sig_id,
+        "instrument": instrument,
+        "ts": time.time(),
+        "pre_balance": pre_bal,
+    })
+
+
+def check_pending_confirms():
+    """Check pending signals for confirmation via balance movement.
+
+    Called every balance poll cycle. If balance changed since the signal
+    fired, the trade is confirmed. If the confirmation window expires
+    with no movement, warn the user.
+    """
+    if not _pending_confirms or not active_account:
+        return
+
+    current_bal = session_current_balances.get(active_account)
+    now = time.time()
+    still_pending = []
+
+    for entry in _pending_confirms:
+        elapsed = now - entry["ts"]
+        pre_bal = entry["pre_balance"]
+
+        if pre_bal is not None and current_bal is not None and pre_bal != current_bal:
+            # Balance moved — trade confirmed
+            logger.info(f"CONFIRMED  id={entry['id']}  instrument={entry['instrument']}  "
+                        f"elapsed={elapsed:.1f}s  bal_change={current_bal - pre_bal:+.2f}")
+            continue  # drop from pending
+
+        if elapsed >= CONFIRM_TIMEOUT:
+            # Timed out — no balance movement detected
+            sys.stdout.write("\r\033[K")
+            print(Fore.YELLOW + Style.DIM +
+                  f"  ⚠  No fill detected for {entry['instrument']} after {CONFIRM_TIMEOUT}s "
+                  f"(ID: {entry['id']})" + Style.RESET_ALL)
+            logger.warning(f"UNCONFIRMED  id={entry['id']}  instrument={entry['instrument']}  "
+                           f"elapsed={elapsed:.1f}s  pre_bal={pre_bal}  cur_bal={current_bal}")
+            continue  # drop from pending
+
+        still_pending.append(entry)
+
+    _pending_confirms.clear()
+    _pending_confirms.extend(still_pending)
+
+
 async def balance_monitor():
     """Periodically check account balance and enforce target/stop."""
     global paused, soft_stopped, hard_stopped
@@ -1147,6 +1205,9 @@ async def balance_monitor():
         for a in all_accounts:
             session_current_balances[a["name"]] = a["cash"]
         refresh_controls()
+
+        # Check if pending signals were filled
+        check_pending_confirms()
 
         if active_account not in session_start_balances:
             continue
@@ -1419,6 +1480,9 @@ async def listen(token: str):
                                 session_contracts.add(sig_parts[2])
 
                             write_signal_to_file(raw_signal)
+                            # Register for fill confirmation
+                            instrument = sig_parts[2] if len(sig_parts) >= 3 else ""
+                            add_pending_confirm(raw_signal, sig_id, instrument)
                             await signal_pulse("SIGNAL RECEIVED")
                             sys.stdout.write("\r\033[K")
                             print(format_signal(raw_signal, signal_count))
