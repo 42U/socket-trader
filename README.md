@@ -1,43 +1,54 @@
-# socket-trader
+<p align="center">
+  <img src="logo/socket-traderLOGO.png" alt="SocketTrader" width="600">
+</p>
 
-A lightweight WebSocket gateway for NinjaTrader 8 that receives trading signals and executes orders in real time.
+<p align="center">
+  <strong>Real-time WebSocket signal gateway for NinjaTrader 8</strong>
+</p>
+
+<p align="center">
+  <a href="#installation">Installation</a> &nbsp;·&nbsp;
+  <a href="#usage">Usage</a> &nbsp;·&nbsp;
+  <a href="#keyboard-controls">Controls</a> &nbsp;·&nbsp;
+  <a href="#configuration">Config</a>
+</p>
+
+---
+
+## Overview
+
+SocketTrader connects to a remote signal server over WebSocket, receives trading signals in real time, and writes them directly into NinjaTrader 8's `incoming/` folder for automated order execution.
 
 ```
-  ╔══════════════════════════════════════════╗
-  ║         VOIDORIGIN  ·  SIGNAL NODE       ║
-  ╚══════════════════════════════════════════╝
+┌──────────┐      WebSocket      ┌──────────────┐      File I/O      ┌──────────────┐
+│  Signal  │ ──────────────────▸ │ socketClient  │ ──────────────────▸ │ NinjaTrader  │
+│  Server  │    JSON signals     │     .py       │   raw order text   │  8 incoming/  │
+└──────────┘                     └──────────────┘                     └──────────────┘
 ```
 
-## What It Does
-
-`socket-trader` connects to a remote WebSocket signal server, receives JSON-formatted trading signals, and writes them as raw order strings directly into NinjaTrader 8's `incoming/` folder for automated execution.
-
-**Signal flow:**
+**Signal transformation:**
 ```
-Server → WebSocket → socketClient.py → incoming/ → NinjaTrader 8
+IN   {"signal": "PLACE;SimAccount;NQ 06-26;BUY;1;MARKET;;;DAY;;;NQ_Med;1020", "ts": 1711000000000}
+OUT  PLACE;YourAccount;NQ 06-26;BUY;1;MARKET;;;DAY;;;NQ_Med;1020
 ```
 
-**Example:**
-```
-Received:  {"signal": "PLACE;SimAccount;NQ 06-26;BUY;1;MARKET;;;DAY;;;NQ_Med;1020"}
-Written:   PLACE;YourAccount;NQ 06-26;BUY;1;MARKET;;;DAY;;;NQ_Med;1020
-```
+The sim account is automatically swapped with your real NinjaTrader account name. Server timestamps are used to display signal latency.
 
-The sim account in the signal is automatically replaced with your real NinjaTrader account name.
+---
 
 ## Features
 
-- **Cross-platform** — Windows and Linux
-- **Auto-detects NinjaTrader 8** `incoming/` folder on Windows (Documents, OneDrive, drive roots)
-- **Persistent config** — password, account name, and output directory saved to `~/.voidorigin_config.json` so you only configure once
-- **Auto-reconnect** — exponential backoff on connection loss (1s → 2s → 4s → ... → 60s max)
-- **Re-prompts on auth failure** — bad password doesn't loop forever, it asks again
-- **ASCII terminal UI** — animated boot sequence, signal pulse animations, status bar
+| | |
+|---|---|
+| **Cross-platform** | Windows and Linux support |
+| **Auto-detect** | Finds NinjaTrader 8 `incoming/` folder on Windows automatically |
+| **Persistent config** | Token, account, and directory saved to `~/.voidorigin_config.json` |
+| **Smart reconnect** | Fibonacci backoff: 1m → 1m → 2m → 3m → 5m → 8m → ... → 30m max |
+| **Auth handling** | Invalid token triggers re-prompt instead of infinite retry |
+| **Latency monitoring** | Displays signal delivery time with color-coded thresholds |
+| **Terminal UI** | Animated boot sequence, signal pulses, live status bar |
 
-## Requirements
-
-- Python 3.7+
-- NinjaTrader 8 (Windows) or any target directory (Linux)
+---
 
 ## Installation
 
@@ -47,44 +58,86 @@ cd socket-trader
 pip install -r requirements.txt
 ```
 
+**Requirements:** Python 3.7+ &nbsp;·&nbsp; NinjaTrader 8 (Windows) or any target directory (Linux)
+
+---
+
 ## Usage
 
 ```bash
 python socketClient.py
 ```
 
-On first run, you'll be prompted for:
+On first run you'll be prompted for:
 
-1. **Password** — server authentication token
-2. **Account** — your NinjaTrader account name (replaces `Sim*` in signals)
-3. **Output directory** — auto-detected on Windows, manually entered on Linux
+| Prompt | Description |
+|--------|-------------|
+| **Token** | Server authentication token |
+| **Account** | Your NinjaTrader account name (replaces `Sim*` in signals) |
+| **Directory** | Auto-detected on Windows, manually entered on Linux |
 
-These are saved to `~/.voidorigin_config.json` and loaded automatically on subsequent runs.
+All settings are saved and loaded automatically on subsequent runs.
+
+---
 
 ## Keyboard Controls
 
+```
+╔══════════════════════════════════════════════════════════════╗
+║  P = PAUSE   A = ACCOUNT   D = DIR   R = RECONNECT   C = CLOSE  ║
+╚══════════════════════════════════════════════════════════════╝
+```
+
 | Key | Action |
-|-----|--------|
-| `P` | Pause/resume signal output |
-| `A` | Change NinjaTrader account |
+|:---:|--------|
+| `P` | Pause / resume signal output |
+| `A` | Switch NinjaTrader account |
 | `D` | Change output directory |
-| `R` | Force reconnect |
+| `R` | Force immediate reconnect (resets backoff) |
 | `C` | Close connection and exit |
 
-## Config
+---
 
-Settings are stored in `~/.voidorigin_config.json`:
+## Configuration
+
+Settings persist in `~/.voidorigin_config.json`:
 
 ```json
 {
-  "password": "your_token",
+  "token": "your_connection_token",
   "account": "YourNTAccount",
   "output_directory": "C:\\Users\\you\\Documents\\NinjaTrader 8\\incoming"
 }
 ```
 
-This file is excluded from version control via `.gitignore`.
+> This file contains your authentication token and is excluded from version control via `.gitignore`.
+
+---
+
+## Signal Latency
+
+Each signal displays delivery time from server to client, color-coded:
+
+| Color | Threshold |
+|:-----:|-----------|
+| Green | < 200ms |
+| Yellow | < 1s |
+| Red | > 1s |
+
+```
+[14:32:05] ▸  PLACE;MyAccount;NQ 06-26;BUY;1;MARKET;;;DAY;;;NQ_Med;1020
+   ├─ latency: 47ms
+   └─ saved → C:\Users\...\NinjaTrader 8\incoming
+```
+
+---
 
 ## License
 
 See [LICENSE](LICENSE) for details.
+
+---
+
+<p align="center">
+  <sub>Built by <a href="https://github.com/42U">42U</a> &nbsp;·&nbsp; Powered by <a href="https://voidorigin.com">VoidOrigin</a></sub>
+</p>
