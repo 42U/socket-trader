@@ -29,6 +29,7 @@ paused = False
 shutdown = asyncio.Event()
 signal_count = 0
 output_directory = None
+active_account = None          # Current NinjaTrader account name
 awaiting_directory_input = False
 awaiting_user_input = False  # Block key handler during any input prompt
 
@@ -272,7 +273,7 @@ def row(text, width, pad="║"):
 def build_header():
     width = term_width()
     subtitle = "LINK ESTABLISHED  ·  SIGNAL BUS ACTIVE  ·  NODE AUTHORIZED"
-    commands = "P = PAUSE     D = SET OUTPUT DIR     R = RECONNECT     C = CLOSE"
+    commands = "P = PAUSE   A = ACCOUNT   D = DIR   R = RECONNECT   C = CLOSE"
 
     lines = [
         hline(width, "╔", "═", "╗"),
@@ -419,6 +420,36 @@ async def prompt_directory():
     awaiting_user_input = False
 
 
+# ---------- Account prompt ----------
+async def prompt_account():
+    global active_account, awaiting_user_input
+    awaiting_user_input = True
+    show_cursor()
+    print(Fore.CYAN + "\n┌─ CHANGE ACCOUNT ─────────────────────────────────┐" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Enter new NinjaTrader account name.              │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Press ENTER to keep current.                     │" + Style.RESET_ALL)
+    if active_account:
+        print(Fore.CYAN + f"│  Current: {active_account[:57].ljust(57)} │" + Style.RESET_ALL)
+    print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
+    sys.stdout.write(Fore.WHITE + "  ACCOUNT ▸ " + Style.RESET_ALL)
+    sys.stdout.flush()
+    raw = await asyncio.to_thread(read_line_raw)
+
+    if raw == "":
+        print(Fore.YELLOW + "  ↩  No change — keeping current account." + Style.RESET_ALL)
+    else:
+        active_account = raw.strip()
+        cfg = load_config()
+        cfg["account"] = active_account
+        save_config(cfg)
+        print(Fore.GREEN + f"  ✔  Account set → {active_account}" + Style.RESET_ALL)
+
+    print()
+    print(status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS"))
+    print()
+    awaiting_user_input = False
+
+
 # ---------- Keyboard loop ----------
 reconnect_event = asyncio.Event()
 
@@ -435,6 +466,8 @@ async def keyboard_loop():
                 sys.stdout.write("\r" + " " * term_width() + "\r")
                 sys.stdout.flush()
                 print(Fore.GREEN + "▶  SIGNAL OUTPUT RESUMED" + Style.RESET_ALL)
+        elif key.lower() == "a":
+            await prompt_account()
         elif key.lower() == "d":
             await prompt_directory()
         elif key.lower() == "r":
@@ -501,7 +534,7 @@ def write_signal_to_file(signal_text: str):
 MAX_BACKOFF = 60  # seconds
 
 
-async def listen(password: str, account: str):
+async def listen(password: str):
     global signal_count
     uri = f"{WS_HOST}?token={password}"
     backoff = 1
@@ -525,7 +558,7 @@ async def listen(password: str, account: str):
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=1)
                         if not paused:
-                            raw_signal = extract_signal_string(msg, account)
+                            raw_signal = extract_signal_string(msg, active_account)
                             if raw_signal:
                                 write_signal_to_file(raw_signal)
                                 await signal_pulse("SIGNAL RECEIVED")
@@ -623,10 +656,10 @@ def setup() -> tuple[str, dict]:
 
 # ---------- Main ----------
 async def main():
-    global output_directory
+    global output_directory, active_account
 
     password, cfg = setup()
-    account = cfg.get("account", "")
+    active_account = cfg.get("account", "")
 
     if cfg.get("output_directory"):
         output_directory = cfg["output_directory"]
@@ -638,7 +671,7 @@ async def main():
         reconnect_event.clear()
 
         tasks = [
-            asyncio.create_task(listen(password, account)),
+            asyncio.create_task(listen(password)),
             asyncio.create_task(keyboard_loop()),
             asyncio.create_task(pause_indicator()),
         ]

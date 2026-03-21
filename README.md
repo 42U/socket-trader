@@ -66,6 +66,7 @@ These are saved to `~/.voidorigin_config.json` and loaded automatically on subse
 | Key | Action |
 |-----|--------|
 | `P` | Pause/resume signal output |
+| `A` | Change NinjaTrader account |
 | `D` | Change output directory |
 | `R` | Force reconnect |
 | `C` | Close connection and exit |
