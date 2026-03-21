@@ -31,7 +31,7 @@ SocketTrader connects to a remote signal server over WebSocket, receives trading
 
 **Signal format:**
 ```
-PLACE;<account>;<contract>;<action>;<qty>;<order type>;<limit>;<stop>;<tif>;<oco>;<order id>;<atm strategy>;<strategy id>
+PLACE;<account>;<instrument>;<action>;<qty>;<order type>;<limit price>;<stop price>;<tif>;<oco id>;<order id>;<strategy>;<strategy id>
 ```
 
 **Signal transformation:**
@@ -289,11 +289,11 @@ Each signal displays delivery time from server to client. The first signal on ea
 | Red | More than 250ms slower than baseline |
 
 ```
-[14:32:05] ▸  PLACE;<account>;<contract>;BUY;1;MARKET;;;DAY;;;<atm strategy>;<strategy id>
+[14:32:05] ▸  PLACE;<account>;<instrument>;BUY;1;MARKET;;;DAY;;;<strategy>;<strategy id>
    ├─ latency: 47ms
    └─ saved → C:\Users\...\NinjaTrader 8\incoming
 
-[14:33:12] ▸  PLACE;<account>;<contract>;SELL;1;MARKET;;;DAY;;;<atm strategy>;<strategy id>
+[14:33:12] ▸  PLACE;<account>;<instrument>;SELL;1;MARKET;;;DAY;;;<strategy>;<strategy id>
    ├─ latency: 312ms (+265ms)     ← red: 265ms slower than baseline
    └─ saved → C:\Users\...\NinjaTrader 8\incoming
 ```
