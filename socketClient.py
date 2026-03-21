@@ -93,6 +93,47 @@ def save_config(cfg: dict):
         print(Fore.RED + f"  ✖  Could not save config: {exc}" + Style.RESET_ALL)
 
 
+# ---------- Strategy template helpers ----------
+def _nt_base() -> Path | None:
+    """Return the NinjaTrader 8 root directory (parent of incoming/)."""
+    if output_directory:
+        return Path(output_directory).parent
+    return None
+
+
+def list_atm_strategies() -> list[str]:
+    """List available ATM strategy template names from the NinjaTrader directory."""
+    base = _nt_base()
+    if not base:
+        return []
+    atm_dir = base / "templates" / "AtmStrategy"
+    if not atm_dir.is_dir():
+        return []
+    return sorted(p.stem for p in atm_dir.glob("*.xml"))
+
+
+def validate_strategy(name: str) -> bool:
+    """Check if a strategy template exists in AtmStrategy or StopStrategy."""
+    base = _nt_base()
+    if not base:
+        return False
+    for subdir in ("AtmStrategy", "StopStrategy"):
+        if (base / "templates" / subdir / f"{name}.xml").exists():
+            return True
+    return False
+
+
+def is_trade_ready() -> bool:
+    """Check all requirements for signals to fire."""
+    if not output_directory or not Path(output_directory).is_dir():
+        return False
+    if not active_account:
+        return False
+    if not validate_strategy(atm_strategy):
+        return False
+    return True
+
+
 # ---------- NinjaTrader incoming folder detection ----------
 def find_ninjatrader_incoming_windows() -> str | None:
     """Search common Windows locations for NinjaTrader 8\\incoming."""
@@ -520,7 +561,7 @@ def visible_len(s: str) -> int:
 def status_bar(text):
     width = term_width()
     inner = width - 2
-    dir_indicator = Fore.GREEN + "● TRADE READY" + Fore.CYAN if output_directory else Fore.RED + "● NOT READY" + Fore.CYAN
+    dir_indicator = Fore.GREEN + "● TRADE READY" + Fore.CYAN if is_trade_ready() else Fore.RED + "● NOT READY" + Fore.CYAN
     content = f"{text}  ·  {dir_indicator}"
     vis = visible_len(content)
     total_pad = max(0, inner - vis)
@@ -744,9 +785,17 @@ async def prompt_strategy():
     global atm_strategy, awaiting_user_input
     awaiting_user_input = True
     show_cursor()
+    available = list_atm_strategies()
     print(Fore.CYAN + "\n┌─ ATM STRATEGY TEMPLATE ───────────────────────────┐" + Style.RESET_ALL)
-    print(Fore.CYAN + "│  Enter the ATM strategy template name to use.     │" + Style.RESET_ALL)
-    print(Fore.CYAN + "│  This must match a template in NinjaTrader.       │" + Style.RESET_ALL)
+    if available:
+        for i, name in enumerate(available, 1):
+            marker = " ◀" if name == atm_strategy else ""
+            line = f"{i}. {name}{marker}"
+            print(Fore.CYAN + f"│  {line.ljust(49)}│" + Style.RESET_ALL)
+        print(Fore.CYAN + "│  Enter # to select, or type a name manually.     │" + Style.RESET_ALL)
+    else:
+        print(Fore.CYAN + "│  No templates found in AtmStrategy directory.     │" + Style.RESET_ALL)
+        print(Fore.CYAN + "│  Type a strategy name manually.                   │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  Press ENTER to keep current.                     │" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  Current: {atm_strategy[:39].ljust(39)}│" + Style.RESET_ALL)
     print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
@@ -756,12 +805,23 @@ async def prompt_strategy():
 
     if raw == "":
         print(Fore.YELLOW + "  ↩  No change — keeping current strategy." + Style.RESET_ALL)
-    else:
-        atm_strategy = raw.strip()
+    elif available and raw.strip().isdigit() and 1 <= int(raw.strip()) <= len(available):
+        atm_strategy = available[int(raw.strip()) - 1]
         cfg = load_config()
         cfg["atm_strategy"] = atm_strategy
         save_config(cfg)
         print(Fore.GREEN + f"  ✔  ATM Strategy set → {atm_strategy}" + Style.RESET_ALL)
+    else:
+        name = raw.strip()
+        if validate_strategy(name):
+            atm_strategy = name
+            cfg = load_config()
+            cfg["atm_strategy"] = atm_strategy
+            save_config(cfg)
+            print(Fore.GREEN + f"  ✔  ATM Strategy set → {atm_strategy}" + Style.RESET_ALL)
+        else:
+            print(Fore.RED + f"  ✖  '{name}' not found in AtmStrategy or StopStrategy templates." + Style.RESET_ALL)
+            print(Fore.YELLOW + f"  ↩  Keeping current: {atm_strategy}" + Style.RESET_ALL)
 
     print()
     awaiting_user_input = False
@@ -1235,6 +1295,8 @@ async def listen(token: str):
                     missing.append("A = set account")
                 if not output_directory:
                     missing.append("D = set output directory")
+                if not validate_strategy(atm_strategy):
+                    missing.append(f"S = strategy '{atm_strategy}' not found")
 
                 if missing:
                     sys.stdout.write("\r\033[K")
