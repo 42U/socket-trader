@@ -56,14 +56,23 @@ awaiting_user_input = False  # Block key handler during any input prompt
 # States drive the status bar indicator in the pinned header.
 # Add new states here as the system evolves.
 SESSION_STATES = {
-    "ready":       "SESSION ACTIVE  ·  AWAITING SIGNALS",
-    "paused":      "SESSION ACTIVE  ·  SIGNALS PAUSED",
-    "soft_stop":   "SESSION ACTIVE  ·  SOFT STOP HIT",
-    "hard_stop":   "SESSION ACTIVE  ·  HARD STOP — LOCKED",
-    "connecting":  "CONNECTING TO SERVER",
-    "reconnecting": "CONNECTION LOST  ·  RECONNECTING",
+    "ready":        ("SESSION ACTIVE  ·  AWAITING SIGNALS",   None),
+    "paused":       ("SESSION ACTIVE  ·  SIGNALS PAUSED",     "YELLOW"),
+    "soft_stop":    ("SESSION ACTIVE  ·  STOP LIMIT HIT",     "RED"),
+    "hard_stop":    ("SESSION ACTIVE  ·  HARD STOP — LOCKED", "RED"),
+    "soft_target":  ("SESSION ACTIVE  ·  TARGET REACHED",     "GREEN"),
+    "hard_target":  ("SESSION ACTIVE  ·  TARGET — LOCKED",    "GREEN"),
+    "connecting":   ("CONNECTING TO SERVER",                   None),
+    "reconnecting": ("CONNECTION LOST  ·  RECONNECTING",      "YELLOW"),
 }
 _session_state = "ready"
+
+# Map state color names to colorama codes
+_STATE_COLORS = {
+    "YELLOW": Fore.LIGHTYELLOW_EX,
+    "RED": Fore.RED,
+    "GREEN": Fore.GREEN,
+}
 
 
 def set_session_state(state: str):
@@ -76,8 +85,14 @@ def set_session_state(state: str):
 
 
 def get_session_status_text() -> str:
-    """Return the status text for the current session state."""
-    return SESSION_STATES.get(_session_state, SESSION_STATES["ready"])
+    """Return the status text for the current session state, with color applied."""
+    text, color_name = SESSION_STATES.get(_session_state, SESSION_STATES["ready"])
+    if color_name and color_name in _STATE_COLORS:
+        # Color the dynamic part (after the ·)
+        parts = text.rsplit("·", 1)
+        if len(parts) == 2:
+            return parts[0] + "·" + _STATE_COLORS[color_name] + parts[1] + Fore.CYAN
+    return text
 
 
 # ---------- Risk management ----------
@@ -1180,7 +1195,7 @@ async def balance_monitor():
             if limits["target_mode"] == "hard":
                 hard_stopped = True
                 paused = True
-                set_session_state("hard_stop")
+                set_session_state("hard_target")
                 sys.stdout.write("\r\033[K")
                 print(Fore.GREEN + Style.BRIGHT + f"  🎯  TARGET HIT (HARD)  ·  P&L: ${pnl:+,.2f}  ·  Target: ${limits['target']:+,.2f}" + Style.RESET_ALL)
                 sys.stdout.write("\r\033[K")
@@ -1195,7 +1210,7 @@ async def balance_monitor():
             elif not soft_stopped:
                 soft_stopped = True
                 paused = True
-                set_session_state("soft_stop")
+                set_session_state("soft_target")
                 sys.stdout.write("\r\033[K")
                 print(Fore.GREEN + Style.BRIGHT + f"  🎯  SESSION TARGET HIT  ·  P&L: ${pnl:+,.2f}  ·  Target: ${limits['target']:+,.2f}" + Style.RESET_ALL)
                 sys.stdout.write("\r\033[K")
