@@ -113,14 +113,11 @@ def list_atm_strategies() -> list[str]:
 
 
 def validate_strategy(name: str) -> bool:
-    """Check if a strategy template exists in AtmStrategy or StopStrategy."""
+    """Check if a strategy template exists in AtmStrategy."""
     base = _nt_base()
     if not base:
         return False
-    for subdir in ("AtmStrategy", "StopStrategy"):
-        if (base / "templates" / subdir / f"{name}.xml").exists():
-            return True
-    return False
+    return (base / "templates" / "AtmStrategy" / f"{name}.xml").exists()
 
 
 def is_trade_ready() -> bool:
@@ -820,7 +817,7 @@ async def prompt_strategy():
             save_config(cfg)
             print(Fore.GREEN + f"  ✔  ATM Strategy set → {atm_strategy}" + Style.RESET_ALL)
         else:
-            print(Fore.RED + f"  ✖  '{name}' not found in AtmStrategy or StopStrategy templates." + Style.RESET_ALL)
+            print(Fore.RED + f"  ✖  '{name}' not found in templates/AtmStrategy/." + Style.RESET_ALL)
             print(Fore.YELLOW + f"  ↩  Keeping current: {atm_strategy}" + Style.RESET_ALL)
 
     print()
