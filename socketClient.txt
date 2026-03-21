@@ -1175,6 +1175,7 @@ async def prompt_limits():
     if limits["target"] or limits["stop"]:
         cur = f"Target: ${limits['target']:+,.2f} ({limits['target_mode']})  ·  Stop: ${limits['stop']:+,.2f} ({limits['stop_mode']})"
         print(Fore.CYAN + f"\r\033[K│  {cur.ljust(52)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"\r\033[K│  When a limit is hit, the lockout mode decides:   │" + Style.RESET_ALL)
     print(Fore.CYAN + f"\r\033[K│  soft = pause signals · resumable with P          │" + Style.RESET_ALL)
     print(Fore.CYAN + f"\r\033[K│  hard = flatten all positions · session locked     │" + Style.RESET_ALL)
     print(Fore.CYAN + f"\r\033[K│  Enter 0 to disable. ENTER to keep current.       │" + Style.RESET_ALL)
