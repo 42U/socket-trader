@@ -150,20 +150,21 @@ All settings are saved and loaded automatically on subsequent runs.
 The controls bar is **pinned to the bottom** of the terminal at all times:
 
 ```
-  P=PAUSE  A=ACCT  B=BAL  S=STRAT  D=DIR  T=LIMITS  O=PORT  R=RECONN  C=CLOSE
+  P=PAUSE  A=ACCT  B=BAL  S=STRAT  D=DIR  T=LIMITS  O=PORT  R=RECONN  C=CLOSE  ⇧X=EXIT
 ```
 
 | Key | Action |
 |:---:|--------|
 | `P` | Pause / resume signal output |
 | `A` | Switch NinjaTrader account (pick from ATI list or type manually) |
-| `B` | Show live balances and session P&L for all accounts |
+| `B` | Show live balances and session P&L (press `R` to reset P&L) |
 | `S` | Change ATM strategy template |
 | `D` | Change output directory |
 | `T` | Set session target and stop limits |
 | `O` | Change NinjaTrader AT Interface port |
 | `R` | Force immediate reconnect (resets backoff) |
-| `C` | Close connection and exit |
+| `C` | Close open positions (arrow keys to select, `Y` to confirm) |
+| `Shift+X` | Exit SocketTrader |
 
 ---
 
@@ -218,7 +219,7 @@ Each limit (target and stop) can independently be set to **soft** or **hard** mo
 | Mode | Action | Recovery |
 |------|--------|----------|
 | **Soft** | Pauses signals · press `P` to resume | Resume any time with `P` |
-| **Hard** | Flattens all positions · signals off for the session | Press `C` to exit — cannot resume |
+| **Hard** | Flattens all positions · signals off for the session | Press `Shift+X` to exit — cannot resume |
 
 When a **hard** limit fires, SocketTrader writes a `CLOSEPOSITION;{account};{contract};;;;;;;;;;` file to the `incoming/` folder for every instrument traded during the session. This tells NinjaTrader to flatten all positions immediately.
 

@@ -13,6 +13,7 @@ import os
 import re
 import platform
 from collections import deque
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from colorama import init, Fore, Style
 
@@ -102,6 +103,25 @@ session_contracts: set[str] = set()              # instruments traded this sessi
 soft_stopped = False                              # True if soft stop triggered
 hard_stopped = False                              # True if hard stop triggered
 BALANCE_POLL_INTERVAL = 3                         # seconds between balance checks
+
+# Auto-reset: futures session ends ~4:15 PM ET, reset P&L at 4:20 PM ET
+ET = timezone(timedelta(hours=-5))  # Eastern Time (EST; no DST handling needed — close is 4:20 either way)
+SESSION_RESET_HOUR = 16
+SESSION_RESET_MINUTE = 20
+_last_auto_reset_date: str | None = None  # tracks which date we already reset on
+
+
+def reset_session_pnl():
+    """Re-snapshot all account balances and clear session state."""
+    global soft_stopped, hard_stopped, signal_count, _last_auto_reset_date
+    # Re-snapshot current balances as new starting point
+    for name, bal in session_current_balances.items():
+        session_start_balances[name] = bal
+    session_contracts.clear()
+    soft_stopped = False
+    hard_stopped = False
+    signal_count = 0
+    set_session_state("ready")
 
 # ---------- Signal confirmation ----------
 # After a signal fires, we snapshot positions for that instrument and verify
@@ -276,7 +296,7 @@ def _nt_host() -> str:
     return "127.0.0.1"
 
 
-def _query_ati(command: str, port: int = 36973, timeout: float = 3.0) -> str:
+def _query_ati(command: str, port: int = 36973, timeout: float = 2.0) -> str:
     """Send a command to NinjaTrader ATI and return the raw response text."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -290,6 +310,8 @@ def _query_ati(command: str, port: int = 36973, timeout: float = 3.0) -> str:
                 if not chunk:
                     break
                 parts.append(chunk)
+                # After first data arrives, shorten timeout — no more data = done
+                s.settimeout(0.25)
             except socket.timeout:
                 break
         return b"".join(parts).decode("utf-8", errors="ignore")
@@ -437,7 +459,17 @@ if os.name == "nt":  # Windows
         """Non-blocking poll so the thread can exit when _kb_stop is set."""
         while not _kb_stop:
             if msvcrt.kbhit():
-                return msvcrt.getch().decode("utf-8", errors="ignore")
+                ch = msvcrt.getch()
+                if ch in (b"\x00", b"\xe0"):
+                    # Special key — read scan code
+                    if msvcrt.kbhit():
+                        sc = msvcrt.getch()
+                        if sc == b"H":
+                            return "UP"
+                        elif sc == b"P":
+                            return "DOWN"
+                        continue  # ignore other special keys
+                return ch.decode("utf-8", errors="ignore")
             time.sleep(0.05)
         return ""
 
@@ -449,28 +481,54 @@ else:  # POSIX
     import tty
     import select
 
+    _saved_termios = None
+
+    def _ensure_raw():
+        """Set terminal to raw mode once, saving original settings."""
+        global _saved_termios
+        fd = sys.stdin.fileno()
+        if _saved_termios is None:
+            _saved_termios = termios.tcgetattr(fd)
+        tty.setraw(fd)
+
+    def _restore_termios():
+        """Restore original terminal settings."""
+        if _saved_termios is not None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _saved_termios)
+
     def get_key():
-        while not _kb_stop:
-            fd = sys.stdin.fileno()
-            old = termios.tcgetattr(fd)
-            try:
-                tty.setraw(fd)
-                # Poll with timeout so _kb_stop can be checked
+        fd = sys.stdin.fileno()
+        _ensure_raw()
+        try:
+            while not _kb_stop:
                 ready, _, _ = select.select([fd], [], [], 0.1)
                 if ready:
-                    return sys.stdin.read(1)
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                    ch = os.read(fd, 1).decode("utf-8", errors="ignore")
+                    if ch == "\x1b":
+                        # Escape sequence — bytes arrive together, no wait needed
+                        ready2, _, _ = select.select([fd], [], [], 0.01)
+                        if ready2:
+                            ch2 = os.read(fd, 1).decode("utf-8", errors="ignore")
+                            if ch2 == "[":
+                                ready3, _, _ = select.select([fd], [], [], 0.01)
+                                if ready3:
+                                    ch3 = os.read(fd, 1).decode("utf-8", errors="ignore")
+                                    if ch3 == "A":
+                                        return "UP"
+                                    elif ch3 == "B":
+                                        return "DOWN"
+                        return ch  # bare Escape
+                    return ch
+        finally:
+            _restore_termios()
         return ""
 
     def read_line_raw():
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
+        _restore_termios()  # Need cooked mode for readline
         try:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
             line = sys.stdin.readline()
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            pass  # get_key will re-enter raw mode when called
         return line.strip()
 
 
@@ -507,35 +565,43 @@ def show_cursor():
 _controls_pinned = False
 _header_lines = 0  # Number of lines the pinned header occupies
 _status_bar_row = 0  # Terminal row where the status bar starts
-CONTROLS_TEXT = "P=PAUSE  A=ACCT  B=BAL  S=STRAT  D=DIR  T=LIMITS  O=PORT  R=RECONN  C=CLOSE"
+CONTROLS_TEXT = "P=PAUSE  A=ACCT  B=BAL  S=STRAT  D=DIR  T=LIMITS  O=PORT  R=RECONN  C=CLOSE  ⇧X=EXIT"
 
 
 def _build_controls_line():
-    """Build the controls bar text with account info on the right."""
+    """Build the controls bar text with account info on the right, truncated to terminal width."""
     left = f"  {CONTROLS_TEXT}"
     # Build account info
     acct_info = ""
+    acct_info_colored = ""
     if active_account:
         start = session_start_balances.get(active_account)
         current = session_current_balances.get(active_account)
         if start is not None and current is not None:
             pnl = current - start
             pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
-            acct_info = f"{active_account}: ${current:,.2f} (" + pnl_color + f"${pnl:+,.2f}" + Fore.CYAN + Style.DIM + ")  "
+            acct_info = f"{active_account}: ${current:,.2f} (${pnl:+,.2f})"
+            acct_info_colored = f"{active_account}: ${current:,.2f} (" + pnl_color + f"${pnl:+,.2f}" + Fore.CYAN + Style.DIM + ")"
         elif current is not None:
-            acct_info = f"{active_account}: ${current:,.2f}  "
+            acct_info = f"{active_account}: ${current:,.2f}"
+            acct_info_colored = acct_info
         elif start is not None:
-            acct_info = f"{active_account}: ${start:,.2f}  "
+            acct_info = f"{active_account}: ${start:,.2f}"
+            acct_info_colored = acct_info
         else:
-            acct_info = f"{active_account}  "
+            acct_info = active_account
+            acct_info_colored = acct_info
     if not acct_info:
-        acct_info = "NO ACCOUNT SET  "
-    # Pad between controls and account info
+        acct_info = "NO ACCOUNT SET"
+        acct_info_colored = acct_info
     width = term_width()
-    visible_left = len(left)
-    visible_right = len(_ANSI_ESCAPE.sub('', acct_info))
-    gap = max(2, width - visible_left - visible_right)
-    return f"{Fore.CYAN}{Style.DIM}{left}{' ' * gap}{acct_info}{Style.RESET_ALL}"
+    # If controls + account info won't fit, truncate controls
+    min_gap = 2
+    avail_for_left = width - len(acct_info) - min_gap - 2  # 2 for trailing spaces
+    if len(left) > avail_for_left > 20:
+        left = left[:avail_for_left]
+    gap = max(min_gap, width - len(left) - len(acct_info) - 2)
+    return f"{Fore.CYAN}{Style.DIM}{left}{' ' * gap}{acct_info_colored}  {Style.RESET_ALL}"
 
 
 def pin_layout():
@@ -598,21 +664,15 @@ def unpin_layout():
 
 
 def refresh_controls():
-    """Redraw the pinned controls bar and maintain scroll region."""
+    """Redraw the pinned controls bar without disrupting scroll region."""
     if not _controls_pinned:
         return
     rows = term_height()
-    scroll_top = _header_lines + 1
-    scroll_bottom = rows - 1
-    # Save cursor position
-    sys.stdout.write("\033[s")
-    # Update scroll region in case terminal resized
-    sys.stdout.write(f"\033[{scroll_top};{scroll_bottom}r")
-    # Move to last row and redraw controls
-    sys.stdout.write(f"\033[{rows};1H")
-    sys.stdout.write(f"\033[K{_build_controls_line()}")
-    # Restore cursor position
-    sys.stdout.write("\033[u")
+    # Save cursor, jump outside scroll region to last row, redraw, restore
+    sys.stdout.write("\033[s")                          # save cursor
+    sys.stdout.write(f"\033[{rows};1H")                 # move to last row
+    sys.stdout.write(f"\033[K{_build_controls_line()}")  # clear line + draw
+    sys.stdout.write("\033[u")                          # restore cursor
     sys.stdout.flush()
 
 
@@ -979,7 +1039,136 @@ async def show_balances():
             print(f"\r\033[K" + Fore.CYAN + f"  │  {line.ljust(box_inner)}│" + Style.RESET_ALL)
     print(f"\r\033[K" + Fore.CYAN + f"  ╰{'─' * (box_inner + 2)}╯" + Style.RESET_ALL)
     sys.stdout.write("\r\033[K")
+    print(Fore.WHITE + Style.DIM + "  Press R to reset session P&L, or any key to close." + Style.RESET_ALL)
     sys.stdout.flush()
+
+    global awaiting_user_input
+    awaiting_user_input = True
+    show_cursor()
+    key = await asyncio.to_thread(get_key)
+    hide_cursor()
+    awaiting_user_input = False
+
+    if key.lower() == "r":
+        reset_session_pnl()
+        sys.stdout.write("\r\033[K")
+        print(Fore.GREEN + "  ✔  Session P&L reset — balances re-snapshotted." + Style.RESET_ALL)
+        logger.info("MANUAL RESET  session P&L reset by user")
+    sys.stdout.write("\r\033[K")
+    sys.stdout.flush()
+
+
+# ---------- Close positions menu ----------
+def _draw_close_menu(entries: list[tuple[str, int]], selected: int, box_inner: int, account: str):
+    """Draw the close positions box with the current selection highlighted."""
+    total = len(entries)  # entries = positions + "Close ALL"
+    title = f"─ CLOSE POSITIONS ({account}) "
+    top_dashes = max(0, box_inner - len(title) + 2)
+    sys.stdout.write(f"\033[{total + 4}A")  # move cursor up to top of box
+    sys.stdout.write(Fore.CYAN + f"\r\033[K┌{title}{'─' * top_dashes}┐" + Style.RESET_ALL + "\n")
+    for i, (instrument, qty) in enumerate(entries):
+        if instrument == "_ALL_":
+            label = f"Close ALL ({qty} position{'s' if qty != 1 else ''})"
+            plain = label
+            colored = label
+        else:
+            direction = "LONG" if qty > 0 else "SHORT"
+            dir_color = Fore.GREEN if qty > 0 else Fore.RED
+            plain = f"{instrument}  {direction} {abs(qty)}"
+            colored = f"{instrument}  {dir_color}{direction} {abs(qty)}{Fore.CYAN}"
+        if i == selected:
+            marker = " ◀"
+            line_color = Fore.WHITE + Style.BRIGHT
+            reset = Style.RESET_ALL + Fore.CYAN
+        else:
+            marker = ""
+            line_color = Fore.CYAN
+            reset = ""
+        pad = box_inner - len(plain) - len(marker)
+        sys.stdout.write(Fore.CYAN + f"\r\033[K│  {line_color}{colored}{reset}{marker}{' ' * max(0, pad)}│" + Style.RESET_ALL + "\n")
+    hint = "↑↓ navigate · ENTER select · ESC cancel"
+    sys.stdout.write(Fore.CYAN + f"\r\033[K│  " + Fore.WHITE + Style.DIM + f"{hint.ljust(box_inner)}" + Style.RESET_ALL + Fore.CYAN + "│" + Style.RESET_ALL + "\n")
+    sys.stdout.write(Fore.CYAN + f"\r\033[K└{'─' * (box_inner + 2)}┘" + Style.RESET_ALL + "\n")
+    sys.stdout.flush()
+
+
+async def close_positions_menu():
+    """Show open positions and let user close one or all via arrow keys."""
+    global awaiting_user_input
+    if not active_account:
+        sys.stdout.write("\r\033[K")
+        print(Fore.YELLOW + "  ⚠  Set an account first (press A)." + Style.RESET_ALL)
+        return
+    if not output_directory:
+        sys.stdout.write("\r\033[K")
+        print(Fore.YELLOW + "  ⚠  Set an output directory first (press D)." + Style.RESET_ALL)
+        return
+
+    positions = await asyncio.to_thread(query_nt_positions, active_account, nt_port)
+    open_pos = {k: v for k, v in positions.items() if v != 0}
+
+    if not open_pos:
+        sys.stdout.write("\r\033[K")
+        print(Fore.YELLOW + "  ⚠  No open positions for " + Fore.WHITE + active_account + Fore.YELLOW + "." + Style.RESET_ALL)
+        return
+
+    # Build entries: individual positions + "Close ALL"
+    entries = list(open_pos.items())
+    entries.append(("_ALL_", len(open_pos)))
+    box_inner = max(max(len(k) for k in open_pos) + 25, 42)
+
+    awaiting_user_input = True
+    hide_cursor()
+    selected = 0
+
+    # Print blank lines to reserve space, then draw
+    for _ in range(len(entries) + 4):
+        print()
+    _draw_close_menu(entries, selected, box_inner, active_account)
+
+    # Arrow key navigation loop
+    while True:
+        key = await asyncio.to_thread(get_key)
+        if key == "UP":
+            selected = (selected - 1) % len(entries)
+            _draw_close_menu(entries, selected, box_inner, active_account)
+        elif key == "DOWN":
+            selected = (selected + 1) % len(entries)
+            _draw_close_menu(entries, selected, box_inner, active_account)
+        elif key == "\r" or key == "\n":
+            # Selected — ask for confirmation
+            chosen = entries[selected]
+            if chosen[0] == "_ALL_":
+                confirm_msg = f"Close ALL {len(open_pos)} position{'s' if len(open_pos) != 1 else ''}?"
+            else:
+                direction = "LONG" if chosen[1] > 0 else "SHORT"
+                confirm_msg = f"Close {chosen[0]} ({direction} {abs(chosen[1])})?"
+            sys.stdout.write(f"\r\033[K" + Fore.YELLOW + f"  {confirm_msg} [y/N] " + Style.RESET_ALL)
+            sys.stdout.flush()
+            confirm = await asyncio.to_thread(get_key)
+            if confirm.lower() == "y":
+                if chosen[0] == "_ALL_":
+                    for instrument, qty in open_pos.items():
+                        fire_close_position(active_account, instrument)
+                        sys.stdout.write("\r\033[K")
+                        print(Fore.RED + f"  ⛔  CLOSEPOSITION → {instrument}" + Style.RESET_ALL)
+                    logger.info(f"CLOSE ALL  account={active_account}  contracts={list(open_pos.keys())}")
+                else:
+                    fire_close_position(active_account, chosen[0])
+                    sys.stdout.write("\r\033[K")
+                    print(Fore.RED + f"  ⛔  CLOSEPOSITION → {chosen[0]}" + Style.RESET_ALL)
+                    logger.info(f"CLOSE  account={active_account}  contract={chosen[0]}")
+            else:
+                sys.stdout.write("\r\033[K")
+                print(Fore.WHITE + Style.DIM + "  Cancelled." + Style.RESET_ALL)
+            break
+        elif key == "\x1b" or key.lower() == "q":
+            # ESC or Q to cancel
+            sys.stdout.write("\r\033[K")
+            print(Fore.WHITE + Style.DIM + "  Cancelled." + Style.RESET_ALL)
+            break
+
+    awaiting_user_input = False
 
 
 # ---------- Keyboard loop ----------
@@ -996,7 +1185,7 @@ async def keyboard_loop():
             if key.lower() == "p":
                 if hard_stopped:
                     sys.stdout.write("\r\033[K")
-                    print(Fore.RED + "  ⛔  Hard stop active — cannot resume. Press C to exit." + Style.RESET_ALL)
+                    print(Fore.RED + "  ⛔  Hard stop active — cannot resume. Press Shift+X to exit." + Style.RESET_ALL)
                     continue
                 paused = not paused
                 soft_stopped = False  # Reset soft stop on manual resume
@@ -1024,6 +1213,8 @@ async def keyboard_loop():
                 print(Fore.YELLOW + "🔄  MANUAL RECONNECT REQUESTED" + Style.RESET_ALL)
                 reconnect_event.set()
             elif key.lower() == "c":
+                await close_positions_menu()
+            elif key == "X":  # Shift+X only
                 unpin_layout()
                 clear()
                 shutdown.set()
@@ -1271,7 +1462,7 @@ async def balance_monitor():
             return
 
         try:
-            if not active_account or hard_stopped:
+            if not active_account:
                 continue
 
             # Always poll balances for status bar display (non-blocking)
@@ -1279,6 +1470,22 @@ async def balance_monitor():
             for a in all_accounts:
                 session_current_balances[a["name"]] = a["cash"]
             refresh_controls()
+
+            # Auto-reset P&L at 4:20 PM ET (futures session boundary)
+            global _last_auto_reset_date
+            now_et = datetime.now(ET)
+            today_str = now_et.strftime("%Y-%m-%d")
+            past_reset = ((now_et.hour == SESSION_RESET_HOUR and now_et.minute >= SESSION_RESET_MINUTE)
+                          or now_et.hour > SESSION_RESET_HOUR)
+            if past_reset and _last_auto_reset_date != today_str:
+                _last_auto_reset_date = today_str
+                reset_session_pnl()
+                sys.stdout.write("\r\033[K")
+                print(Fore.CYAN + Style.BRIGHT + "  🔄  Session P&L auto-reset (4:20 PM ET)" + Style.RESET_ALL)
+                logger.info("AUTO RESET  session P&L reset at 4:20 PM ET")
+
+            if hard_stopped:
+                continue
 
             # Check if pending signals were filled
             if _pending_confirms:
@@ -1313,7 +1520,7 @@ async def balance_monitor():
                         sys.stdout.write("\r\033[K")
                         print(Fore.RED + f"  ⛔  CLOSEPOSITION → {contract}" + Style.RESET_ALL)
                     sys.stdout.write("\r\033[K")
-                    print(Fore.RED + "  ⛔  Signals LOCKED — hard stop active. Press C to exit." + Style.RESET_ALL)
+                    print(Fore.RED + "  ⛔  Signals LOCKED — hard stop active. Press Shift+X to exit." + Style.RESET_ALL)
                     logger.info(f"HARD STOP  pnl={pnl:.2f}  limit={limits['stop']}  contracts={list(session_contracts)}")
                 elif not soft_stopped:
                     soft_stopped = True
@@ -1341,7 +1548,7 @@ async def balance_monitor():
                         sys.stdout.write("\r\033[K")
                         print(Fore.RED + f"  ⛔  CLOSEPOSITION → {contract}" + Style.RESET_ALL)
                     sys.stdout.write("\r\033[K")
-                    print(Fore.RED + "  ⛔  Signals LOCKED — target hard stop active. Press C to exit." + Style.RESET_ALL)
+                    print(Fore.RED + "  ⛔  Signals LOCKED — target hard stop active. Press Shift+X to exit." + Style.RESET_ALL)
                     logger.info(f"HARD STOP (TARGET)  pnl={pnl:.2f}  target={limits['target']}  contracts={list(session_contracts)}")
                 elif not soft_stopped:
                     soft_stopped = True
@@ -1789,7 +1996,6 @@ async def main():
         for t in pending:
             t.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
-        await asyncio.sleep(0.2)  # Let polling threads exit
 
         # Check if auth failed
         result = None
@@ -1821,9 +2027,9 @@ def print_exit_summary():
     print(f"\r\033[K" + Fore.CYAN + f"\n\r\033[K  ┌─ SESSION SUMMARY ─────────────────────────┐" + Style.RESET_ALL)
     sig_text = f"Signals received: {signal_count}"[:inner]
     print(f"\r\033[K" + Fore.CYAN + f"  │  {sig_text.ljust(inner)}│" + Style.RESET_ALL)
-    # Show final P&L if we have balance data
+    # Show final P&L from cached balance (no ATI call on exit)
     if active_account and active_account in session_start_balances:
-        final_bal = query_nt_balance(active_account)
+        final_bal = session_current_balances.get(active_account)
         if final_bal is not None:
             pnl = final_bal - session_start_balances[active_account]
             pnl_str = f"${pnl:+,.2f}"
@@ -1843,4 +2049,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     finally:
+        # Restore terminal before printing summary
+        if os.name != "nt" and _saved_termios is not None:
+            _restore_termios()
         print_exit_summary()
