@@ -1,4 +1,5 @@
 .voidorigin_config.json
+socketServer*
 __pycache__/
 *.pyc
 .env

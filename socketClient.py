@@ -498,24 +498,25 @@ def format_signal(signal_text: str, idx: int):
 
 
 # ---------- File output ----------
-def extract_signal_string(msg: str, account: str) -> str | None:
-    """Parse JSON message and extract the raw signal string.
+def extract_signal_string(msg: str, account: str) -> tuple[str | None, int | None]:
+    """Parse JSON message and extract the raw signal string + server timestamp.
 
-    Expected format: {"signal": "PLACE;SimAccount;NQ 06-26;BUY;1;MARKET;;;DAY;;;TAG;VALUE"}
+    Expected format: {"signal": "PLACE;SimAccount;NQ 06-26;BUY;1;MARKET;;;DAY;;;TAG;VALUE", "ts": 1234567890123}
     The account is always the second semicolon-delimited field (index 1).
-    Returns the signal with the sim account replaced, or None if not a signal message.
+    Returns (signal_with_account_replaced, server_timestamp_ms) or (None, None).
     """
     try:
         data = json.loads(msg)
         if isinstance(data, dict) and "signal" in data:
             raw = data["signal"]
+            ts = data.get("ts")
             # Replace the second field (sim account) with real account
             first_semi = raw.index(";")
             second_semi = raw.index(";", first_semi + 1)
-            return f"{raw[:first_semi + 1]}{account}{raw[second_semi:]}"
+            return f"{raw[:first_semi + 1]}{account}{raw[second_semi:]}", ts
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
-    return None
+    return None, None
 
 
 def write_signal_to_file(signal_text: str):
@@ -588,11 +589,21 @@ async def listen(password: str):
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=1)
                         if not paused:
-                            raw_signal = extract_signal_string(msg, active_account)
+                            raw_signal, server_ts = extract_signal_string(msg, active_account)
                             if raw_signal:
                                 write_signal_to_file(raw_signal)
                                 await signal_pulse("SIGNAL RECEIVED")
                                 print(format_signal(raw_signal, signal_count))
+                                # Latency display
+                                if server_ts:
+                                    latency_ms = int(time.time() * 1000) - server_ts
+                                    if latency_ms < 1000:
+                                        lat_str = f"{latency_ms}ms"
+                                    else:
+                                        lat_str = f"{latency_ms / 1000:.1f}s"
+                                    lat_color = Fore.GREEN if latency_ms < 200 else Fore.YELLOW if latency_ms < 1000 else Fore.RED
+                                    sys.stdout.write(lat_color + Style.DIM + f"   ├─ latency: {lat_str}\n" + Style.RESET_ALL)
+                                    sys.stdout.flush()
                                 if output_directory:
                                     sys.stdout.write(Fore.GREEN + Style.DIM + f"   └─ saved → {output_directory}\n" + Style.RESET_ALL)
                                     sys.stdout.flush()
