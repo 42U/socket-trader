@@ -112,7 +112,7 @@ _pending_confirms: list[dict] = []  # [{signal, ts, pre_pos, instrument, id, act
 # ---------- Logging ----------
 LOG_FILE = Path.home() / ".voidorigin_signals.log"
 logger = logging.getLogger("sockettrader")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 _log_handler = logging.FileHandler(str(LOG_FILE), encoding="utf-8")
 _log_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 logger.addHandler(_log_handler)
@@ -328,6 +328,8 @@ def query_nt_positions(account: str, port: int = 36973) -> dict[str, int]:
     text = _query_ati("POSITIONS", port)
     if not text:
         return {}
+    # Log raw response so we can verify/fix parsing against live ATI
+    logger.debug(f"ATI POSITIONS raw ({len(text)} bytes): {repr(text[:500])}")
     # ATI POSITIONS response contains MarketPosition|Account\x00Value
     # and Quantity|Account\x00Value patterns per instrument
     positions = {}
@@ -359,6 +361,7 @@ def query_nt_positions(account: str, port: int = 36973) -> dict[str, int]:
                     quantities[instrument] = qty
                 except ValueError:
                     pass
+    logger.debug(f"ATI POSITIONS parsed: {quantities}")
     return quantities
 
 
