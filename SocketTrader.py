@@ -219,10 +219,82 @@ def reset_session_pnl():
     set_session_state("ready")
     clear_saved_session()
 
+
+# ---------- Input sanitization / validation ----------
+MAX_SESSION_CONTRACTS = 50  # cap unique instruments per session
+
+# All valid NinjaTrader 8 ATI OIF commands
+VALID_ATI_COMMANDS = {
+    "PLACE", "CANCEL", "CHANGE", "CLOSEPOSITION",
+    "CLOSESTRATEGY", "REVERSEPOSITION",
+    "CANCELALLORDERS", "FLATTENEVERYTHING",
+}
+VALID_ACTIONS = {"BUY", "SELL"}
+VALID_ORDER_TYPES = {"MARKET", "LIMIT", "STOP", "STOPLIMIT"}
+VALID_TIF = {"DAY", "GTC"}
+
+
+def sanitize_ati(value: str) -> str:
+    """Strip characters that could break ATI line-based parsing."""
+    return value.replace('\n', '').replace('\r', '').replace('\x00', '')
+
+
+def validate_signal(parts: list[str]) -> str | None:
+    """Validate signal fields against NinjaTrader ATI OIF spec.
+
+    Returns None if valid, or an error string describing the problem.
+    """
+    if not parts:
+        return "empty signal"
+
+    cmd = parts[0].upper()
+    if cmd not in VALID_ATI_COMMANDS:
+        return f"unknown command: {cmd}"
+
+    # Commands that require order fields: PLACE, REVERSEPOSITION
+    if cmd in ("PLACE", "REVERSEPOSITION"):
+        if len(parts) < 13:
+            return f"{cmd} requires 13 fields, got {len(parts)}"
+        action = parts[3].upper()
+        if action not in VALID_ACTIONS:
+            return f"invalid action: {action}"
+        try:
+            qty = int(parts[4])
+            if qty <= 0:
+                return f"invalid qty: {qty}"
+        except ValueError:
+            return f"non-numeric qty: {parts[4]}"
+        order_type = parts[5].upper()
+        if order_type not in VALID_ORDER_TYPES:
+            return f"invalid order type: {order_type}"
+        tif = parts[8].upper()
+        if tif and tif not in VALID_TIF:
+            return f"invalid TIF: {tif}"
+
+    elif cmd == "CLOSEPOSITION":
+        if len(parts) < 3:
+            return "CLOSEPOSITION requires account and instrument"
+
+    elif cmd == "CHANGE":
+        if len(parts) < 11 or not parts[10]:
+            return "CHANGE requires order ID (field 10)"
+
+    elif cmd == "CANCEL":
+        if len(parts) < 11 or not parts[10]:
+            return "CANCEL requires order ID (field 10)"
+
+    elif cmd == "CLOSESTRATEGY":
+        if len(parts) < 13 or not parts[12]:
+            return "CLOSESTRATEGY requires strategy ID (field 12)"
+
+    return None
+
+
 # ---------- Signal confirmation ----------
 # After a signal fires, we snapshot positions for that instrument and verify
 # NinjaTrader processed it by checking if the position changed.
 CONFIRM_TIMEOUT = 9  # seconds to wait for position change after signal
+MAX_PENDING_CONFIRMS = 20  # cap to prevent unbounded growth
 _pending_confirms: list[dict] = []  # [{signal, ts, pre_pos, instrument, id, action}]
 _confirms_lock = __import__("threading").Lock()
 
@@ -1403,7 +1475,12 @@ def extract_signal_string(msg: str, account: str, atm: str) -> tuple[str | None,
         if isinstance(data, dict) and "signal" in data:
             raw = data["signal"]
             ts = data.get("ts")
-            parts = raw.split(";")
+            parts = [sanitize_ati(p) for p in raw.split(";")]
+            # Validate against NinjaTrader ATI spec
+            error = validate_signal(parts)
+            if error:
+                logger.warning(f"REJECTED  {error}  raw={raw[:200]}")
+                return None, None, None
             # Extract signal ID (last non-empty field)
             signal_id = parts[-1] if parts else None
             # Replace account (field 1)
@@ -1472,7 +1549,7 @@ def fire_close_position(account: str, contract: str):
     """Write a CLOSEPOSITION command to the incoming folder."""
     if not output_directory:
         return
-    cmd = f"CLOSEPOSITION;{account};{contract};;;;;;;;;;"
+    cmd = f"CLOSEPOSITION;{sanitize_ati(account)};{sanitize_ati(contract)};;;;;;;;;;"
     ts = time.strftime("%Y%m%d_%H%M%S")
     ms = int((time.time() % 1) * 1000)
     filename = f"close_{ts}_{ms:03d}.txt"
@@ -1492,6 +1569,8 @@ def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, a
     positions = query_nt_positions(active_account, nt_port)
     pre_pos = positions.get(instrument, 0)
     with _confirms_lock:
+        if len(_pending_confirms) >= MAX_PENDING_CONFIRMS:
+            _pending_confirms.pop(0)  # drop oldest
         _pending_confirms.append({
             "signal": signal_text,
             "id": sig_id,
@@ -1887,7 +1966,7 @@ async def listen(token: str):
 
                             # Track traded contracts for hard stop
                             sig_parts = raw_signal.split(";")
-                            if len(sig_parts) >= 3 and sig_parts[2]:
+                            if len(sig_parts) >= 3 and sig_parts[2] and len(session_contracts) < MAX_SESSION_CONTRACTS:
                                 session_contracts.add(sig_parts[2])
 
                             write_signal_to_file(raw_signal)
