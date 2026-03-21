@@ -1394,54 +1394,61 @@ async def listen(token: str):
 
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=1)
-                        if not paused:
-                            raw_signal, server_ts, sig_id = extract_signal_string(msg, active_account, atm_strategy)
-                            if raw_signal:
-                                # Duplicate detection by signal ID
-                                if sig_id and sig_id in _recent_signal_ids:
+                        raw_signal, server_ts, sig_id = extract_signal_string(msg, active_account, atm_strategy)
+                        if raw_signal:
+                            # Duplicate detection by signal ID
+                            if sig_id and sig_id in _recent_signal_ids:
+                                if not paused:
                                     sys.stdout.write("\r\033[K")
                                     print(Fore.YELLOW + Style.DIM + f"  ⚠  Duplicate signal ignored (ID: {sig_id})" + Style.RESET_ALL)
-                                    logger.info(f"DUPLICATE IGNORED  id={sig_id}  signal={raw_signal}")
-                                    continue
-                                if sig_id:
-                                    _recent_signal_ids.append(sig_id)
+                                logger.info(f"DUPLICATE IGNORED  id={sig_id}  signal={raw_signal}")
+                                continue
+                            if sig_id:
+                                _recent_signal_ids.append(sig_id)
 
-                                # Track traded contracts for hard stop
-                                sig_parts = raw_signal.split(";")
-                                if len(sig_parts) >= 3 and sig_parts[2]:
-                                    session_contracts.add(sig_parts[2])
+                            signal_count += 1
 
-                                write_signal_to_file(raw_signal)
-                                await signal_pulse("SIGNAL RECEIVED")
-                                sys.stdout.write("\r\033[K")
-                                print(format_signal(raw_signal, signal_count))
-                                logger.info(f"SIGNAL #{signal_count}  {raw_signal}")
-                                # Latency display (first signal = baseline)
-                                if server_ts:
-                                    latency_ms = int(time.time() * 1000) - server_ts
-                                    if baseline_latency is None:
-                                        baseline_latency = latency_ms
-                                    if latency_ms < 1000:
-                                        lat_str = f"{latency_ms}ms"
-                                    else:
-                                        lat_str = f"{latency_ms / 1000:.1f}s"
-                                    diff = latency_ms - baseline_latency
-                                    if diff < 0:
-                                        lat_color = Fore.GREEN   # Faster than first signal
-                                    elif diff <= 250:
-                                        lat_color = Fore.YELLOW  # Within 250ms of first signal
-                                    else:
-                                        lat_color = Fore.RED     # >250ms slower than first signal
-                                    diff_str = f" (+{diff}ms)" if diff > 0 else f" ({diff}ms)" if diff < 0 else ""
-                                    sys.stdout.write("\r\033[K" + lat_color + Style.DIM + f"   ├─ latency: {lat_str}{diff_str}\n" + Style.RESET_ALL)
-                                    sys.stdout.flush()
-                                    logger.info(f"  latency={latency_ms}ms  diff={diff}ms  baseline={baseline_latency}ms")
-                                if output_directory:
-                                    sys.stdout.write("\r\033[K" + Fore.GREEN + Style.DIM + f"   └─ saved → {output_directory}\n" + Style.RESET_ALL)
-                                    sys.stdout.flush()
-                                signal_count += 1
-                            else:
-                                # Non-signal message (server info, heartbeat, etc.)
+                            if paused:
+                                # Log but don't trade or print
+                                logger.info(f"SIGNAL #{signal_count} (PAUSED)  {raw_signal}")
+                                continue
+
+                            # Track traded contracts for hard stop
+                            sig_parts = raw_signal.split(";")
+                            if len(sig_parts) >= 3 and sig_parts[2]:
+                                session_contracts.add(sig_parts[2])
+
+                            write_signal_to_file(raw_signal)
+                            await signal_pulse("SIGNAL RECEIVED")
+                            sys.stdout.write("\r\033[K")
+                            print(format_signal(raw_signal, signal_count))
+                            logger.info(f"SIGNAL #{signal_count}  {raw_signal}")
+                            # Latency display (first signal = baseline)
+                            if server_ts:
+                                latency_ms = int(time.time() * 1000) - server_ts
+                                if baseline_latency is None:
+                                    baseline_latency = latency_ms
+                                if latency_ms < 1000:
+                                    lat_str = f"{latency_ms}ms"
+                                else:
+                                    lat_str = f"{latency_ms / 1000:.1f}s"
+                                diff = latency_ms - baseline_latency
+                                if diff < 0:
+                                    lat_color = Fore.GREEN   # Faster than first signal
+                                elif diff <= 250:
+                                    lat_color = Fore.YELLOW  # Within 250ms of first signal
+                                else:
+                                    lat_color = Fore.RED     # >250ms slower than first signal
+                                diff_str = f" (+{diff}ms)" if diff > 0 else f" ({diff}ms)" if diff < 0 else ""
+                                sys.stdout.write("\r\033[K" + lat_color + Style.DIM + f"   ├─ latency: {lat_str}{diff_str}\n" + Style.RESET_ALL)
+                                sys.stdout.flush()
+                                logger.info(f"  latency={latency_ms}ms  diff={diff}ms  baseline={baseline_latency}ms")
+                            if output_directory:
+                                sys.stdout.write("\r\033[K" + Fore.GREEN + Style.DIM + f"   └─ saved → {output_directory}\n" + Style.RESET_ALL)
+                                sys.stdout.flush()
+                        else:
+                            # Non-signal message (server info, heartbeat, etc.)
+                            if not paused:
                                 try:
                                     data = json.loads(msg)
                                     await display_server_message(data, connect_latency)
