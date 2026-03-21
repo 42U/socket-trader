@@ -52,6 +52,34 @@ nt_port = 36973                # NinjaTrader AT Interface port (default 36973)
 awaiting_directory_input = False
 awaiting_user_input = False  # Block key handler during any input prompt
 
+# ---------- Session state machine ----------
+# States drive the status bar indicator in the pinned header.
+# Add new states here as the system evolves.
+SESSION_STATES = {
+    "ready":       "SESSION ACTIVE  ·  AWAITING SIGNALS",
+    "paused":      "SESSION ACTIVE  ·  SIGNALS PAUSED",
+    "soft_stop":   "SESSION ACTIVE  ·  SOFT STOP HIT",
+    "hard_stop":   "SESSION ACTIVE  ·  HARD STOP — LOCKED",
+    "connecting":  "CONNECTING TO SERVER",
+    "reconnecting": "CONNECTION LOST  ·  RECONNECTING",
+}
+_session_state = "ready"
+
+
+def set_session_state(state: str):
+    """Update session state and refresh the header status bar."""
+    global _session_state
+    if state not in SESSION_STATES:
+        return
+    _session_state = state
+    refresh_header_status()
+
+
+def get_session_status_text() -> str:
+    """Return the status text for the current session state."""
+    return SESSION_STATES.get(_session_state, SESSION_STATES["ready"])
+
+
 # ---------- Risk management ----------
 session_start_balances: dict[str, float] = {}   # account -> starting balance
 session_current_balances: dict[str, float] = {}  # account -> latest polled balance
@@ -399,6 +427,7 @@ def show_cursor():
 # ---------- Pinned controls bar ----------
 _controls_pinned = False
 _header_lines = 0  # Number of lines the pinned header occupies
+_status_bar_row = 0  # Terminal row where the status bar starts
 CONTROLS_TEXT = "P=PAUSE  A=ACCT  B=BAL  S=STRAT  D=DIR  T=LIMITS  O=PORT  R=RECONN  C=CLOSE"
 
 
@@ -432,7 +461,7 @@ def _build_controls_line():
 
 def pin_layout():
     """Pin header at top and controls bar at bottom using scroll regions."""
-    global _controls_pinned, _header_lines
+    global _controls_pinned, _header_lines, _status_bar_row
     rows = term_height()
 
     # Draw header at the top (rows 1 through _header_lines)
@@ -453,8 +482,10 @@ def pin_layout():
     else:
         banner_text = "V O I D O R I G I N".center(width)
     header_text = build_header()
-    sb = status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS")
-    header_content = banner_text + "\n" + header_text + "\n\n" + sb
+    pre_sb = banner_text + "\n" + header_text + "\n"
+    _status_bar_row = len(pre_sb.splitlines()) + 1  # row where status bar starts
+    sb = status_bar(get_session_status_text())
+    header_content = pre_sb + "\n" + sb
 
     header_parts = header_content.splitlines()
     _header_lines = len(header_parts) + 1  # +1 for blank line after
@@ -503,6 +534,18 @@ def refresh_controls():
     sys.stdout.write(f"\033[K{_build_controls_line()}")
     # Restore cursor position
     sys.stdout.write("\033[u")
+    sys.stdout.flush()
+
+
+def refresh_header_status():
+    """Redraw the status bar in the pinned header without touching scroll content."""
+    if not _controls_pinned or _status_bar_row == 0:
+        return
+    sb_lines = status_bar(get_session_status_text()).splitlines()
+    sys.stdout.write("\033[s")  # save cursor
+    for i, line in enumerate(sb_lines):
+        sys.stdout.write(f"\033[{_status_bar_row + i};1H\033[K{Fore.GREEN}{line}{Style.RESET_ALL}")
+    sys.stdout.write("\033[u")  # restore cursor
     sys.stdout.flush()
 
 
@@ -877,7 +920,10 @@ async def keyboard_loop():
                 continue
             paused = not paused
             soft_stopped = False  # Reset soft stop on manual resume
-            if not paused:
+            if paused:
+                set_session_state("paused")
+            else:
+                set_session_state("ready")
                 sys.stdout.write("\r\033[K")
                 sys.stdout.flush()
                 print(Fore.GREEN + "▶  SIGNAL OUTPUT RESUMED" + Style.RESET_ALL)
@@ -1106,6 +1152,7 @@ async def balance_monitor():
             if limits["stop_mode"] == "hard":
                 hard_stopped = True
                 paused = True
+                set_session_state("hard_stop")
                 sys.stdout.write("\r\033[K")
                 print(Fore.RED + Style.BRIGHT + f"  ⛔  HARD STOP HIT  ·  P&L: ${pnl:+,.2f}  ·  Limit: ${limits['stop']:+,.2f}" + Style.RESET_ALL)
                 sys.stdout.write("\r\033[K")
@@ -1120,6 +1167,7 @@ async def balance_monitor():
             elif not soft_stopped:
                 soft_stopped = True
                 paused = True
+                set_session_state("soft_stop")
                 sys.stdout.write("\r\033[K")
                 print(Fore.RED + Style.BRIGHT + f"  ⛔  STOP LIMIT HIT  ·  P&L: ${pnl:+,.2f}  ·  Limit: ${limits['stop']:+,.2f}" + Style.RESET_ALL)
                 sys.stdout.write("\r\033[K")
@@ -1132,6 +1180,7 @@ async def balance_monitor():
             if limits["target_mode"] == "hard":
                 hard_stopped = True
                 paused = True
+                set_session_state("hard_stop")
                 sys.stdout.write("\r\033[K")
                 print(Fore.GREEN + Style.BRIGHT + f"  🎯  TARGET HIT (HARD)  ·  P&L: ${pnl:+,.2f}  ·  Target: ${limits['target']:+,.2f}" + Style.RESET_ALL)
                 sys.stdout.write("\r\033[K")
@@ -1146,6 +1195,7 @@ async def balance_monitor():
             elif not soft_stopped:
                 soft_stopped = True
                 paused = True
+                set_session_state("soft_stop")
                 sys.stdout.write("\r\033[K")
                 print(Fore.GREEN + Style.BRIGHT + f"  🎯  SESSION TARGET HIT  ·  P&L: ${pnl:+,.2f}  ·  Target: ${limits['target']:+,.2f}" + Style.RESET_ALL)
                 sys.stdout.write("\r\033[K")
