@@ -78,7 +78,7 @@ Before SocketTrader can send orders, you must enable the **Automated Trading Int
   <img src="images/ninjatrader_conf.PNG" alt="NinjaTrader AT Interface Settings" width="500">
 </p>
 
-> **Important:** NinjaTrader must be running with the AT Interface enabled for signals to be processed from the `incoming/` folder.
+> **Important:** After clicking OK/Apply, you must **restart NinjaTrader 8** for the AT Interface changes to take effect. NinjaTrader must be running with the AT Interface enabled for signals to be processed from the `incoming/` folder.
 
 ---
 
