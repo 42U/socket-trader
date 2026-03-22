@@ -24,7 +24,7 @@ SocketTrader connects to a remote signal server over WebSocket, receives trading
 
 ```
 ┌────────────┐    WebSocket    ┌────────────────┐    File I/O    ┌────────────────┐
-│   Signal   │ ─────────────▸ │  SocketTrader  │ ─────────────▸  │  NinjaTrader   │
+│   Signal   │ ─────────────▸  │  SocketTrader  │ ─────────────▸ │  NinjaTrader   │
 │   Server   │  JSON signals   │      .py       │ raw order text │  8 incoming/   │
 └────────────┘                 └────────────────┘                └────────────────┘
 ```
