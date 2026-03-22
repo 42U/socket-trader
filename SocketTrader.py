@@ -1665,7 +1665,7 @@ async def display_server_message(data: dict, connect_latency: int):
             sys.stdout.flush()
             await asyncio.sleep(0.2)
         ts = time.strftime("%H:%M:%S")
-        sys.stdout.write(f"\r\033[K{Fore.RED}{Style.DIM}  ♥  [{ts}] heartbeat{Style.RESET_ALL}\n")
+        sys.stdout.write(f"\r\033[K{Fore.RED}{Style.DIM}  ♥  [{ts}] server heartbeat{Style.RESET_ALL}\n")
         sys.stdout.flush()
         logger.info("HEARTBEAT")
 
