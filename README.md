@@ -252,12 +252,12 @@ Press `T` during a session:
 ```
 ┌─ SESSION LIMITS (Sim101) ────────────────────────┐
 │  Balance: $28,857.02  ·  Session P&L: +$0.00     │
-│  Target: +500.00 (soft)  ·  Stop: -300.00 (hard)  │
-│  When a limit is hit, the lockout mode decides:   │
-│  soft = pause signals · resumable with P          │
-│  hard = flatten all positions · signals off    │
-│  Enter 0 to disable. ENTER to keep current.       │
-└───────────────────────────────────────────────────┘
+│  Target: +500.00 (soft)  ·  Stop: -300.00 (hard) │
+│  When a limit is hit, the lockout mode decides:  │
+│  soft = pause signals · resumable with P         │
+│  hard = flatten all positions · signals off      │
+│  Enter 0 to disable. ENTER to keep current.      │
+└──────────────────────────────────────────────────┘
   TARGET $ (current: +500.00) ▸ 500
   TARGET MODE (current: soft) [soft/hard] ▸ soft
   STOP $ (current: -300.00) ▸ -300
