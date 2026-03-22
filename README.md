@@ -346,6 +346,12 @@ Settings persist in `~/.voidorigin_config.json`:
 
 ---
 
+## Security
+
+SocketTrader communicates with NinjaTrader over a local TCP socket as designed by the ATI. Always run on a trusted machine.
+
+---
+
 ## License
 
 See [LICENSE](LICENSE) for details.
