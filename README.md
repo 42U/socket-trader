@@ -23,10 +23,10 @@
 SocketTrader connects to a remote signal server over WebSocket, receives trading signals in real time, and writes them directly into NinjaTrader 8's `incoming/` folder for automated order execution.
 
 ```
-┌──────────┐      WebSocket      ┌──────────────┐      File I/O      ┌──────────────┐
-│  Signal  │ ──────────────────▸ │ SocketTrader  │ ──────────────────▸ │ NinjaTrader  │
-│  Server  │    JSON signals     │     .py       │   raw order text   │  8 incoming/  │
-└──────────┘                     └──────────────┘                     └──────────────┘
+┌────────────┐    WebSocket    ┌────────────────┐    File I/O    ┌────────────────┐
+│   Signal   │ ─────────────▸ │  SocketTrader  │ ─────────────▸  │  NinjaTrader   │
+│   Server   │  JSON signals   │      .py       │ raw order text │  8 incoming/   │
+└────────────┘                 └────────────────┘                └────────────────┘
 ```
 
 **Signal format:**
