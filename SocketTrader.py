@@ -4,10 +4,12 @@ import asyncio
 import websockets
 import json
 import logging
+import logging.handlers
 import shutil
 import socket
 import sys
 import time
+import tempfile
 import random
 import os
 import re
@@ -41,7 +43,6 @@ else:
 
 # ---------- Config persistence ----------
 CONFIG_FILE = Path.home() / ".voidorigin_config.json"
-WS_HOST = "ws://ec2-16-59-44-39.us-east-2.compute.amazonaws.com:8420/ws"
 
 paused = False
 shutdown = asyncio.Event()
@@ -222,6 +223,8 @@ def reset_session_pnl():
 
 # ---------- Input sanitization / validation ----------
 MAX_SESSION_CONTRACTS = 50  # cap unique instruments per session
+MAX_FIELD_LENGTH = 256      # max bytes per ATI field — prevent oversized payloads
+MAX_SIGNAL_FIELDS = 20      # hard cap on semicolon-delimited fields
 
 # All valid NinjaTrader 8 ATI OIF commands
 VALID_ATI_COMMANDS = {
@@ -235,8 +238,11 @@ VALID_TIF = {"DAY", "GTC"}
 
 
 def sanitize_ati(value: str) -> str:
-    """Strip characters that could break ATI line-based parsing."""
-    return value.replace('\n', '').replace('\r', '').replace('\x00', '')
+    """Strip characters that could break ATI line-based parsing or inject fields."""
+    return (value
+            .replace('\n', '').replace('\r', '').replace('\x00', '')
+            .replace(';', ''))
+
 
 
 def validate_signal(parts: list[str]) -> str | None:
@@ -246,6 +252,13 @@ def validate_signal(parts: list[str]) -> str | None:
     """
     if not parts:
         return "empty signal"
+
+    # Guard against oversized or malformed payloads
+    if len(parts) > MAX_SIGNAL_FIELDS:
+        return f"too many fields: {len(parts)} (max {MAX_SIGNAL_FIELDS})"
+    for i, field in enumerate(parts):
+        if len(field) > MAX_FIELD_LENGTH:
+            return f"field {i} too long: {len(field)} bytes (max {MAX_FIELD_LENGTH})"
 
     cmd = parts[0].upper()
     if cmd not in VALID_ATI_COMMANDS:
@@ -300,11 +313,20 @@ _confirms_lock = __import__("threading").Lock()
 
 # ---------- Logging ----------
 LOG_FILE = Path.home() / ".voidorigin_signals.log"
+LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per file
+LOG_BACKUP_COUNT = 3             # keep 3 rotated copies (.log.1, .log.2, .log.3)
 logger = logging.getLogger("sockettrader")
 logger.setLevel(logging.INFO)
-_log_handler = logging.FileHandler(str(LOG_FILE), encoding="utf-8")
+_log_handler = logging.handlers.RotatingFileHandler(
+    str(LOG_FILE), maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
+)
 _log_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 logger.addHandler(_log_handler)
+if not IS_WINDOWS:
+    try:
+        os.chmod(LOG_FILE, 0o600)
+    except OSError:
+        pass
 
 # ---------- Duplicate detection ----------
 # Track recent signal IDs (the unique number at the end of each signal)
@@ -323,10 +345,20 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict):
-    """Persist config to disk."""
+    """Persist config to disk atomically with restricted permissions."""
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
+        fd, tmp = tempfile.mkstemp(
+            dir=str(CONFIG_FILE.parent), suffix=".tmp", prefix=".voidorigin_"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+            if not IS_WINDOWS:
+                os.chmod(tmp, 0o600)
+            os.replace(tmp, CONFIG_FILE)
+        except BaseException:
+            os.unlink(tmp)
+            raise
     except OSError as exc:
         print(Fore.RED + f"  ✖  Could not save config: {exc}" + Style.RESET_ALL)
 
@@ -617,6 +649,36 @@ def ask_token(cfg: dict, force: bool = False) -> str:
         print(Fore.YELLOW + "  ⚠  Token cannot be empty." + Style.RESET_ALL)
 
 
+def ask_server(cfg: dict) -> tuple[str, str]:
+    """Get WebSocket server URL from config or prompt user.
+
+    Returns (url, name) tuple.
+    """
+    saved = cfg.get("ws_host")
+    if saved:
+        # Find matching name in servers list
+        for s in cfg.get("servers", []):
+            if s.get("url") == saved:
+                return saved, s.get("name", "Default")
+        return saved, "Default"
+
+    print(Fore.CYAN + "\n┌─ SERVER ─────────────────────────────────────────────┐" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Enter the WebSocket server URL.                     │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Example: ws://host:8420/ws  or  wss://host:8420/ws  │" + Style.RESET_ALL)
+    print(Fore.CYAN + "└──────────────────────────────────────────────────────┘" + Style.RESET_ALL)
+
+    while True:
+        url = input(Fore.WHITE + "  URL ▸ " + Style.RESET_ALL).strip()
+        if url and (url.startswith("ws://") or url.startswith("wss://")):
+            break
+        print(Fore.YELLOW + "  ⚠  URL must start with ws:// or wss://" + Style.RESET_ALL)
+
+    name = input(Fore.WHITE + "  NAME (optional) ▸ " + Style.RESET_ALL).strip()
+    if not name:
+        name = "Default"
+    return url, name
+
+
 # ---------- Cross-platform keyboard helpers ----------
 _kb_stop = False  # Set True to unblock get_key threads
 
@@ -733,7 +795,7 @@ def show_cursor():
 _controls_pinned = False
 _header_lines = 0  # Number of lines the pinned header occupies
 _status_bar_row = 0  # Terminal row where the status bar starts
-CONTROLS_TEXT = "P=PAUSE  A=ACCT  B=BAL  S=STRAT  D=DIR  T=LIMITS  O=PORT  R=RECONN  C=CLOSE  ⇧X=EXIT"
+CONTROLS_TEXT = "P=PAUSE  B=BAL  T=LIMITS  C=CLOSE  R=RECONN  S=SETUP  ⇧X=EXIT"
 
 
 def _build_controls_line():
@@ -1174,6 +1236,165 @@ async def prompt_strategy():
     awaiting_user_input = False
 
 
+# ---------- Server selector ----------
+MAX_SAVED_SERVERS = 10  # cap saved server list
+
+
+async def prompt_server():
+    """Show saved servers and let user pick one or add a new server."""
+    global awaiting_user_input
+    awaiting_user_input = True
+    show_cursor()
+
+    cfg = load_config()
+    servers = cfg.get("servers", [])
+    current = cfg.get("ws_host", "")
+
+    print(Fore.CYAN + "\n┌─ SERVER SELECT ───────────────────────────────────┐" + Style.RESET_ALL)
+    if servers:
+        for i, srv in enumerate(servers, 1):
+            marker = " ◀" if srv.get("url") == current else ""
+            line = f"{i}. {srv.get('name', 'unnamed')}  {srv.get('url', '')}{marker}"
+            print(Fore.CYAN + f"│  {line[:49].ljust(49)}│" + Style.RESET_ALL)
+    n = len(servers) + 1
+    print(Fore.CYAN + f"│  {n}. + Add new server{' ' * (49 - len(str(n)) - 20)}│" + Style.RESET_ALL)
+    if servers:
+        d = n + 1
+        print(Fore.CYAN + f"│  {d}. - Remove a server{' ' * (49 - len(str(d)) - 21)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Press ENTER to keep current.                     │" + Style.RESET_ALL)
+    print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
+    sys.stdout.write(Fore.WHITE + "  SERVER ▸ " + Style.RESET_ALL)
+    sys.stdout.flush()
+    raw = (await asyncio.to_thread(read_line_raw)).strip()
+
+    if raw == "":
+        print(Fore.YELLOW + "  ↩  No change." + Style.RESET_ALL)
+    elif raw.isdigit():
+        choice = int(raw)
+        if 1 <= choice <= len(servers):
+            # Select existing server
+            srv = servers[choice - 1]
+            if srv["url"] != current:
+                cfg["ws_host"] = srv["url"]
+                save_config(cfg)
+                print(Fore.GREEN + f"  ✔  Server → {srv['name']} ({srv['url']})" + Style.RESET_ALL)
+                print(Fore.YELLOW + "  🔄  Reconnecting..." + Style.RESET_ALL)
+                reconnect_event.set()
+            else:
+                print(Fore.YELLOW + "  ↩  Already connected to this server." + Style.RESET_ALL)
+        elif choice == n:
+            # Add new server
+            sys.stdout.write(Fore.WHITE + "  NAME ▸ " + Style.RESET_ALL)
+            sys.stdout.flush()
+            name = (await asyncio.to_thread(read_line_raw)).strip()
+            if not name:
+                print(Fore.YELLOW + "  ↩  Cancelled." + Style.RESET_ALL)
+            else:
+                sys.stdout.write(Fore.WHITE + "  URL ▸ " + Style.RESET_ALL)
+                sys.stdout.flush()
+                url = (await asyncio.to_thread(read_line_raw)).strip()
+                if url and (url.startswith("ws://") or url.startswith("wss://")):
+                    if len(servers) >= MAX_SAVED_SERVERS:
+                        print(Fore.RED + f"  ✖  Max {MAX_SAVED_SERVERS} servers. Remove one first." + Style.RESET_ALL)
+                    else:
+                        servers.append({"name": name, "url": url})
+                        cfg["servers"] = servers
+                        cfg["ws_host"] = url
+                        save_config(cfg)
+                        print(Fore.GREEN + f"  ✔  Added & selected → {name} ({url})" + Style.RESET_ALL)
+                        print(Fore.YELLOW + "  🔄  Reconnecting..." + Style.RESET_ALL)
+                        reconnect_event.set()
+                else:
+                    print(Fore.RED + "  ✖  URL must start with ws:// or wss://" + Style.RESET_ALL)
+        elif servers and choice == n + 1:
+            # Remove a server
+            sys.stdout.write(Fore.WHITE + "  REMOVE # ▸ " + Style.RESET_ALL)
+            sys.stdout.flush()
+            rm_raw = (await asyncio.to_thread(read_line_raw)).strip()
+            if rm_raw.isdigit() and 1 <= int(rm_raw) <= len(servers):
+                removed = servers.pop(int(rm_raw) - 1)
+                cfg["servers"] = servers
+                save_config(cfg)
+                print(Fore.GREEN + f"  ✔  Removed → {removed['name']}" + Style.RESET_ALL)
+            else:
+                print(Fore.YELLOW + "  ↩  Cancelled." + Style.RESET_ALL)
+
+    print()
+    awaiting_user_input = False
+
+
+# ---------- Token prompt (runtime) ----------
+async def prompt_token():
+    """Prompt user to update their connection token."""
+    global awaiting_user_input
+    awaiting_user_input = True
+    show_cursor()
+
+    cfg = load_config()
+    current = cfg.get("token", "")
+    masked = "*" * len(current) if current else "not set"
+
+    print(Fore.CYAN + "\n┌─ CONNECTION TOKEN ────────────────────────────────┐" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  Current: {masked[:39].ljust(39)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Press ENTER to keep current.                     │" + Style.RESET_ALL)
+    print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
+    sys.stdout.write(Fore.WHITE + "  TOKEN ▸ " + Style.RESET_ALL)
+    sys.stdout.flush()
+    raw = (await asyncio.to_thread(read_line_raw)).strip()
+
+    if raw == "":
+        print(Fore.YELLOW + "  ↩  No change." + Style.RESET_ALL)
+    else:
+        cfg["token"] = raw
+        save_config(cfg)
+        print(Fore.GREEN + "  ✔  Token updated." + Style.RESET_ALL)
+        print(Fore.YELLOW + "  🔄  Reconnecting..." + Style.RESET_ALL)
+        reconnect_event.set()
+
+    print()
+    awaiting_user_input = False
+
+
+# ---------- Setup submenu ----------
+async def setup_menu():
+    """Show the setup submenu for config changes."""
+    global awaiting_user_input
+    awaiting_user_input = True
+    show_cursor()
+    cfg = load_config()
+    current_server = cfg.get("ws_host", "not set")
+    masked_token = "*" * min(len(cfg.get("token", "")), 33) or "not set"
+    print(Fore.CYAN + "\n┌─ SETUP ──────────────────────────────────────────┐" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  1. Server    ({current_server[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  2. Token     ({masked_token[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  3. Account   ({(active_account or 'not set')[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  4. Strategy  ({atm_strategy[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  5. Directory ({(output_directory or 'not set')[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  6. ATI Port  ({nt_port})" .ljust(53) + "│" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  ESC to close                                    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "└──────────────────────────────────────────────────┘" + Style.RESET_ALL)
+    sys.stdout.write(Fore.WHITE + "  SETUP ▸ " + Style.RESET_ALL)
+    sys.stdout.flush()
+    key = await asyncio.to_thread(get_key)
+    hide_cursor()
+    awaiting_user_input = False
+
+    if key == "1":
+        await prompt_server()
+    elif key == "2":
+        await prompt_token()
+    elif key == "3":
+        await prompt_account()
+    elif key == "4":
+        await prompt_strategy()
+    elif key == "5":
+        await prompt_directory()
+    elif key == "6":
+        await prompt_port()
+    else:
+        sys.stdout.write("\r\033[K")
+
+
 # ---------- Balances display ----------
 async def show_balances():
     """Display all NinjaTrader account balances with session P&L."""
@@ -1366,16 +1587,10 @@ async def keyboard_loop():
                     print(Fore.GREEN + "▶  SIGNAL OUTPUT RESUMED" + Style.RESET_ALL)
             elif key.lower() == "b":
                 await show_balances()
-            elif key.lower() == "a":
-                await prompt_account()
-            elif key.lower() == "d":
-                await prompt_directory()
             elif key.lower() == "s":
-                await prompt_strategy()
+                await setup_menu()
             elif key.lower() == "t":
                 await prompt_limits()
-            elif key.lower() == "o":
-                await prompt_port()
             elif key.lower() == "r":
                 sys.stdout.write("\r\033[K")
                 print(Fore.YELLOW + "🔄  MANUAL RECONNECT REQUESTED" + Style.RESET_ALL)
@@ -1872,13 +2087,20 @@ def fmt_wait(seconds: int) -> str:
 
 async def listen(token: str):
     global signal_count
-    uri = f"{WS_HOST}?token={token}"
     fib_prev, fib_curr = 60, 60  # Start at 1m, 1m → 2m → 3m → 5m → ...
 
     await boot_sequence()
 
     while not shutdown.is_set():
         try:
+            # Re-read config each loop so server/token changes via Setup take effect
+            cfg = load_config()
+            ws_host = cfg.get("ws_host", "")
+            if not ws_host:
+                logger.error("No ws_host configured — cannot connect")
+                return
+            token = cfg.get("token", token)
+            uri = f"{ws_host}?token={token}"
             connect_start = time.time()
             async with websockets.connect(uri) as ws:
                 connect_latency = int((time.time() - connect_start) * 1000)
@@ -2109,8 +2331,21 @@ def install_strategy_templates(nt_base: Path):
             print(Fore.RED + f"  ✖  Could not install {filename}: {exc}" + Style.RESET_ALL)
 
 
+def _save_server_to_list(cfg: dict, ws_host: str, server_name: str):
+    """Ensure the server URL is in the saved servers list."""
+    servers = cfg.get("servers", [])
+    if not any(s.get("url") == ws_host for s in servers):
+        servers.append({"name": server_name, "url": ws_host})
+        cfg["servers"] = servers
+
+
 def setup() -> tuple[str, dict]:
-    """Run first-time or repeat setup. Returns (token, config)."""
+    """Run first-time or repeat setup. Returns (token, config).
+
+    Only server + token are required to connect. Account, directory, and
+    strategy can be configured later via the Setup menu (S key) — the app
+    will connect but show "setup incomplete" until they are set.
+    """
     cfg = load_config()
 
     print(Fore.GREEN + Style.BRIGHT)
@@ -2119,42 +2354,53 @@ def setup() -> tuple[str, dict]:
     print("  ╚══════════════════════════════════════════╝")
     print(Style.RESET_ALL)
 
-    if cfg.get("token") and cfg.get("account") and cfg.get("output_directory") and Path(cfg["output_directory"]).is_dir():
-        print(Fore.GREEN + f"  ✔  Config loaded from {CONFIG_FILE}" + Style.RESET_ALL)
+    changed = False
+
+    # 1. Server — required to connect
+    if not cfg.get("ws_host"):
+        ws_host, server_name = ask_server(cfg)
+        cfg["ws_host"] = ws_host
+        _save_server_to_list(cfg, ws_host, server_name)
+        changed = True
+
+    # 2. Token — required to authenticate
+    if not cfg.get("token"):
+        token = ask_token(cfg)
+        cfg["token"] = token
+        changed = True
+
+    # 3. Account / directory — optional at startup, prompted later if missing
+    #    Only ask during fresh first-time setup (nothing saved at all)
+    if not cfg.get("account") and not cfg.get("output_directory"):
+        account = ask_account(cfg)
+        cfg["account"] = account
+
+        global output_directory
+        output_directory = detect_or_ask_directory(cfg)
+        if output_directory:
+            cfg["output_directory"] = output_directory
+        changed = True
+
+    if changed:
+        save_config(cfg)
+
+    # Display current config
+    print(Fore.GREEN + f"  ✔  Server: {cfg['ws_host']}" + Style.RESET_ALL)
+    print(Fore.GREEN + f"  ✔  Token: {'*' * len(cfg.get('token', ''))}" + Style.RESET_ALL)
+    if cfg.get("account"):
         print(Fore.GREEN + f"  ✔  Account: {cfg['account']}" + Style.RESET_ALL)
+    if cfg.get("output_directory") and Path(cfg["output_directory"]).is_dir():
         print(Fore.GREEN + f"  ✔  Output: {cfg['output_directory']}" + Style.RESET_ALL)
-        print(Fore.GREEN + f"  ✔  Token: {'*' * len(cfg['token'])}" + Style.RESET_ALL)
-        # Install strategy templates if needed
+    if not cfg.get("account") or not cfg.get("output_directory"):
+        print(Fore.YELLOW + f"  ⚠  Press S after connecting to finish setup." + Style.RESET_ALL)
+
+    # Install strategy templates if output directory is configured
+    if cfg.get("output_directory") and Path(cfg["output_directory"]).is_dir():
         nt_base = Path(cfg["output_directory"]).parent
         install_strategy_templates(nt_base)
-        print()
-        return cfg["token"], cfg
 
-    # Token
-    token = ask_token(cfg)
-
-    # Account
-    account = ask_account(cfg)
-
-    # Output directory
-    global output_directory
-    output_directory = detect_or_ask_directory(cfg)
-
-    # Save config
-    cfg["token"] = token
-    cfg["account"] = account
-    if output_directory:
-        cfg["output_directory"] = output_directory
-    save_config(cfg)
-
-    # Install strategy templates if output directory is under NinjaTrader 8
-    if output_directory:
-        nt_base = Path(output_directory).parent
-        install_strategy_templates(nt_base)
-
-    print(Fore.GREEN + f"\n  ✔  Config saved to {CONFIG_FILE}" + Style.RESET_ALL)
     print()
-    return token, cfg
+    return cfg["token"], cfg
 
 
 # ---------- Main ----------
