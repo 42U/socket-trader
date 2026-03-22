@@ -278,9 +278,9 @@ On exit, SocketTrader displays your session results including final P&L:
 
 ```
   ┌─ SESSION SUMMARY ───────────────────────────────────────────┐
-  │  Signals received: 12                                      │
-  │  Session P&L: +$247.50                                     │
-  │  Log: C:\Users\trader\.voidorigin_signals.log              │
+  │  Signals received: 12                                       │
+  │  Session P&L: +$247.50                                      │
+  │  Log: C:\Users\trader\.voidorigin_signals.log               │
   └─────────────────────────────────────────────────────────────┘
 ```
 
