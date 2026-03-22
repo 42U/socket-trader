@@ -51,7 +51,8 @@ The sim account is automatically swapped with your real NinjaTrader account name
 | **Cross-platform** | Windows and Linux support |
 | **ATI integration** | Auto-detect accounts, live balances, and position closing via NinjaTrader ATI |
 | **Auto-detect directory** | Finds NinjaTrader 8 `incoming/` folder on Windows automatically |
-| **Persistent config** | Token, account, limits, and directory saved to `~/.voidorigin_config.json` |
+| **Multi-server support** | Save and switch between multiple signal servers |
+| **Persistent config** | Server, token, account, limits, and directory saved to `~/.voidorigin_config.json` |
 | **Smart reconnect** | Fibonacci backoff: 1m → 1m → 2m → 3m → 5m → 8m → ... → 30m max |
 | **Auth handling** | Invalid token triggers re-prompt instead of infinite retry |
 | **Latency monitoring** | Color-coded signal delivery time relative to baseline |
@@ -60,6 +61,9 @@ The sim account is automatically swapped with your real NinjaTrader account name
 | **Signal confirmation** | Verifies trade execution via ATI position tracking per instrument |
 | **Trade readiness gate** | Blocks signals when account, directory, or strategy is missing |
 | **Duplicate detection** | Prevents the same signal from firing twice |
+| **Input validation** | Field length, count, and format checks on all incoming signals |
+| **Atomic config writes** | Crash-safe config persistence via temp file + rename |
+| **Log rotation** | 5 MB per log file, 3 backups kept automatically |
 | **Terminal UI** | Animated boot, color-coded session states, pinned header and controls bar |
 
 ---
@@ -84,7 +88,7 @@ Before SocketTrader can send orders, you must enable the **Automated Trading Int
 2. Go to **Tools** → **Settings**
 3. Select **Automated trading interface** from the left panel
 4. Check the **AT Interface** checkbox to enable it
-5. Note the **Server port** (default: `36973`) — if you change it, press `O` in SocketTrader to update
+5. Note the **Server port** (default: `36973`) — if you change it, go to Setup (`S`) > ATI Port in SocketTrader
 6. Click **OK**
 
 <p align="center">
@@ -111,7 +115,7 @@ The signal sent to NinjaTrader includes an **ATM Strategy template name** that c
 If you want to use a different ATM strategy:
 
 1. Create your custom ATM strategy template in NinjaTrader 8 (via the ATM Strategy selector on a chart or SuperDOM)
-2. Press `S` in SocketTrader to set the strategy name to match your template
+2. Press `S` in SocketTrader to open Setup, then select **Strategy** to set the name
 3. The new name is saved to config and applied to all future signals
 
 > The ATM strategy name in the signal **must match** an existing template in your NinjaTrader `templates/AtmStrategy/` folder, or the order will be rejected.
@@ -124,29 +128,18 @@ If you want to use a different ATM strategy:
 python SocketTrader.py
 ```
 
-On first run you'll be prompted for:
+On first run you'll be prompted in order:
 
 | Prompt | Description |
 |--------|-------------|
+| **Server** | WebSocket server URL (`ws://` or `wss://`) and an optional name |
 | **Token** | Server authentication token |
 | **Account** | Auto-detected from NinjaTrader ATI, or manually entered |
 | **Directory** | Auto-detected on Windows, manually entered on Linux |
 
-If NinjaTrader is running, accounts are auto-detected via ATI with live balances:
+Server and token are required to connect. Account and directory can also be configured later via the Setup menu (`S`).
 
-```
-┌─ CHANGE ACCOUNT ─────────────────────────────────┐
-│  1. Sim101  ($28,857.02)                ◀        │
-│  2. MyLiveAccount  ($50,000.00)                  │
-│  Enter # to select, or type a name manually.     │
-│  Press ENTER to keep current.                     │
-└───────────────────────────────────────────────────┘
-  ACCOUNT ▸
-```
-
-Enter a number to pick from the list, or type any account name manually. If NinjaTrader isn't running, you'll be prompted to type the account name directly.
-
-All settings are saved and loaded automatically on subsequent runs.
+All settings are saved and loaded automatically on subsequent runs. To change any setting mid-session, press `S` to open the Setup menu.
 
 ---
 
@@ -155,21 +148,36 @@ All settings are saved and loaded automatically on subsequent runs.
 The controls bar is **pinned to the bottom** of the terminal at all times:
 
 ```
-  P=PAUSE  A=ACCT  B=BAL  S=STRAT  D=DIR  T=LIMITS  O=PORT  R=RECONN  C=CLOSE  ⇧X=EXIT
+  P=PAUSE  B=BAL  T=LIMITS  C=CLOSE  R=RECONN  S=SETUP  ⇧X=EXIT
 ```
 
 | Key | Action |
 |:---:|--------|
 | `P` | Pause / resume signal output |
-| `A` | Switch NinjaTrader account (pick from ATI list or type manually) |
 | `B` | Show live balances and session P&L (press `R` to reset P&L) |
-| `S` | Change ATM strategy template |
-| `D` | Change output directory |
 | `T` | Set session target and stop limits |
-| `O` | Change NinjaTrader AT Interface port |
-| `R` | Force immediate reconnect (resets backoff) |
 | `C` | Close open positions (arrow keys to select, `Y` to confirm) |
+| `R` | Force immediate reconnect (resets backoff) |
+| `S` | Open Setup menu (see below) |
 | `Shift+X` | Exit SocketTrader |
+
+### Setup Menu
+
+Press `S` to open the Setup menu for all configuration options:
+
+```
+┌─ SETUP ──────────────────────────────────────────┐
+│  1. Server    (wss://host:8420/ws)               │
+│  2. Token     (****)                             │
+│  3. Account   (Sim101)                           │
+│  4. Strategy  (NQ_Med)                           │
+│  5. Directory (/path/to/incoming)                │
+│  6. ATI Port  (36973)                            │
+│  ESC to close                                    │
+└──────────────────────────────────────────────────┘
+```
+
+Changing the **server** or **token** automatically triggers a reconnect. The server selector supports saving multiple servers:
 
 ---
 
@@ -306,6 +314,11 @@ Settings persist in `~/.voidorigin_config.json`:
 
 ```json
 {
+  "ws_host": "wss://your-server:8420/ws",
+  "servers": [
+    { "name": "Production", "url": "wss://your-server:8420/ws" },
+    { "name": "Dev", "url": "ws://localhost:8420/ws" }
+  ],
   "token": "your_connection_token",
   "account": "Sim101",
   "atm_strategy": "NQ_Med",
@@ -318,7 +331,18 @@ Settings persist in `~/.voidorigin_config.json`:
 }
 ```
 
-> This file contains your authentication token and is excluded from version control via `.gitignore`.
+| Field | Description |
+|-------|-------------|
+| `ws_host` | Active WebSocket server URL |
+| `servers` | Saved server list (up to 10) for quick switching |
+| `token` | Authentication token (rotates frequently) |
+| `account` | Active NinjaTrader account name |
+| `atm_strategy` | ATM strategy template name |
+| `output_directory` | Path to NinjaTrader 8 `incoming/` folder |
+| `nt_port` | NinjaTrader AT Interface port |
+| `account_limits` | Per-account risk management settings |
+
+> This file contains your authentication token and is excluded from version control via `.gitignore`. On non-Windows systems, file permissions are set to `0600` (owner-only).
 
 ---
 
