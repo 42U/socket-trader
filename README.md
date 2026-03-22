@@ -187,7 +187,7 @@ Press `B` at any time to see all NinjaTrader accounts with real-time balances an
 
 ```
   ╭─ BALANCES ─────────────────────────────────╮
-  │  Sim101      $28,857.02  P&L: +$247.50 ◀   │
+  │  Sim101      $28,857.02  P&L: +$247.50 ◀  │
   │  SimXFAFK     $3,939.48  P&L: -$60.52      │
   ╰────────────────────────────────────────────╯
 ```
