@@ -7,6 +7,14 @@
 </p>
 
 <p align="center">
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
+  <a href="#"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue" alt="Platform"></a>
+  <a href="#ninjatrader-setup"><img src="https://img.shields.io/badge/NinjaTrader-8-orange" alt="NinjaTrader 8"></a>
+  <a href="https://voidorigin.com"><img src="https://img.shields.io/badge/VoidOrigin-signal%20server-blueviolet" alt="VoidOrigin"></a>
+</p>
+
+<p align="center">
   <a href="#installation">Installation</a> &nbsp;·&nbsp;
   <a href="#ninjatrader-setup">NinjaTrader Setup</a> &nbsp;·&nbsp;
   <a href="#usage">Usage</a> &nbsp;·&nbsp;
@@ -46,6 +54,9 @@ The sim account is automatically swapped with your real NinjaTrader account name
 
 ## Features
 
+> **Signal in. Order out. No GUI required.**
+> SocketTrader runs entirely in the terminal with a keyboard-driven interface, real-time risk controls, and sub-second signal delivery.
+
 | | |
 |---|---|
 | **Cross-platform** | Windows and Linux support |
@@ -53,7 +64,7 @@ The sim account is automatically swapped with your real NinjaTrader account name
 | **Auto-detect directory** | Finds NinjaTrader 8 `incoming/` folder on Windows automatically |
 | **Multi-server support** | Save and switch between multiple signal servers |
 | **Persistent config** | Server, token, account, limits, and directory saved to `~/.voidorigin_config.json` |
-| **Smart reconnect** | Fibonacci backoff: 1m → 1m → 2m → 3m → 5m → 8m → ... → 30m max |
+| **Smart reconnect** | Fibonacci backoff: 1 &rarr; 1 &rarr; 2 &rarr; 3 &rarr; 5 &rarr; 8 &rarr; ... &rarr; 30 min max |
 | **Auth handling** | Invalid token triggers re-prompt instead of infinite retry |
 | **Latency monitoring** | Color-coded signal delivery time relative to baseline |
 | **Risk management** | Per-account target and stop with independent soft/hard modes |
@@ -354,10 +365,11 @@ SocketTrader communicates with NinjaTrader over a local TCP socket as designed b
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+Distributed under the **MIT License**. See [LICENSE](LICENSE) for details.
 
 ---
 
 <p align="center">
-  <sub>Built by <a href="https://github.com/42U">42U</a> &nbsp;·&nbsp; Powered by <a href="https://voidorigin.com">VoidOrigin</a></sub>
+  <a href="https://github.com/42U"><img src="https://img.shields.io/badge/built%20by-42U-181717?logo=github" alt="Built by 42U"></a>
+  <a href="https://voidorigin.com"><img src="https://img.shields.io/badge/powered%20by-VoidOrigin-blueviolet" alt="Powered by VoidOrigin"></a>
 </p>
