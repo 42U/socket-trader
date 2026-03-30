@@ -1716,7 +1716,7 @@ def write_signal_to_file(signal_text: str):
         return
     ts = time.strftime("%Y%m%d_%H%M%S")
     ms = int((time.time() % 1) * 1000)
-    filename = f"signal_{ts}_{ms:03d}.txt"
+    filename = f"oif_{ts}_{ms:03d}.txt"
     filepath = os.path.join(output_directory, filename)
     try:
         with open(filepath, "w", encoding="utf-8") as f:
