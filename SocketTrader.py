@@ -16,6 +16,7 @@ import re
 import platform
 from collections import deque
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from colorama import init, Fore, Style
 
@@ -106,7 +107,7 @@ hard_stopped = False                              # True if hard stop triggered
 BALANCE_POLL_INTERVAL = 3                         # seconds between balance checks
 
 # Auto-reset: futures session ends ~4:15 PM ET, reset P&L at 4:20 PM ET
-ET = timezone(timedelta(hours=-5))  # Eastern Time (EST; no DST handling needed — close is 4:20 either way)
+ET = ZoneInfo("America/New_York")  # Eastern Time (handles EST/EDT automatically)
 SESSION_RESET_HOUR = 16
 SESSION_RESET_MINUTE = 20
 # If launching after the reset time, mark today as already reset so we don't
@@ -191,6 +192,7 @@ def restore_session_state() -> bool:
     cfg = load_config()
     saved = cfg.get("session")
     if not saved:
+        _clear_positive_stops()
         return False
 
     current_session = get_session_id()
@@ -204,7 +206,29 @@ def restore_session_state() -> bool:
 
     # Different session or outside hours — clear stale data
     clear_saved_session()
+    _clear_positive_stops()
     return False
+
+
+def _clear_positive_stops():
+    """Reset any positive stop limits to 0 — they are profit-protection
+    limits that only make sense within the session that set them.
+    Starting a new session with PnL at $0 would immediately trip them."""
+    cfg = load_config()
+    cleared = []
+    for account, limits in cfg.get("account_limits", {}).items():
+        if limits.get("stop", 0) > 0:
+            old_stop = limits["stop"]
+            limits["stop"] = 0
+            cleared.append((account, old_stop))
+            logger.info(f"RESET positive stop to 0 for {account} (new session)")
+    if cleared:
+        save_config(cfg)
+        for account, old_stop in cleared:
+            _dash_set_alert(
+                Fore.YELLOW +
+                f"  ⚠  Positive stop (${old_stop:+,.2f}) cleared for {account} — "
+                f"new session. Press T to set a new limit." + Style.RESET_ALL)
 
 
 def reset_session_pnl():
@@ -217,6 +241,7 @@ def reset_session_pnl():
     soft_stopped = False
     hard_stopped = False
     signal_count = 0
+    _clear_positive_stops()
     set_session_state("ready")
     clear_saved_session()
 
@@ -846,7 +871,9 @@ def pin_layout():
         # Use compact font for pinned header to save vertical space
         for font in ["small", "standard", "big"]:
             try:
-                art = pyfiglet.figlet_format("VOIDORIGIN", font=font)
+                # width=1000 prevents pyfiglet from wrapping the word onto
+                # multiple "lines" when its default 80-col width is exceeded
+                art = pyfiglet.figlet_format("VOIDORIGIN", font=font, width=1000)
                 if max(len(l) for l in art.splitlines()) <= width:
                     break
             except Exception:
@@ -883,6 +910,7 @@ def pin_layout():
     sys.stdout.write(f"\033[{scroll_top};1H")
     sys.stdout.flush()
     _controls_pinned = True
+    _dash_redraw_all()
 
 
 def unpin_layout():
@@ -918,19 +946,130 @@ def refresh_header_status():
     sys.stdout.flush()
 
 
+# ---------- Dashboard layout ----------
+# Fixed-row dashboard within the scroll region.  Row offsets are relative
+# to scroll_top (= _header_lines + 1).  Content updates in-place via
+# cursor positioning — no scrolling.
+DASH_ROW_HEARTBEAT = 0       # connection / heartbeat status
+DASH_ROW_SEP1 = 1            # ─── separator ───
+DASH_SIGNAL_START = 2        # first signal row (newest at top)
+DASH_SIGNAL_COUNT = 5        # visible signal slots
+DASH_ROW_SEP2 = 7            # ─── separator ───  (SIGNAL_START + COUNT)
+DASH_ROW_MOTD = 8            # server MOTD / maintenance notices
+DASH_ROW_ALERT = 9           # system alerts / fill confirmations
+DASH_TOTAL_ROWS = 10
+
+_signal_buffer: deque[str] = deque(maxlen=DASH_SIGNAL_COUNT)
+_motd_text = ""
+_alert_text = ""
+_heartbeat_text = ""
+_server_name = ""
+_menu_active = False
+
+
+def _dash_write(row_offset: int, text: str):
+    """Write text to a fixed dashboard row (no scroll, no newline)."""
+    if _menu_active or not _controls_pinned:
+        return
+    abs_row = _header_lines + 1 + row_offset
+    sys.stdout.write(f"\033[s\033[{abs_row};1H\033[K{text}\033[u")
+    sys.stdout.flush()
+
+
+def _dash_separator(row_offset: int):
+    """Draw a dim separator line."""
+    width = term_width()
+    _dash_write(row_offset,
+                Fore.CYAN + Style.DIM + f"  {'─' * (width - 4)}" + Style.RESET_ALL)
+
+
+def _dash_add_signal(text: str):
+    """Add a formatted signal line to the rolling buffer and redraw."""
+    _signal_buffer.append(text)
+    _redraw_signals()
+
+
+def _redraw_signals():
+    """Redraw signal rows (newest at top)."""
+    buf = list(_signal_buffer)
+    for i in range(DASH_SIGNAL_COUNT):
+        idx = len(buf) - 1 - i
+        _dash_write(DASH_SIGNAL_START + i,
+                    buf[idx] if 0 <= idx < len(buf) else "")
+
+
+def _dash_set_heartbeat(text: str):
+    """Update the heartbeat / connection status line."""
+    global _heartbeat_text
+    _heartbeat_text = text
+    _dash_write(DASH_ROW_HEARTBEAT, text)
+
+
+def _dash_set_motd(text: str):
+    """Update the MOTD / server-message line."""
+    global _motd_text
+    _motd_text = text
+    _dash_write(DASH_ROW_MOTD, text)
+
+
+def _dash_set_alert(text: str):
+    """Update the alert / status line."""
+    global _alert_text
+    _alert_text = text
+    _dash_write(DASH_ROW_ALERT, text)
+
+
+def _dash_redraw_all():
+    """Redraw entire dashboard (after menu exit or resize)."""
+    _dash_write(DASH_ROW_HEARTBEAT, _heartbeat_text)
+    _dash_separator(DASH_ROW_SEP1)
+    _redraw_signals()
+    _dash_separator(DASH_ROW_SEP2)
+    _dash_write(DASH_ROW_MOTD, _motd_text)
+    _dash_write(DASH_ROW_ALERT, _alert_text)
+
+
+def _dash_enter_menu():
+    """Clear dashboard for menu overlay."""
+    global _menu_active
+    _menu_active = True
+    if _controls_pinned:
+        rows = term_height()
+        scroll_top = _header_lines + 1
+        scroll_bottom = rows - 1
+        for r in range(scroll_top, scroll_bottom + 1):
+            sys.stdout.write(f"\033[{r};1H\033[K")
+        move_to(scroll_top)
+        sys.stdout.flush()
+
+
+def _dash_exit_menu():
+    """Restore dashboard after menu overlay."""
+    global _menu_active
+    _menu_active = False
+    if _controls_pinned:
+        rows = term_height()
+        scroll_top = _header_lines + 1
+        scroll_bottom = rows - 1
+        for r in range(scroll_top, scroll_bottom + 1):
+            sys.stdout.write(f"\033[{r};1H\033[K")
+        sys.stdout.flush()
+    _dash_redraw_all()
+
+
 # ---------- Dynamic ASCII banner ----------
 def build_banner():
     width = term_width()
     if pyfiglet:
         for font in ["block", "banner3-D", "banner3", "doom", "larry3d", "big", "standard", "small"]:
             try:
-                art = pyfiglet.figlet_format("VOIDORIGIN", font=font)
+                art = pyfiglet.figlet_format("VOIDORIGIN", font=font, width=1000)
                 if max(len(l) for l in art.splitlines()) <= width:
                     break
             except Exception:
                 continue
         else:
-            art = pyfiglet.figlet_format("VOIDORIGIN", font="small")
+            art = pyfiglet.figlet_format("VOIDORIGIN", font="small", width=1000)
     else:
         art = "V O I D O R I G I N"
     return "\n".join(line.center(width) for line in art.splitlines())
@@ -1015,12 +1154,9 @@ PULSE_FRAMES = ["·", "•", "●", "◉", "●", "•", "·", " "]
 
 
 async def signal_pulse(label="SIGNAL RECEIVED"):
-    for frame in PULSE_FRAMES:
-        sys.stdout.write(f"\r\033[K{Fore.GREEN}{frame} {label}{Style.RESET_ALL}")
-        sys.stdout.flush()
-        await asyncio.sleep(0.05)
-    sys.stdout.write("\r\033[K")
-    sys.stdout.flush()
+    _dash_set_alert(Fore.GREEN + f"  ● {label}" + Style.RESET_ALL)
+    await asyncio.sleep(0.4)
+    _dash_set_alert("")
 
 
 # ---------- Pause indicator ----------
@@ -1036,11 +1172,14 @@ async def pause_indicator():
     i = 0
     while not shutdown.is_set():
         if paused and not awaiting_user_input:
-            sys.stdout.write(Fore.YELLOW + "\r\033[K" + PAUSE_FRAMES[i % len(PAUSE_FRAMES)] + Style.RESET_ALL)
-            sys.stdout.flush()
+            # Use MOTD line so it doesn't overwrite alerts
+            _dash_set_motd(
+                Fore.YELLOW + "  " + PAUSE_FRAMES[i % len(PAUSE_FRAMES)] + Style.RESET_ALL)
             i += 1
             await asyncio.sleep(0.35)
         else:
+            if i > 0:
+                _dash_set_motd("")  # clear pause text on resume
             i = 0
             await asyncio.sleep(0.1)
 
@@ -1088,10 +1227,6 @@ async def prompt_directory():
         cfg["output_directory"] = output_directory
         save_config(cfg)
 
-    if not output_directory or not active_account:
-        print()
-        print(status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS"))
-    print()
     awaiting_directory_input = False
     awaiting_user_input = False
 
@@ -1359,6 +1494,7 @@ async def prompt_token():
 async def setup_menu():
     """Show the setup submenu for config changes."""
     global awaiting_user_input
+    _dash_enter_menu()
     awaiting_user_input = True
     show_cursor()
     cfg = load_config()
@@ -1391,8 +1527,7 @@ async def setup_menu():
         await prompt_directory()
     elif key == "6":
         await prompt_port()
-    else:
-        sys.stdout.write("\r\033[K")
+    _dash_exit_menu()
 
 
 # ---------- Balances display ----------
@@ -1400,16 +1535,15 @@ async def show_balances():
     """Display all NinjaTrader account balances with session P&L."""
     accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
     if not accounts:
-        sys.stdout.write("\r\033[K")
-        print(Fore.YELLOW + "  ⚠  Could not reach NinjaTrader ATI." + Style.RESET_ALL)
+        _dash_set_alert(Fore.YELLOW + "  ⚠  Could not reach NinjaTrader ATI." + Style.RESET_ALL)
         return
 
+    _dash_enter_menu()
     # Find longest account name for formatting
     max_name = max(len(a["name"]) for a in accounts)
     box_inner = max(max_name + 35, 50)
 
-    sys.stdout.write("\r\033[K")
-    print(Fore.CYAN + f"\r\033[K  ╭─ BALANCES {'─' * (box_inner - 9)}╮" + Style.RESET_ALL)
+    print(Fore.CYAN + f"  ╭─ BALANCES {'─' * (box_inner - 9)}╮" + Style.RESET_ALL)
     for a in accounts:
         name = a["name"]
         cash = a["cash"]
@@ -1440,11 +1574,11 @@ async def show_balances():
 
     if key.lower() == "r":
         reset_session_pnl()
-        sys.stdout.write("\r\033[K")
-        print(Fore.GREEN + "  ✔  Session P&L reset — balances re-snapshotted." + Style.RESET_ALL)
         logger.info("MANUAL RESET  session P&L reset by user")
-    sys.stdout.write("\r\033[K")
-    sys.stdout.flush()
+        # Alert will be visible after menu exit
+        global _alert_text
+        _alert_text = Fore.GREEN + "  ✔  Session P&L reset — balances re-snapshotted." + Style.RESET_ALL
+    _dash_exit_menu()
 
 
 # ---------- Close positions menu ----------
@@ -1485,22 +1619,22 @@ async def close_positions_menu():
     """Show open positions and let user close one or all via arrow keys."""
     global awaiting_user_input
     if not active_account:
-        sys.stdout.write("\r\033[K")
-        print(Fore.YELLOW + "  ⚠  Set an account first (press A)." + Style.RESET_ALL)
+        _dash_set_alert(Fore.YELLOW + "  ⚠  Set an account first (press A)." + Style.RESET_ALL)
         return
     if not output_directory:
-        sys.stdout.write("\r\033[K")
-        print(Fore.YELLOW + "  ⚠  Set an output directory first (press D)." + Style.RESET_ALL)
+        _dash_set_alert(Fore.YELLOW + "  ⚠  Set an output directory first (press D)." + Style.RESET_ALL)
         return
 
     positions = await asyncio.to_thread(query_nt_positions, active_account, nt_port)
     open_pos = {k: v for k, v in positions.items() if v != 0}
 
     if not open_pos:
-        sys.stdout.write("\r\033[K")
-        print(Fore.YELLOW + "  ⚠  No open positions for " + Fore.WHITE + active_account + Fore.YELLOW + "." + Style.RESET_ALL)
+        _dash_set_alert(
+            Fore.YELLOW + "  ⚠  No open positions for " + Fore.WHITE + active_account +
+            Fore.YELLOW + "." + Style.RESET_ALL)
         return
 
+    _dash_enter_menu()
     # Build entries: individual positions + "Close ALL"
     entries = list(open_pos.items())
     entries.append(("_ALL_", len(open_pos)))
@@ -1552,12 +1686,10 @@ async def close_positions_menu():
                 print(Fore.WHITE + Style.DIM + "  Cancelled." + Style.RESET_ALL)
             break
         elif key == "\x1b" or key.lower() == "q":
-            # ESC or Q to cancel
-            sys.stdout.write("\r\033[K")
-            print(Fore.WHITE + Style.DIM + "  Cancelled." + Style.RESET_ALL)
             break
 
     awaiting_user_input = False
+    _dash_exit_menu()
 
 
 # ---------- Keyboard loop ----------
@@ -1573,8 +1705,8 @@ async def keyboard_loop():
                 continue
             if key.lower() == "p":
                 if hard_stopped:
-                    sys.stdout.write("\r\033[K")
-                    print(Fore.RED + "  ⛔  Hard stop active — cannot resume. Press Shift+X to exit." + Style.RESET_ALL)
+                    _dash_set_alert(
+                        Fore.RED + "  ⛔  Hard stop active — cannot resume. Press Shift+X to exit." + Style.RESET_ALL)
                     continue
                 paused = not paused
                 soft_stopped = False  # Reset soft stop on manual resume
@@ -1582,9 +1714,8 @@ async def keyboard_loop():
                     set_session_state("paused")
                 else:
                     set_session_state("ready")
-                    sys.stdout.write("\r\033[K")
-                    sys.stdout.flush()
-                    print(Fore.GREEN + "▶  SIGNAL OUTPUT RESUMED" + Style.RESET_ALL)
+                    _dash_set_alert(
+                        Fore.GREEN + "  ▶  SIGNAL OUTPUT RESUMED" + Style.RESET_ALL)
             elif key.lower() == "b":
                 await show_balances()
             elif key.lower() == "s":
@@ -1592,8 +1723,8 @@ async def keyboard_loop():
             elif key.lower() == "t":
                 await prompt_limits()
             elif key.lower() == "r":
-                sys.stdout.write("\r\033[K")
-                print(Fore.YELLOW + "🔄  MANUAL RECONNECT REQUESTED" + Style.RESET_ALL)
+                _dash_set_alert(
+                    Fore.YELLOW + "  🔄  MANUAL RECONNECT REQUESTED" + Style.RESET_ALL)
                 reconnect_event.set()
             elif key.lower() == "c":
                 await close_positions_menu()
@@ -1610,15 +1741,17 @@ async def keyboard_loop():
 SIGNAL_COLOURS = [Fore.GREEN, Fore.CYAN, Fore.LIGHTGREEN_EX]
 
 
-def format_signal(signal_text: str, idx: int):
+def format_signal(signal_text: str, idx: int, latency_str: str = ""):
     colour = SIGNAL_COLOURS[idx % len(SIGNAL_COLOURS)]
     ts = time.strftime("%H:%M:%S")
     width = term_width()
-    inner = width - 4
+    prefix = f"  #{idx} [{ts}] ▸  "
+    suffix = f"  · {latency_str}" if latency_str else ""
+    avail = width - len(prefix) - len(suffix) - 2
     body = signal_text
-    if len(body) > inner:
-        body = body[: inner - 3] + "..."
-    return f"{colour}[{ts}] ▸  {body}{Style.RESET_ALL}"
+    if len(body) > avail:
+        body = body[: avail - 1] + "…"
+    return f"{colour}{prefix}{body}{Style.DIM}{suffix}{Style.RESET_ALL}"
 
 
 # ---------- Server message display ----------
@@ -1627,50 +1760,52 @@ HEARTBEAT_FRAMES = ["♡", "♥", "♡", "♥"]
 
 
 async def display_server_message(data: dict, connect_latency: int):
-    """Parse and display server messages with styled output."""
-    sys.stdout.write("\r\033[K")
+    """Parse and display server messages on fixed dashboard rows."""
+    global _server_name
 
     if "welcome" in data:
-        # Animated welcome
-        server_name = data.get("server", "SocketTrader")
+        _server_name = data.get("server", "SocketTrader")
         hb_interval = data.get("heartbeat_interval")
         ts = data.get("ts")
 
+        # Animated welcome on heartbeat row
         for frame in WELCOME_FRAMES:
-            sys.stdout.write(f"\r\033[K{Fore.CYAN}{frame} Connecting to {server_name}...{Style.RESET_ALL}")
-            sys.stdout.flush()
+            _dash_set_heartbeat(
+                f"{Fore.CYAN}  {frame} Connecting to {_server_name}...{Style.RESET_ALL}")
             await asyncio.sleep(0.15)
-        sys.stdout.write("\r\033[K")
-        sys.stdout.flush()
 
-        print(f"\r\033[K" + Fore.CYAN + "  ╭─ SERVER ───────────────────────────────────────╮" + Style.RESET_ALL)
-        print(f"\r\033[K" + Fore.CYAN + f"  │  {server_name[:46].ljust(46)}│" + Style.RESET_ALL)
+        # Final heartbeat line with connection details
+        parts = [f"●  {_server_name}"]
         if ts:
             welcome_lat = int(time.time() * 1000) - ts
-            lat_line = f"Message latency: {welcome_lat}ms  ·  Handshake: {connect_latency}ms"
-            print(f"\r\033[K" + Fore.CYAN + f"  │  {lat_line.ljust(46)}│" + Style.RESET_ALL)
+            parts.append(f"Latency: {welcome_lat}ms")
             logger.info(f"WELCOME  latency={welcome_lat}ms  handshake={connect_latency}ms")
+        parts.append(f"Handshake: {connect_latency}ms")
         if hb_interval:
-            mins = hb_interval // 60
-            hb_line = f"Heartbeat every {mins} min"
-            print(f"\r\033[K" + Fore.CYAN + f"  │  {hb_line.ljust(46)}│" + Style.RESET_ALL)
-        print(f"\r\033[K" + Fore.CYAN + "  ╰────────────────────────────────────────────────╯" + Style.RESET_ALL)
-        sys.stdout.write("\r\033[K")
-        sys.stdout.flush()
+            parts.append(f"HB every {hb_interval // 60}min")
+        _dash_set_heartbeat(
+            Fore.CYAN + "  " + "  ·  ".join(parts) + Style.RESET_ALL)
 
     elif data.get("type") == "heartbeat":
-        # Animated heartbeat pulse — subtle, single line
+        # Animated heartbeat pulse on fixed row
         for frame in HEARTBEAT_FRAMES:
-            sys.stdout.write(f"\r\033[K{Fore.RED}{Style.DIM}  {frame}{Style.RESET_ALL}")
-            sys.stdout.flush()
+            _dash_set_heartbeat(f"{Fore.RED}{Style.DIM}  {frame}{Style.RESET_ALL}")
             await asyncio.sleep(0.2)
         ts = time.strftime("%H:%M:%S")
-        sys.stdout.write(f"\r\033[K{Fore.RED}{Style.DIM}  ♥  [{ts}] server heartbeat{Style.RESET_ALL}\n")
-        sys.stdout.flush()
+        _dash_set_heartbeat(
+            f"{Fore.RED}{Style.DIM}  ♥  [{ts}] heartbeat  ·  {_server_name}{Style.RESET_ALL}")
         logger.info("HEARTBEAT")
 
+        # MOTD support: show server message-of-the-day, clear when absent
+        motd = data.get("motd", "")
+        if motd:
+            _dash_set_motd(
+                Fore.CYAN + f"  📢  {motd}" + Style.RESET_ALL)
+        else:
+            _dash_set_motd("")
+
     else:
-        # Unknown server message — log it, don't clutter terminal
+        # Unknown server message — log only
         logger.info(f"SERVER  {data}")
 
 
@@ -1722,8 +1857,7 @@ def write_signal_to_file(signal_text: str):
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(signal_text)
     except Exception as exc:
-        sys.stdout.write("\r\033[K")
-        print(Fore.RED + f"  ✖  File write error: {exc}" + Style.RESET_ALL)
+        _dash_set_alert(Fore.RED + f"  ✖  File write error: {exc}" + Style.RESET_ALL)
 
 
 # ---------- Risk management ----------
@@ -1774,15 +1908,11 @@ def fire_close_position(account: str, contract: str):
             f.write(cmd)
         logger.info(f"CLOSEPOSITION  account={account}  contract={contract}  file={filename}")
     except Exception as exc:
-        sys.stdout.write("\r\033[K")
-        print(Fore.RED + f"  ✖  Close position write error: {exc}" + Style.RESET_ALL)
+        _dash_set_alert(Fore.RED + f"  ✖  Close position write error: {exc}" + Style.RESET_ALL)
 
 
-def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, action: str):
+def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, action: str, pre_pos: int = 0):
     """Register a signal for post-trade confirmation via position check."""
-    # Snapshot current position for this specific instrument
-    positions = query_nt_positions(active_account, nt_port)
-    pre_pos = positions.get(instrument, 0)
     with _confirms_lock:
         if len(_pending_confirms) >= MAX_PENDING_CONFIRMS:
             _pending_confirms.pop(0)  # drop oldest
@@ -1819,6 +1949,10 @@ def check_pending_confirms():
 
             if cur_pos != pre_pos:
                 # Position changed on this instrument — trade confirmed
+                _dash_set_alert(
+                    Fore.GREEN +
+                    f"  ✔  FILLED {instrument} {entry['action']}  pos: {pre_pos}→{cur_pos}" +
+                    Style.RESET_ALL)
                 logger.info(f"CONFIRMED  id={entry['id']}  {instrument}  "
                             f"{entry['action']}  pos: {pre_pos} → {cur_pos}  "
                             f"elapsed={elapsed:.1f}s")
@@ -1826,10 +1960,10 @@ def check_pending_confirms():
 
             if elapsed >= CONFIRM_TIMEOUT:
                 # Timed out — position did not change for this instrument
-                sys.stdout.write("\r\033[K")
-                print(Fore.YELLOW + Style.DIM +
-                      f"  ⚠  No fill detected for {instrument} after {CONFIRM_TIMEOUT}s "
-                      f"(ID: {entry['id']})" + Style.RESET_ALL)
+                _dash_set_alert(
+                    Fore.YELLOW + Style.DIM +
+                    f"  ⚠  No fill detected for {instrument} after {CONFIRM_TIMEOUT}s "
+                    f"(ID: {entry['id']})" + Style.RESET_ALL)
                 logger.warning(f"UNCONFIRMED  id={entry['id']}  {instrument}  "
                                f"{entry['action']}  pos unchanged at {pre_pos}  "
                                f"elapsed={elapsed:.1f}s")
@@ -1870,8 +2004,8 @@ async def balance_monitor():
             if past_reset and _last_auto_reset_date != today_str:
                 _last_auto_reset_date = today_str
                 reset_session_pnl()
-                sys.stdout.write("\r\033[K")
-                print(Fore.CYAN + Style.BRIGHT + "  🔄  Session P&L auto-reset (4:20 PM ET)" + Style.RESET_ALL)
+                _dash_set_alert(
+                    Fore.CYAN + Style.BRIGHT + "  🔄  Session P&L auto-reset (4:20 PM ET)" + Style.RESET_ALL)
                 logger.info("AUTO RESET  session P&L reset at 4:20 PM ET")
 
             # Periodically persist session state for crash recovery
@@ -1907,25 +2041,24 @@ async def balance_monitor():
                     hard_stopped = True
                     paused = True
                     set_session_state("hard_stop")
-                    sys.stdout.write("\r\033[K")
-                    print(Fore.RED + Style.BRIGHT + f"  ⛔  HARD STOP HIT  ·  P&L: ${pnl:+,.2f}  ·  Limit: ${limits['stop']:+,.2f}" + Style.RESET_ALL)
-                    sys.stdout.write("\r\033[K")
-                    print(Fore.RED + "  ⛔  CLOSING ALL POSITIONS..." + Style.RESET_ALL)
+                    closed = []
                     for contract in session_contracts:
                         fire_close_position(active_account, contract)
-                        sys.stdout.write("\r\033[K")
-                        print(Fore.RED + f"  ⛔  CLOSEPOSITION → {contract}" + Style.RESET_ALL)
-                    sys.stdout.write("\r\033[K")
-                    print(Fore.RED + "  ⛔  Signals LOCKED — hard stop active. Press Shift+X to exit." + Style.RESET_ALL)
+                        closed.append(contract)
+                    close_str = ", ".join(closed) if closed else "none"
+                    _dash_set_alert(
+                        Fore.RED + Style.BRIGHT +
+                        f"  ⛔  HARD STOP  P&L: ${pnl:+,.2f}  Limit: ${limits['stop']:+,.2f}  Closed: {close_str}  ⇧X=EXIT" +
+                        Style.RESET_ALL)
                     logger.info(f"HARD STOP  pnl={pnl:.2f}  limit={limits['stop']}  contracts={list(session_contracts)}")
                 elif not soft_stopped:
                     soft_stopped = True
                     paused = True
                     set_session_state("soft_stop")
-                    sys.stdout.write("\r\033[K")
-                    print(Fore.RED + Style.BRIGHT + f"  ⛔  STOP LIMIT HIT  ·  P&L: ${pnl:+,.2f}  ·  Limit: ${limits['stop']:+,.2f}" + Style.RESET_ALL)
-                    sys.stdout.write("\r\033[K")
-                    print(Fore.YELLOW + "  ⏸  Signals PAUSED — stop reached. Press P to resume." + Style.RESET_ALL)
+                    _dash_set_alert(
+                        Fore.RED + Style.BRIGHT +
+                        f"  ⛔  STOP HIT  P&L: ${pnl:+,.2f}  Limit: ${limits['stop']:+,.2f}  — P to resume" +
+                        Style.RESET_ALL)
                     logger.info(f"SOFT STOP (LOSS)  pnl={pnl:.2f}  stop={limits['stop']}")
                 continue
 
@@ -1935,25 +2068,24 @@ async def balance_monitor():
                     hard_stopped = True
                     paused = True
                     set_session_state("hard_target")
-                    sys.stdout.write("\r\033[K")
-                    print(Fore.GREEN + Style.BRIGHT + f"  🎯  TARGET HIT (HARD)  ·  P&L: ${pnl:+,.2f}  ·  Target: ${limits['target']:+,.2f}" + Style.RESET_ALL)
-                    sys.stdout.write("\r\033[K")
-                    print(Fore.RED + "  ⛔  CLOSING ALL POSITIONS..." + Style.RESET_ALL)
+                    closed = []
                     for contract in session_contracts:
                         fire_close_position(active_account, contract)
-                        sys.stdout.write("\r\033[K")
-                        print(Fore.RED + f"  ⛔  CLOSEPOSITION → {contract}" + Style.RESET_ALL)
-                    sys.stdout.write("\r\033[K")
-                    print(Fore.RED + "  ⛔  Signals LOCKED — target hard stop active. Press Shift+X to exit." + Style.RESET_ALL)
+                        closed.append(contract)
+                    close_str = ", ".join(closed) if closed else "none"
+                    _dash_set_alert(
+                        Fore.GREEN + Style.BRIGHT +
+                        f"  🎯  TARGET HIT  P&L: ${pnl:+,.2f}  Target: ${limits['target']:+,.2f}  Closed: {close_str}  ⇧X=EXIT" +
+                        Style.RESET_ALL)
                     logger.info(f"HARD STOP (TARGET)  pnl={pnl:.2f}  target={limits['target']}  contracts={list(session_contracts)}")
                 elif not soft_stopped:
                     soft_stopped = True
                     paused = True
                     set_session_state("soft_target")
-                    sys.stdout.write("\r\033[K")
-                    print(Fore.GREEN + Style.BRIGHT + f"  🎯  SESSION TARGET HIT  ·  P&L: ${pnl:+,.2f}  ·  Target: ${limits['target']:+,.2f}" + Style.RESET_ALL)
-                    sys.stdout.write("\r\033[K")
-                    print(Fore.YELLOW + "  ⏸  Signals PAUSED — target reached. Press P to resume." + Style.RESET_ALL)
+                    _dash_set_alert(
+                        Fore.GREEN + Style.BRIGHT +
+                        f"  🎯  TARGET HIT  P&L: ${pnl:+,.2f}  Target: ${limits['target']:+,.2f}  — P to resume" +
+                        Style.RESET_ALL)
                     logger.info(f"SOFT STOP (TARGET)  pnl={pnl:.2f}  target={limits['target']}")
         except Exception as e:
             logger.error(f"balance_monitor error: {e}")
@@ -1963,10 +2095,10 @@ async def prompt_limits():
     """Prompt user to set session target and stop for the active account."""
     global awaiting_user_input, soft_stopped
     if not active_account:
-        sys.stdout.write("\r\033[K")
-        print(Fore.YELLOW + "  ⚠  Set an account first (press A)." + Style.RESET_ALL)
+        _dash_set_alert(Fore.YELLOW + "  ⚠  Set an account first (press A)." + Style.RESET_ALL)
         return
 
+    _dash_enter_menu()
     awaiting_user_input = True
     show_cursor()
     limits = get_account_limits(active_account)
@@ -2062,10 +2194,12 @@ async def prompt_limits():
     soft_stopped = False  # Reset soft stop when limits change
     t_label = f"${target:+,.2f} ({target_mode})" if target else "off"
     s_label = f"${stop:+,.2f} ({stop_mode})" if stop else "off"
-    print(Fore.GREEN + f"  ✔  {active_account} → Target: {t_label}  ·  Stop: {s_label}" + Style.RESET_ALL)
+    # Will be visible on alert line after menu exit
+    global _alert_text
+    _alert_text = Fore.GREEN + f"  ✔  {active_account} → Target: {t_label}  ·  Stop: {s_label}" + Style.RESET_ALL
 
-    print()
     awaiting_user_input = False
+    _dash_exit_menu()
 
 
 # ---------- WebSocket listener with reconnection ----------
@@ -2092,6 +2226,7 @@ async def listen(token: str):
     await boot_sequence()
 
     while not shutdown.is_set():
+        manual_reconnect = False
         try:
             # Re-read config each loop so server/token changes via Setup take effect
             cfg = load_config()
@@ -2123,10 +2258,10 @@ async def listen(token: str):
                         cur = session_current_balances.get(name)
                         if cur is not None:
                             pnl_parts.append(f"{name}: ${cur - session_start_balances[name]:+,.2f}")
-                    sys.stdout.write("\r\033[K")
-                    print(Fore.CYAN + Style.BRIGHT +
-                          f"  🔄  Session P&L restored ({', '.join(pnl_parts) if pnl_parts else 'no data'})"
-                          + Style.RESET_ALL)
+                    _dash_set_alert(
+                        Fore.CYAN + Style.BRIGHT +
+                        f"  🔄  Session P&L restored ({', '.join(pnl_parts) if pnl_parts else 'no data'})" +
+                        Style.RESET_ALL)
                     logger.info(f"SESSION RESTORED  id={get_session_id()}  accounts={list(session_start_balances.keys())}")
 
                 # Context-aware welcome message
@@ -2139,14 +2274,12 @@ async def listen(token: str):
                     missing.append(f"S = strategy '{atm_strategy}' not found")
 
                 if missing:
-                    sys.stdout.write("\r\033[K")
-                    print(Fore.YELLOW + f"⚠  Connected, but setup incomplete: {', '.join(missing)}" + Style.RESET_ALL)
+                    _dash_set_alert(
+                        Fore.YELLOW + f"  ⚠  Setup incomplete: {', '.join(missing)}" + Style.RESET_ALL)
                 else:
-                    sys.stdout.write("\r\033[K")
-                    print(Fore.GREEN + f"✔  Connected  ·  Account: {active_account}  ·  Handshake: {connect_latency}ms" + Style.RESET_ALL)
+                    _dash_set_heartbeat(
+                        Fore.GREEN + f"  ✔  Connected  ·  Account: {active_account}  ·  Handshake: {connect_latency}ms" + Style.RESET_ALL)
                     logger.info(f"CONNECTED  account={active_account}  handshake={connect_latency}ms  strategy={atm_strategy}")
-                sys.stdout.write("\r\033[K")
-                sys.stdout.flush()
                 reconnect_event.clear()
 
                 while not shutdown.is_set():
@@ -2154,8 +2287,9 @@ async def listen(token: str):
                     if reconnect_event.is_set():
                         reconnect_event.clear()
                         fib_prev, fib_curr = 60, 60  # Reset backoff on manual reconnect
-                        sys.stdout.write("\r\033[K")
-                        print(Fore.YELLOW + "  🔄  Dropping connection for reconnect..." + Style.RESET_ALL)
+                        manual_reconnect = True
+                        _dash_set_alert(
+                            Fore.YELLOW + "  🔄  Dropping connection for reconnect..." + Style.RESET_ALL)
                         break
 
                     try:
@@ -2165,8 +2299,10 @@ async def listen(token: str):
                             # Duplicate detection by signal ID
                             if sig_id and sig_id in _recent_signal_ids:
                                 if not paused:
-                                    sys.stdout.write("\r\033[K")
-                                    print(Fore.YELLOW + Style.DIM + f"  ⚠  Duplicate signal ignored (ID: {sig_id})" + Style.RESET_ALL)
+                                    _dash_set_alert(
+                                        Fore.YELLOW + Style.DIM +
+                                        f"  ⚠  Duplicate signal ignored (ID: {sig_id})" +
+                                        Style.RESET_ALL)
                                 logger.info(f"DUPLICATE IGNORED  id={sig_id}  signal={raw_signal}")
                                 continue
                             if sig_id:
@@ -2181,8 +2317,9 @@ async def listen(token: str):
 
                             if not is_trade_ready():
                                 # System not ready — log but don't trade
-                                sys.stdout.write("\r\033[K")
-                                print(Fore.RED + f"  ✖  Signal blocked — system NOT READY" + Style.RESET_ALL)
+                                _dash_set_alert(
+                                    Fore.RED + f"  ✖  Signal blocked — system NOT READY" +
+                                    Style.RESET_ALL)
                                 logger.warning(f"SIGNAL #{signal_count} (NOT READY)  {raw_signal}")
                                 continue
 
@@ -2191,38 +2328,26 @@ async def listen(token: str):
                             if len(sig_parts) >= 3 and sig_parts[2] and len(session_contracts) < MAX_SESSION_CONTRACTS:
                                 session_contracts.add(sig_parts[2])
 
-                            write_signal_to_file(raw_signal)
-                            # Register for fill confirmation
+                            # Snapshot position BEFORE writing file so
+                            # fast fills don't make pre/post look identical
                             instrument = sig_parts[2] if len(sig_parts) >= 3 else ""
                             action = sig_parts[3] if len(sig_parts) >= 4 else ""
-                            await asyncio.to_thread(add_pending_confirm, raw_signal, sig_id, instrument, action)
-                            await signal_pulse("SIGNAL RECEIVED")
-                            sys.stdout.write("\r\033[K")
-                            print(format_signal(raw_signal, signal_count))
-                            logger.info(f"SIGNAL #{signal_count}  {raw_signal}")
-                            # Latency display (first signal = baseline)
+                            pre_positions = await asyncio.to_thread(query_nt_positions, active_account, nt_port)
+                            pre_pos = pre_positions.get(instrument, 0)
+                            write_signal_to_file(raw_signal)
+                            # Register for fill confirmation with pre-snapshot
+                            add_pending_confirm(raw_signal, sig_id, instrument, action, pre_pos)
+                            # Compute latency for inline display
+                            lat_str = ""
                             if server_ts:
                                 latency_ms = int(time.time() * 1000) - server_ts
                                 if baseline_latency is None:
                                     baseline_latency = latency_ms
-                                if latency_ms < 1000:
-                                    lat_str = f"{latency_ms}ms"
-                                else:
-                                    lat_str = f"{latency_ms / 1000:.1f}s"
-                                diff = latency_ms - baseline_latency
-                                if diff < 0:
-                                    lat_color = Fore.GREEN   # Faster than first signal
-                                elif diff <= 250:
-                                    lat_color = Fore.YELLOW  # Within 250ms of first signal
-                                else:
-                                    lat_color = Fore.RED     # >250ms slower than first signal
-                                diff_str = f" (+{diff}ms)" if diff > 0 else f" ({diff}ms)" if diff < 0 else ""
-                                sys.stdout.write("\r\033[K" + lat_color + Style.DIM + f"   ├─ latency: {lat_str}{diff_str}\n" + Style.RESET_ALL)
-                                sys.stdout.flush()
-                                logger.info(f"  latency={latency_ms}ms  diff={diff}ms  baseline={baseline_latency}ms")
-                            if output_directory:
-                                sys.stdout.write("\r\033[K" + Fore.GREEN + Style.DIM + f"   └─ saved → {output_directory}\n" + Style.RESET_ALL)
-                                sys.stdout.flush()
+                                lat_str = f"{latency_ms}ms" if latency_ms < 1000 else f"{latency_ms / 1000:.1f}s"
+                                logger.info(f"  latency={latency_ms}ms  baseline={baseline_latency}ms")
+                            _dash_add_signal(format_signal(raw_signal, signal_count, lat_str))
+                            await signal_pulse("SIGNAL RECEIVED")
+                            logger.info(f"SIGNAL #{signal_count}  {raw_signal}")
                         else:
                             # Non-signal message (server info, heartbeat, etc.)
                             if not paused:
@@ -2235,13 +2360,10 @@ async def listen(token: str):
                         continue
 
         except websockets.exceptions.InvalidURI:
-            sys.stdout.write("\r\033[K")
-            print(Fore.RED + "⛔  INVALID SERVER URI" + Style.RESET_ALL)
+            _dash_set_alert(Fore.RED + "  ⛔  INVALID SERVER URI" + Style.RESET_ALL)
             return "shutdown"
 
         except Exception as e:
-            sys.stdout.write("\r\033[K")
-
             # Check for HTTP status rejection (old and new websockets lib)
             http_status = getattr(e, "status_code", None) or getattr(e, "status", None)
 
@@ -2252,26 +2374,33 @@ async def listen(token: str):
                 ws_code = getattr(ws_code, "code", None)
 
             if http_status is not None and int(http_status) in (401, 403):
-                print(Fore.RED + f"⛔  AUTHENTICATION FAILED (HTTP {http_status})" + Style.RESET_ALL)
+                _dash_set_alert(Fore.RED + f"  ⛔  AUTH FAILED (HTTP {http_status})" + Style.RESET_ALL)
                 logger.warning(f"AUTH FAILED  http={http_status}")
                 return "auth_failed"
             elif ws_code == 1008:
-                print(Fore.RED + "⛔  AUTHENTICATION FAILED (invalid token)" + Style.RESET_ALL)
+                _dash_set_alert(Fore.RED + "  ⛔  AUTH FAILED (invalid token)" + Style.RESET_ALL)
                 logger.warning("AUTH FAILED  ws_code=1008")
                 return "auth_failed"
             elif http_status is not None:
-                print(Fore.RED + f"⛔  CONNECTION ERROR (HTTP {http_status})  ·  Retrying in {fmt_wait(fib_curr)}..." + Style.RESET_ALL)
+                _dash_set_heartbeat(
+                    Fore.RED + f"  ⛔  CONNECTION ERROR (HTTP {http_status})  ·  Retrying in {fmt_wait(fib_curr)}..." + Style.RESET_ALL)
                 logger.warning(f"CONNECTION ERROR  http={http_status}  retry={fmt_wait(fib_curr)}")
             elif shutdown.is_set():
                 break
             else:
-                print(Fore.RED + f"⛔  CONNECTION LOST  ·  {e}" + Style.RESET_ALL)
-                sys.stdout.write("\r\033[K")
-                print(Fore.YELLOW + f"  ↻  Reconnecting in {fmt_wait(fib_curr)}..." + Style.RESET_ALL)
+                _dash_set_heartbeat(
+                    Fore.RED + f"  ⛔  CONNECTION LOST  ·  {e}" + Style.RESET_ALL)
+                _dash_set_alert(
+                    Fore.YELLOW + f"  ↻  Reconnecting in {fmt_wait(fib_curr)}..." + Style.RESET_ALL)
                 logger.warning(f"CONNECTION LOST  error={e}  retry={fmt_wait(fib_curr)}")
 
         if shutdown.is_set():
             break
+
+        # Manual reconnect: brief 3s pause then reconnect (skip fib backoff)
+        if manual_reconnect:
+            await asyncio.sleep(3)
+            continue
 
         # Fibonacci backoff wait (interruptible by shutdown or manual reconnect)
         wait_end = time.time() + fib_curr
@@ -2281,8 +2410,8 @@ async def listen(token: str):
             if reconnect_event.is_set():
                 reconnect_event.clear()
                 fib_prev, fib_curr = 60, 60
-                sys.stdout.write("\r\033[K")
-                print(Fore.YELLOW + "  🔄  Manual reconnect — resetting backoff." + Style.RESET_ALL)
+                _dash_set_alert(
+                    Fore.YELLOW + "  🔄  Manual reconnect — resetting backoff." + Style.RESET_ALL)
                 break
             await asyncio.sleep(0.5)
 
