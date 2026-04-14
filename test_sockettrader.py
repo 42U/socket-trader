@@ -188,7 +188,7 @@ class TestExtractSignalString:
 
     def test_basic_extraction(self):
         msg = self._make_msg()
-        result, ts, sig_id = st.extract_signal_string(msg, "MyAcct", "MyStrat")
+        result, ts, sig_id, _ = st.extract_signal_string(msg, "MyAcct", "MyStrat")
         assert result is not None
         parts = result.split(";")
         assert parts[0] == "PLACE"
@@ -198,42 +198,44 @@ class TestExtractSignalString:
 
     def test_account_replacement(self):
         msg = self._make_msg()
-        result, _, _ = st.extract_signal_string(msg, "LiveAccount", "NQ_Med")
+        result, _, _, _ = st.extract_signal_string(msg, "LiveAccount", "NQ_Med")
         assert ";LiveAccount;" in result
 
     def test_strategy_replacement(self):
         msg = self._make_msg()
-        result, _, _ = st.extract_signal_string(msg, "Sim101", "CustomStrat")
+        result, _, _, _ = st.extract_signal_string(msg, "Sim101", "CustomStrat")
         assert ";CustomStrat;" in result
 
     def test_signal_id_extracted(self):
         msg = self._make_msg()
-        _, _, sig_id = st.extract_signal_string(msg, "Sim101", "NQ_Med")
+        _, _, sig_id, _ = st.extract_signal_string(msg, "Sim101", "NQ_Med")
         assert sig_id == "1020"
 
     def test_invalid_json_returns_none(self):
-        result, ts, sig_id = st.extract_signal_string("not json", "Sim101", "NQ_Med")
+        result, ts, sig_id, reason = st.extract_signal_string("not json", "Sim101", "NQ_Med")
         assert result is None
 
     def test_missing_signal_key_returns_none(self):
         msg = json.dumps({"type": "heartbeat"})
-        result, ts, sig_id = st.extract_signal_string(msg, "Sim101", "NQ_Med")
+        result, ts, sig_id, reason = st.extract_signal_string(msg, "Sim101", "NQ_Med")
         assert result is None
 
     def test_invalid_signal_rejected(self):
         msg = self._make_msg(signal="BOGUS;bad;signal")
-        result, _, _ = st.extract_signal_string(msg, "Sim101", "NQ_Med")
-        assert result is None
+        result, _, _, reason = st.extract_signal_string(msg, "Sim101", "NQ_Med")
+        # Rejected signals return the raw text plus a reason so the UI can show them
+        assert reason is not None
+        assert result is not None
 
     def test_sanitizes_fields(self):
         msg = self._make_msg(signal="PLACE;Sim101;NQ\n06-26;BUY;1;MARKET;;;DAY;;;NQ_Med;1020")
-        result, _, _ = st.extract_signal_string(msg, "Sim101", "NQ_Med")
+        result, _, _, _ = st.extract_signal_string(msg, "Sim101", "NQ_Med")
         assert result is not None
         assert "\n" not in result
 
     def test_semicolon_injection_stripped(self):
         msg = self._make_msg(signal="PLACE;Sim101;NQ;injected;BUY;1;MARKET;;;DAY;;;NQ_Med;1020")
-        result, _, _ = st.extract_signal_string(msg, "Sim101", "NQ_Med")
+        result, _, _, _ = st.extract_signal_string(msg, "Sim101", "NQ_Med")
         # The semicolons in "NQ;injected" are split by the outer split, then
         # sanitize_ati strips any remaining semicolons within fields.
         # This will have too many fields but they'll be sanitized.
@@ -543,3 +545,280 @@ class TestResetSession:
         assert st.soft_stopped is False
         assert st.hard_stopped is False
         assert st.signal_count == 0
+
+
+# ── Rejected signal surfacing ────────────────────────────────────────
+
+
+class TestRejectedSignalSurfaced:
+    """Rejected signals should return raw text + reason so the UI can show them."""
+
+    def test_unknown_command_returns_raw_and_reason(self):
+        msg = json.dumps({"signal": "BOGUS;bad;signal", "ts": 1711000000000})
+        raw, ts, sig_id, reason = st.extract_signal_string(msg, "Sim101", "NQ_Med")
+        assert raw == "BOGUS;bad;signal"
+        assert reason is not None
+        assert "unknown command" in reason.lower()
+        assert sig_id is None
+        assert ts == 1711000000000
+
+    def test_too_few_fields_returns_reason(self):
+        msg = json.dumps({"signal": "PLACE;Sim101;NQ", "ts": 1})
+        raw, _, _, reason = st.extract_signal_string(msg, "Sim101", "NQ_Med")
+        assert raw is not None
+        assert reason is not None
+
+    def test_empty_signal_returns_reason(self):
+        msg = json.dumps({"signal": "", "ts": 1})
+        raw, _, _, reason = st.extract_signal_string(msg, "Sim101", "NQ_Med")
+        # Empty split yields [""], which validates as unknown command (not empty)
+        assert reason is not None
+
+    def test_non_dict_returns_all_none(self):
+        # Plain JSON that is not a dict should return all None
+        raw, ts, sig_id, reason = st.extract_signal_string("[]", "Sim101", "NQ_Med")
+        assert raw is None
+        assert reason is None
+
+
+# ── format_signal tagging ────────────────────────────────────────────
+
+
+class TestFormatSignalTag:
+    def test_untagged_has_no_bracket_prefix(self):
+        out = st.format_signal("PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;NQ_Med;1020", 1)
+        # No tag → plain format, no [TAG] marker
+        assert "[PAUSED]" not in out
+        assert "[LOCKED]" not in out
+
+    def test_paused_tag_rendered(self):
+        out = st.format_signal("PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;NQ_Med;1020", 1, tag="PAUSED")
+        assert "[PAUSED]" in out
+
+    def test_locked_tag_rendered(self):
+        out = st.format_signal("PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;NQ_Med;1020", 2, tag="LOCKED")
+        assert "[LOCKED]" in out
+
+    def test_rejected_tag_rendered(self):
+        out = st.format_signal("BOGUS", 3, tag="REJECTED")
+        assert "[REJECTED]" in out
+
+
+# ── close_all_open_positions ─────────────────────────────────────────
+
+
+class TestCloseAllOpenPositions:
+    def test_no_account_returns_empty(self, tmp_output_dir):
+        original_acct = st.active_account
+        original_dir = st.output_directory
+        st.active_account = ""
+        st.output_directory = str(tmp_output_dir)
+        try:
+            assert st.close_all_open_positions() == []
+        finally:
+            st.active_account = original_acct
+            st.output_directory = original_dir
+
+    def test_closes_positions_from_nt_query(self, tmp_output_dir):
+        """When NT reports positions, each one gets a close file."""
+        original_acct = st.active_account
+        original_dir = st.output_directory
+        st.active_account = "Sim101"
+        st.output_directory = str(tmp_output_dir)
+        try:
+            with patch.object(st, "query_nt_positions",
+                              return_value={"NQ 06-26": 2, "ES 06-26": -1}):
+                closed = st.close_all_open_positions()
+            assert set(closed) == {"NQ 06-26", "ES 06-26"}
+            close_files = list(tmp_output_dir.glob("close_*.txt"))
+            assert len(close_files) == 2
+            # CANCELALLORDERS is written before the closes
+            cancel_files = list(tmp_output_dir.glob("cancelall_*.txt"))
+            assert len(cancel_files) == 1
+            contents = [f.read_text() for f in close_files]
+            assert any("NQ 06-26" in c for c in contents)
+            assert any("ES 06-26" in c for c in contents)
+        finally:
+            st.active_account = original_acct
+            st.output_directory = original_dir
+
+    def test_flat_positions_skipped(self, tmp_output_dir):
+        """qty == 0 means flat — don't waste a close command."""
+        original_acct = st.active_account
+        original_dir = st.output_directory
+        st.active_account = "Sim101"
+        st.output_directory = str(tmp_output_dir)
+        try:
+            with patch.object(st, "query_nt_positions",
+                              return_value={"NQ 06-26": 0, "ES 06-26": 1}):
+                closed = st.close_all_open_positions()
+            assert closed == ["ES 06-26"]
+            close_files = list(tmp_output_dir.glob("close_*.txt"))
+            assert len(close_files) == 1
+        finally:
+            st.active_account = original_acct
+            st.output_directory = original_dir
+
+    def test_session_contracts_safety_net(self, tmp_output_dir):
+        """If NT query returns nothing, session_contracts still gets closed."""
+        original_acct = st.active_account
+        original_dir = st.output_directory
+        st.active_account = "Sim101"
+        st.output_directory = str(tmp_output_dir)
+        st.session_contracts.add("MNQ 06-26")
+        try:
+            with patch.object(st, "query_nt_positions", return_value={}):
+                closed = st.close_all_open_positions()
+            assert "MNQ 06-26" in closed
+            close_files = list(tmp_output_dir.glob("close_*.txt"))
+            assert len(close_files) == 1
+            assert "MNQ 06-26" in close_files[0].read_text()
+        finally:
+            st.active_account = original_acct
+            st.output_directory = original_dir
+
+    def test_query_failure_still_closes_tracked(self, tmp_output_dir):
+        """If NT query raises, session_contracts fallback still runs."""
+        original_acct = st.active_account
+        original_dir = st.output_directory
+        st.active_account = "Sim101"
+        st.output_directory = str(tmp_output_dir)
+        st.session_contracts.add("NQ 06-26")
+        try:
+            with patch.object(st, "query_nt_positions", side_effect=RuntimeError("ATI down")):
+                closed = st.close_all_open_positions()
+            assert closed == ["NQ 06-26"]
+        finally:
+            st.active_account = original_acct
+            st.output_directory = original_dir
+
+    def test_union_query_and_tracked_no_duplicates(self, tmp_output_dir):
+        """A contract in both NT positions and session_contracts is closed once."""
+        original_acct = st.active_account
+        original_dir = st.output_directory
+        st.active_account = "Sim101"
+        st.output_directory = str(tmp_output_dir)
+        st.session_contracts.add("NQ 06-26")
+        try:
+            with patch.object(st, "query_nt_positions",
+                              return_value={"NQ 06-26": 1, "ES 06-26": 2}):
+                closed = st.close_all_open_positions()
+            assert set(closed) == {"NQ 06-26", "ES 06-26"}
+            close_files = list(tmp_output_dir.glob("close_*.txt"))
+            assert len(close_files) == 2
+        finally:
+            st.active_account = original_acct
+            st.output_directory = original_dir
+
+
+# ── fire_cancel_all_orders ───────────────────────────────────────────
+
+
+class TestFireCancelAllOrders:
+    def test_writes_cancelall_file(self, tmp_output_dir):
+        original = st.output_directory
+        st.output_directory = str(tmp_output_dir)
+        try:
+            st.fire_cancel_all_orders("Sim101")
+            files = list(tmp_output_dir.glob("cancelall_*.txt"))
+            assert len(files) == 1
+            assert files[0].read_text().startswith("CANCELALLORDERS;Sim101")
+        finally:
+            st.output_directory = original
+
+    def test_no_write_without_directory(self):
+        original = st.output_directory
+        st.output_directory = None
+        try:
+            st.fire_cancel_all_orders("Sim101")  # should not raise
+        finally:
+            st.output_directory = original
+
+
+# ── Session persistence: hard stop lockout across restart ──────────
+
+
+class TestSessionLockoutPersistence:
+    def _within_session_now(self):
+        """Return True only when get_session_id() is currently non-None.
+        Tests that depend on live session hours should skip otherwise."""
+        return st.get_session_id() is not None
+
+    def test_hard_stop_persists_and_restores(self, tmp_config):
+        if not self._within_session_now():
+            pytest.skip("outside active CME session hours")
+        st.session_start_balances["Sim101"] = 10000.0
+        st.session_current_balances["Sim101"] = 9500.0
+        st.session_contracts.add("NQ 06-26")
+        st.hard_stopped = True
+        st.signal_count = 3
+        st.set_session_state("hard_stop")
+
+        st.save_session_state()
+
+        # Simulate process restart: wipe in-memory state, then restore
+        st.session_start_balances.clear()
+        st.session_contracts.clear()
+        st.hard_stopped = False
+        st.soft_stopped = False
+        st.paused = False
+        st.signal_count = 0
+        st.set_session_state("ready")
+
+        restored = st.restore_session_state()
+        assert restored is True
+        assert st.hard_stopped is True
+        assert st.paused is True
+        assert st._session_state == "hard_stop"
+        assert st.session_start_balances.get("Sim101") == 10000.0
+        assert "NQ 06-26" in st.session_contracts
+        assert st.signal_count == 3
+
+    def test_hard_target_lock_state_preserved(self, tmp_config):
+        if not self._within_session_now():
+            pytest.skip("outside active CME session hours")
+        st.session_start_balances["Sim101"] = 10000.0
+        st.session_current_balances["Sim101"] = 10500.0
+        st.hard_stopped = True
+        st.set_session_state("hard_target")
+
+        st.save_session_state()
+
+        st.hard_stopped = False
+        st.paused = False
+        st.set_session_state("ready")
+
+        st.restore_session_state()
+        assert st.hard_stopped is True
+        assert st._session_state == "hard_target"
+
+    def test_soft_stop_persists_and_restores(self, tmp_config):
+        if not self._within_session_now():
+            pytest.skip("outside active CME session hours")
+        st.session_start_balances["Sim101"] = 10000.0
+        st.session_current_balances["Sim101"] = 9800.0
+        st.soft_stopped = True
+        st.set_session_state("soft_stop")
+
+        st.save_session_state()
+
+        st.soft_stopped = False
+        st.paused = False
+        st.set_session_state("ready")
+
+        st.restore_session_state()
+        assert st.soft_stopped is True
+        assert st.paused is True
+        assert st._session_state == "soft_stop"
+
+    def test_clean_session_does_not_set_flags(self, tmp_config):
+        if not self._within_session_now():
+            pytest.skip("outside active CME session hours")
+        st.session_start_balances["Sim101"] = 10000.0
+        st.session_current_balances["Sim101"] = 10000.0
+
+        st.save_session_state()
+
+        st.restore_session_state()
+        assert st.hard_stopped is False
+        assert st.soft_stopped is False

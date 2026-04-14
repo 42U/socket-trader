@@ -172,6 +172,9 @@ def save_session_state():
         "start_balances": dict(session_start_balances),
         "contracts": list(session_contracts),
         "signal_count": signal_count,
+        "hard_stopped": hard_stopped,
+        "soft_stopped": soft_stopped,
+        "lock_state": _session_state if hard_stopped else None,
     }
     save_config(cfg)
 
@@ -197,11 +200,23 @@ def restore_session_state() -> bool:
 
     current_session = get_session_id()
     if current_session and saved.get("id") == current_session:
-        global signal_count
+        global signal_count, hard_stopped, soft_stopped, paused
         for name, bal in saved.get("start_balances", {}).items():
             session_start_balances[name] = bal
         session_contracts.update(saved.get("contracts", []))
         signal_count = saved.get("signal_count", 0)
+        if saved.get("hard_stopped"):
+            hard_stopped = True
+            paused = True
+            lock_state = saved.get("lock_state") or "hard_stop"
+            if lock_state in SESSION_STATES:
+                set_session_state(lock_state)
+            else:
+                set_session_state("hard_stop")
+        elif saved.get("soft_stopped"):
+            soft_stopped = True
+            paused = True
+            set_session_state("soft_stop")
         return True
 
     # Different session or outside hours — clear stale data
@@ -1741,13 +1756,29 @@ async def keyboard_loop():
 SIGNAL_COLOURS = [Fore.GREEN, Fore.CYAN, Fore.LIGHTGREEN_EX]
 
 
-def format_signal(signal_text: str, idx: int, latency_str: str = ""):
+# Signal tag colours for non-trade states
+SIGNAL_TAG_COLOURS = {
+    "PAUSED":   Fore.YELLOW,
+    "LOCKED":   Fore.RED,
+    "BLOCKED":  Fore.RED,
+    "DUPE":     Fore.LIGHTBLACK_EX,
+    "REJECTED": Fore.RED,
+}
+
+
+def format_signal(signal_text: str, idx: int, latency_str: str = "", tag: str | None = None):
     colour = SIGNAL_COLOURS[idx % len(SIGNAL_COLOURS)]
     ts = time.strftime("%H:%M:%S")
     width = term_width()
-    prefix = f"  #{idx} [{ts}] ▸  "
+    tag_str = ""
+    if tag:
+        tag_colour = SIGNAL_TAG_COLOURS.get(tag, Fore.YELLOW)
+        tag_str = f"{tag_colour}[{tag}]{Style.RESET_ALL}{colour} "
+        colour = Style.DIM + colour  # dim body when tagged
+    prefix_plain = f"  #{idx} [{ts}] ▸  " + (f"[{tag}] " if tag else "")
+    prefix = f"  #{idx} [{ts}] ▸  {tag_str}"
     suffix = f"  · {latency_str}" if latency_str else ""
-    avail = width - len(prefix) - len(suffix) - 2
+    avail = width - len(prefix_plain) - len(suffix) - 2
     body = signal_text
     if len(body) > avail:
         body = body[: avail - 1] + "…"
@@ -1810,15 +1841,16 @@ async def display_server_message(data: dict, connect_latency: int):
 
 
 # ---------- File output ----------
-def extract_signal_string(msg: str, account: str, atm: str) -> tuple[str | None, int | None, str | None]:
-    """Parse JSON message and extract the raw signal string, server timestamp, and signal ID.
+def extract_signal_string(msg: str, account: str, atm: str) -> tuple[str | None, int | None, str | None, str | None]:
+    """Parse JSON message and extract the raw signal string, server timestamp, signal ID, and reject reason.
 
     Signal format: PLACE;Account;Instrument;Action;Qty;OrderType;;;TIF;;;AtmStrategy;SignalID
     Index:           0      1        2        3     4      5     678  9  10 11          12
     - Field 1 (account) is replaced with the user's real account.
     - Field 11 (ATM strategy) is replaced with the user's chosen strategy.
     - Field 12 (last field) is the unique signal ID used for dedup.
-    Returns (processed_signal, server_timestamp_ms, signal_id) or (None, None, None).
+    Returns (processed_signal, server_timestamp_ms, signal_id, reject_reason).
+    A rejected-but-parsed signal returns (raw, ts, id, reason) so the UI can show it.
     """
     try:
         data = json.loads(msg)
@@ -1830,7 +1862,7 @@ def extract_signal_string(msg: str, account: str, atm: str) -> tuple[str | None,
             error = validate_signal(parts)
             if error:
                 logger.warning(f"REJECTED  {error}  raw={raw[:200]}")
-                return None, None, None
+                return raw[:200], ts, None, error
             # Extract signal ID (last non-empty field)
             signal_id = parts[-1] if parts else None
             # Replace account (field 1)
@@ -1839,19 +1871,35 @@ def extract_signal_string(msg: str, account: str, atm: str) -> tuple[str | None,
             # Replace ATM strategy (field 11)
             if len(parts) >= 12:
                 parts[11] = atm
-            return ";".join(parts), ts, signal_id
+            return ";".join(parts), ts, signal_id, None
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
-    return None, None, None
+    return None, None, None, None
+
+
+_ati_write_seq = 0
+
+
+def _next_ati_filename(prefix: str) -> str:
+    """Return a unique incoming-folder filename.
+
+    A bare millisecond timestamp isn't unique — two writes in the same
+    millisecond (which happens when the hard-stop loop closes multiple
+    contracts back-to-back) would overwrite each other. Append a
+    process-local monotonic counter to guarantee uniqueness.
+    """
+    global _ati_write_seq
+    _ati_write_seq += 1
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    ms = int((time.time() % 1) * 1000)
+    return f"{prefix}_{ts}_{ms:03d}_{_ati_write_seq:04d}.txt"
 
 
 def write_signal_to_file(signal_text: str):
     """Write the raw signal string (not JSON) to the output directory."""
     if not output_directory:
         return
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    ms = int((time.time() % 1) * 1000)
-    filename = f"oif_{ts}_{ms:03d}.txt"
+    filename = _next_ati_filename("oif")
     filepath = os.path.join(output_directory, filename)
     try:
         with open(filepath, "w", encoding="utf-8") as f:
@@ -1899,9 +1947,7 @@ def fire_close_position(account: str, contract: str):
     if not output_directory:
         return
     cmd = f"CLOSEPOSITION;{sanitize_ati(account)};{sanitize_ati(contract)};;;;;;;;;;"
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    ms = int((time.time() % 1) * 1000)
-    filename = f"close_{ts}_{ms:03d}.txt"
+    filename = _next_ati_filename("close")
     filepath = os.path.join(output_directory, filename)
     try:
         with open(filepath, "w", encoding="utf-8") as f:
@@ -1909,6 +1955,57 @@ def fire_close_position(account: str, contract: str):
         logger.info(f"CLOSEPOSITION  account={account}  contract={contract}  file={filename}")
     except Exception as exc:
         _dash_set_alert(Fore.RED + f"  ✖  Close position write error: {exc}" + Style.RESET_ALL)
+
+
+def fire_cancel_all_orders(account: str):
+    """Write a CANCELALLORDERS command so no working orders survive a hard stop."""
+    if not output_directory:
+        return
+    cmd = f"CANCELALLORDERS;{sanitize_ati(account)};;;;;;;;;;;"
+    filename = _next_ati_filename("cancelall")
+    filepath = os.path.join(output_directory, filename)
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(cmd)
+        logger.info(f"CANCELALLORDERS  account={account}  file={filename}")
+    except Exception as exc:
+        _dash_set_alert(Fore.RED + f"  ✖  Cancel-all write error: {exc}" + Style.RESET_ALL)
+
+
+def close_all_open_positions() -> list[str]:
+    """Close every open position on the active account.
+
+    Queries NT for actual positions and closes each one, unioned with
+    any contracts tracked in session_contracts as a safety net in case
+    the position query fails or is slow to refresh after a fast fill.
+    Also cancels any working orders first so a pending entry can't
+    leak through during the close.
+    """
+    if not active_account:
+        return []
+
+    # Cancel working orders first so they don't refill after we close
+    fire_cancel_all_orders(active_account)
+
+    closed: set[str] = set()
+
+    try:
+        positions = query_nt_positions(active_account, nt_port)
+        for instrument, qty in positions.items():
+            if qty != 0 and instrument:
+                fire_close_position(active_account, instrument)
+                closed.add(instrument)
+    except Exception as e:
+        logger.error(f"close_all_open_positions  query error: {e}")
+
+    # Safety net: anything tracked in session_contracts that we haven't
+    # closed yet (e.g. position query was empty due to fill latency).
+    for contract in session_contracts:
+        if contract and contract not in closed:
+            fire_close_position(active_account, contract)
+            closed.add(contract)
+
+    return sorted(closed)
 
 
 def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, action: str, pre_pos: int = 0):
@@ -2041,16 +2138,14 @@ async def balance_monitor():
                     hard_stopped = True
                     paused = True
                     set_session_state("hard_stop")
-                    closed = []
-                    for contract in session_contracts:
-                        fire_close_position(active_account, contract)
-                        closed.append(contract)
+                    closed = await asyncio.to_thread(close_all_open_positions)
                     close_str = ", ".join(closed) if closed else "none"
+                    save_session_state()
                     _dash_set_alert(
                         Fore.RED + Style.BRIGHT +
                         f"  ⛔  HARD STOP  P&L: ${pnl:+,.2f}  Limit: ${limits['stop']:+,.2f}  Closed: {close_str}  ⇧X=EXIT" +
                         Style.RESET_ALL)
-                    logger.info(f"HARD STOP  pnl={pnl:.2f}  limit={limits['stop']}  contracts={list(session_contracts)}")
+                    logger.info(f"HARD STOP  pnl={pnl:.2f}  limit={limits['stop']}  closed={closed}")
                 elif not soft_stopped:
                     soft_stopped = True
                     paused = True
@@ -2068,16 +2163,14 @@ async def balance_monitor():
                     hard_stopped = True
                     paused = True
                     set_session_state("hard_target")
-                    closed = []
-                    for contract in session_contracts:
-                        fire_close_position(active_account, contract)
-                        closed.append(contract)
+                    closed = await asyncio.to_thread(close_all_open_positions)
                     close_str = ", ".join(closed) if closed else "none"
+                    save_session_state()
                     _dash_set_alert(
                         Fore.GREEN + Style.BRIGHT +
                         f"  🎯  TARGET HIT  P&L: ${pnl:+,.2f}  Target: ${limits['target']:+,.2f}  Closed: {close_str}  ⇧X=EXIT" +
                         Style.RESET_ALL)
-                    logger.info(f"HARD STOP (TARGET)  pnl={pnl:.2f}  target={limits['target']}  contracts={list(session_contracts)}")
+                    logger.info(f"HARD STOP (TARGET)  pnl={pnl:.2f}  target={limits['target']}  closed={closed}")
                 elif not soft_stopped:
                     soft_stopped = True
                     paused = True
@@ -2294,10 +2387,29 @@ async def listen(token: str):
 
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=1)
-                        raw_signal, server_ts, sig_id = extract_signal_string(msg, active_account, atm_strategy)
+                        raw_signal, server_ts, sig_id, reject_reason = extract_signal_string(msg, active_account, atm_strategy)
                         if raw_signal:
-                            # Duplicate detection by signal ID
+                            # Compute latency once — used by all paths below
+                            lat_str = ""
+                            if server_ts:
+                                latency_ms = int(time.time() * 1000) - server_ts
+                                if baseline_latency is None:
+                                    baseline_latency = latency_ms
+                                lat_str = f"{latency_ms}ms" if latency_ms < 1000 else f"{latency_ms / 1000:.1f}s"
+                                logger.info(f"  latency={latency_ms}ms  baseline={baseline_latency}ms")
+
+                            # Validation-rejected — show in dashboard and skip the trade path
+                            if reject_reason:
+                                signal_count += 1
+                                _dash_add_signal(format_signal(raw_signal, signal_count, lat_str, tag="REJECTED"))
+                                _dash_set_alert(
+                                    Fore.RED + f"  ✖  Signal rejected: {reject_reason}" + Style.RESET_ALL)
+                                continue
+
+                            # Duplicate detection by signal ID — still show in dashboard so user can see it arrived
                             if sig_id and sig_id in _recent_signal_ids:
+                                signal_count += 1
+                                _dash_add_signal(format_signal(raw_signal, signal_count, lat_str, tag="DUPE"))
                                 if not paused:
                                     _dash_set_alert(
                                         Fore.YELLOW + Style.DIM +
@@ -2310,17 +2422,24 @@ async def listen(token: str):
 
                             signal_count += 1
 
-                            if paused:
-                                # Log but don't trade or print
-                                logger.info(f"SIGNAL #{signal_count} (PAUSED)  {raw_signal}")
-                                continue
+                            # Non-trade states still show the signal in the dashboard, tagged
+                            tag = None
+                            if hard_stopped:
+                                tag = "LOCKED"
+                            elif paused:
+                                tag = "PAUSED"
+                            elif not is_trade_ready():
+                                tag = "BLOCKED"
 
-                            if not is_trade_ready():
-                                # System not ready — log but don't trade
-                                _dash_set_alert(
-                                    Fore.RED + f"  ✖  Signal blocked — system NOT READY" +
-                                    Style.RESET_ALL)
-                                logger.warning(f"SIGNAL #{signal_count} (NOT READY)  {raw_signal}")
+                            if tag:
+                                _dash_add_signal(format_signal(raw_signal, signal_count, lat_str, tag=tag))
+                                if tag == "BLOCKED":
+                                    _dash_set_alert(
+                                        Fore.RED + f"  ✖  Signal blocked — system NOT READY" +
+                                        Style.RESET_ALL)
+                                    logger.warning(f"SIGNAL #{signal_count} (NOT READY)  {raw_signal}")
+                                else:
+                                    logger.info(f"SIGNAL #{signal_count} ({tag})  {raw_signal}")
                                 continue
 
                             # Track traded contracts for hard stop
@@ -2337,14 +2456,6 @@ async def listen(token: str):
                             write_signal_to_file(raw_signal)
                             # Register for fill confirmation with pre-snapshot
                             add_pending_confirm(raw_signal, sig_id, instrument, action, pre_pos)
-                            # Compute latency for inline display
-                            lat_str = ""
-                            if server_ts:
-                                latency_ms = int(time.time() * 1000) - server_ts
-                                if baseline_latency is None:
-                                    baseline_latency = latency_ms
-                                lat_str = f"{latency_ms}ms" if latency_ms < 1000 else f"{latency_ms / 1000:.1f}s"
-                                logger.info(f"  latency={latency_ms}ms  baseline={baseline_latency}ms")
                             _dash_add_signal(format_signal(raw_signal, signal_count, lat_str))
                             await signal_pulse("SIGNAL RECEIVED")
                             logger.info(f"SIGNAL #{signal_count}  {raw_signal}")
