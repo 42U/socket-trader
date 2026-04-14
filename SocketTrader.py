@@ -162,7 +162,11 @@ def get_session_id(now_et: datetime | None = None) -> str | None:
 
 
 def save_session_state():
-    """Persist session P&L data to config for crash recovery."""
+    """Persist session P&L data to config for crash recovery.
+
+    Note: lockout flags (hard_stopped/soft_stopped) are intentionally NOT
+    persisted — exit-and-restart is one of the ways to clear a hard stop.
+    """
     session_id = get_session_id()
     if not session_id or not session_start_balances:
         return
@@ -172,9 +176,6 @@ def save_session_state():
         "start_balances": dict(session_start_balances),
         "contracts": list(session_contracts),
         "signal_count": signal_count,
-        "hard_stopped": hard_stopped,
-        "soft_stopped": soft_stopped,
-        "lock_state": _session_state if hard_stopped else None,
     }
     save_config(cfg)
 
@@ -200,23 +201,11 @@ def restore_session_state() -> bool:
 
     current_session = get_session_id()
     if current_session and saved.get("id") == current_session:
-        global signal_count, hard_stopped, soft_stopped, paused
+        global signal_count
         for name, bal in saved.get("start_balances", {}).items():
             session_start_balances[name] = bal
         session_contracts.update(saved.get("contracts", []))
         signal_count = saved.get("signal_count", 0)
-        if saved.get("hard_stopped"):
-            hard_stopped = True
-            paused = True
-            lock_state = saved.get("lock_state") or "hard_stop"
-            if lock_state in SESSION_STATES:
-                set_session_state(lock_state)
-            else:
-                set_session_state("hard_stop")
-        elif saved.get("soft_stopped"):
-            soft_stopped = True
-            paused = True
-            set_session_state("soft_stop")
         return True
 
     # Different session or outside hours — clear stale data
@@ -1721,7 +1710,7 @@ async def keyboard_loop():
             if key.lower() == "p":
                 if hard_stopped:
                     _dash_set_alert(
-                        Fore.RED + "  ⛔  Hard stop active — cannot resume. Press Shift+X to exit." + Style.RESET_ALL)
+                        Fore.RED + "  ⛔  Hard stop locked for the session — B→R to reset P&L, or exit to clear." + Style.RESET_ALL)
                     continue
                 paused = not paused
                 soft_stopped = False  # Reset soft stop on manual resume
@@ -2147,14 +2136,19 @@ async def balance_monitor():
                         Style.RESET_ALL)
                     logger.info(f"HARD STOP  pnl={pnl:.2f}  limit={limits['stop']}  closed={closed}")
                 elif not soft_stopped:
+                    # Soft stop also flattens — broker-side stops can get
+                    # dropped when multiple orders fire in close succession,
+                    # so leaving positions running on ATM only isn't safe.
                     soft_stopped = True
                     paused = True
                     set_session_state("soft_stop")
+                    closed = await asyncio.to_thread(close_all_open_positions)
+                    close_str = ", ".join(closed) if closed else "none"
                     _dash_set_alert(
                         Fore.RED + Style.BRIGHT +
-                        f"  ⛔  STOP HIT  P&L: ${pnl:+,.2f}  Limit: ${limits['stop']:+,.2f}  — P to resume" +
+                        f"  ⛔  STOP HIT  P&L: ${pnl:+,.2f}  Limit: ${limits['stop']:+,.2f}  Closed: {close_str}  — P to resume" +
                         Style.RESET_ALL)
-                    logger.info(f"SOFT STOP (LOSS)  pnl={pnl:.2f}  stop={limits['stop']}")
+                    logger.info(f"SOFT STOP (LOSS)  pnl={pnl:.2f}  stop={limits['stop']}  closed={closed}")
                 continue
 
             # Check target (profit goal)
@@ -2172,14 +2166,19 @@ async def balance_monitor():
                         Style.RESET_ALL)
                     logger.info(f"HARD STOP (TARGET)  pnl={pnl:.2f}  target={limits['target']}  closed={closed}")
                 elif not soft_stopped:
+                    # Soft target also flattens for the same reason — let
+                    # the user lock in the win rather than risking a
+                    # dropped broker stop giving it back.
                     soft_stopped = True
                     paused = True
                     set_session_state("soft_target")
+                    closed = await asyncio.to_thread(close_all_open_positions)
+                    close_str = ", ".join(closed) if closed else "none"
                     _dash_set_alert(
                         Fore.GREEN + Style.BRIGHT +
-                        f"  🎯  TARGET HIT  P&L: ${pnl:+,.2f}  Target: ${limits['target']:+,.2f}  — P to resume" +
+                        f"  🎯  TARGET HIT  P&L: ${pnl:+,.2f}  Target: ${limits['target']:+,.2f}  Closed: {close_str}  — P to resume" +
                         Style.RESET_ALL)
-                    logger.info(f"SOFT STOP (TARGET)  pnl={pnl:.2f}  target={limits['target']}")
+                    logger.info(f"SOFT STOP (TARGET)  pnl={pnl:.2f}  target={limits['target']}  closed={closed}")
         except Exception as e:
             logger.error(f"balance_monitor error: {e}")
 
@@ -2453,6 +2452,15 @@ async def listen(token: str):
                             action = sig_parts[3] if len(sig_parts) >= 4 else ""
                             pre_positions = await asyncio.to_thread(query_nt_positions, active_account, nt_port)
                             pre_pos = pre_positions.get(instrument, 0)
+                            # Re-check state after the await — balance_monitor could
+                            # have fired a soft/hard stop while we were querying NT.
+                            # Without this, a signal in-flight during a stop can race
+                            # the close and open a new position right after flatten.
+                            if hard_stopped or paused:
+                                late_tag = "LOCKED" if hard_stopped else "PAUSED"
+                                _dash_add_signal(format_signal(raw_signal, signal_count, lat_str, tag=late_tag))
+                                logger.info(f"SIGNAL #{signal_count} ({late_tag} post-query)  {raw_signal}")
+                                continue
                             write_signal_to_file(raw_signal)
                             # Register for fill confirmation with pre-snapshot
                             add_pending_confirm(raw_signal, sig_id, instrument, action, pre_pos)

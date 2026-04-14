@@ -735,30 +735,30 @@ class TestFireCancelAllOrders:
             st.output_directory = original
 
 
-# ── Session persistence: hard stop lockout across restart ──────────
+# ── Session persistence: lockout flags are NOT persisted ──────────
 
 
-class TestSessionLockoutPersistence:
+class TestSessionLockoutNotPersisted:
+    """Lockout flags intentionally don't persist across restart — exit-and-
+    restart is one of the supported ways to clear a hard stop. Only
+    balances, contracts, and signal_count survive a restart."""
+
     def _within_session_now(self):
-        """Return True only when get_session_id() is currently non-None.
-        Tests that depend on live session hours should skip otherwise."""
         return st.get_session_id() is not None
 
-    def test_hard_stop_persists_and_restores(self, tmp_config):
+    def test_hard_stop_does_not_persist(self, tmp_config):
         if not self._within_session_now():
             pytest.skip("outside active CME session hours")
         st.session_start_balances["Sim101"] = 10000.0
         st.session_current_balances["Sim101"] = 9500.0
-        st.session_contracts.add("NQ 06-26")
         st.hard_stopped = True
         st.signal_count = 3
         st.set_session_state("hard_stop")
 
         st.save_session_state()
 
-        # Simulate process restart: wipe in-memory state, then restore
+        # Simulate restart: wipe runtime state
         st.session_start_balances.clear()
-        st.session_contracts.clear()
         st.hard_stopped = False
         st.soft_stopped = False
         st.paused = False
@@ -767,58 +767,24 @@ class TestSessionLockoutPersistence:
 
         restored = st.restore_session_state()
         assert restored is True
-        assert st.hard_stopped is True
-        assert st.paused is True
-        assert st._session_state == "hard_stop"
+        # Balances and counters come back
         assert st.session_start_balances.get("Sim101") == 10000.0
-        assert "NQ 06-26" in st.session_contracts
         assert st.signal_count == 3
-
-    def test_hard_target_lock_state_preserved(self, tmp_config):
-        if not self._within_session_now():
-            pytest.skip("outside active CME session hours")
-        st.session_start_balances["Sim101"] = 10000.0
-        st.session_current_balances["Sim101"] = 10500.0
-        st.hard_stopped = True
-        st.set_session_state("hard_target")
-
-        st.save_session_state()
-
-        st.hard_stopped = False
-        st.paused = False
-        st.set_session_state("ready")
-
-        st.restore_session_state()
-        assert st.hard_stopped is True
-        assert st._session_state == "hard_target"
-
-    def test_soft_stop_persists_and_restores(self, tmp_config):
-        if not self._within_session_now():
-            pytest.skip("outside active CME session hours")
-        st.session_start_balances["Sim101"] = 10000.0
-        st.session_current_balances["Sim101"] = 9800.0
-        st.soft_stopped = True
-        st.set_session_state("soft_stop")
-
-        st.save_session_state()
-
-        st.soft_stopped = False
-        st.paused = False
-        st.set_session_state("ready")
-
-        st.restore_session_state()
-        assert st.soft_stopped is True
-        assert st.paused is True
-        assert st._session_state == "soft_stop"
-
-    def test_clean_session_does_not_set_flags(self, tmp_config):
-        if not self._within_session_now():
-            pytest.skip("outside active CME session hours")
-        st.session_start_balances["Sim101"] = 10000.0
-        st.session_current_balances["Sim101"] = 10000.0
-
-        st.save_session_state()
-
-        st.restore_session_state()
+        # But lockout flags do NOT
         assert st.hard_stopped is False
         assert st.soft_stopped is False
+
+    def test_save_payload_excludes_lockout_flags(self, tmp_config):
+        if not self._within_session_now():
+            pytest.skip("outside active CME session hours")
+        st.session_start_balances["Sim101"] = 10000.0
+        st.session_current_balances["Sim101"] = 9500.0
+        st.hard_stopped = True
+
+        st.save_session_state()
+
+        cfg = st.load_config()
+        saved = cfg.get("session", {})
+        assert "hard_stopped" not in saved
+        assert "soft_stopped" not in saved
+        assert "lock_state" not in saved
