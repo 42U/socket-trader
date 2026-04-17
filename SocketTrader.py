@@ -1999,6 +1999,7 @@ def close_all_open_positions() -> list[str]:
 
 def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, action: str, pre_pos: int = 0):
     """Register a signal for post-trade confirmation via position check."""
+    pre_balance = session_current_balances.get(active_account) if active_account else None
     with _confirms_lock:
         if len(_pending_confirms) >= MAX_PENDING_CONFIRMS:
             _pending_confirms.pop(0)  # drop oldest
@@ -2009,20 +2010,22 @@ def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, a
             "action": action,
             "ts": time.time(),
             "pre_pos": pre_pos,
+            "pre_balance": pre_balance,
         })
 
 
 def check_pending_confirms():
-    """Check pending signals for confirmation via position change.
+    """Check pending signals for confirmation via position or balance change.
 
-    Called every balance poll cycle. Queries ATI for current positions
-    and checks if the position changed for the specific instrument
-    that was traded. This works even with other positions open.
+    Called every balance poll cycle. Position delta catches trades that
+    stay open; cash-balance delta catches fast round-trips where the ATM
+    stop/target closes the fill before any poll sees the open position.
     """
     if not _pending_confirms or not active_account:
         return
 
     positions = query_nt_positions(active_account, nt_port)
+    cur_balance = session_current_balances.get(active_account)
     now = time.time()
     still_pending = []
 
@@ -2031,28 +2034,40 @@ def check_pending_confirms():
             elapsed = now - entry["ts"]
             instrument = entry["instrument"]
             pre_pos = entry["pre_pos"]
+            pre_balance = entry.get("pre_balance")
             cur_pos = positions.get(instrument, 0)
 
-            if cur_pos != pre_pos:
-                # Position changed on this instrument — trade confirmed
+            pos_changed = cur_pos != pre_pos
+            balance_changed = (
+                pre_balance is not None
+                and cur_balance is not None
+                and abs(cur_balance - pre_balance) > 0.01
+            )
+
+            if pos_changed or balance_changed:
+                if pos_changed:
+                    detail = f"pos: {pre_pos}→{cur_pos}"
+                else:
+                    delta = cur_balance - pre_balance
+                    detail = f"round-trip  balance: ${delta:+.2f}"
                 _dash_set_alert(
                     Fore.GREEN +
-                    f"  ✔  FILLED {instrument} {entry['action']}  pos: {pre_pos}→{cur_pos}" +
+                    f"  ✔  FILLED {instrument} {entry['action']}  {detail}" +
                     Style.RESET_ALL)
                 logger.info(f"CONFIRMED  id={entry['id']}  {instrument}  "
-                            f"{entry['action']}  pos: {pre_pos} → {cur_pos}  "
+                            f"{entry['action']}  {detail}  "
                             f"elapsed={elapsed:.1f}s")
                 continue  # drop from pending
 
             if elapsed >= CONFIRM_TIMEOUT:
-                # Timed out — position did not change for this instrument
+                # Timed out — no position delta and no balance delta
                 _dash_set_alert(
                     Fore.YELLOW + Style.DIM +
                     f"  ⚠  No fill detected for {instrument} after {CONFIRM_TIMEOUT}s "
                     f"(ID: {entry['id']})" + Style.RESET_ALL)
                 logger.warning(f"UNCONFIRMED  id={entry['id']}  {instrument}  "
-                               f"{entry['action']}  pos unchanged at {pre_pos}  "
-                               f"elapsed={elapsed:.1f}s")
+                               f"{entry['action']}  pos unchanged at {pre_pos}, "
+                               f"balance unchanged  elapsed={elapsed:.1f}s")
                 continue  # drop from pending
 
             still_pending.append(entry)
