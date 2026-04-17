@@ -26,7 +26,7 @@ try:
 except ImportError:
     pyfiglet = None
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -1351,7 +1351,7 @@ async def prompt_strategy():
     else:
         print(Fore.CYAN + "│  No templates found in AtmStrategy directory.     │" + Style.RESET_ALL)
         print(Fore.CYAN + "│  Type a strategy name manually.                   │" + Style.RESET_ALL)
-    print(Fore.CYAN + "│  T = toggle mode · ENTER = keep · Q = cancel      │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Type T+ENTER to toggle mode · ENTER to keep      │" + Style.RESET_ALL)
     print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
     sys.stdout.write(Fore.WHITE + "  STRATEGY ▸ " + Style.RESET_ALL)
     sys.stdout.flush()
@@ -1368,7 +1368,10 @@ async def prompt_strategy():
         cfg["follow_publisher_strategy"] = follow_publisher_strategy
         save_config(cfg)
         new_label = "FOLLOW PUBLISHER" if follow_publisher_strategy else "LOCKED (override)"
+        global _alert_text
+        _alert_text = Fore.GREEN + f"  ✔  Strategy mode → {new_label}  ·  Fallback: {atm_strategy}" + Style.RESET_ALL
         print(Fore.GREEN + f"  ✔  Mode → {new_label}  ·  Fallback: {atm_strategy}" + Style.RESET_ALL)
+        logger.info(f"STRATEGY MODE  follow_publisher={follow_publisher_strategy}  fallback={atm_strategy}")
     elif available and choice.isdigit() and 1 <= int(choice) <= len(available):
         atm_strategy = available[int(choice) - 1]
         cfg["atm_strategy"] = atm_strategy
@@ -1521,7 +1524,9 @@ async def setup_menu():
     print(Fore.CYAN + f"│  1. Server    ({current_server[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  2. Token     ({masked_token[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  3. Account   ({(active_account or 'not set')[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
-    print(Fore.CYAN + f"│  4. Strategy  ({atm_strategy[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
+    mode_tag = "FOLLOW" if follow_publisher_strategy else "LOCKED"
+    strat_label = f"{atm_strategy} · {mode_tag}"
+    print(Fore.CYAN + f"│  4. Strategy  ({strat_label[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  5. Directory ({(output_directory or 'not set')[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  6. ATI Port  ({nt_port})" .ljust(53) + "│" + Style.RESET_ALL)
     print(Fore.CYAN + "│  ESC to close                                    │" + Style.RESET_ALL)
