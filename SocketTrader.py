@@ -26,7 +26,7 @@ try:
 except ImportError:
     pyfiglet = None
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -52,7 +52,8 @@ shutdown = asyncio.Event()
 signal_count = 0
 output_directory = None
 active_account = None          # Current NinjaTrader account name
-atm_strategy = "NQ_Med"        # ATM strategy template name
+atm_strategy = "NQ_Med"        # ATM strategy template name (fallback)
+follow_publisher_strategy = False  # If True, use the publisher's strategy per-signal when locally installed
 nt_port = 36973                # NinjaTrader AT Interface port (default 36973)
 awaiting_directory_input = False
 awaiting_user_input = False  # Block key handler during any input prompt
@@ -1332,45 +1333,55 @@ async def prompt_port():
 
 # ---------- ATM Strategy prompt ----------
 async def prompt_strategy():
-    global atm_strategy, awaiting_user_input
+    global atm_strategy, follow_publisher_strategy, awaiting_user_input
     awaiting_user_input = True
     show_cursor()
     available = list_atm_strategies()
+    mode_label = "FOLLOW PUBLISHER" if follow_publisher_strategy else "LOCKED (override)"
     print(Fore.CYAN + "\n┌─ ATM STRATEGY TEMPLATE ───────────────────────────┐" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  Mode: {mode_label.ljust(43)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  Fallback: {atm_strategy[:38].ljust(38)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + "│                                                   │" + Style.RESET_ALL)
     if available:
         for i, name in enumerate(available, 1):
             marker = " ◀" if name == atm_strategy else ""
             line = f"{i}. {name}{marker}"
             print(Fore.CYAN + f"│  {line.ljust(49)}│" + Style.RESET_ALL)
-        print(Fore.CYAN + "│  Enter # to select, or type a name manually.     │" + Style.RESET_ALL)
+        print(Fore.CYAN + "│  # = set fallback · type name manually also OK   │" + Style.RESET_ALL)
     else:
         print(Fore.CYAN + "│  No templates found in AtmStrategy directory.     │" + Style.RESET_ALL)
         print(Fore.CYAN + "│  Type a strategy name manually.                   │" + Style.RESET_ALL)
-    print(Fore.CYAN + "│  Press ENTER to keep current.                     │" + Style.RESET_ALL)
-    print(Fore.CYAN + f"│  Current: {atm_strategy[:39].ljust(39)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  T = toggle mode · ENTER = keep · Q = cancel      │" + Style.RESET_ALL)
     print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
     sys.stdout.write(Fore.WHITE + "  STRATEGY ▸ " + Style.RESET_ALL)
     sys.stdout.flush()
     raw = await asyncio.to_thread(read_line_raw)
+    choice = raw.strip()
 
-    if raw == "":
+    cfg = load_config()
+    if choice == "":
         print(Fore.YELLOW + "  ↩  No change — keeping current strategy." + Style.RESET_ALL)
-    elif available and raw.strip().isdigit() and 1 <= int(raw.strip()) <= len(available):
-        atm_strategy = available[int(raw.strip()) - 1]
-        cfg = load_config()
+    elif choice.lower() == "q":
+        print(Fore.YELLOW + "  ↩  Cancelled." + Style.RESET_ALL)
+    elif choice.lower() == "t":
+        follow_publisher_strategy = not follow_publisher_strategy
+        cfg["follow_publisher_strategy"] = follow_publisher_strategy
+        save_config(cfg)
+        new_label = "FOLLOW PUBLISHER" if follow_publisher_strategy else "LOCKED (override)"
+        print(Fore.GREEN + f"  ✔  Mode → {new_label}  ·  Fallback: {atm_strategy}" + Style.RESET_ALL)
+    elif available and choice.isdigit() and 1 <= int(choice) <= len(available):
+        atm_strategy = available[int(choice) - 1]
         cfg["atm_strategy"] = atm_strategy
         save_config(cfg)
-        print(Fore.GREEN + f"  ✔  ATM Strategy set → {atm_strategy}" + Style.RESET_ALL)
+        print(Fore.GREEN + f"  ✔  Fallback strategy set → {atm_strategy}" + Style.RESET_ALL)
     else:
-        name = raw.strip()
-        if validate_strategy(name):
-            atm_strategy = name
-            cfg = load_config()
+        if validate_strategy(choice):
+            atm_strategy = choice
             cfg["atm_strategy"] = atm_strategy
             save_config(cfg)
-            print(Fore.GREEN + f"  ✔  ATM Strategy set → {atm_strategy}" + Style.RESET_ALL)
+            print(Fore.GREEN + f"  ✔  Fallback strategy set → {atm_strategy}" + Style.RESET_ALL)
         else:
-            print(Fore.RED + f"  ✖  '{name}' not found in templates/AtmStrategy/." + Style.RESET_ALL)
+            print(Fore.RED + f"  ✖  '{choice}' not found in templates/AtmStrategy/." + Style.RESET_ALL)
             print(Fore.YELLOW + f"  ↩  Keeping current: {atm_strategy}" + Style.RESET_ALL)
 
     print()
@@ -1832,13 +1843,15 @@ async def display_server_message(data: dict, connect_latency: int):
 
 
 # ---------- File output ----------
-def extract_signal_string(msg: str, account: str, atm: str) -> tuple[str | None, int | None, str | None, str | None]:
+def extract_signal_string(msg: str, account: str, atm: str, follow_publisher: bool = False) -> tuple[str | None, int | None, str | None, str | None]:
     """Parse JSON message and extract the raw signal string, server timestamp, signal ID, and reject reason.
 
     Signal format: PLACE;Account;Instrument;Action;Qty;OrderType;;;TIF;;;AtmStrategy;SignalID
     Index:           0      1        2        3     4      5     678  9  10 11          12
     - Field 1 (account) is replaced with the user's real account.
-    - Field 11 (ATM strategy) is replaced with the user's chosen strategy.
+    - Field 11 (ATM strategy): if follow_publisher is True and the publisher's
+      template exists locally, keep it; otherwise replace with the user's
+      chosen strategy (`atm`) as a fallback.
     - Field 12 (last field) is the unique signal ID used for dedup.
     Returns (processed_signal, server_timestamp_ms, signal_id, reject_reason).
     A rejected-but-parsed signal returns (raw, ts, id, reason) so the UI can show it.
@@ -1859,9 +1872,17 @@ def extract_signal_string(msg: str, account: str, atm: str) -> tuple[str | None,
             # Replace account (field 1)
             if len(parts) >= 2:
                 parts[1] = account
-            # Replace ATM strategy (field 11)
+            # Resolve ATM strategy (field 11)
             if len(parts) >= 12:
-                parts[11] = atm
+                pub_strategy = parts[11].strip()
+                if follow_publisher and pub_strategy and validate_strategy(pub_strategy):
+                    # Keep publisher's choice — it's installed locally
+                    parts[11] = pub_strategy
+                else:
+                    if follow_publisher and pub_strategy and pub_strategy != atm:
+                        logger.info(
+                            f"STRATEGY FALLBACK  publisher='{pub_strategy}' not installed → using '{atm}'")
+                    parts[11] = atm
             return ";".join(parts), ts, signal_id, None
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
@@ -2403,7 +2424,8 @@ async def listen(token: str):
 
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=1)
-                        raw_signal, server_ts, sig_id, reject_reason = extract_signal_string(msg, active_account, atm_strategy)
+                        raw_signal, server_ts, sig_id, reject_reason = extract_signal_string(
+                            msg, active_account, atm_strategy, follow_publisher_strategy)
                         if raw_signal:
                             # Compute latency once — used by all paths below
                             lat_str = ""
@@ -2670,11 +2692,12 @@ def setup() -> tuple[str, dict]:
 
 # ---------- Main ----------
 async def main():
-    global output_directory, active_account, atm_strategy, nt_port
+    global output_directory, active_account, atm_strategy, follow_publisher_strategy, nt_port
 
     token, cfg = setup()
     active_account = cfg.get("account", "")
     atm_strategy = cfg.get("atm_strategy", "NQ_Med")
+    follow_publisher_strategy = bool(cfg.get("follow_publisher_strategy", False))
     nt_port = cfg.get("nt_port", 36973)
 
     if cfg.get("output_directory"):
