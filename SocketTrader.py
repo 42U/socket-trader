@@ -26,6 +26,8 @@ try:
 except ImportError:
     pyfiglet = None
 
+__version__ = "0.1.0"
+
 IS_WINDOWS = platform.system() == "Windows"
 
 if IS_WINDOWS:
@@ -1095,7 +1097,7 @@ def build_header():
 
     lines = [
         hline(width, "╔", "═", "╗"),
-        row("SOCKET TRADER", width),
+        row(f"SOCKET TRADER  v{__version__}", width),
         row(subtitle, width),
         hline(width, "╚", "═", "╝"),
     ]
