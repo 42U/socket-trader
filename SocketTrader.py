@@ -26,9 +26,25 @@ try:
 except ImportError:
     pyfiglet = None
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 IS_WINDOWS = platform.system() == "Windows"
+
+
+def _detect_wsl() -> bool:
+    """Return True if running under Windows Subsystem for Linux."""
+    if IS_WINDOWS:
+        return False
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        with open("/proc/version", "r") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
+IS_WSL = _detect_wsl()
 
 if IS_WINDOWS:
     # Windows 10+ handles ANSI natively — skip colorama conversion
@@ -434,37 +450,84 @@ def is_trade_ready() -> bool:
 
 
 # ---------- NinjaTrader incoming folder detection ----------
-def find_ninjatrader_incoming_windows() -> str | None:
-    """Search common Windows locations for NinjaTrader 8\\incoming."""
-    candidates = []
-
-    # Most common: Documents\NinjaTrader 8\incoming
-    docs = Path.home() / "Documents" / "NinjaTrader 8" / "incoming"
-    candidates.append(docs)
-
-    # Sometimes under OneDrive\Documents
-    onedrive = Path.home() / "OneDrive" / "Documents" / "NinjaTrader 8" / "incoming"
-    candidates.append(onedrive)
-
-    # Check all drives for NinjaTrader 8\incoming at root level
+def _find_nt_incoming_candidates_windows() -> list[Path]:
+    """Candidate NinjaTrader 8 incoming paths on native Windows."""
+    home = Path.home()
+    cands = [
+        home / "Documents" / "NinjaTrader 8" / "incoming",
+        home / "OneDrive" / "Documents" / "NinjaTrader 8" / "incoming",
+    ]
     for drive_letter in "CDEFGH":
-        candidates.append(Path(f"{drive_letter}:/NinjaTrader 8/incoming"))
+        cands.append(Path(f"{drive_letter}:/NinjaTrader 8/incoming"))
+    return cands
+
+
+def _find_nt_incoming_candidates_wsl() -> list[Path]:
+    """Candidate NinjaTrader 8 incoming paths when running under WSL.
+
+    Scans /mnt/<letter>/Users/<user>/(OneDrive/)Documents/NinjaTrader 8/incoming
+    across all mounted Windows drives.
+    """
+    cands: list[Path] = []
+    mnt = Path("/mnt")
+    if not mnt.is_dir():
+        return cands
+
+    skip_users = {"Public", "Default", "Default User", "All Users", "desktop.ini"}
+
+    try:
+        drives = [p for p in mnt.iterdir() if p.is_dir() and len(p.name) == 1]
+    except OSError:
+        return cands
+
+    for drive in drives:
+        users = drive / "Users"
+        try:
+            if users.is_dir():
+                for user_dir in users.iterdir():
+                    if not user_dir.is_dir() or user_dir.name in skip_users:
+                        continue
+                    cands.append(user_dir / "Documents" / "NinjaTrader 8" / "incoming")
+                    cands.append(user_dir / "OneDrive" / "Documents" / "NinjaTrader 8" / "incoming")
+        except OSError:
+            pass
+        # Root-level install (rare)
+        cands.append(drive / "NinjaTrader 8" / "incoming")
+    return cands
+
+
+def find_ninjatrader_incoming() -> str | None:
+    """Search known locations for NinjaTrader 8\\incoming on Windows or WSL."""
+    if IS_WINDOWS:
+        candidates = _find_nt_incoming_candidates_windows()
+    elif IS_WSL:
+        candidates = _find_nt_incoming_candidates_wsl()
+    else:
+        return None
 
     for path in candidates:
-        if path.is_dir():
-            return str(path.resolve())
+        try:
+            if path.is_dir():
+                return str(path.resolve())
+        except OSError:
+            continue
 
-    # Broader search: look for any NinjaTrader 8 folder under home
-    home = Path.home()
-    try:
-        for p in home.rglob("NinjaTrader 8"):
-            incoming = p / "incoming"
-            if incoming.is_dir():
-                return str(incoming.resolve())
-    except (PermissionError, OSError):
-        pass
+    # Broader fallback: recursive search under user home (native Windows only;
+    # skipped on WSL because rglobbing /mnt is pathologically slow).
+    if IS_WINDOWS:
+        try:
+            for p in Path.home().rglob("NinjaTrader 8"):
+                incoming = p / "incoming"
+                if incoming.is_dir():
+                    return str(incoming.resolve())
+        except (PermissionError, OSError):
+            pass
 
     return None
+
+
+# Back-compat alias for any external callers
+find_ninjatrader_incoming_windows = find_ninjatrader_incoming
 
 
 def detect_or_ask_directory(cfg: dict) -> str | None:
@@ -474,9 +537,10 @@ def detect_or_ask_directory(cfg: dict) -> str | None:
     if saved and Path(saved).is_dir():
         return saved
 
-    if IS_WINDOWS:
-        print(Fore.CYAN + "\n  🔍  Searching for NinjaTrader 8 incoming folder..." + Style.RESET_ALL)
-        found = find_ninjatrader_incoming_windows()
+    if IS_WINDOWS or IS_WSL:
+        env_label = "WSL" if IS_WSL else "Windows"
+        print(Fore.CYAN + f"\n  🔍  Searching for NinjaTrader 8 incoming folder ({env_label})..." + Style.RESET_ALL)
+        found = find_ninjatrader_incoming()
         if found:
             print(Fore.GREEN + f"  ✔  Found: {found}" + Style.RESET_ALL)
             confirm = input(Fore.WHITE + "  Use this path? [Y/n] " + Style.RESET_ALL).strip()
@@ -485,14 +549,14 @@ def detect_or_ask_directory(cfg: dict) -> str | None:
         else:
             print(Fore.YELLOW + "  ⚠  Could not auto-detect NinjaTrader 8 incoming folder." + Style.RESET_ALL)
 
-    # Linux or Windows fallback: ask the user
-    if not IS_WINDOWS:
+    # Native Linux or no auto-detect match: ask the user
+    if IS_WINDOWS or IS_WSL:
+        print(Fore.CYAN + "\n  Enter the NinjaTrader 8 incoming folder path manually:" + Style.RESET_ALL)
+    else:
         print(Fore.CYAN + "\n┌─ LINUX DETECTED ─────────────────────────────────────┐" + Style.RESET_ALL)
         print(Fore.CYAN + "│  Enter the path to your signal output folder.        │" + Style.RESET_ALL)
         print(Fore.CYAN + "│  (NinjaTrader incoming folder or any target dir)      │" + Style.RESET_ALL)
         print(Fore.CYAN + "└──────────────────────────────────────────────────────┘" + Style.RESET_ALL)
-    else:
-        print(Fore.CYAN + "\n  Enter the NinjaTrader 8 incoming folder path manually:" + Style.RESET_ALL)
 
     while True:
         raw = input(Fore.WHITE + "  PATH ▸ " + Style.RESET_ALL).strip().strip('"').strip("'")
@@ -513,19 +577,62 @@ def detect_or_ask_directory(cfg: dict) -> str | None:
             print(Fore.YELLOW + "  Try again or press ENTER to skip." + Style.RESET_ALL)
 
 
-def _nt_host() -> str:
-    """Return the correct host for NinjaTrader ATI (handles WSL)."""
+_nt_host_cache: dict[int, str] = {}
+
+
+def _nt_host_candidates() -> list[str]:
+    """Return ATI host candidates in preference order."""
     if IS_WINDOWS:
-        return "127.0.0.1"
-    # WSL: NinjaTrader runs on the Windows host
+        return ["127.0.0.1"]
+    if IS_WSL:
+        # 127.0.0.1 reaches Windows under WSL2 mirrored networking; the
+        # resolv.conf nameserver IP reaches it under classic NAT.
+        cands = ["127.0.0.1"]
+        try:
+            with open("/etc/resolv.conf") as f:
+                for line in f:
+                    if line.strip().startswith("nameserver"):
+                        ip = line.split()[1]
+                        if ip and ip not in cands:
+                            cands.append(ip)
+                        break
+        except OSError:
+            pass
+        return cands
+    return ["127.0.0.1"]
+
+
+def _probe_host(host: str, port: int, timeout: float = 0.4) -> bool:
     try:
-        with open("/etc/resolv.conf") as f:
-            for line in f:
-                if line.strip().startswith("nameserver"):
-                    return line.split()[1]
-    except Exception:
-        pass
-    return "127.0.0.1"
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect((host, port))
+        return True
+    except OSError:
+        return False
+
+
+def invalidate_nt_host_cache() -> None:
+    """Clear the cached ATI host (call after port/network changes)."""
+    _nt_host_cache.clear()
+
+
+def _nt_host(port: int = 36973) -> str:
+    """Return the correct host for NinjaTrader ATI (handles WSL).
+
+    Probes candidates on first call per port and caches the first that
+    accepts a connection. If no candidate responds, returns the first
+    candidate without caching so a later call can retry.
+    """
+    cached = _nt_host_cache.get(port)
+    if cached is not None:
+        return cached
+    candidates = _nt_host_candidates()
+    for host in candidates:
+        if _probe_host(host, port):
+            _nt_host_cache[port] = host
+            return host
+    return candidates[0] if candidates else "127.0.0.1"
 
 
 def _query_ati(command: str, port: int = 36973, timeout: float = 2.0) -> str:
@@ -533,7 +640,7 @@ def _query_ati(command: str, port: int = 36973, timeout: float = 2.0) -> str:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.settimeout(timeout)
-        s.connect((_nt_host(), port))
+        s.connect((_nt_host(port), port))
         s.sendall(f"{command}\n".encode())
         parts = []
         while True:
@@ -1321,6 +1428,7 @@ async def prompt_port():
                 cfg = load_config()
                 cfg["nt_port"] = nt_port
                 save_config(cfg)
+                invalidate_nt_host_cache()
                 print(Fore.GREEN + f"  ✔  Port set → {nt_port}" + Style.RESET_ALL)
             else:
                 print(Fore.RED + "  ✖  Port must be between 1 and 65535." + Style.RESET_ALL)
