@@ -27,7 +27,7 @@ try:
 except ImportError:
     pyfiglet = None
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -733,20 +733,59 @@ def detect_or_ask_directory(cfg: dict) -> str | None:
 _nt_host_cache: dict[int, str] = {}
 
 
+def _wsl_windows_host_ip() -> str | None:
+    """Return the Windows host IP as seen from WSL (the default gateway).
+
+    On WSL2 classic NAT networking this is the vEthernet (WSL) adapter IP
+    Windows services should be reachable on. Returns None if unavailable.
+    """
+    out = _run_cmd(["ip", "route", "show", "default"], timeout=1.0)
+    if out:
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[0] == "default" and parts[1] == "via":
+                ip = parts[2]
+                if ip and not ip.startswith("127.") and not ip.startswith("169.254."):
+                    return ip
+    # Fallback: parse /proc/net/route (hex, little-endian, col 2 = gateway)
+    try:
+        with open("/proc/net/route") as f:
+            next(f)  # skip header
+            for line in f:
+                cols = line.split()
+                if len(cols) >= 3 and cols[1] == "00000000":  # destination 0.0.0.0
+                    gw_hex = cols[2]
+                    if len(gw_hex) == 8 and gw_hex != "00000000":
+                        ip = ".".join(str(int(gw_hex[i:i+2], 16)) for i in (6, 4, 2, 0))
+                        if not ip.startswith("127.") and not ip.startswith("169.254."):
+                            return ip
+    except (OSError, ValueError, StopIteration):
+        pass
+    return None
+
+
 def _nt_host_candidates() -> list[str]:
     """Return ATI host candidates in preference order."""
     if IS_WINDOWS:
         return ["127.0.0.1"]
     if IS_WSL:
-        # 127.0.0.1 reaches Windows under WSL2 mirrored networking; the
-        # resolv.conf nameserver IP reaches it under classic NAT.
+        # 127.0.0.1 reaches Windows under WSL2 mirrored networking.
+        # The default gateway is the Windows host IP under classic NAT.
+        # resolv.conf nameserver is a legacy fallback (pre-systemd-resolved).
         cands = ["127.0.0.1"]
+        gw = _wsl_windows_host_ip()
+        if gw and gw not in cands:
+            cands.append(gw)
         try:
             with open("/etc/resolv.conf") as f:
                 for line in f:
                     if line.strip().startswith("nameserver"):
                         ip = line.split()[1]
-                        if ip and ip not in cands:
+                        # Skip stub resolver (127.0.0.53) and link-local
+                        if (ip
+                                and not ip.startswith("127.")
+                                and not ip.startswith("169.254.")
+                                and ip not in cands):
                             cands.append(ip)
                         break
         except OSError:
@@ -927,6 +966,12 @@ def ask_account(cfg: dict) -> str:
     default_line = f"Press ENTER for default: {DEFAULT_ACCOUNT}"
     print(Fore.CYAN + f"│  {default_line.ljust(54)}│" + Style.RESET_ALL)
     print(Fore.CYAN + "└───────────────────────────────────────────────────────┘" + Style.RESET_ALL)
+
+    if IS_WSL:
+        tried = ", ".join(_nt_host_candidates()) or "127.0.0.1"
+        print(Fore.YELLOW + f"  💡  WSL: tried {tried} on port {nt_port}." + Style.RESET_ALL)
+        print(Fore.YELLOW + "      If NinjaTrader is running, allow inbound TCP " + str(nt_port) + " in" + Style.RESET_ALL)
+        print(Fore.YELLOW + "      Windows Firewall for the WSL profile/subnet, then re-run setup." + Style.RESET_ALL)
 
     acct = input(Fore.WHITE + f"  ACCOUNT [{DEFAULT_ACCOUNT}] ▸ " + Style.RESET_ALL).strip()
     return acct or DEFAULT_ACCOUNT
