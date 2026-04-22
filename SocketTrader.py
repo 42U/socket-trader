@@ -27,7 +27,7 @@ try:
 except ImportError:
     pyfiglet = None
 
-__version__ = "0.2.5"
+__version__ = "0.2.6"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -889,6 +889,114 @@ def _pick_field(fields: dict[str, float], names: tuple[str, ...]) -> float | Non
         if n in fields:
             return fields[n]
     return None
+
+
+# ---------- Internal unrealized P&L computation ----------
+# NT ATI's TCP ACCOUNTS response typically exposes CashValue only — no
+# NetLiquidation / UnrealizedProfitLoss — so the stop/target monitor needs
+# to compute mark-to-market itself from (last - avg) * qty * point_value.
+FUTURES_POINT_VALUES: dict[str, float] = {
+    # E-minis / micros
+    "ES": 50.0,   "MES": 5.0,
+    "NQ": 20.0,   "MNQ": 2.0,
+    "YM": 5.0,    "MYM": 0.5,
+    "RTY": 50.0,  "M2K": 5.0,
+    # Energy
+    "CL": 1000.0, "MCL": 100.0,
+    "NG": 10000.0, "QG": 2500.0,
+    "RB": 42000.0, "HO": 42000.0,
+    # Metals
+    "GC": 100.0,  "MGC": 10.0,
+    "SI": 5000.0, "SIL": 1000.0,
+    "HG": 25000.0, "MHG": 2500.0,
+    "PL": 50.0,
+    # Rates
+    "ZB": 1000.0, "ZN": 1000.0, "ZF": 1000.0, "ZT": 2000.0,
+    "UB": 1000.0,
+    # Grains
+    "ZC": 50.0, "ZS": 50.0, "ZW": 50.0, "ZL": 600.0, "ZM": 100.0,
+    # Livestock
+    "HE": 400.0, "LE": 400.0, "GF": 500.0,
+    # Currencies (per 1.0 price move)
+    "6E": 125000.0, "6B": 62500.0, "6J": 12500000.0,
+    "6A": 100000.0, "6C": 100000.0, "6S": 125000.0, "6N": 100000.0,
+    # Crypto
+    "BTC": 5.0, "MBT": 0.1,
+    "ETH": 50.0, "MET": 0.1,
+}
+
+
+def _instrument_root(instrument: str) -> str:
+    """Extract futures root symbol. 'NQ 06-26' → 'NQ', 'MNQ-03-27' → 'MNQ'."""
+    if not instrument:
+        return ""
+    head = instrument.strip().split()[0]
+    return head.split("-")[0].upper()
+
+
+def _point_value(instrument: str) -> float | None:
+    """Return USD per 1.0 price-point for an instrument, or None if unknown."""
+    return FUTURES_POINT_VALUES.get(_instrument_root(instrument))
+
+
+def _query_ati_scalar(command: str, port: int = 36973, timeout: float = 1.5) -> float | None:
+    """Send an ATI command whose response is a single scalar; return the float
+    or None if the response was empty / zero / unparseable. Zero is treated
+    as 'no data' because NT returns 0 for unsubscribed instruments."""
+    text = _query_ati(command, port, timeout)
+    if not text:
+        return None
+    cleaned = text.replace("\x00", " ").strip()
+    m = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+    if not m:
+        return None
+    try:
+        v = float(m.group())
+    except ValueError:
+        return None
+    return v if v != 0.0 else None
+
+
+def query_nt_last_price(instrument: str, port: int = 36973) -> float | None:
+    """Query the last traded price for an instrument via ATI."""
+    return _query_ati_scalar(f"LASTPRICE|{instrument}", port)
+
+
+def query_nt_avg_entry_price(account: str, instrument: str, port: int = 36973) -> float | None:
+    """Query the average entry price for an open position via ATI."""
+    return _query_ati_scalar(f"AVGENTRYPRICE|{account}|{instrument}", port)
+
+
+def compute_unrealized_pnl(account: str, port: int = 36973,
+                           positions: dict[str, int] | None = None) -> float:
+    """Compute total unrealized P&L across open positions on an account.
+
+    Uses POSITIONS quantities, ATI LASTPRICE / AVGENTRYPRICE per instrument,
+    and the futures point-value table. Positions we can't price (missing
+    data or unknown root) are skipped silently — the returned total covers
+    priceable positions only. Passing `positions` avoids a redundant ATI
+    POSITIONS query when the caller already has it.
+    """
+    if not account:
+        return 0.0
+    if positions is None:
+        positions = query_nt_positions(account, port)
+    total = 0.0
+    for instrument, qty in positions.items():
+        if not instrument or qty == 0:
+            continue
+        pv = _point_value(instrument)
+        if pv is None:
+            logger.debug(f"unrealized: unknown point value for '{instrument}'")
+            continue
+        last = query_nt_last_price(instrument, port)
+        avg = query_nt_avg_entry_price(account, instrument, port)
+        if last is None or avg is None:
+            logger.debug(f"unrealized: price data missing for {instrument} "
+                         f"(last={last}, avg={avg})")
+            continue
+        total += (last - avg) * qty * pv
+    return total
 
 
 def query_nt_accounts(port: int = 36973, timeout: float = 3.0) -> list[dict]:
@@ -2494,8 +2602,25 @@ async def balance_monitor():
 
             # Always poll balances for status bar display (non-blocking)
             all_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
+
+            # For the active account, if ATI didn't expose unrealized P&L
+            # directly (NT8 TCP ATI typically doesn't), compute it from
+            # open positions so the stop/target monitor reacts to live
+            # mark-to-market moves instead of only realized cash.
+            active_equity_override: float | None = None
+            if active_account:
+                active_row = next((a for a in all_accounts if a["name"] == active_account), None)
+                if active_row and active_row["unrealized"] == 0.0:
+                    unreal = await asyncio.to_thread(
+                        compute_unrealized_pnl, active_account, nt_port)
+                    if unreal != 0.0:
+                        active_equity_override = active_row["cash"] + unreal
+
             for a in all_accounts:
-                session_current_balances[a["name"]] = a["equity"]
+                if a["name"] == active_account and active_equity_override is not None:
+                    session_current_balances[a["name"]] = active_equity_override
+                else:
+                    session_current_balances[a["name"]] = a["equity"]
                 session_current_cash[a["name"]] = a["cash"]
             refresh_controls()
 
@@ -2760,10 +2885,23 @@ async def listen(token: str):
                 # target monitor responds to open-trade mark-to-market moves;
                 # session_current_cash keeps realized-only for fill detection.
                 nt_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
+
+                # If there are open positions at connect time, compute
+                # unrealized so the start snapshot is true equity (otherwise
+                # the first poll would look like a sudden P&L swing).
+                connect_unreal = 0.0
+                if active_account:
+                    connect_unreal = await asyncio.to_thread(
+                        compute_unrealized_pnl, active_account, nt_port)
+
                 for a in nt_accounts:
+                    if a["name"] == active_account and a["unrealized"] == 0.0 and connect_unreal != 0.0:
+                        equity = a["cash"] + connect_unreal
+                    else:
+                        equity = a["equity"]
                     if a["name"] not in session_start_balances:
-                        session_start_balances[a["name"]] = a["equity"]
-                    session_current_balances[a["name"]] = a["equity"]
+                        session_start_balances[a["name"]] = equity
+                    session_current_balances[a["name"]] = equity
                     session_current_cash[a["name"]] = a["cash"]
 
                 if restored:
