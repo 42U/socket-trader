@@ -1957,41 +1957,63 @@ async def prompt_live_bridge():
     hide_cursor()
 
     cfg = load_config()
+    host = _nt_host(nt_port)
+    # Results go through _dash_set_alert because _dash_exit_menu() wipes
+    # everything the submenu printed the moment control returns to the
+    # outer setup_menu. The alert row is the only output that survives.
     if key == "1":
         live_bridge_enabled = not live_bridge_enabled
         cfg["live_bridge_enabled"] = live_bridge_enabled
         save_config(cfg)
-        action = "enabled" if live_bridge_enabled else "disabled"
-        print(Fore.GREEN + f"\n  ✔  Live monitor {action}." + Style.RESET_ALL)
         if live_bridge_enabled:
             ok = await asyncio.to_thread(
-                probe_live_bridge, _nt_host(nt_port), live_bridge_port)
-            if not ok:
-                print(Fore.YELLOW +
-                      f"  ⚠  AddOn not responding on "
-                      f"{_nt_host(nt_port)}:{live_bridge_port}. "
-                      "See install steps (option 2)." + Style.RESET_ALL)
+                probe_live_bridge, host, live_bridge_port)
+            if ok:
+                _dash_set_alert(
+                    Fore.GREEN +
+                    f"  ✔  Live monitor enabled · AddOn active on "
+                    f"{host}:{live_bridge_port}." + Style.RESET_ALL)
+            else:
+                _dash_set_alert(
+                    Fore.YELLOW +
+                    f"  ⚠  Live monitor enabled but AddOn not reachable on "
+                    f"{host}:{live_bridge_port}.  S → 7 → 2 for install steps." +
+                    Style.RESET_ALL)
+        else:
+            _dash_set_alert(
+                Fore.CYAN + "  ✔  Live monitor disabled." + Style.RESET_ALL)
     elif key == "2":
         _print_addon_install_steps()
+        sys.stdout.write(Fore.WHITE +
+                         "\n  Press ENTER to return... " + Style.RESET_ALL)
+        sys.stdout.flush()
+        show_cursor()
+        await asyncio.to_thread(read_line_raw)
+        hide_cursor()
     elif key == "3":
-        sys.stdout.write(Fore.WHITE + "  Testing…" + Style.RESET_ALL)
+        sys.stdout.write(Fore.WHITE +
+                         "  Testing connection..." + Style.RESET_ALL)
         sys.stdout.flush()
         ok = await asyncio.to_thread(
-            probe_live_bridge, _nt_host(nt_port), live_bridge_port)
+            probe_live_bridge, host, live_bridge_port, 2.5)
         if ok:
-            print(Fore.GREEN +
-                  f"\r  ✔  AddOn reachable at "
-                  f"{_nt_host(nt_port)}:{live_bridge_port}." + Style.RESET_ALL)
+            _dash_set_alert(
+                Fore.GREEN +
+                f"  ✔  AddOn reachable · streaming live P&L from "
+                f"{host}:{live_bridge_port}." + Style.RESET_ALL)
         else:
-            print(Fore.YELLOW +
-                  f"\r  ✖  No response at "
-                  f"{_nt_host(nt_port)}:{live_bridge_port}." + Style.RESET_ALL)
+            _dash_set_alert(
+                Fore.YELLOW +
+                f"  ✖  No response from {host}:{live_bridge_port}.  "
+                "NinjaTrader down, AddOn not compiled, or port mismatch." +
+                Style.RESET_ALL)
     elif key == "4":
         show_cursor()
         sys.stdout.write(Fore.WHITE +
                          f"  NEW PORT [{live_bridge_port}] ▸ " + Style.RESET_ALL)
         sys.stdout.flush()
         raw = await asyncio.to_thread(read_line_raw)
+        hide_cursor()
         if raw:
             try:
                 p = int(raw.strip())
@@ -1999,11 +2021,15 @@ async def prompt_live_bridge():
                     live_bridge_port = p
                     cfg["live_bridge_port"] = p
                     save_config(cfg)
-                    print(Fore.GREEN + f"  ✔  Port set → {p}" + Style.RESET_ALL)
+                    _dash_set_alert(
+                        Fore.GREEN +
+                        f"  ✔  Live monitor port set → {p}." + Style.RESET_ALL)
                 else:
-                    print(Fore.RED + "  ✖  Port must be 1–65535." + Style.RESET_ALL)
+                    _dash_set_alert(
+                        Fore.RED + "  ✖  Port must be 1–65535." + Style.RESET_ALL)
             except ValueError:
-                print(Fore.RED + "  ✖  Invalid port." + Style.RESET_ALL)
+                _dash_set_alert(
+                    Fore.RED + "  ✖  Invalid port." + Style.RESET_ALL)
 
     awaiting_user_input = False
 
