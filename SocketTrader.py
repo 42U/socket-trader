@@ -1884,12 +1884,18 @@ async def prompt_token():
 
 # ---------- Setup submenu ----------
 # ---------- Live-monitor prompt (optional NinjaScript AddOn) ----------
-def _live_bridge_status() -> tuple[str, str]:
-    """Return (label, color) summarising the current live-monitor state."""
+def _live_bridge_status(timeout: float = 1.0) -> tuple[str, str]:
+    """Return (label, color) summarising the current live-monitor state.
+
+    The default timeout is short because the AddOn broadcasts a snapshot
+    immediately on accept; anything slower than ~1s means it's not there.
+    Callers that want a more patient probe (explicit Test Connection) can
+    pass a longer timeout.
+    """
     if not live_bridge_enabled:
         return ("disabled", "WHITE")
     host = _nt_host(nt_port)
-    reachable = probe_live_bridge(host, live_bridge_port)
+    reachable = probe_live_bridge(host, live_bridge_port, timeout=timeout)
     return ("enabled · active", "GREEN") if reachable else ("enabled · NOT REACHABLE", "YELLOW")
 
 
@@ -2011,7 +2017,9 @@ async def setup_menu():
     cfg = load_config()
     current_server = cfg.get("ws_host", "not set")
     masked_token = "*" * min(len(cfg.get("token", "")), 33) or "not set"
-    live_label, live_color = _live_bridge_status()
+    # Probe off-loop — a blocking probe here stalls the asyncio event loop
+    # long enough for the WebSocket server to time out the connection.
+    live_label, live_color = await asyncio.to_thread(_live_bridge_status)
     live_color_code = _STATE_COLORS.get(live_color, "")
     print(Fore.CYAN + "\n┌─ SETUP ──────────────────────────────────────────┐" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  1. Server    ({current_server[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
