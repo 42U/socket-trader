@@ -7,6 +7,7 @@ import logging
 import logging.handlers
 import shutil
 import socket
+import subprocess
 import sys
 import time
 import tempfile
@@ -26,7 +27,7 @@ try:
 except ImportError:
     pyfiglet = None
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -450,30 +451,97 @@ def is_trade_ready() -> bool:
 
 
 # ---------- NinjaTrader incoming folder detection ----------
+_NT_USER_SKIP = {"Public", "Default", "Default User", "All Users", "desktop.ini"}
+_NT_SCAN_SKIP = {
+    "Windows", "WinSxS", "Program Files", "Program Files (x86)",
+    "$RECYCLE.BIN", "System Volume Information", "ProgramData",
+    "AppData", "Recovery", "PerfLogs", "MSOCache",
+    "node_modules", ".git", ".cache",
+}
+
+
+def _run_cmd(args: list[str], timeout: float = 6.0) -> str | None:
+    """Run a subprocess and return trimmed stdout, or None on any failure."""
+    try:
+        result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    out = (result.stdout or "").strip()
+    return out or None
+
+
+def _windows_to_wsl_path(win_path: str) -> str | None:
+    """Convert a Windows path to a WSL (/mnt/...) path via wslpath."""
+    return _run_cmd(["wslpath", "-u", win_path])
+
+
+def _query_windows_docs_folder() -> str | None:
+    """Ask Windows for the actual MyDocuments folder via PowerShell.
+
+    Returns a filesystem path usable from the current OS (native path on
+    Windows, /mnt/... path under WSL), or None if PowerShell is unavailable.
+    Handles Windows folder redirection, OneDrive, and OneDrive-Corporate.
+    """
+    if not (IS_WINDOWS or IS_WSL):
+        return None
+    win_path = _run_cmd([
+        "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+        "[Environment]::GetFolderPath('MyDocuments')",
+    ])
+    if not win_path:
+        return None
+    if IS_WINDOWS:
+        return win_path
+    return _windows_to_wsl_path(win_path)
+
+
 def _find_nt_incoming_candidates_windows() -> list[Path]:
     """Candidate NinjaTrader 8 incoming paths on native Windows."""
     home = Path.home()
-    cands = [
+    cands: list[Path] = []
+
+    # Ask Windows for the real Documents folder (handles redirection)
+    docs = _query_windows_docs_folder()
+    if docs:
+        cands.append(Path(docs) / "NinjaTrader 8" / "incoming")
+
+    cands.extend([
         home / "Documents" / "NinjaTrader 8" / "incoming",
         home / "OneDrive" / "Documents" / "NinjaTrader 8" / "incoming",
-    ]
+        home / "NinjaTrader 8" / "incoming",
+    ])
+
+    # OneDrive-Corporate: "OneDrive - <tenant>"
+    try:
+        for onedrive_dir in home.glob("OneDrive - */Documents"):
+            cands.append(onedrive_dir / "NinjaTrader 8" / "incoming")
+    except OSError:
+        pass
+
     for drive_letter in "CDEFGH":
         cands.append(Path(f"{drive_letter}:/NinjaTrader 8/incoming"))
+        cands.append(Path(f"{drive_letter}:/Documents/NinjaTrader 8/incoming"))
     return cands
 
 
 def _find_nt_incoming_candidates_wsl() -> list[Path]:
     """Candidate NinjaTrader 8 incoming paths when running under WSL.
 
-    Scans /mnt/<letter>/Users/<user>/(OneDrive/)Documents/NinjaTrader 8/incoming
-    across all mounted Windows drives.
+    Scans /mnt/<letter>/Users/<user>/.../NinjaTrader 8/incoming across all
+    mounted Windows drives, plus any path Windows reports for MyDocuments.
     """
     cands: list[Path] = []
+
+    # Ask Windows directly (handles redirection + OneDrive-Corporate cleanly)
+    docs = _query_windows_docs_folder()
+    if docs:
+        cands.append(Path(docs) / "NinjaTrader 8" / "incoming")
+
     mnt = Path("/mnt")
     if not mnt.is_dir():
         return cands
-
-    skip_users = {"Public", "Default", "Default User", "All Users", "desktop.ini"}
 
     try:
         drives = [p for p in mnt.iterdir() if p.is_dir() and len(p.name) == 1]
@@ -485,19 +553,100 @@ def _find_nt_incoming_candidates_wsl() -> list[Path]:
         try:
             if users.is_dir():
                 for user_dir in users.iterdir():
-                    if not user_dir.is_dir() or user_dir.name in skip_users:
+                    if not user_dir.is_dir() or user_dir.name in _NT_USER_SKIP:
                         continue
                     cands.append(user_dir / "Documents" / "NinjaTrader 8" / "incoming")
                     cands.append(user_dir / "OneDrive" / "Documents" / "NinjaTrader 8" / "incoming")
+                    cands.append(user_dir / "NinjaTrader 8" / "incoming")
+                    try:
+                        for onedrive_dir in user_dir.glob("OneDrive - */Documents"):
+                            cands.append(onedrive_dir / "NinjaTrader 8" / "incoming")
+                    except OSError:
+                        pass
         except OSError:
             pass
-        # Root-level install (rare)
+        # Drive-root variants
         cands.append(drive / "NinjaTrader 8" / "incoming")
+        cands.append(drive / "Documents" / "NinjaTrader 8" / "incoming")
     return cands
 
 
-def find_ninjatrader_incoming() -> str | None:
-    """Search known locations for NinjaTrader 8\\incoming on Windows or WSL."""
+def _shallow_scan_for_nt(roots: list[Path], max_depth: int = 4, time_budget: float = 3.0) -> str | None:
+    """Time-bounded BFS for `NinjaTrader 8/incoming` under the given roots.
+
+    Skips system and cache directories. Intended as a last-resort fallback
+    when the candidate list misses a custom install location.
+    """
+    deadline = time.monotonic() + time_budget
+    for root in roots:
+        try:
+            if not root.is_dir():
+                continue
+        except OSError:
+            continue
+        queue: list[tuple[Path, int]] = [(root, 0)]
+        while queue:
+            if time.monotonic() > deadline:
+                return None
+            current, depth = queue.pop(0)
+            try:
+                children = list(current.iterdir())
+            except (OSError, PermissionError):
+                continue
+            for child in children:
+                if time.monotonic() > deadline:
+                    return None
+                try:
+                    if not child.is_dir():
+                        continue
+                except OSError:
+                    continue
+                if child.name in _NT_SCAN_SKIP:
+                    continue
+                if child.name == "NinjaTrader 8":
+                    incoming = child / "incoming"
+                    try:
+                        if incoming.is_dir():
+                            return str(incoming.resolve())
+                    except OSError:
+                        pass
+                    continue
+                if depth + 1 <= max_depth:
+                    queue.append((child, depth + 1))
+    return None
+
+
+def _scan_roots() -> list[Path]:
+    """Roots to feed into the shallow scan fallback."""
+    if IS_WINDOWS:
+        roots = [Path.home()]
+        for d in "CDEFGH":
+            roots.append(Path(f"{d}:/"))
+        return roots
+    if IS_WSL:
+        mnt = Path("/mnt")
+        roots: list[Path] = []
+        if mnt.is_dir():
+            try:
+                for p in mnt.iterdir():
+                    if p.is_dir() and len(p.name) == 1:
+                        users = p / "Users"
+                        if users.is_dir():
+                            roots.append(users)
+                        else:
+                            roots.append(p)
+            except OSError:
+                pass
+        return roots
+    return []
+
+
+def find_ninjatrader_incoming(deep_scan: bool = True) -> str | None:
+    """Search known locations for NinjaTrader 8\\incoming on Windows or WSL.
+
+    If the fast candidate list misses and `deep_scan` is True, falls back to
+    a time-bounded shallow scan under likely roots.
+    """
     if IS_WINDOWS:
         candidates = _find_nt_incoming_candidates_windows()
     elif IS_WSL:
@@ -505,23 +654,27 @@ def find_ninjatrader_incoming() -> str | None:
     else:
         return None
 
+    # Dedupe while preserving order
+    seen: set[str] = set()
+    ordered: list[Path] = []
     for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(path)
+
+    for path in ordered:
         try:
             if path.is_dir():
                 return str(path.resolve())
         except OSError:
             continue
 
-    # Broader fallback: recursive search under user home (native Windows only;
-    # skipped on WSL because rglobbing /mnt is pathologically slow).
-    if IS_WINDOWS:
-        try:
-            for p in Path.home().rglob("NinjaTrader 8"):
-                incoming = p / "incoming"
-                if incoming.is_dir():
-                    return str(incoming.resolve())
-        except (PermissionError, OSError):
-            pass
+    if deep_scan:
+        found = _shallow_scan_for_nt(_scan_roots())
+        if found:
+            return found
 
     return None
 
@@ -561,7 +714,7 @@ def detect_or_ask_directory(cfg: dict) -> str | None:
     while True:
         raw = input(Fore.WHITE + "  PATH ▸ " + Style.RESET_ALL).strip().strip('"').strip("'")
         if not raw:
-            print(Fore.YELLOW + "  ↩  No directory set. You can set one later with D key." + Style.RESET_ALL)
+            print(Fore.YELLOW + "  ↩  No directory set. Press S → 5 after connecting to set one." + Style.RESET_ALL)
             return None
         path = Path(raw)
         if path.is_dir():
@@ -728,11 +881,15 @@ def query_nt_positions(account: str, port: int = 36973) -> dict[str, int]:
     return quantities
 
 
+DEFAULT_ACCOUNT = "Sim101"
+
+
 def ask_account(cfg: dict) -> str:
     """Get NinjaTrader account name from config or prompt user.
 
-    On first run, queries ATI for accounts or prompts manually.
-    Saves choice to config and reuses it on subsequent runs.
+    On first run, queries ATI for accounts or prompts manually. The
+    recommended default is Sim101 — if present in the detected list it is
+    pre-selected, and if ATI is unreachable pressing ENTER uses Sim101.
     """
     saved = cfg.get("account")
     if saved:
@@ -741,31 +898,38 @@ def ask_account(cfg: dict) -> str:
     # First run — try to auto-detect accounts from NinjaTrader ATI
     accounts = query_nt_accounts(nt_port)
     if accounts:
+        names = [a["name"] for a in accounts]
+        default_idx = names.index(DEFAULT_ACCOUNT) + 1 if DEFAULT_ACCOUNT in names else 1
+        default_name = accounts[default_idx - 1]["name"]
         print(Fore.CYAN + "\n┌─ NINJATRADER ACCOUNTS (auto-detected) ────────────────┐" + Style.RESET_ALL)
         for i, a in enumerate(accounts, 1):
-            line = f"{i}. {a['name']}  (${a['cash']:,.2f})"
+            star = "★" if i == default_idx else " "
+            line = f"{i}. {star} {a['name']}  (${a['cash']:,.2f})"
             print(Fore.CYAN + f"│  {line.ljust(54)}│" + Style.RESET_ALL)
         print(Fore.CYAN + "└───────────────────────────────────────────────────────┘" + Style.RESET_ALL)
         if len(accounts) == 1:
-            print(Fore.GREEN + f"  ✔  Auto-selected: {accounts[0]['name']}" + Style.RESET_ALL)
-            return accounts[0]["name"]
+            print(Fore.GREEN + f"  ✔  Auto-selected: {default_name}" + Style.RESET_ALL)
+            return default_name
         while True:
-            choice = input(Fore.WHITE + "  SELECT # ▸ " + Style.RESET_ALL).strip()
+            choice = input(
+                Fore.WHITE + f"  SELECT # [ENTER = {default_name}] ▸ " + Style.RESET_ALL
+            ).strip()
+            if not choice:
+                return default_name
             if choice.isdigit() and 1 <= int(choice) <= len(accounts):
                 return accounts[int(choice) - 1]["name"]
-            print(Fore.YELLOW + f"  ⚠  Enter 1-{len(accounts)}." + Style.RESET_ALL)
+            print(Fore.YELLOW + f"  ⚠  Enter 1-{len(accounts)} or press ENTER for default." + Style.RESET_ALL)
 
-    # ATI not available — manual entry
+    # ATI not available — manual entry with Sim101 default
     print(Fore.CYAN + "\n┌─ NINJATRADER ACCOUNT ─────────────────────────────────┐" + Style.RESET_ALL)
-    print(Fore.CYAN + "│  Enter your NinjaTrader account name.                 │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  NinjaTrader ATI unreachable — enter account name.    │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  This replaces the Sim account in incoming signals.   │" + Style.RESET_ALL)
+    default_line = f"Press ENTER for default: {DEFAULT_ACCOUNT}"
+    print(Fore.CYAN + f"│  {default_line.ljust(54)}│" + Style.RESET_ALL)
     print(Fore.CYAN + "└───────────────────────────────────────────────────────┘" + Style.RESET_ALL)
 
-    while True:
-        acct = input(Fore.WHITE + "  ACCOUNT ▸ " + Style.RESET_ALL).strip()
-        if acct:
-            return acct
-        print(Fore.YELLOW + "  ⚠  Account cannot be empty." + Style.RESET_ALL)
+    acct = input(Fore.WHITE + f"  ACCOUNT [{DEFAULT_ACCOUNT}] ▸ " + Style.RESET_ALL).strip()
+    return acct or DEFAULT_ACCOUNT
 
 
 def ask_token(cfg: dict, force: bool = False) -> str:
@@ -2769,17 +2933,19 @@ def setup() -> tuple[str, dict]:
         cfg["token"] = token
         changed = True
 
-    # 3. Account / directory — optional at startup, prompted later if missing
-    #    Only ask during fresh first-time setup (nothing saved at all)
-    if not cfg.get("account") and not cfg.get("output_directory"):
+    # 3. Account — auto-detected via ATI when reachable, manual otherwise.
+    if not cfg.get("account"):
         account = ask_account(cfg)
         cfg["account"] = account
+        changed = True
 
+    # 4. Output directory — auto-detected on Windows/WSL, manual otherwise.
+    if not cfg.get("output_directory"):
         global output_directory
         output_directory = detect_or_ask_directory(cfg)
         if output_directory:
             cfg["output_directory"] = output_directory
-        changed = True
+            changed = True
 
     if changed:
         save_config(cfg)
