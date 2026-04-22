@@ -72,6 +72,8 @@ active_account = None          # Current NinjaTrader account name
 atm_strategy = "NQ_Med"        # ATM strategy template name (fallback)
 follow_publisher_strategy = False  # If True, use the publisher's strategy per-signal when locally installed
 nt_port = 36973                # NinjaTrader AT Interface port (default 36973)
+live_bridge_enabled = False    # If True, prefer the optional SocketTraderBridge AddOn
+live_bridge_port = 36974       # Port the NinjaScript AddOn listens on (see addon/)
 awaiting_directory_input = False
 awaiting_user_input = False  # Block key handler during any input prompt
 
@@ -807,6 +809,32 @@ def _probe_host(host: str, port: int, timeout: float = 0.4) -> bool:
 def invalidate_nt_host_cache() -> None:
     """Clear the cached ATI host (call after port/network changes)."""
     _nt_host_cache.clear()
+
+
+def probe_live_bridge(host: str, port: int, timeout: float = 2.5) -> bool:
+    """Probe the optional SocketTraderBridge AddOn.
+
+    Success = TCP connect + at least one newline-delimited JSON line that
+    parses and carries an 'accounts' field. A plain TCP open isn't enough
+    because the default ATI also listens and would give a false positive
+    if the user pointed this at the wrong port.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                return False
+            buf += chunk
+        s.close()
+        line = buf.split(b"\n", 1)[0].decode("utf-8", errors="ignore")
+        obj = json.loads(line)
+        return isinstance(obj, dict) and "accounts" in obj
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def _nt_host(port: int = 36973) -> str:
@@ -1855,6 +1883,125 @@ async def prompt_token():
 
 
 # ---------- Setup submenu ----------
+# ---------- Live-monitor prompt (optional NinjaScript AddOn) ----------
+def _live_bridge_status() -> tuple[str, str]:
+    """Return (label, color) summarising the current live-monitor state."""
+    if not live_bridge_enabled:
+        return ("disabled", "WHITE")
+    host = _nt_host(nt_port)
+    reachable = probe_live_bridge(host, live_bridge_port)
+    return ("enabled · active", "GREEN") if reachable else ("enabled · NOT REACHABLE", "YELLOW")
+
+
+def _print_addon_install_steps():
+    print(Fore.CYAN + "\n┌─ INSTALL SOCKETTRADER ADDON ───────────────────────┐" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  The AddOn publishes live account P&L from inside  │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  NinjaTrader so stops/targets fire DURING a trade. │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│                                                    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  1. On your NinjaTrader machine, copy              │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│     addon/SocketTraderBridge.cs into               │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│     Documents\\NinjaTrader 8\\bin\\Custom\\AddOns\\     │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  2. In NinjaTrader:                                │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│     Control Center → New → NinjaScript Editor.     │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  3. Press F5 to compile. (No restart needed —      │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│     AddOn hot-loads on successful compile.)        │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  4. Output tab should print:                       │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│     'SocketTraderBridge listening on 0.0.0.0:XXX'  │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│                                                    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Full docs: addon/README.md                        │" + Style.RESET_ALL)
+    print(Fore.CYAN + "└────────────────────────────────────────────────────┘" + Style.RESET_ALL)
+
+
+async def prompt_live_bridge():
+    """Setup submenu for the optional live-monitoring NinjaScript AddOn."""
+    global live_bridge_enabled, live_bridge_port, awaiting_user_input
+    awaiting_user_input = True
+    show_cursor()
+
+    label, color = await asyncio.to_thread(_live_bridge_status)
+    state_color = _STATE_COLORS.get(color, Fore.WHITE)
+
+    print(Fore.CYAN + "\n┌─ LIVE TRADE MONITOR (optional AddOn) ──────────────┐" + Style.RESET_ALL)
+    status_line = f"Status: {label}"
+    print(Fore.CYAN + "│  " + state_color + status_line.ljust(50) + Fore.CYAN + "│" + Style.RESET_ALL)
+    port_line = f"Port:   {live_bridge_port}   (NT host: {_nt_host(nt_port)})"
+    print(Fore.CYAN + f"│  {port_line[:50].ljust(50)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + "│                                                    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  With the AddOn: session stops/targets fire DURING │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  an open trade. Without it: only after trade close.│" + Style.RESET_ALL)
+    print(Fore.CYAN + "│                                                    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  1. Toggle enabled / disabled                      │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  2. Show install steps                             │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  3. Test connection now                            │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  4. Change port                                    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  ESC to close                                      │" + Style.RESET_ALL)
+    print(Fore.CYAN + "└────────────────────────────────────────────────────┘" + Style.RESET_ALL)
+
+    if live_bridge_enabled and color != "GREEN":
+        print(Fore.YELLOW + Style.BRIGHT +
+              f"  ⚠  Live monitor is enabled but unreachable at " +
+              f"{_nt_host(nt_port)}:{live_bridge_port}." + Style.RESET_ALL)
+        print(Fore.YELLOW +
+              "     The AddOn isn't compiled or NinjaTrader is down. "
+              "Press 2 for steps." + Style.RESET_ALL)
+
+    sys.stdout.write(Fore.WHITE + "  LIVE ▸ " + Style.RESET_ALL)
+    sys.stdout.flush()
+    key = await asyncio.to_thread(get_key)
+    hide_cursor()
+
+    cfg = load_config()
+    if key == "1":
+        live_bridge_enabled = not live_bridge_enabled
+        cfg["live_bridge_enabled"] = live_bridge_enabled
+        save_config(cfg)
+        action = "enabled" if live_bridge_enabled else "disabled"
+        print(Fore.GREEN + f"\n  ✔  Live monitor {action}." + Style.RESET_ALL)
+        if live_bridge_enabled:
+            ok = await asyncio.to_thread(
+                probe_live_bridge, _nt_host(nt_port), live_bridge_port)
+            if not ok:
+                print(Fore.YELLOW +
+                      f"  ⚠  AddOn not responding on "
+                      f"{_nt_host(nt_port)}:{live_bridge_port}. "
+                      "See install steps (option 2)." + Style.RESET_ALL)
+    elif key == "2":
+        _print_addon_install_steps()
+    elif key == "3":
+        sys.stdout.write(Fore.WHITE + "  Testing…" + Style.RESET_ALL)
+        sys.stdout.flush()
+        ok = await asyncio.to_thread(
+            probe_live_bridge, _nt_host(nt_port), live_bridge_port)
+        if ok:
+            print(Fore.GREEN +
+                  f"\r  ✔  AddOn reachable at "
+                  f"{_nt_host(nt_port)}:{live_bridge_port}." + Style.RESET_ALL)
+        else:
+            print(Fore.YELLOW +
+                  f"\r  ✖  No response at "
+                  f"{_nt_host(nt_port)}:{live_bridge_port}." + Style.RESET_ALL)
+    elif key == "4":
+        show_cursor()
+        sys.stdout.write(Fore.WHITE +
+                         f"  NEW PORT [{live_bridge_port}] ▸ " + Style.RESET_ALL)
+        sys.stdout.flush()
+        raw = await asyncio.to_thread(read_line_raw)
+        if raw:
+            try:
+                p = int(raw.strip())
+                if 1 <= p <= 65535:
+                    live_bridge_port = p
+                    cfg["live_bridge_port"] = p
+                    save_config(cfg)
+                    print(Fore.GREEN + f"  ✔  Port set → {p}" + Style.RESET_ALL)
+                else:
+                    print(Fore.RED + "  ✖  Port must be 1–65535." + Style.RESET_ALL)
+            except ValueError:
+                print(Fore.RED + "  ✖  Invalid port." + Style.RESET_ALL)
+
+    awaiting_user_input = False
+
+
 async def setup_menu():
     """Show the setup submenu for config changes."""
     global awaiting_user_input
@@ -1864,6 +2011,8 @@ async def setup_menu():
     cfg = load_config()
     current_server = cfg.get("ws_host", "not set")
     masked_token = "*" * min(len(cfg.get("token", "")), 33) or "not set"
+    live_label, live_color = _live_bridge_status()
+    live_color_code = _STATE_COLORS.get(live_color, "")
     print(Fore.CYAN + "\n┌─ SETUP ──────────────────────────────────────────┐" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  1. Server    ({current_server[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  2. Token     ({masked_token[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
@@ -1873,8 +2022,24 @@ async def setup_menu():
     print(Fore.CYAN + f"│  4. Strategy  ({strat_label[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  5. Directory ({(output_directory or 'not set')[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  6. ATI Port  ({nt_port})" .ljust(53) + "│" + Style.RESET_ALL)
+    # Live monitor row with inline color on the status label
+    live_row_plain = f"│  7. Live Mon. ({live_label[:33]})"
+    live_pad = " " * max(0, 53 - len(live_row_plain))
+    live_row = (
+        Fore.CYAN + "│  7. Live Mon. (" +
+        live_color_code + live_label[:33] + Fore.CYAN +
+        ")" + live_pad + "│"
+    )
+    print(live_row + Style.RESET_ALL)
     print(Fore.CYAN + "│  ESC to close                                    │" + Style.RESET_ALL)
     print(Fore.CYAN + "└──────────────────────────────────────────────────┘" + Style.RESET_ALL)
+
+    # Inline warning if enabled-but-not-active
+    if live_bridge_enabled and live_color != "GREEN":
+        print(Fore.YELLOW +
+              "  ⚠  Live monitor enabled but AddOn not reachable "
+              "(option 7 for steps)." + Style.RESET_ALL)
+
     sys.stdout.write(Fore.WHITE + "  SETUP ▸ " + Style.RESET_ALL)
     sys.stdout.flush()
     key = await asyncio.to_thread(get_key)
@@ -1893,6 +2058,8 @@ async def setup_menu():
         await prompt_directory()
     elif key == "6":
         await prompt_port()
+    elif key == "7":
+        await prompt_live_bridge()
     _dash_exit_menu()
 
 
@@ -3038,6 +3205,20 @@ def setup() -> tuple[str, dict]:
     if not cfg.get("account") or not cfg.get("output_directory"):
         print(Fore.YELLOW + f"  ⚠  Press S after connecting to finish setup." + Style.RESET_ALL)
 
+    # Startup warning: live monitor enabled but AddOn not reachable.
+    if cfg.get("live_bridge_enabled"):
+        _bridge_port = int(cfg.get("live_bridge_port", 36974))
+        if probe_live_bridge(_nt_host(cfg.get("nt_port", 36973)), _bridge_port):
+            print(Fore.GREEN +
+                  f"  ✔  Live monitor active on port {_bridge_port}." + Style.RESET_ALL)
+        else:
+            print(Fore.YELLOW +
+                  f"  ⚠  Live monitor enabled but AddOn not reachable on "
+                  f"port {_bridge_port}." + Style.RESET_ALL)
+            print(Fore.YELLOW +
+                  "     Press S → 7 for install steps, or disable to silence." +
+                  Style.RESET_ALL)
+
     # Install strategy templates if output directory is configured
     if cfg.get("output_directory") and Path(cfg["output_directory"]).is_dir():
         nt_base = Path(cfg["output_directory"]).parent
@@ -3056,6 +3237,9 @@ async def main():
     atm_strategy = cfg.get("atm_strategy", "NQ_Med")
     follow_publisher_strategy = bool(cfg.get("follow_publisher_strategy", False))
     nt_port = cfg.get("nt_port", 36973)
+    global live_bridge_enabled, live_bridge_port
+    live_bridge_enabled = bool(cfg.get("live_bridge_enabled", False))
+    live_bridge_port = int(cfg.get("live_bridge_port", 36974))
 
     if cfg.get("output_directory"):
         output_directory = cfg["output_directory"]
