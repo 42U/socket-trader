@@ -27,7 +27,7 @@ try:
 except ImportError:
     pyfiglet = None
 
-__version__ = "0.2.4"
+__version__ = "0.2.5"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -120,7 +120,8 @@ def get_session_status_text() -> str:
 
 # ---------- Risk management ----------
 session_start_balances: dict[str, float] = {}   # account -> starting balance
-session_current_balances: dict[str, float] = {}  # account -> latest polled balance
+session_current_balances: dict[str, float] = {}  # account -> latest polled EQUITY (cash + unrealized)
+session_current_cash: dict[str, float] = {}        # account -> latest polled CASH (realized only, for fill detection)
 session_contracts: set[str] = set()              # instruments traded this session
 soft_stopped = False                              # True if soft stop triggered
 hard_stopped = False                              # True if hard stop triggered
@@ -852,25 +853,79 @@ def _query_ati(command: str, port: int = 36973, timeout: float = 2.0) -> str:
         s.close()
 
 
+# Candidate NinjaTrader ATI field names (first match wins)
+_ATI_FIELDS_EQUITY = ("NetLiquidation", "TotalCashBalance", "AccountValue")
+_ATI_FIELDS_UNREAL = ("UnrealizedProfitLoss", "UnrealizedPnL")
+_ATI_FIELDS_REAL   = ("RealizedProfitLoss", "RealizedPnL", "GrossRealizedProfitLoss")
+
+_accounts_fields_logged = False
+
+
+def _parse_ati_account_fields(text: str) -> dict[str, dict[str, float]]:
+    """Parse ACCOUNTS response into {account_name: {field: value}}.
+
+    The TCP ATI response encodes repeated `Key|Account\\x00Value` triples;
+    we collect every scalar-float field per account so callers can pick
+    the one they want (CashValue, NetLiquidation, UnrealizedProfitLoss…).
+    """
+    by_account: dict[str, dict[str, float]] = {}
+    for m in re.finditer(r"([A-Za-z][A-Za-z0-9_]+)\|([^\x00]+)\x00([^\x00]+)", text):
+        key, name, val = m.group(1), m.group(2), m.group(3)
+        try:
+            float(name)
+            continue  # numeric "name" — skip header/separator rows
+        except ValueError:
+            pass
+        try:
+            v = float(val)
+        except ValueError:
+            continue
+        by_account.setdefault(name, {})[key] = v
+    return by_account
+
+
+def _pick_field(fields: dict[str, float], names: tuple[str, ...]) -> float | None:
+    for n in names:
+        if n in fields:
+            return fields[n]
+    return None
+
+
 def query_nt_accounts(port: int = 36973, timeout: float = 3.0) -> list[dict]:
     """Query NinjaTrader ATI for connected accounts with balances.
 
-    Returns list of dicts: [{"name": "Sim101", "cash": 28857.02}, ...]
+    Returns list of dicts per account with keys:
+        name:       account name
+        cash:       realized CashValue (back-compat; used for fill detection)
+        equity:     mark-to-market equity (cash + unrealized) — drives the
+                    session P&L / stop / target monitor so open trades
+                    contribute to the limit check
+        unrealized: open-position P&L reported by ATI (0.0 if not exposed)
     """
+    global _accounts_fields_logged
     text = _query_ati("ACCOUNTS", port, timeout)
     if not text:
         return []
-    accounts = {}
-    for m in re.finditer(r"CashValue\|([^\x00]+)\x00([^\x00]+)", text):
-        name, val = m.group(1), m.group(2)
-        try:
-            float(name)  # skip bare value (no account name)
-        except ValueError:
-            try:
-                accounts[name] = float(val)
-            except ValueError:
-                accounts[name] = 0.0
-    return [{"name": n, "cash": v} for n, v in accounts.items()]
+    by_account = _parse_ati_account_fields(text)
+    if not _accounts_fields_logged and by_account:
+        _accounts_fields_logged = True
+        sample_name, sample_fields = next(iter(by_account.items()))
+        logger.info(f"ATI ACCOUNTS fields for {sample_name}: {sorted(sample_fields.keys())}")
+    out = []
+    for name, fields in by_account.items():
+        cash = fields.get("CashValue", 0.0)
+        unreal = _pick_field(fields, _ATI_FIELDS_UNREAL) or 0.0
+        equity = _pick_field(fields, _ATI_FIELDS_EQUITY)
+        if equity is None:
+            # No net-liq field exposed — compose from CashValue + unrealized.
+            equity = cash + unreal
+        out.append({
+            "name": name,
+            "cash": cash,
+            "equity": equity,
+            "unrealized": unreal,
+        })
+    return out
 
 
 def query_nt_positions(account: str, port: int = 36973) -> dict[str, int]:
@@ -2344,7 +2399,9 @@ def close_all_open_positions() -> list[str]:
 
 def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, action: str, pre_pos: int = 0):
     """Register a signal for post-trade confirmation via position check."""
-    pre_balance = session_current_balances.get(active_account) if active_account else None
+    # Use realized cash (not equity) so fill detection keys off closed-P&L
+    # deltas; equity moves with unrealized swings that don't indicate a fill.
+    pre_balance = session_current_cash.get(active_account) if active_account else None
     with _confirms_lock:
         if len(_pending_confirms) >= MAX_PENDING_CONFIRMS:
             _pending_confirms.pop(0)  # drop oldest
@@ -2370,7 +2427,7 @@ def check_pending_confirms():
         return
 
     positions = query_nt_positions(active_account, nt_port)
-    cur_balance = session_current_balances.get(active_account)
+    cur_balance = session_current_cash.get(active_account)
     now = time.time()
     still_pending = []
 
@@ -2438,7 +2495,8 @@ async def balance_monitor():
             # Always poll balances for status bar display (non-blocking)
             all_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
             for a in all_accounts:
-                session_current_balances[a["name"]] = a["cash"]
+                session_current_balances[a["name"]] = a["equity"]
+                session_current_cash[a["name"]] = a["cash"]
             refresh_controls()
 
             # Auto-reset P&L at 4:20 PM ET (futures session boundary)
@@ -2697,12 +2755,16 @@ async def listen(token: str):
                 # Restore persisted session if still in the same trading session
                 restored = restore_session_state()
 
-                # Snapshot account balances for risk management
+                # Snapshot account balances for risk management.
+                # Start/current track EQUITY (cash + unrealized) so the stop /
+                # target monitor responds to open-trade mark-to-market moves;
+                # session_current_cash keeps realized-only for fill detection.
                 nt_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
                 for a in nt_accounts:
                     if a["name"] not in session_start_balances:
-                        session_start_balances[a["name"]] = a["cash"]
-                    session_current_balances[a["name"]] = a["cash"]
+                        session_start_balances[a["name"]] = a["equity"]
+                    session_current_balances[a["name"]] = a["equity"]
+                    session_current_cash[a["name"]] = a["cash"]
 
                 if restored:
                     pnl_parts = []
