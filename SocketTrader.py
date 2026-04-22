@@ -27,7 +27,7 @@ try:
 except ImportError:
     pyfiglet = None
 
-__version__ = "0.2.6"
+__version__ = "0.2.7"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -120,8 +120,7 @@ def get_session_status_text() -> str:
 
 # ---------- Risk management ----------
 session_start_balances: dict[str, float] = {}   # account -> starting balance
-session_current_balances: dict[str, float] = {}  # account -> latest polled EQUITY (cash + unrealized)
-session_current_cash: dict[str, float] = {}        # account -> latest polled CASH (realized only, for fill detection)
+session_current_balances: dict[str, float] = {}  # account -> latest polled CashValue (realized cash)
 session_contracts: set[str] = set()              # instruments traded this session
 soft_stopped = False                              # True if soft stop triggered
 hard_stopped = False                              # True if hard stop triggered
@@ -853,234 +852,99 @@ def _query_ati(command: str, port: int = 36973, timeout: float = 2.0) -> str:
         s.close()
 
 
-# Candidate NinjaTrader ATI field names (first match wins)
-_ATI_FIELDS_EQUITY = ("NetLiquidation", "TotalCashBalance", "AccountValue")
-_ATI_FIELDS_UNREAL = ("UnrealizedProfitLoss", "UnrealizedPnL")
-_ATI_FIELDS_REAL   = ("RealizedProfitLoss", "RealizedPnL", "GrossRealizedProfitLoss")
+def _parse_ati_fields(text: str) -> list[tuple[str, str, str]]:
+    """Parse NT ATI state-dump into a list of (field, key, value) triples.
 
-_accounts_fields_logged = False
-
-
-def _parse_ati_account_fields(text: str) -> dict[str, dict[str, float]]:
-    """Parse ACCOUNTS response into {account_name: {field: value}}.
-
-    The TCP ATI response encodes repeated `Key|Account\\x00Value` triples;
-    we collect every scalar-float field per account so callers can pick
-    the one they want (CashValue, NetLiquidation, UnrealizedProfitLoss…).
+    Wire format repeats `<Field>|<Key>\\x00<Value>\\x00` where Key is an
+    account name, instrument+account, or an order UUID depending on Field.
+    Value may be any string (signed integer, decimal, pipe-joined UUIDs,
+    status text, or empty). We don't coerce to float here — callers that
+    want numeric fields do their own parsing.
     """
-    by_account: dict[str, dict[str, float]] = {}
-    for m in re.finditer(r"([A-Za-z][A-Za-z0-9_]+)\|([^\x00]+)\x00([^\x00]+)", text):
-        key, name, val = m.group(1), m.group(2), m.group(3)
-        try:
-            float(name)
-            continue  # numeric "name" — skip header/separator rows
-        except ValueError:
-            pass
-        try:
-            v = float(val)
-        except ValueError:
-            continue
-        by_account.setdefault(name, {})[key] = v
-    return by_account
-
-
-def _pick_field(fields: dict[str, float], names: tuple[str, ...]) -> float | None:
-    for n in names:
-        if n in fields:
-            return fields[n]
-    return None
-
-
-# ---------- Internal unrealized P&L computation ----------
-# NT ATI's TCP ACCOUNTS response typically exposes CashValue only — no
-# NetLiquidation / UnrealizedProfitLoss — so the stop/target monitor needs
-# to compute mark-to-market itself from (last - avg) * qty * point_value.
-FUTURES_POINT_VALUES: dict[str, float] = {
-    # E-minis / micros
-    "ES": 50.0,   "MES": 5.0,
-    "NQ": 20.0,   "MNQ": 2.0,
-    "YM": 5.0,    "MYM": 0.5,
-    "RTY": 50.0,  "M2K": 5.0,
-    # Energy
-    "CL": 1000.0, "MCL": 100.0,
-    "NG": 10000.0, "QG": 2500.0,
-    "RB": 42000.0, "HO": 42000.0,
-    # Metals
-    "GC": 100.0,  "MGC": 10.0,
-    "SI": 5000.0, "SIL": 1000.0,
-    "HG": 25000.0, "MHG": 2500.0,
-    "PL": 50.0,
-    # Rates
-    "ZB": 1000.0, "ZN": 1000.0, "ZF": 1000.0, "ZT": 2000.0,
-    "UB": 1000.0,
-    # Grains
-    "ZC": 50.0, "ZS": 50.0, "ZW": 50.0, "ZL": 600.0, "ZM": 100.0,
-    # Livestock
-    "HE": 400.0, "LE": 400.0, "GF": 500.0,
-    # Currencies (per 1.0 price move)
-    "6E": 125000.0, "6B": 62500.0, "6J": 12500000.0,
-    "6A": 100000.0, "6C": 100000.0, "6S": 125000.0, "6N": 100000.0,
-    # Crypto
-    "BTC": 5.0, "MBT": 0.1,
-    "ETH": 50.0, "MET": 0.1,
-}
-
-
-def _instrument_root(instrument: str) -> str:
-    """Extract futures root symbol. 'NQ 06-26' → 'NQ', 'MNQ-03-27' → 'MNQ'."""
-    if not instrument:
-        return ""
-    head = instrument.strip().split()[0]
-    return head.split("-")[0].upper()
-
-
-def _point_value(instrument: str) -> float | None:
-    """Return USD per 1.0 price-point for an instrument, or None if unknown."""
-    return FUTURES_POINT_VALUES.get(_instrument_root(instrument))
-
-
-def _query_ati_scalar(command: str, port: int = 36973, timeout: float = 1.5) -> float | None:
-    """Send an ATI command whose response is a single scalar; return the float
-    or None if the response was empty / zero / unparseable. Zero is treated
-    as 'no data' because NT returns 0 for unsubscribed instruments."""
-    text = _query_ati(command, port, timeout)
-    if not text:
-        return None
-    cleaned = text.replace("\x00", " ").strip()
-    m = re.search(r"-?\d+(?:\.\d+)?", cleaned)
-    if not m:
-        return None
-    try:
-        v = float(m.group())
-    except ValueError:
-        return None
-    return v if v != 0.0 else None
-
-
-def query_nt_last_price(instrument: str, port: int = 36973) -> float | None:
-    """Query the last traded price for an instrument via ATI."""
-    return _query_ati_scalar(f"LASTPRICE|{instrument}", port)
-
-
-def query_nt_avg_entry_price(account: str, instrument: str, port: int = 36973) -> float | None:
-    """Query the average entry price for an open position via ATI."""
-    return _query_ati_scalar(f"AVGENTRYPRICE|{account}|{instrument}", port)
-
-
-def compute_unrealized_pnl(account: str, port: int = 36973,
-                           positions: dict[str, int] | None = None) -> float:
-    """Compute total unrealized P&L across open positions on an account.
-
-    Uses POSITIONS quantities, ATI LASTPRICE / AVGENTRYPRICE per instrument,
-    and the futures point-value table. Positions we can't price (missing
-    data or unknown root) are skipped silently — the returned total covers
-    priceable positions only. Passing `positions` avoids a redundant ATI
-    POSITIONS query when the caller already has it.
-    """
-    if not account:
-        return 0.0
-    if positions is None:
-        positions = query_nt_positions(account, port)
-    total = 0.0
-    for instrument, qty in positions.items():
-        if not instrument or qty == 0:
-            continue
-        pv = _point_value(instrument)
-        if pv is None:
-            logger.debug(f"unrealized: unknown point value for '{instrument}'")
-            continue
-        last = query_nt_last_price(instrument, port)
-        avg = query_nt_avg_entry_price(account, instrument, port)
-        if last is None or avg is None:
-            logger.debug(f"unrealized: price data missing for {instrument} "
-                         f"(last={last}, avg={avg})")
-            continue
-        total += (last - avg) * qty * pv
-    return total
+    return [(m.group(1), m.group(2), m.group(3))
+            for m in re.finditer(r"([A-Za-z][A-Za-z0-9_]+)\|([^\x00]*)\x00([^\x00]*)", text)]
 
 
 def query_nt_accounts(port: int = 36973, timeout: float = 3.0) -> list[dict]:
-    """Query NinjaTrader ATI for connected accounts with balances.
+    """Query NinjaTrader ATI for connected accounts with cash balances.
 
-    Returns list of dicts per account with keys:
-        name:       account name
-        cash:       realized CashValue (back-compat; used for fill detection)
-        equity:     mark-to-market equity (cash + unrealized) — drives the
-                    session P&L / stop / target monitor so open trades
-                    contribute to the limit check
-        unrealized: open-position P&L reported by ATI (0.0 if not exposed)
+    Returns list of dicts: [{"name": "Sim101", "cash": 27462.14}, ...]
+
+    Only CashValue (realized cash) is returned — NT's TCP ATI doesn't push
+    a live-equity field on typical installs, so session risk is enforced
+    on realized cash deltas from completed trades. Per-trade risk is
+    handled by NinjaTrader's own ATM stop/target.
     """
-    global _accounts_fields_logged
     text = _query_ati("ACCOUNTS", port, timeout)
     if not text:
         return []
-    by_account = _parse_ati_account_fields(text)
-    if not _accounts_fields_logged and by_account:
-        _accounts_fields_logged = True
-        sample_name, sample_fields = next(iter(by_account.items()))
-        logger.info(f"ATI ACCOUNTS fields for {sample_name}: {sorted(sample_fields.keys())}")
-    out = []
-    for name, fields in by_account.items():
-        cash = fields.get("CashValue", 0.0)
-        unreal = _pick_field(fields, _ATI_FIELDS_UNREAL) or 0.0
-        equity = _pick_field(fields, _ATI_FIELDS_EQUITY)
-        if equity is None:
-            # No net-liq field exposed — compose from CashValue + unrealized.
-            equity = cash + unreal
-        out.append({
-            "name": name,
-            "cash": cash,
-            "equity": equity,
-            "unrealized": unreal,
-        })
-    return out
+    cash_by_account: dict[str, float] = {}
+    for field, key, val in _parse_ati_fields(text):
+        if field != "CashValue" or not key:
+            continue
+        try:
+            cash_by_account[key] = float(val)
+        except ValueError:
+            pass
+    return [{"name": n, "cash": v} for n, v in cash_by_account.items()]
 
 
 def query_nt_positions(account: str, port: int = 36973) -> dict[str, int]:
     """Query NinjaTrader ATI for open positions on an account.
 
-    Returns dict of instrument -> market position quantity.
-    Positive = long, negative = short, 0 = flat.
-    e.g. {"NQ 06-26": 1, "ES 06-26": -2}
+    Returns dict of instrument -> signed quantity (positive = long,
+    negative = short). Flat positions are omitted.
+
+    NT broadcasts the same position under multiple aliases (e.g.
+    "NQ JUN26", "@NQ", "NQM26", "NQ M6"); we dedupe by preferring the
+    first alias that contains a space (the human-readable "ROOT MONTHYY"
+    form) since NT accepts that format back in PLACE / CLOSEPOSITION.
     """
     text = _query_ati("POSITIONS", port)
     if not text:
         return {}
-    # Log raw response so we can verify/fix parsing against live ATI
     logger.debug(f"ATI POSITIONS raw ({len(text)} bytes): {repr(text[:500])}")
-    # ATI POSITIONS response contains MarketPosition|Account\x00Value
-    # and Quantity|Account\x00Value patterns per instrument
-    positions = {}
-    # Find all instrument sections with market position for our account
-    # Pattern: instrument data comes in blocks separated by \x00
-    # Look for MarketPosition and Quantity entries for the account
-    for m in re.finditer(r"MarketPosition\|([^\x00]+)\x00([^\x00]+)", text):
-        key, val = m.group(1), m.group(2)
-        if account in key:
-            # key format varies: could be "Account InstrumentName" or just "InstrumentName"
-            instrument = key.replace(account, "").strip()
-            if instrument:
-                # val is typically "Long", "Short", or "Flat"
-                positions[instrument] = val
-    # Also look for Quantity to get actual position size
-    quantities = {}
-    for m in re.finditer(r"Quantity\|([^\x00]+)\x00([^\x00]+)", text):
-        key, val = m.group(1), m.group(2)
-        if account in key:
-            instrument = key.replace(account, "").strip()
-            if instrument:
-                try:
-                    qty = int(float(val))
-                    direction = positions.get(instrument, "")
-                    if "Short" in direction:
-                        qty = -qty
-                    elif "Flat" in direction:
-                        qty = 0
-                    quantities[instrument] = qty
-                except ValueError:
-                    pass
-    logger.debug(f"ATI POSITIONS parsed: {quantities}")
-    return quantities
+
+    # NT pushes MarketPosition|<instrument>|<account>\x00<signed_int>
+    # The <instrument>|<account> is one captured group; we need to split
+    # off the trailing |<account> suffix to get just the instrument alias.
+    suffix = f"|{account}"
+    aliases: dict[str, int] = {}  # alias -> signed qty
+    for field, key, val in _parse_ati_fields(text):
+        if field != "MarketPosition" or not key.endswith(suffix):
+            continue
+        alias = key[:-len(suffix)]
+        if not alias:
+            continue
+        try:
+            qty = int(val)
+        except ValueError:
+            continue
+        if qty == 0:
+            continue
+        aliases[alias] = qty
+
+    # Dedupe: group aliases by (qty, sign) and pick a friendly representative
+    # for each distinct position. This is imperfect if the user holds two
+    # different instruments with identical signed qty, so also split by the
+    # alias's leading "root" token to keep NQ and ES distinct.
+    def root_of(alias: str) -> str:
+        s = alias.strip().lstrip("@")
+        if " " in s:
+            return s.split()[0]
+        # Continuous-contract code like "NQM26" — strip trailing
+        # <month_code><1-2 digit year>. Month codes: FGHJKMNQUVXZ.
+        m = re.match(r"^([A-Za-z]+?)[FGHJKMNQUVXZ]\d{1,2}$", s)
+        return m.group(1) if m else s
+    by_root_qty: dict[tuple[str, int], list[str]] = {}
+    for alias, qty in aliases.items():
+        by_root_qty.setdefault((root_of(alias), qty), []).append(alias)
+    result: dict[str, int] = {}
+    for (root, qty), names in by_root_qty.items():
+        spaced = [n for n in names if " " in n and not n.startswith("@")]
+        result[(spaced or names)[0]] = qty
+    logger.debug(f"ATI POSITIONS parsed: {result}")
+    return result
 
 
 DEFAULT_ACCOUNT = "Sim101"
@@ -2507,9 +2371,7 @@ def close_all_open_positions() -> list[str]:
 
 def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, action: str, pre_pos: int = 0):
     """Register a signal for post-trade confirmation via position check."""
-    # Use realized cash (not equity) so fill detection keys off closed-P&L
-    # deltas; equity moves with unrealized swings that don't indicate a fill.
-    pre_balance = session_current_cash.get(active_account) if active_account else None
+    pre_balance = session_current_balances.get(active_account) if active_account else None
     with _confirms_lock:
         if len(_pending_confirms) >= MAX_PENDING_CONFIRMS:
             _pending_confirms.pop(0)  # drop oldest
@@ -2535,7 +2397,7 @@ def check_pending_confirms():
         return
 
     positions = query_nt_positions(active_account, nt_port)
-    cur_balance = session_current_cash.get(active_account)
+    cur_balance = session_current_balances.get(active_account)
     now = time.time()
     still_pending = []
 
@@ -2600,28 +2462,13 @@ async def balance_monitor():
             if not active_account:
                 continue
 
-            # Always poll balances for status bar display (non-blocking)
+            # Always poll balances for status bar display (non-blocking).
+            # Session limits are enforced on realized CashValue deltas since
+            # NT's TCP ATI doesn't push live equity; per-trade risk is handled
+            # by NinjaTrader's own ATM stop/target on the entry.
             all_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
-
-            # For the active account, if ATI didn't expose unrealized P&L
-            # directly (NT8 TCP ATI typically doesn't), compute it from
-            # open positions so the stop/target monitor reacts to live
-            # mark-to-market moves instead of only realized cash.
-            active_equity_override: float | None = None
-            if active_account:
-                active_row = next((a for a in all_accounts if a["name"] == active_account), None)
-                if active_row and active_row["unrealized"] == 0.0:
-                    unreal = await asyncio.to_thread(
-                        compute_unrealized_pnl, active_account, nt_port)
-                    if unreal != 0.0:
-                        active_equity_override = active_row["cash"] + unreal
-
             for a in all_accounts:
-                if a["name"] == active_account and active_equity_override is not None:
-                    session_current_balances[a["name"]] = active_equity_override
-                else:
-                    session_current_balances[a["name"]] = a["equity"]
-                session_current_cash[a["name"]] = a["cash"]
+                session_current_balances[a["name"]] = a["cash"]
             refresh_controls()
 
             # Auto-reset P&L at 4:20 PM ET (futures session boundary)
@@ -2880,29 +2727,15 @@ async def listen(token: str):
                 # Restore persisted session if still in the same trading session
                 restored = restore_session_state()
 
-                # Snapshot account balances for risk management.
-                # Start/current track EQUITY (cash + unrealized) so the stop /
-                # target monitor responds to open-trade mark-to-market moves;
-                # session_current_cash keeps realized-only for fill detection.
+                # Snapshot account balances (realized CashValue) for the
+                # session P&L baseline. When an ATM stop or target fills and
+                # the position closes, CashValue jumps by the realized delta
+                # — the monitor then trips the session limit if crossed.
                 nt_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
-
-                # If there are open positions at connect time, compute
-                # unrealized so the start snapshot is true equity (otherwise
-                # the first poll would look like a sudden P&L swing).
-                connect_unreal = 0.0
-                if active_account:
-                    connect_unreal = await asyncio.to_thread(
-                        compute_unrealized_pnl, active_account, nt_port)
-
                 for a in nt_accounts:
-                    if a["name"] == active_account and a["unrealized"] == 0.0 and connect_unreal != 0.0:
-                        equity = a["cash"] + connect_unreal
-                    else:
-                        equity = a["equity"]
                     if a["name"] not in session_start_balances:
-                        session_start_balances[a["name"]] = equity
-                    session_current_balances[a["name"]] = equity
-                    session_current_cash[a["name"]] = a["cash"]
+                        session_start_balances[a["name"]] = a["cash"]
+                    session_current_balances[a["name"]] = a["cash"]
 
                 if restored:
                     pnl_parts = []
