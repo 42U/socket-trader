@@ -52,6 +52,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         // has something to see. NT may go minutes without events when flat.
         private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(5);
 
+        // Per-write deadline. Windows default TCP keepalive on a half-open
+        // connection is ~2h — without this, one dead peer can wedge the
+        // whole broadcast thread and starve every live client.
+        private const int WriteTimeoutMs = 750;
+
         // ---------- State ----------
         private TcpListener listener;
         private Thread acceptThread;
@@ -132,9 +137,46 @@ namespace NinjaTrader.NinjaScript.AddOns
                 try { client = listener.AcceptTcpClient(); }
                 catch { return; }
 
+                // Configure the socket: disable Nagle so the first-snapshot
+                // reaches the client immediately, and cap write time so a
+                // half-open peer can't wedge the accept thread on the next
+                // broadcast.
+                try { client.NoDelay = true; } catch { }
+                try { client.SendTimeout = WriteTimeoutMs; } catch { }
+                try { client.ReceiveTimeout = WriteTimeoutMs; } catch { }
+
+                // Build + send the initial snapshot DIRECTLY to the new
+                // client. Doing this here (before adding to `clients`) means
+                // a hang on an existing dead peer can't block a new client
+                // from getting its first payload.
+                string initialJson = null;
+                try { initialJson = BuildSnapshotJson(); }
+                catch (Exception ex)
+                {
+                    NinjaTrader.Code.Output.Process(
+                        $"SocketTraderBridge: initial snapshot error: {ex.Message}",
+                        PrintTo.OutputTab1);
+                }
+                if (initialJson != null)
+                {
+                    try
+                    {
+                        var bytes = Encoding.UTF8.GetBytes(initialJson + "\n");
+                        var stream = client.GetStream();
+                        stream.WriteTimeout = WriteTimeoutMs;
+                        stream.Write(bytes, 0, bytes.Length);
+                    }
+                    catch (Exception ex)
+                    {
+                        NinjaTrader.Code.Output.Process(
+                            $"SocketTraderBridge: initial write to new client failed: {ex.Message}",
+                            PrintTo.OutputTab1);
+                        try { client.Close(); } catch { }
+                        continue;  // don't register a client we couldn't even snapshot
+                    }
+                }
+
                 lock (clientsLock) { clients.Add(client); }
-                // Send initial snapshot to the new client.
-                SafeBroadcast();
             }
         }
 
@@ -157,6 +199,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     try
                     {
                         var stream = c.GetStream();
+                        stream.WriteTimeout = WriteTimeoutMs;
                         stream.Write(bytes, 0, bytes.Length);
                     }
                     catch { dead.Add(c); }
