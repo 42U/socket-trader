@@ -2602,19 +2602,71 @@ def query_nt_balance(account: str) -> float | None:
     return None
 
 
+# NT futures month codes for converting "NQ JUN26" → "NQ 06-26", the
+# digit-month-dash format the file-based ATI PLACE/CLOSEPOSITION commands
+# actually accept. NT broadcasts the human-readable JUN26 alias over TCP
+# but rejects it as an order symbol.
+_FUTURES_MONTH_CODES = {
+    "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
+    "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
+    "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12",
+}
+
+
+def _nt_contract_aliases(name: str) -> list[str]:
+    """Return contract-name aliases to try on CLOSEPOSITION.
+
+    NT broadcasts positions under many names (NQ JUN26, @NQ, NQM26, NQ M6)
+    but the ATI file-based command only accepts one specific format —
+    '<root> <MM>-<YY>'. We always try that normalized form first, then
+    fall back to the original in case a given install accepts it.
+    Aliases are deduplicated while preserving order.
+    """
+    if not name:
+        return []
+    aliases: list[str] = []
+    normalized = name
+    parts = name.strip().split()
+    if len(parts) == 2:
+        root, suffix = parts
+        suffix_up = suffix.upper()
+        if "-" not in suffix and len(suffix_up) == 5 and suffix_up[:3] in _FUTURES_MONTH_CODES:
+            mm = _FUTURES_MONTH_CODES[suffix_up[:3]]
+            yy = suffix_up[3:]
+            normalized = f"{root} {mm}-{yy}"
+    # Preferred format first
+    for a in (normalized, name):
+        if a and a not in aliases:
+            aliases.append(a)
+    return aliases
+
+
 def fire_close_position(account: str, contract: str):
-    """Write a CLOSEPOSITION command to the incoming folder."""
+    """Write a CLOSEPOSITION command to the incoming folder.
+
+    NT's file-based ATI wants the '<root> <MM>-<YY>' contract format
+    even though it broadcasts positions as '<root> <MMM><YY>' (e.g.
+    NQ JUN26). We write one command per valid alias — the first NT
+    recognizes flattens the position, subsequent ones no-op because
+    MarketPosition is already Flat. Harmless and covers both format
+    conventions without having to guess which NT version accepts which.
+    """
     if not output_directory:
         return
-    cmd = f"CLOSEPOSITION;{sanitize_ati(account)};{sanitize_ati(contract)};;;;;;;;;;"
-    filename = _next_ati_filename("close")
-    filepath = os.path.join(output_directory, filename)
-    try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(cmd)
-        logger.info(f"CLOSEPOSITION  account={account}  contract={contract}  file={filename}")
-    except Exception as exc:
-        _dash_set_alert(Fore.RED + f"  ✖  Close position write error: {exc}" + Style.RESET_ALL)
+    aliases = _nt_contract_aliases(contract)
+    for alias in aliases:
+        cmd = f"CLOSEPOSITION;{sanitize_ati(account)};{sanitize_ati(alias)};;;;;;;;;;"
+        filename = _next_ati_filename("close")
+        filepath = os.path.join(output_directory, filename)
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(cmd)
+            logger.info(
+                f"CLOSEPOSITION  account={account}  contract={alias}  "
+                f"file={filename}  (aliases_tried={len(aliases)})")
+        except Exception as exc:
+            _dash_set_alert(Fore.RED + f"  ✖  Close position write error: {exc}" + Style.RESET_ALL)
+            return
 
 
 def fire_cancel_all_orders(account: str):
@@ -2904,6 +2956,23 @@ async def balance_monitor():
 
             start = session_start_balances[active_account]
             pnl = current - start
+
+            # Diagnostic: log every tick where we actually have an active
+            # limit. Makes it obvious why a stop did/didn't fire — if the
+            # pnl never crosses the threshold, or the threshold is zero,
+            # or bridge==False (so we're still on realized-cash only), the
+            # log shows it. Throttle to once per 5 polls (~15s) so normal
+            # operation isn't spammed.
+            global _pnl_log_count
+            _pnl_log_count = (_pnl_log_count + 1) if "_pnl_log_count" in globals() else 1
+            if _pnl_log_count % 5 == 1:
+                logger.info(
+                    f"pnl_check  account={active_account}  "
+                    f"current={current:.2f}  start={start:.2f}  "
+                    f"pnl={pnl:+.2f}  stop={limits['stop']}({limits['stop_mode']})  "
+                    f"target={limits['target']}({limits['target_mode']})  "
+                    f"bridge={'on' if _live_bridge_connected else 'off'}  "
+                    f"soft={soft_stopped}  hard={hard_stopped}")
 
             # Check stop (loss limit)
             if limits["stop"] != 0 and pnl <= limits["stop"]:
