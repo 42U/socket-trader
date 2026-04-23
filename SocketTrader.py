@@ -1940,18 +1940,20 @@ def _print_addon_install_steps():
     print(Fore.CYAN + "│  The AddOn publishes live account P&L from inside  │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  NinjaTrader so stops/targets fire DURING a trade. │" + Style.RESET_ALL)
     print(Fore.CYAN + "│                                                    │" + Style.RESET_ALL)
-    print(Fore.CYAN + "│  1. On your NinjaTrader machine, copy              │" + Style.RESET_ALL)
-    print(Fore.CYAN + "│     addon/SocketTraderBridge.cs into               │" + Style.RESET_ALL)
-    print(Fore.CYAN + "│     Documents\\NinjaTrader 8\\bin\\Custom\\AddOns\\     │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  1. Enable (option 1). Socket Trader copies the    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│     .cs into NinjaTrader\\bin\\Custom\\AddOns\\ for    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│     you (if NT folder is accessible locally).      │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  2. In NinjaTrader:                                │" + Style.RESET_ALL)
     print(Fore.CYAN + "│     Control Center → New → NinjaScript Editor.     │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  3. Press F5 to compile. (No restart needed —      │" + Style.RESET_ALL)
     print(Fore.CYAN + "│     AddOn hot-loads on successful compile.)        │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  4. Output tab should print:                       │" + Style.RESET_ALL)
     print(Fore.CYAN + "│     'SocketTraderBridge listening on 0.0.0.0:XXX'  │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  5. Test from the menu (option 3).                 │" + Style.RESET_ALL)
     print(Fore.CYAN + "│                                                    │" + Style.RESET_ALL)
-    print(Fore.CYAN + "│  Remote NinjaTrader? If NT runs on a different     │" + Style.RESET_ALL)
-    print(Fore.CYAN + "│  machine, set its LAN IP via option 5 (NT host).   │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Manual install: copy addon/SocketTraderBridge.cs  │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  into Documents\\NinjaTrader 8\\bin\\Custom\\AddOns\\.  │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Remote NT? Set its LAN IP via option 5.           │" + Style.RESET_ALL)
     print(Fore.CYAN + "│                                                    │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  Full docs: addon/README.md                        │" + Style.RESET_ALL)
     print(Fore.CYAN + "└────────────────────────────────────────────────────┘" + Style.RESET_ALL)
@@ -2009,18 +2011,33 @@ async def prompt_live_bridge():
         cfg["live_bridge_enabled"] = live_bridge_enabled
         save_config(cfg)
         if live_bridge_enabled:
+            # Auto-install SocketTraderBridge.cs into NT's AddOns folder
+            # when we know where NT lives (output_directory's parent). This
+            # only works when NT runs on the same box as SocketTrader or
+            # the folder is mounted — remote NT installs still need manual
+            # drop + F5.
+            install_note = ""
+            if output_directory and Path(output_directory).is_dir():
+                nt_base = Path(output_directory).parent
+                inst_ok, inst_msg = await asyncio.to_thread(
+                    install_live_bridge_addon, nt_base)
+                if inst_ok and "copied" in inst_msg.lower():
+                    install_note = " · .cs copied to AddOns (F5 to compile)"
+                elif not inst_ok:
+                    install_note = f" · auto-install skipped: {inst_msg}"
             ok = await asyncio.to_thread(
                 probe_live_bridge, host, live_bridge_port)
             if ok:
                 _dash_set_alert(
                     Fore.GREEN +
                     f"  ✔  Live monitor enabled · AddOn active on "
-                    f"{host}:{live_bridge_port}." + Style.RESET_ALL)
+                    f"{host}:{live_bridge_port}.{install_note}" +
+                    Style.RESET_ALL)
             else:
                 _dash_set_alert(
                     Fore.YELLOW +
-                    f"  ⚠  Live monitor enabled but AddOn not reachable on "
-                    f"{host}:{live_bridge_port}.  S → 7 → 2 for install steps." +
+                    f"  ⚠  Live monitor enabled.{install_note or ''}  "
+                    f"Once compiled in NT (F5), S → 7 → 3 to test." +
                     Style.RESET_ALL)
         else:
             _dash_set_alert(
@@ -3348,6 +3365,50 @@ def install_strategy_templates(nt_base: Path):
             print(Fore.GREEN + f"  ✔  Installed {filename} → {dest}" + Style.RESET_ALL)
         except OSError as exc:
             print(Fore.RED + f"  ✖  Could not install {filename}: {exc}" + Style.RESET_ALL)
+
+
+def install_live_bridge_addon(nt_base: Path) -> tuple[bool, str]:
+    """Copy SocketTraderBridge.cs from the repo into NT's AddOns folder.
+
+    Returns (ok, message). Three outcomes:
+      - Source missing → (False, reason).
+      - Dest missing or differs from source → copy (backing up any existing
+        local edits as .cs.bak) and return (True, "installed" message).
+      - Dest already matches source → (True, "already installed" message).
+    Caller surfaces the message to the user.
+    """
+    source = SCRIPT_DIR / "addon" / "SocketTraderBridge.cs"
+    if not source.is_file():
+        return False, "addon/SocketTraderBridge.cs not found in repo."
+    dest_dir = nt_base / "bin" / "Custom" / "AddOns"
+    dest = dest_dir / "SocketTraderBridge.cs"
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, f"cannot create AddOns dir: {exc}"
+
+    try:
+        src_bytes = source.read_bytes()
+    except OSError as exc:
+        return False, f"cannot read source: {exc}"
+
+    if dest.exists():
+        try:
+            if dest.read_bytes() == src_bytes:
+                return True, f"AddOn already installed at {dest}"
+        except OSError:
+            pass
+        # Exists and differs — preserve any local edits before overwriting.
+        backup = dest.with_suffix(".cs.bak")
+        try:
+            shutil.copy2(str(dest), str(backup))
+        except OSError:
+            pass
+    try:
+        dest.write_bytes(src_bytes)
+        return True, f"AddOn copied to {dest} — F5 in NT to compile."
+    except OSError as exc:
+        return False, f"copy failed: {exc}"
 
 
 def _save_server_to_list(cfg: dict, ws_host: str, server_name: str):
