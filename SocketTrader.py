@@ -74,7 +74,7 @@ follow_publisher_strategy = False  # If True, use the publisher's strategy per-s
 nt_port = 36973                # NinjaTrader AT Interface port (default 36973)
 nt_host_override: str = ""     # Explicit NT host (empty = auto-detect local/WSL)
 live_bridge_enabled = False    # If True, prefer the optional SocketTraderBridge AddOn
-live_bridge_port = 36974       # Port the NinjaScript AddOn listens on (see addon/)
+live_bridge_port = 36984       # Port the NinjaScript AddOn listens on (see addon/)
 awaiting_directory_input = False
 awaiting_user_input = False  # Block key handler during any input prompt
 
@@ -3322,7 +3322,7 @@ def setup() -> tuple[str, dict]:
 
     # Startup warning: live monitor enabled but AddOn not reachable.
     if cfg.get("live_bridge_enabled"):
-        _bridge_port = int(cfg.get("live_bridge_port", 36974))
+        _bridge_port = int(cfg.get("live_bridge_port", 36984))
         if probe_live_bridge(_nt_host(cfg.get("nt_port", 36973)), _bridge_port):
             print(Fore.GREEN +
                   f"  ✔  Live monitor active on port {_bridge_port}." + Style.RESET_ALL)
@@ -3354,7 +3354,7 @@ async def main():
     nt_port = cfg.get("nt_port", 36973)
     global live_bridge_enabled, live_bridge_port, nt_host_override
     live_bridge_enabled = bool(cfg.get("live_bridge_enabled", False))
-    live_bridge_port = int(cfg.get("live_bridge_port", 36974))
+    live_bridge_port = int(cfg.get("live_bridge_port", 36984))
     nt_host_override = str(cfg.get("nt_host", "") or "").strip()
 
     if cfg.get("output_directory"):

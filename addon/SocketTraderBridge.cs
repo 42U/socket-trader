@@ -24,7 +24,9 @@
 //     then receive updates whenever account / position / price changes.
 //   - Multiple clients supported (list of TcpClient, broadcast on each event).
 //   - Binds to 0.0.0.0 by default; change BindAddress below to restrict.
-//   - Default port 36974 to sit alongside NT's built-in ATI on 36973.
+//   - Default port 36984 to sit alongside NT's built-in ATI on 36973
+//     without colliding with VSCode's auto-port-forwarder (which claims
+//     36974 on loopback if your terminal session is using it).
 
 #region Using declarations
 using System;
@@ -45,7 +47,13 @@ namespace NinjaTrader.NinjaScript.AddOns
     public class SocketTraderBridge : AddOnBase
     {
         // ---------- User-tunable ----------
-        private const int ListenPort = 36974;
+        // 36984 sits adjacent to NT's ATI on 36973 (easy to remember as a
+        // pair) and deliberately avoids 36974, which VSCode's built-in
+        // port auto-forwarder is prone to claiming on loopback when it
+        // runs in the same session — that creates a silent loopback-only
+        // listener that wins over our 0.0.0.0 binding and starves clients
+        // on the same box of data.
+        private const int ListenPort = 36984;
         private static readonly IPAddress BindAddress = IPAddress.Any;
 
         // Heartbeat snapshot while idle so stale-detection on the client side

@@ -206,7 +206,7 @@ If you want session limits to react **during** an open trade, install the option
 2. In NinjaTrader: **Control Center → New → NinjaScript Editor**.
 3. Press **F5** to compile. No restart needed — the AddOn hot-loads on successful compile.
 4. The Output tab should print:
-   `SocketTraderBridge listening on 0.0.0.0:36974`
+   `SocketTraderBridge listening on 0.0.0.0:36984`
 
 **Enable in SocketTrader:** `S → 7 → 1` to toggle. The menu shows three states:
 

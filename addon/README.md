@@ -36,10 +36,10 @@ you don't need this AddOn — the default TCP ATI path is enough.
    Output tab should print:
 
    ```
-   SocketTraderBridge listening on 0.0.0.0:36974
+   SocketTraderBridge listening on 0.0.0.0:36984
    ```
 
-5. Port **36974** is the AddOn; port **36973** is NT's built-in ATI.
+5. Port **36984** is the AddOn; port **36973** is NT's built-in ATI.
    Socket Trader will use the AddOn when it's reachable and fall back
    to plain ATI otherwise.
 
@@ -48,7 +48,7 @@ you don't need this AddOn — the default TCP ATI path is enough.
 From any machine on the network:
 
 ```bash
-nc 192.168.1.111 36974
+nc 192.168.1.111 36984
 ```
 
 You should see a JSON line every ~5 seconds (heartbeat) plus one per
