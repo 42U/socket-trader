@@ -311,60 +311,114 @@ namespace NinjaTrader.NinjaScript.AddOns
             sb.Append("{\"t\":").Append(ts.ToString("F3", CultureInfo.InvariantCulture));
             sb.Append(",\"accounts\":[");
 
-            lock (Account.All)
+            // Snapshot the collection so NT can mutate it during our
+            // iteration without throwing InvalidOperationException.
+            Account[] accountsSnapshot;
+            try
             {
-                bool firstAcct = true;
-                foreach (var acct in Account.All)
+                var list = new List<Account>();
+                foreach (var a in Account.All) list.Add(a);
+                accountsSnapshot = list.ToArray();
+            }
+            catch (Exception ex)
+            {
+                NinjaTrader.Code.Output.Process(
+                    $"SocketTraderBridge: Account.All snapshot failed: {ex.Message}",
+                    PrintTo.OutputTab1);
+                accountsSnapshot = new Account[0];
+            }
+
+            bool firstAcct = true;
+            foreach (var acct in accountsSnapshot)
+            {
+                string accountFragment;
+                try { accountFragment = BuildAccountFragment(acct); }
+                catch (Exception ex)
                 {
-                    if (!firstAcct) sb.Append(',');
-                    firstAcct = false;
-
-                    double cash = acct.Get(AccountItem.CashValue, Currency.UsDollar);
-                    double realized = acct.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar);
-
-                    sb.Append("{\"name\":").Append(JsonString(acct.Name));
-                    sb.Append(",\"cash\":").Append(D(cash));
-                    sb.Append(",\"realized\":").Append(D(realized));
-
-                    // Positions + unrealized
-                    double unrealizedSum = 0;
-                    sb.Append(",\"positions\":[");
-                    bool firstPos = true;
-                    foreach (var pos in acct.Positions)
-                    {
-                        if (pos.MarketPosition == MarketPosition.Flat) continue;
-                        double last;
-                        lock (subsLock)
-                        {
-                            lastPrice.TryGetValue(pos.Instrument, out last);
-                        }
-                        int qty = pos.Quantity;
-                        if (pos.MarketPosition == MarketPosition.Short) qty = -qty;
-                        double avg = pos.AveragePrice;
-                        double pl = 0;
-                        if (last > 0)
-                        {
-                            try { pl = pos.GetUnrealizedProfitLoss(PerformanceUnit.Currency, last); }
-                            catch { pl = 0; }
-                        }
-                        unrealizedSum += pl;
-
-                        if (!firstPos) sb.Append(',');
-                        firstPos = false;
-                        sb.Append("{\"inst\":").Append(JsonString(pos.Instrument.FullName));
-                        sb.Append(",\"qty\":").Append(qty);
-                        sb.Append(",\"avg\":").Append(D(avg));
-                        sb.Append(",\"last\":").Append(D(last));
-                        sb.Append(",\"pl\":").Append(D(pl));
-                        sb.Append('}');
-                    }
-                    sb.Append(']');
-                    sb.Append(",\"unrealized\":").Append(D(unrealizedSum));
-                    sb.Append(",\"equity\":").Append(D(cash + unrealizedSum));
-                    sb.Append('}');
+                    // One rogue account must not kill the whole response.
+                    NinjaTrader.Code.Output.Process(
+                        $"SocketTraderBridge: skipping account " +
+                        $"'{(acct == null ? "<null>" : acct.Name)}': {ex.Message}",
+                        PrintTo.OutputTab1);
+                    continue;
                 }
+                if (accountFragment == null) continue;
+                if (!firstAcct) sb.Append(',');
+                firstAcct = false;
+                sb.Append(accountFragment);
             }
             sb.Append("]}");
+            return sb.ToString();
+        }
+
+        private string BuildAccountFragment(Account acct)
+        {
+            if (acct == null) return null;
+            var sb = new StringBuilder(256);
+
+            double cash = 0, realized = 0;
+            try { cash = acct.Get(AccountItem.CashValue, Currency.UsDollar); } catch { }
+            try { realized = acct.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar); } catch { }
+
+            sb.Append("{\"name\":").Append(JsonString(acct.Name ?? ""));
+            sb.Append(",\"cash\":").Append(D(cash));
+            sb.Append(",\"realized\":").Append(D(realized));
+
+            double unrealizedSum = 0;
+            sb.Append(",\"positions\":[");
+
+            Position[] posSnapshot;
+            try
+            {
+                var list = new List<Position>();
+                foreach (var p in acct.Positions) list.Add(p);
+                posSnapshot = list.ToArray();
+            }
+            catch { posSnapshot = new Position[0]; }
+
+            bool firstPos = true;
+            foreach (var pos in posSnapshot)
+            {
+                try
+                {
+                    if (pos == null || pos.Instrument == null) continue;
+                    if (pos.MarketPosition == MarketPosition.Flat) continue;
+                    double last;
+                    lock (subsLock)
+                    {
+                        lastPrice.TryGetValue(pos.Instrument, out last);
+                    }
+                    int qty = pos.Quantity;
+                    if (pos.MarketPosition == MarketPosition.Short) qty = -qty;
+                    double avg = pos.AveragePrice;
+                    double pl = 0;
+                    if (last > 0)
+                    {
+                        try { pl = pos.GetUnrealizedProfitLoss(PerformanceUnit.Currency, last); }
+                        catch { pl = 0; }
+                    }
+                    unrealizedSum += pl;
+
+                    if (!firstPos) sb.Append(',');
+                    firstPos = false;
+                    sb.Append("{\"inst\":").Append(JsonString(pos.Instrument.FullName ?? ""));
+                    sb.Append(",\"qty\":").Append(qty);
+                    sb.Append(",\"avg\":").Append(D(avg));
+                    sb.Append(",\"last\":").Append(D(last));
+                    sb.Append(",\"pl\":").Append(D(pl));
+                    sb.Append('}');
+                }
+                catch (Exception ex)
+                {
+                    NinjaTrader.Code.Output.Process(
+                        $"SocketTraderBridge: skipping position on " +
+                        $"{acct.Name}: {ex.Message}", PrintTo.OutputTab1);
+                }
+            }
+            sb.Append(']');
+            sb.Append(",\"unrealized\":").Append(D(unrealizedSum));
+            sb.Append(",\"equity\":").Append(D(cash + unrealizedSum));
+            sb.Append('}');
             return sb.ToString();
         }
 
