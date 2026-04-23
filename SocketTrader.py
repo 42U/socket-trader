@@ -2730,6 +2730,97 @@ def check_pending_confirms():
         _pending_confirms.extend(still_pending)
 
 
+# ---------- Live P&L bridge consumer (optional SocketTraderBridge AddOn) ----------
+_live_bridge_connected = False
+_live_bridge_last_data_ts: float = 0.0  # wall-clock seconds of last parsed line
+
+async def live_bridge_task():
+    """Maintain a streaming connection to the SocketTraderBridge AddOn.
+
+    When connected, feeds `equity` (cash + unrealized) from the AddOn's
+    JSON stream into session_current_balances[active_account] so the
+    existing balance_monitor trips stops/targets mid-trade. Falls back
+    silently to ATI CashValue polling (via balance_monitor) whenever the
+    AddOn is disabled, unreachable, or stale.
+
+    Reconnects with exponential backoff up to 30s so NT restarts,
+    temporary network hiccups, or AddOn recompiles auto-recover.
+    """
+    global _live_bridge_connected, _live_bridge_last_data_ts
+    backoff = 1.0
+    stale_seconds = 12.0  # no data in this long → drop + reconnect
+
+    while not shutdown.is_set():
+        if not live_bridge_enabled:
+            await asyncio.sleep(2.0)
+            backoff = 1.0
+            continue
+
+        host = _nt_host(nt_port)
+        port = live_bridge_port
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=3.0)
+        except (OSError, asyncio.TimeoutError):
+            _live_bridge_connected = False
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+            continue
+
+        _live_bridge_connected = True
+        backoff = 1.0
+        logger.info(f"live bridge connected → {host}:{port}")
+
+        try:
+            while not shutdown.is_set():
+                try:
+                    line = await asyncio.wait_for(
+                        reader.readline(), timeout=stale_seconds)
+                except asyncio.TimeoutError:
+                    logger.info("live bridge stale — reconnecting")
+                    break
+                if not line:
+                    logger.info("live bridge EOF — reconnecting")
+                    break
+                try:
+                    obj = json.loads(line.decode("utf-8", errors="ignore"))
+                except (ValueError, json.JSONDecodeError):
+                    continue
+                _live_bridge_last_data_ts = time.time()
+                accts = obj.get("accounts") if isinstance(obj, dict) else None
+                if not accts:
+                    continue
+                for a in accts:
+                    name = a.get("name")
+                    if not name:
+                        continue
+                    eq = a.get("equity")
+                    if eq is None:
+                        continue
+                    # Only drive session_current_balances for the active
+                    # account — other accounts still get CashValue from
+                    # balance_monitor, which is enough for their display.
+                    if name == active_account:
+                        try:
+                            session_current_balances[name] = float(eq)
+                        except (TypeError, ValueError):
+                            pass
+        except asyncio.CancelledError:
+            try: writer.close()
+            except Exception: pass
+            _live_bridge_connected = False
+            return
+        except Exception as e:
+            logger.error(f"live_bridge_task error: {e}")
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            _live_bridge_connected = False
+
+
 async def balance_monitor():
     """Periodically check account balance and enforce target/stop."""
     global paused, soft_stopped, hard_stopped
@@ -2744,12 +2835,16 @@ async def balance_monitor():
             if not active_account:
                 continue
 
-            # Always poll balances for status bar display (non-blocking).
-            # Session limits are enforced on realized CashValue deltas since
-            # NT's TCP ATI doesn't push live equity; per-trade risk is handled
-            # by NinjaTrader's own ATM stop/target on the entry.
+            # Poll balances for status bar + realized-cash fallback. When
+            # the live bridge AddOn is streaming, it owns the active
+            # account's entry in session_current_balances (equity, not
+            # cash) so mid-trade unrealized P&L reaches the stop/target
+            # check. Other accounts always get ATI's CashValue.
             all_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
             for a in all_accounts:
+                if (live_bridge_enabled and _live_bridge_connected
+                        and a["name"] == active_account):
+                    continue  # bridge is authoritative here
                 session_current_balances[a["name"]] = a["cash"]
             refresh_controls()
 
@@ -3371,6 +3466,7 @@ async def main():
             asyncio.create_task(keyboard_loop()),
             asyncio.create_task(pause_indicator()),
             asyncio.create_task(balance_monitor()),
+            asyncio.create_task(live_bridge_task()),
         ]
 
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
