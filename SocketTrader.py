@@ -72,6 +72,7 @@ active_account = None          # Current NinjaTrader account name
 atm_strategy = "NQ_Med"        # ATM strategy template name (fallback)
 follow_publisher_strategy = False  # If True, use the publisher's strategy per-signal when locally installed
 nt_port = 36973                # NinjaTrader AT Interface port (default 36973)
+nt_host_override: str = ""     # Explicit NT host (empty = auto-detect local/WSL)
 live_bridge_enabled = False    # If True, prefer the optional SocketTraderBridge AddOn
 live_bridge_port = 36974       # Port the NinjaScript AddOn listens on (see addon/)
 awaiting_directory_input = False
@@ -768,6 +769,10 @@ def _wsl_windows_host_ip() -> str | None:
 
 def _nt_host_candidates() -> list[str]:
     """Return ATI host candidates in preference order."""
+    # Explicit user override always wins — used when NinjaTrader runs on a
+    # different machine on the LAN and auto-detection can't reach it.
+    if nt_host_override:
+        return [nt_host_override]
     if IS_WINDOWS:
         return ["127.0.0.1"]
     if IS_WSL:
@@ -840,10 +845,14 @@ def probe_live_bridge(host: str, port: int, timeout: float = 2.5) -> bool:
 def _nt_host(port: int = 36973) -> str:
     """Return the correct host for NinjaTrader ATI (handles WSL).
 
-    Probes candidates on first call per port and caches the first that
-    accepts a connection. If no candidate responds, returns the first
-    candidate without caching so a later call can retry.
+    If the user set `nt_host` in config, use it unconditionally — no probe,
+    no cache. Otherwise probe each auto-detected candidate on first call
+    per port and cache the first that accepts a connection. If no candidate
+    responds, return the first candidate without caching so a later call
+    can retry.
     """
+    if nt_host_override:
+        return nt_host_override
     cached = _nt_host_cache.get(port)
     if cached is not None:
         return cached
@@ -1914,23 +1923,29 @@ def _print_addon_install_steps():
     print(Fore.CYAN + "│  4. Output tab should print:                       │" + Style.RESET_ALL)
     print(Fore.CYAN + "│     'SocketTraderBridge listening on 0.0.0.0:XXX'  │" + Style.RESET_ALL)
     print(Fore.CYAN + "│                                                    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Remote NinjaTrader? If NT runs on a different     │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  machine, set its LAN IP via option 5 (NT host).   │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│                                                    │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  Full docs: addon/README.md                        │" + Style.RESET_ALL)
     print(Fore.CYAN + "└────────────────────────────────────────────────────┘" + Style.RESET_ALL)
 
 
 async def prompt_live_bridge():
     """Setup submenu for the optional live-monitoring NinjaScript AddOn."""
-    global live_bridge_enabled, live_bridge_port, awaiting_user_input
+    global live_bridge_enabled, live_bridge_port, nt_host_override, awaiting_user_input
     awaiting_user_input = True
     show_cursor()
 
     label, color = await asyncio.to_thread(_live_bridge_status)
     state_color = _STATE_COLORS.get(color, Fore.WHITE)
+    host_display = nt_host_override or f"auto ({_nt_host(nt_port)})"
 
     print(Fore.CYAN + "\n┌─ LIVE TRADE MONITOR (optional AddOn) ──────────────┐" + Style.RESET_ALL)
     status_line = f"Status: {label}"
     print(Fore.CYAN + "│  " + state_color + status_line.ljust(50) + Fore.CYAN + "│" + Style.RESET_ALL)
-    port_line = f"Port:   {live_bridge_port}   (NT host: {_nt_host(nt_port)})"
+    host_line = f"NT host: {host_display}"
+    print(Fore.CYAN + f"│  {host_line[:50].ljust(50)}│" + Style.RESET_ALL)
+    port_line = f"Port:    {live_bridge_port}"
     print(Fore.CYAN + f"│  {port_line[:50].ljust(50)}│" + Style.RESET_ALL)
     print(Fore.CYAN + "│                                                    │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  With the AddOn: session stops/targets fire DURING │" + Style.RESET_ALL)
@@ -1940,6 +1955,7 @@ async def prompt_live_bridge():
     print(Fore.CYAN + "│  2. Show install steps                             │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  3. Test connection now                            │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  4. Change port                                    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  5. Change NT host (for remote NT on LAN)          │" + Style.RESET_ALL)
     print(Fore.CYAN + "│  ESC to close                                      │" + Style.RESET_ALL)
     print(Fore.CYAN + "└────────────────────────────────────────────────────┘" + Style.RESET_ALL)
 
@@ -2030,6 +2046,45 @@ async def prompt_live_bridge():
             except ValueError:
                 _dash_set_alert(
                     Fore.RED + "  ✖  Invalid port." + Style.RESET_ALL)
+    elif key == "5":
+        show_cursor()
+        current = nt_host_override or "(auto)"
+        sys.stdout.write(Fore.WHITE +
+                         f"  NT HOST [{current}]  "
+                         f"(IP or hostname, blank = auto) ▸ " + Style.RESET_ALL)
+        sys.stdout.flush()
+        raw = await asyncio.to_thread(read_line_raw)
+        hide_cursor()
+        raw = (raw or "").strip()
+        # Clear the per-port probe cache so the new host gets re-tested.
+        invalidate_nt_host_cache()
+        if not raw:
+            # Blank input = clear override, revert to auto-detect.
+            nt_host_override = ""
+            cfg["nt_host"] = ""
+            save_config(cfg)
+            _dash_set_alert(
+                Fore.CYAN + "  ✔  NT host reverted to auto-detect." +
+                Style.RESET_ALL)
+        else:
+            nt_host_override = raw
+            cfg["nt_host"] = raw
+            save_config(cfg)
+            # Probe the new host on the live bridge port right away so the
+            # alert tells the user whether it actually reaches NT.
+            ok = await asyncio.to_thread(
+                probe_live_bridge, raw, live_bridge_port, 2.5)
+            if ok:
+                _dash_set_alert(
+                    Fore.GREEN +
+                    f"  ✔  NT host set → {raw} · AddOn reachable on "
+                    f"port {live_bridge_port}." + Style.RESET_ALL)
+            else:
+                _dash_set_alert(
+                    Fore.YELLOW +
+                    f"  ⚠  NT host set → {raw} but AddOn not responding "
+                    f"on port {live_bridge_port}.  NT running? "
+                    "Firewall open for the WSL/LAN subnet?" + Style.RESET_ALL)
 
     awaiting_user_input = False
 
@@ -3271,9 +3326,10 @@ async def main():
     atm_strategy = cfg.get("atm_strategy", "NQ_Med")
     follow_publisher_strategy = bool(cfg.get("follow_publisher_strategy", False))
     nt_port = cfg.get("nt_port", 36973)
-    global live_bridge_enabled, live_bridge_port
+    global live_bridge_enabled, live_bridge_port, nt_host_override
     live_bridge_enabled = bool(cfg.get("live_bridge_enabled", False))
     live_bridge_port = int(cfg.get("live_bridge_port", 36974))
+    nt_host_override = str(cfg.get("nt_host", "") or "").strip()
 
     if cfg.get("output_directory"):
         output_directory = cfg["output_directory"]
