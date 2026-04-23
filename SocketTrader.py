@@ -817,29 +817,56 @@ def invalidate_nt_host_cache() -> None:
 
 
 def probe_live_bridge(host: str, port: int, timeout: float = 2.5) -> bool:
-    """Probe the optional SocketTraderBridge AddOn.
+    """Probe the optional SocketTraderBridge AddOn. See _probe_live_bridge_detail."""
+    ok, _reason = _probe_live_bridge_detail(host, port, timeout)
+    return ok
+
+
+def _probe_live_bridge_detail(host: str, port: int, timeout: float = 2.5) -> tuple[bool, str]:
+    """Probe the AddOn and return (ok, reason).
 
     Success = TCP connect + at least one newline-delimited JSON line that
-    parses and carries an 'accounts' field. A plain TCP open isn't enough
-    because the default ATI also listens and would give a false positive
-    if the user pointed this at the wrong port.
+    parses and carries an 'accounts' field. On failure, `reason` is a
+    short human-readable string (ConnectionRefused / Timeout / BadJSON /
+    MissingField / etc.) so the caller can surface it to the user.
     """
+    s = None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         s.connect((host, port))
+    except ConnectionRefusedError:
+        return False, "connection refused (nothing listening)"
+    except socket.timeout:
+        return False, "TCP connect timed out"
+    except OSError as e:
+        return False, f"connect error: {e}"
+    try:
         buf = b""
         while b"\n" not in buf:
             chunk = s.recv(4096)
             if not chunk:
-                return False
+                return False, "socket closed before any data"
             buf += chunk
-        s.close()
-        line = buf.split(b"\n", 1)[0].decode("utf-8", errors="ignore")
+    except socket.timeout:
+        return False, "socket accepted but no data arrived (timeout)"
+    except OSError as e:
+        return False, f"read error: {e}"
+    finally:
+        try:
+            if s is not None:
+                s.close()
+        except OSError:
+            pass
+    line = buf.split(b"\n", 1)[0].decode("utf-8", errors="ignore")
+    try:
         obj = json.loads(line)
-        return isinstance(obj, dict) and "accounts" in obj
-    except (OSError, ValueError, json.JSONDecodeError):
-        return False
+    except (ValueError, json.JSONDecodeError):
+        preview = line[:60].replace("\n", " ")
+        return False, f"response is not JSON: {preview!r}"
+    if not isinstance(obj, dict) or "accounts" not in obj:
+        return False, "JSON missing 'accounts' field (wrong port?)"
+    return True, "ok"
 
 
 def _nt_host(port: int = 36973) -> str:
@@ -2010,8 +2037,8 @@ async def prompt_live_bridge():
         sys.stdout.write(Fore.WHITE +
                          "  Testing connection..." + Style.RESET_ALL)
         sys.stdout.flush()
-        ok = await asyncio.to_thread(
-            probe_live_bridge, host, live_bridge_port, 2.5)
+        ok, reason = await asyncio.to_thread(
+            _probe_live_bridge_detail, host, live_bridge_port, 2.5)
         if ok:
             _dash_set_alert(
                 Fore.GREEN +
@@ -2020,8 +2047,7 @@ async def prompt_live_bridge():
         else:
             _dash_set_alert(
                 Fore.YELLOW +
-                f"  ✖  No response from {host}:{live_bridge_port}.  "
-                "NinjaTrader down, AddOn not compiled, or port mismatch." +
+                f"  ✖  {host}:{live_bridge_port}  →  {reason}" +
                 Style.RESET_ALL)
     elif key == "4":
         show_cursor()
