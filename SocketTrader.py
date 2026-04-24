@@ -3228,6 +3228,25 @@ async def listen(token: str):
                     _dash_set_heartbeat(
                         Fore.GREEN + f"  ✔  Connected  ·  Account: {active_account}  ·  Handshake: {connect_latency}ms" + Style.RESET_ALL)
                     logger.info(f"CONNECTED  account={active_account}  handshake={connect_latency}ms  strategy={atm_strategy}")
+                    # Clear stale reconnect-flow alerts from a prior
+                    # disconnect. Only target transient reconnect messages
+                    # so a legitimate alert (signal rejected, session
+                    # limit, etc.) from before the drop isn't wiped.
+                    stale_markers = (
+                        "Dropping connection",
+                        "Reconnecting in",
+                        "Manual reconnect",
+                        "CONNECTION LOST",
+                        "CONNECTION ERROR",
+                    )
+                    if any(m in _alert_text for m in stale_markers):
+                        _dash_set_alert(
+                            Fore.GREEN + "  ✔  Reconnected." + Style.RESET_ALL)
+                # Flip session state back to ready on a successful
+                # (re)connect so the header status bar stops showing
+                # "RECONNECTING" stale yellow.
+                if _session_state in ("reconnecting", "connecting"):
+                    set_session_state("ready")
                 reconnect_event.clear()
 
                 while not shutdown.is_set():
@@ -3236,6 +3255,7 @@ async def listen(token: str):
                         reconnect_event.clear()
                         fib_prev, fib_curr = 60, 60  # Reset backoff on manual reconnect
                         manual_reconnect = True
+                        set_session_state("reconnecting")
                         _dash_set_alert(
                             Fore.YELLOW + "  🔄  Dropping connection for reconnect..." + Style.RESET_ALL)
                         break
@@ -3368,6 +3388,7 @@ async def listen(token: str):
                     Fore.RED + f"  ⛔  CONNECTION LOST  ·  {e}" + Style.RESET_ALL)
                 _dash_set_alert(
                     Fore.YELLOW + f"  ↻  Reconnecting in {fmt_wait(fib_curr)}..." + Style.RESET_ALL)
+                set_session_state("reconnecting")
                 logger.warning(f"CONNECTION LOST  error={e}  retry={fmt_wait(fib_curr)}")
 
         if shutdown.is_set():
