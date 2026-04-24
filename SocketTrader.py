@@ -2747,17 +2747,22 @@ def close_all_open_positions() -> list[str]:
     if bridge_send_command({"cmd": "flatten", "account": active_account}):
         return sorted(closed)
 
-    # Fallback: file-based CLOSEPOSITION per instrument.
+    # Fallback: file-based CLOSEPOSITION per instrument. Track what
+    # we've already fired for so a contract that appears in BOTH the
+    # live-position query AND session_contracts doesn't get two writes.
+    fired: set[str] = set()
     try:
         positions = query_nt_positions(active_account, nt_port)
         for instrument, qty in positions.items():
-            if qty != 0 and instrument:
+            if qty != 0 and instrument and instrument not in fired:
                 fire_close_position(active_account, instrument)
+                fired.add(instrument)
     except Exception as e:
         logger.error(f"close_all_open_positions  query error: {e}")
     for contract in session_contracts:
-        if contract:
+        if contract and contract not in fired:
             fire_close_position(active_account, contract)
+            fired.add(contract)
 
     return sorted(closed)
 
