@@ -185,7 +185,200 @@ namespace NinjaTrader.NinjaScript.AddOns
                 }
 
                 lock (clientsLock) { clients.Add(client); }
+
+                // Per-client reader thread: listens for newline-delimited
+                // JSON commands from the client and dispatches them.
+                // Commands let SocketTrader flatten positions via NT's
+                // own account.Flatten(...) API, bypassing the file-based
+                // ATI and its contract-name-format fragility.
+                var readerThread = new Thread(() => ClientReadLoop(client))
+                {
+                    IsBackground = true,
+                    Name = "STB-ClientRead"
+                };
+                readerThread.Start();
             }
+        }
+
+        private void ClientReadLoop(TcpClient client)
+        {
+            try
+            {
+                // Commands are expected to be infrequent; a larger read
+                // timeout here lets the client connection stay open while
+                // SafeBroadcast continues pushing data from the writer side.
+                client.ReceiveTimeout = 0;  // block indefinitely on read
+                var stream = client.GetStream();
+                var reader = new StreamReader(stream, Encoding.UTF8);
+                string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    line = line.Trim();
+                    if (line.Length == 0) continue;
+                    HandleCommand(line, client);
+                }
+            }
+            catch (Exception)
+            {
+                // connection dropped; SafeBroadcast will evict the client
+                // on the next broadcast when the write fails.
+            }
+        }
+
+        private void HandleCommand(string jsonLine, TcpClient client)
+        {
+            // Tiny JSON parser — we only accept two shapes today:
+            //   {"cmd":"flatten","account":"<name>"}
+            //   {"cmd":"close_position","account":"<name>","instrument":"<inst>"}
+            // Using a string-contains approach keeps this dependency-free
+            // and safe when the rest of NT is running on .NET Framework 4.x
+            // without Newtonsoft or System.Text.Json guaranteed available.
+            string cmd = ExtractJsonString(jsonLine, "cmd");
+            string accountName = ExtractJsonString(jsonLine, "account");
+            if (string.IsNullOrEmpty(cmd) || string.IsNullOrEmpty(accountName))
+            {
+                SendAck(client, false, "missing cmd or account");
+                return;
+            }
+            Account target = null;
+            lock (Account.All)
+            {
+                foreach (var a in Account.All)
+                {
+                    if (a.Name == accountName) { target = a; break; }
+                }
+            }
+            if (target == null)
+            {
+                SendAck(client, false, "account not found: " + accountName);
+                return;
+            }
+            try
+            {
+                if (cmd == "flatten")
+                {
+                    FlattenAccount(target);
+                    SendAck(client, true, "flattened " + accountName);
+                }
+                else if (cmd == "close_position")
+                {
+                    string inst = ExtractJsonString(jsonLine, "instrument");
+                    if (string.IsNullOrEmpty(inst))
+                    {
+                        SendAck(client, false, "close_position missing instrument");
+                        return;
+                    }
+                    ClosePositionOnInstrument(target, inst);
+                    SendAck(client, true, "close_position " + inst);
+                }
+                else
+                {
+                    SendAck(client, false, "unknown cmd: " + cmd);
+                }
+            }
+            catch (Exception ex)
+            {
+                SendAck(client, false, ex.Message);
+                NinjaTrader.Code.Output.Process(
+                    $"SocketTraderBridge: command '{cmd}' error: {ex.Message}",
+                    PrintTo.OutputTab1);
+            }
+        }
+
+        private void FlattenAccount(Account acct)
+        {
+            // Build the set of open-position instruments, then let NT flatten
+            // each one via its own account.Flatten() API — handles ATM stop
+            // cancellation and market-order exit in one call, no contract-name
+            // format fragility, no file-based race.
+            var toFlatten = new List<Instrument>();
+            foreach (var pos in acct.Positions)
+            {
+                if (pos == null || pos.Instrument == null) continue;
+                if (pos.MarketPosition == MarketPosition.Flat) continue;
+                toFlatten.Add(pos.Instrument);
+            }
+            if (toFlatten.Count == 0) return;
+            acct.Flatten(toFlatten.ToArray());
+            NinjaTrader.Code.Output.Process(
+                $"SocketTraderBridge: flattened {toFlatten.Count} position(s) on {acct.Name}",
+                PrintTo.OutputTab1);
+        }
+
+        private void ClosePositionOnInstrument(Account acct, string instName)
+        {
+            foreach (var pos in acct.Positions)
+            {
+                if (pos == null || pos.Instrument == null) continue;
+                if (pos.MarketPosition == MarketPosition.Flat) continue;
+                // Match any alias: FullName, MasterInstrument.Name, or a
+                // case-insensitive substring so "NQ JUN26" lookups hit an
+                // instrument registered as "NQ 06-26" and vice-versa.
+                var full = pos.Instrument.FullName ?? "";
+                var master = pos.Instrument.MasterInstrument != null
+                    ? pos.Instrument.MasterInstrument.Name
+                    : "";
+                if (full.Equals(instName, StringComparison.OrdinalIgnoreCase)
+                    || master.Equals(instName, StringComparison.OrdinalIgnoreCase)
+                    || full.IndexOf(instName, StringComparison.OrdinalIgnoreCase) >= 0
+                    || instName.IndexOf(master, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    acct.Flatten(new[] { pos.Instrument });
+                    NinjaTrader.Code.Output.Process(
+                        $"SocketTraderBridge: closed {pos.Instrument.FullName} on {acct.Name}",
+                        PrintTo.OutputTab1);
+                    return;
+                }
+            }
+        }
+
+        private void SendAck(TcpClient client, bool ok, string message)
+        {
+            try
+            {
+                var sb = new StringBuilder();
+                sb.Append("{\"ack\":");
+                sb.Append(ok ? "true" : "false");
+                sb.Append(",\"msg\":").Append(JsonString(message));
+                sb.Append("}\n");
+                var bytes = Encoding.UTF8.GetBytes(sb.ToString());
+                var stream = client.GetStream();
+                stream.WriteTimeout = WriteTimeoutMs;
+                stream.Write(bytes, 0, bytes.Length);
+            }
+            catch { /* client dropped — SafeBroadcast will evict */ }
+        }
+
+        private static string ExtractJsonString(string json, string key)
+        {
+            // Locate "<key>":"<value>" and unescape \\ and \" inside the value.
+            // Deliberately primitive — avoids a JSON dep and is sufficient for
+            // the fixed-shape command messages this AddOn accepts.
+            var needle = "\"" + key + "\"";
+            int k = json.IndexOf(needle, StringComparison.Ordinal);
+            if (k < 0) return null;
+            int colon = json.IndexOf(':', k + needle.Length);
+            if (colon < 0) return null;
+            int i = colon + 1;
+            while (i < json.Length && char.IsWhiteSpace(json[i])) i++;
+            if (i >= json.Length || json[i] != '"') return null;
+            i++;
+            var val = new StringBuilder();
+            while (i < json.Length)
+            {
+                char c = json[i];
+                if (c == '\\' && i + 1 < json.Length)
+                {
+                    char n = json[i + 1];
+                    if (n == '"' || n == '\\') { val.Append(n); i += 2; continue; }
+                    if (n == 'n') { val.Append('\n'); i += 2; continue; }
+                    if (n == 't') { val.Append('\t'); i += 2; continue; }
+                }
+                if (c == '"') return val.ToString();
+                val.Append(c);
+                i++;
+            }
+            return null;
         }
 
         private void SafeBroadcast()

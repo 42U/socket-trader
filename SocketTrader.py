@@ -2641,6 +2641,33 @@ def _nt_contract_aliases(name: str) -> list[str]:
     return aliases
 
 
+def bridge_send_command(cmd: dict, timeout: float = 2.0) -> bool:
+    """Send a JSON command line to the SocketTraderBridge AddOn.
+
+    Opens a short-lived TCP connection, fires one newline-delimited JSON
+    object, and drops. The AddOn accepts commands on the same socket it
+    uses for the state-push stream; one-shot connections keep this code
+    simple and avoid needing to share state with live_bridge_task.
+    Returns True on successful send (does not await an ack — the AddOn
+    logs its own result to NT's Output tab).
+    """
+    if not (live_bridge_enabled and _live_bridge_connected):
+        return False
+    host = _nt_host(nt_port)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, live_bridge_port))
+        payload = (json.dumps(cmd) + "\n").encode("utf-8")
+        s.sendall(payload)
+        s.close()
+        logger.info(f"bridge cmd sent: {cmd}")
+        return True
+    except OSError as exc:
+        logger.warning(f"bridge cmd failed: {cmd} · {exc}")
+        return False
+
+
 def fire_close_position(account: str, contract: str):
     """Write a CLOSEPOSITION command to the incoming folder.
 
@@ -2687,35 +2714,50 @@ def fire_cancel_all_orders(account: str):
 def close_all_open_positions() -> list[str]:
     """Close every open position on the active account.
 
-    Queries NT for actual positions and closes each one, unioned with
-    any contracts tracked in session_contracts as a safety net in case
-    the position query fails or is slow to refresh after a fast fill.
-    Also cancels any working orders first so a pending entry can't
-    leak through during the close.
+    When the SocketTraderBridge AddOn is connected, sends a single
+    FLATTEN command over the bridge — NT calls `account.Flatten(...)`
+    natively, no file-format fragility, no contract-name-alias dance.
+    The file-based CLOSEPOSITION path is retained as a fallback for
+    when the bridge is disabled or unreachable.
+
+    In either path, cancels working orders first so a pending entry
+    can't refill during the close.
     """
     if not active_account:
         return []
 
-    # Cancel working orders first so they don't refill after we close
     fire_cancel_all_orders(active_account)
 
     closed: set[str] = set()
 
+    # Capture what WAS open so the caller sees the same "Closed: ..."
+    # list regardless of which path executed the flatten.
+    try:
+        positions = query_nt_positions(active_account, nt_port)
+        for instrument, qty in positions.items():
+            if qty != 0 and instrument:
+                closed.add(instrument)
+    except Exception as e:
+        logger.error(f"close_all_open_positions  query error: {e}")
+    for contract in session_contracts:
+        if contract:
+            closed.add(contract)
+
+    # Preferred path: bridge flatten via NT's native API.
+    if bridge_send_command({"cmd": "flatten", "account": active_account}):
+        return sorted(closed)
+
+    # Fallback: file-based CLOSEPOSITION per instrument.
     try:
         positions = query_nt_positions(active_account, nt_port)
         for instrument, qty in positions.items():
             if qty != 0 and instrument:
                 fire_close_position(active_account, instrument)
-                closed.add(instrument)
     except Exception as e:
         logger.error(f"close_all_open_positions  query error: {e}")
-
-    # Safety net: anything tracked in session_contracts that we haven't
-    # closed yet (e.g. position query was empty due to fill latency).
     for contract in session_contracts:
-        if contract and contract not in closed:
+        if contract:
             fire_close_position(active_account, contract)
-            closed.add(contract)
 
     return sorted(closed)
 
