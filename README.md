@@ -60,6 +60,8 @@ The sim account is automatically swapped with your real NinjaTrader account name
 | | |
 |---|---|
 | **Cross-platform** | Windows and Linux support |
+| **Copy trading** | Fan one signal out to a leader account **plus multiple follower accounts** — one order file per account |
+| **Micro mode** | One toggle converts every signal to its CME micro contract — NQ→MNQ, ES→MES, RTY→M2K, GC→MGC, … |
 | **ATI integration** | Auto-detect accounts, live balances, and position closing via NinjaTrader ATI |
 | **Auto-detect directory** | Finds NinjaTrader 8 `incoming/` folder on Windows automatically |
 | **Multi-server support** | Save and switch between multiple signal servers |
@@ -180,15 +182,75 @@ Press `S` to open the Setup menu for all configuration options:
 ┌─ SETUP ──────────────────────────────────────────┐
 │  1. Server    (wss://host:8420/ws)               │
 │  2. Token     (****)                             │
-│  3. Account   (Sim101)                           │
+│  3. Accounts  (Sim101 +2 copy)                   │
 │  4. Strategy  (NQ_Med)                           │
 │  5. Directory (/path/to/incoming)                │
 │  6. ATI Port  (36973)                            │
+│  7. Micros    (OFF)                              │
 │  ESC to close                                    │
 └──────────────────────────────────────────────────┘
 ```
 
 Changing the **server** or **token** automatically triggers a reconnect. The server selector supports saving multiple servers:
+
+---
+
+## Copy Trading
+
+SocketTrader can send **the same signal to multiple NinjaTrader accounts at once**. You pick a **leader** account and any number of **followers**; every incoming signal fires on the leader *and* mimics onto each follower.
+
+Press `S` &rarr; `3` to open the account selector:
+
+```
+┌─ COPY TRADING — LEADER & FOLLOWERS ──────────────┐
+│  1. Sim101  ($28,857.02) ◀ LEADER                │
+│  2. Sim102  ($10,000.00) ＋ FOLLOWER              │
+│  3. Sim103  ($10,000.00) ＋ FOLLOWER              │
+│  Leader trades; followers mimic every signal.    │
+└───────────────────────────────────────────────────┘
+  LEADER [Sim101] ▸ 1
+  FOLLOWERS (numbers/names, 'all', ENTER=none) ▸ 2 3
+```
+
+- **Leader** — the primary account; drives the status-bar P&L display and fill confirmation.
+- **Followers** — enter the account numbers (or names), the word `all` for every other account, or press `ENTER` for none (single-account mode, the classic behavior).
+- Each account receives its **own** order-instruction file with only the account field swapped — instrument, action, quantity, strategy, and signal ID are identical across all accounts.
+- Fan-out writes one unique OIF file per account, with filenames guaranteed unique even when several land in the same millisecond.
+- **Risk is enforced per account, independently.** Each account has its own [session target/stop](#risk-management); when one account trips its limit, only that account is flattened and locked out for the session — the leader and other followers keep trading. When *every* account has stopped, the session pauses.
+- The status bar shows the leader with a copy-count badge, e.g. `Sim101+2: $28,857.02 (+$247.50)`.
+
+Followers are saved to `~/.voidorigin_config.json` (`follower_accounts`) and restored on the next run. Works identically on Windows, WSL2, macOS, and Linux.
+
+---
+
+## Micro Contract Mode
+
+Flip one switch and every incoming signal trades the **CME micro contract** instead of the full size — same market, same direction, same contract month, ≈1/10 the size. Press `S` → `7` to toggle. The setting persists in config, and a `◆ MICROS` badge appears in the header status bar while active.
+
+```
+IN   PLACE;SimAccount;NQ 06-26;BUY;2;MARKET;;;DAY;;;NQ_Med;1044
+OUT  PLACE;YourAccount;MNQ 06-26;BUY;2;MARKET;;;DAY;;;NQ_Med;1044
+```
+
+Quantity is **not** rescaled — 2 NQ becomes 2 MNQ (≈1/10 the notional exposure). Translation is a lookup table, not an "M" prefix, because micro symbols aren't uniform (Russell is `M2K`, silver is `SIL`):
+
+| Full | Micro | | Full | Micro |
+|------|-------|-|------|-------|
+| ES  | MES — Micro E-mini S&P 500      | | CL  | MCL — Micro WTI Crude Oil     |
+| NQ  | MNQ — Micro E-mini Nasdaq-100   | | NG  | MNG — Micro Henry Hub Nat Gas |
+| YM  | MYM — Micro E-mini Dow          | | BTC | MBT — Micro Bitcoin           |
+| RTY | M2K — Micro E-mini Russell 2000 | | ETH | MET — Micro Ether             |
+| GC  | MGC — Micro Gold                | | 6E  | M6E — E-micro EUR/USD         |
+| SI  | SIL — Micro Silver (1,000 oz)   | | 6A  | M6A — E-micro AUD/USD         |
+| HG  | MHG — Micro Copper              | | 6B  | M6B — E-micro GBP/USD         |
+
+Behavior notes:
+
+- **Unmapped symbols are sent unchanged** (e.g. `ZB` has no true micro) with a one-time warning in the dashboard and log — the signal still fires, at full size.
+- Signals already micro (`MNQ`, `MES`, …) pass through untouched.
+- `CLOSEPOSITION` / `REVERSEPOSITION` signals convert too, so server-driven exits target the micro position you actually hold.
+- **Toggle while flat.** A position opened before flipping the switch keeps its original symbol — an exit signal arriving after the flip targets the micro symbol instead of your old full-size position. Manual close (`C`) and hard-stop flatten always act on the real positions NinjaTrader reports, regardless of this setting.
+- Extend or override the table with a `micro_map` dict in the config file; map a symbol to itself to opt it out (`"GC": "GC"`).
 
 ---
 
@@ -333,6 +395,7 @@ Settings persist in `~/.voidorigin_config.json`:
   "token": "your_connection_token",
   "account": "Sim101",
   "atm_strategy": "NQ_Med",
+  "micro_mode": false,
   "output_directory": "C:\\Users\\you\\Documents\\NinjaTrader 8\\incoming",
   "nt_port": 36973,
   "account_limits": {
@@ -349,6 +412,8 @@ Settings persist in `~/.voidorigin_config.json`:
 | `token` | Authentication token (rotates frequently) |
 | `account` | Active NinjaTrader account name |
 | `atm_strategy` | ATM strategy template name |
+| `micro_mode` | Convert every signal to its CME micro contract (toggle: `S` → `7`) |
+| `micro_map` | Optional additions/overrides for the micro symbol table, e.g. `{ "GC": "GC" }` opts gold out |
 | `output_directory` | Path to NinjaTrader 8 `incoming/` folder |
 | `nt_port` | NinjaTrader AT Interface port |
 | `account_limits` | Per-account risk management settings |

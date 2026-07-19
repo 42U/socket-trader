@@ -15,6 +15,7 @@ import random
 import os
 import re
 import platform
+import threading
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -27,7 +28,7 @@ try:
 except ImportError:
     pyfiglet = None
 
-__version__ = "0.2.7"
+__version__ = "0.3.2"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -68,9 +69,14 @@ paused = False
 shutdown = asyncio.Event()
 signal_count = 0
 output_directory = None
-active_account = None          # Current NinjaTrader account name
+active_account = None          # LEADER account: drives status bar / display and is always traded.
+follower_accounts: list[str] = []  # FOLLOWERS that mimic the leader. Every signal fires on the
+                                   # leader plus each follower. Empty = single-account mode.
+account_stops: dict[str, str] = {}  # account -> "hard" | "soft" once its session limit trips.
+                                    # Absent = tradeable. NOT persisted (session-local lockout).
 atm_strategy = "NQ_Med"        # ATM strategy template name (fallback)
 follow_publisher_strategy = False  # If True, use the publisher's strategy per-signal when locally installed
+micro_mode = False             # If True, incoming instruments are translated to their CME micro (NQ→MNQ)
 nt_port = 36973                # NinjaTrader AT Interface port (default 36973)
 awaiting_directory_input = False
 awaiting_user_input = False  # Block key handler during any input prompt
@@ -116,6 +122,30 @@ def get_session_status_text() -> str:
         if len(parts) == 2:
             return parts[0] + "·" + _STATE_COLORS[color_name] + parts[1] + Fore.CYAN
     return text
+
+
+_state_before_conn = "ready"  # header state to restore once the connection is back
+
+
+def note_connection_down(reconnecting: bool = True):
+    """Flip the header to a connection state, remembering what to restore.
+
+    Repeated calls during one outage keep the original pre-outage state.
+    """
+    global _state_before_conn
+    if _session_state not in ("connecting", "reconnecting"):
+        _state_before_conn = _session_state
+    set_session_state("reconnecting" if reconnecting else "connecting")
+
+
+def note_connection_up():
+    """Restore the pre-outage header state after a successful (re)connect.
+
+    If something else moved the state mid-outage (a stop tripped, user
+    paused), that newer state wins and is left untouched.
+    """
+    if _session_state in ("connecting", "reconnecting"):
+        set_session_state(_state_before_conn)
 
 
 # ---------- Risk management ----------
@@ -252,7 +282,8 @@ def _clear_positive_stops():
             _dash_set_alert(
                 Fore.YELLOW +
                 f"  ⚠  Positive stop (${old_stop:+,.2f}) cleared for {account} — "
-                f"new session. Press T to set a new limit." + Style.RESET_ALL)
+                f"new session. Press T to set a new limit." + Style.RESET_ALL,
+                sticky=True)
 
 
 def reset_session_pnl():
@@ -262,6 +293,7 @@ def reset_session_pnl():
     for name, bal in session_current_balances.items():
         session_start_balances[name] = bal
     session_contracts.clear()
+    account_stops.clear()
     soft_stopped = False
     hard_stopped = False
     signal_count = 0
@@ -412,6 +444,76 @@ def save_config(cfg: dict):
         print(Fore.RED + f"  ✖  Could not save config: {exc}" + Style.RESET_ALL)
 
 
+# ---------- Micro contract conversion ----------
+# CME micro equivalents keyed by full-size root symbol. Most micros take
+# an "M" prefix (ES→MES, NQ→MNQ) but not all — Russell is M2K, silver is
+# SIL — so translation is a lookup, never string surgery. The "micro_map"
+# dict in the config file extends or overrides this table; mapping a root
+# to itself (e.g. "GC": "GC") opts that symbol out of conversion.
+MICRO_MAP = {
+    "ES":  "MES",   # Micro E-mini S&P 500
+    "NQ":  "MNQ",   # Micro E-mini Nasdaq-100
+    "YM":  "MYM",   # Micro E-mini Dow
+    "RTY": "M2K",   # Micro E-mini Russell 2000
+    "GC":  "MGC",   # Micro Gold
+    "SI":  "SIL",   # Micro Silver (1,000 oz)
+    "HG":  "MHG",   # Micro Copper
+    "CL":  "MCL",   # Micro WTI Crude Oil
+    "NG":  "MNG",   # Micro Henry Hub Natural Gas
+    "BTC": "MBT",   # Micro Bitcoin
+    "ETH": "MET",   # Micro Ether
+    "6E":  "M6E",   # E-micro EUR/USD
+    "6A":  "M6A",   # E-micro AUD/USD
+    "6B":  "M6B",   # E-micro GBP/USD
+}
+micro_map: dict[str, str] = dict(MICRO_MAP)  # active table: defaults + config overrides
+_micro_unmapped_warned: set[str] = set()     # roots already warned about this run
+
+
+def load_micro_map(cfg: dict) -> dict[str, str]:
+    """Return the built-in micro table merged with config "micro_map" overrides."""
+    merged = dict(MICRO_MAP)
+    overrides = cfg.get("micro_map", {})
+    if isinstance(overrides, dict):
+        for root, micro in overrides.items():
+            if isinstance(root, str) and isinstance(micro, str) and root.strip() and micro.strip():
+                merged[root.strip().upper()] = micro.strip().upper()
+    return merged
+
+
+def to_micro_instrument(instrument: str) -> str:
+    """Translate a full-size instrument to its micro: "NQ 06-26" → "MNQ 06-26".
+
+    The expiry suffix is kept as-is — micros list the same contract months
+    as their parent. Instruments already in micro form pass through
+    unchanged, and a root with no known micro passes through with a
+    one-time warning so the user notices they're still trading full size.
+    """
+    root, sep, rest = instrument.partition(" ")
+    key = root.strip().upper()
+    micro = micro_map.get(key)
+    if micro:
+        return micro + sep + rest
+    if key and key not in micro_map.values() and key not in _micro_unmapped_warned:
+        _micro_unmapped_warned.add(key)
+        logger.warning(f"MICRO MODE  no micro equivalent for '{root}' — instrument sent unchanged")
+        _dash_set_alert(
+            Fore.YELLOW + f"  ⚠  Micro mode: no micro equivalent for {root} — sent full-size" + Style.RESET_ALL)
+    return instrument
+
+
+def toggle_micro_mode() -> bool:
+    """Flip micro conversion on/off, persist it, and reload map overrides."""
+    global micro_mode, micro_map
+    micro_mode = not micro_mode
+    cfg = load_config()
+    cfg["micro_mode"] = micro_mode
+    save_config(cfg)
+    micro_map = load_micro_map(cfg)
+    logger.info(f"MICRO MODE  {'ON' if micro_mode else 'OFF'}")
+    return micro_mode
+
+
 # ---------- Strategy template helpers ----------
 def _nt_base() -> Path | None:
     """Return the NinjaTrader 8 root directory (parent of incoming/)."""
@@ -448,6 +550,35 @@ def is_trade_ready() -> bool:
     if not validate_strategy(atm_strategy):
         return False
     return True
+
+
+# ---------- Copy-trade account fan-out ----------
+def target_accounts() -> list[str]:
+    """Every account a signal fires on: the leader first, then each follower.
+
+    The leader (active_account) is always traded. Followers mimic it. The
+    list is de-duplicated with the leader kept first, so a follower that
+    also names the leader can't get two order files for one signal. With no
+    followers this is just [leader] — classic single-account mode.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for a in ([active_account] + list(follower_accounts)):
+        if a and a not in seen:
+            seen.add(a)
+            out.append(a)
+    return out
+
+
+def tradeable_accounts() -> list[str]:
+    """Target accounts not currently locked out by a hit stop/target."""
+    return [a for a in target_accounts() if a not in account_stops]
+
+
+def session_hard_locked() -> bool:
+    """True when every target account is hard-stopped (session fully locked)."""
+    tgt = target_accounts()
+    return bool(tgt) and all(account_stops.get(a) == "hard" for a in tgt)
 
 
 # ---------- NinjaTrader incoming folder detection ----------
@@ -1180,21 +1311,23 @@ def _build_controls_line():
     acct_info = ""
     acct_info_colored = ""
     if active_account:
+        # Leader label; copy-trading appends "+N" for the follower count.
+        lead = active_account + (f"+{len(follower_accounts)}" if follower_accounts else "")
         start = session_start_balances.get(active_account)
         current = session_current_balances.get(active_account)
         if start is not None and current is not None:
             pnl = current - start
             pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
-            acct_info = f"{active_account}: ${current:,.2f} (${pnl:+,.2f})"
-            acct_info_colored = f"{active_account}: ${current:,.2f} (" + pnl_color + f"${pnl:+,.2f}" + Fore.CYAN + Style.DIM + ")"
+            acct_info = f"{lead}: ${current:,.2f} (${pnl:+,.2f})"
+            acct_info_colored = f"{lead}: ${current:,.2f} (" + pnl_color + f"${pnl:+,.2f}" + Fore.CYAN + Style.DIM + ")"
         elif current is not None:
-            acct_info = f"{active_account}: ${current:,.2f}"
+            acct_info = f"{lead}: ${current:,.2f}"
             acct_info_colored = acct_info
         elif start is not None:
-            acct_info = f"{active_account}: ${start:,.2f}"
+            acct_info = f"{lead}: ${start:,.2f}"
             acct_info_colored = acct_info
         else:
-            acct_info = active_account
+            acct_info = lead
             acct_info_colored = acct_info
     if not acct_info:
         acct_info = "NO ACCOUNT SET"
@@ -1311,10 +1444,21 @@ DASH_TOTAL_ROWS = 10
 
 _signal_buffer: deque[str] = deque(maxlen=DASH_SIGNAL_COUNT)
 _motd_text = ""
-_alert_text = ""
 _heartbeat_text = ""
 _server_name = ""
 _menu_active = False
+
+# Alert row model: alerts are one-shot EVENTS, not states. Each is stamped
+# with the time it happened so it stays truthful after the moment passes;
+# ongoing conditions (connected/reconnecting/paused/stopped) belong on the
+# heartbeat row and header status bar, which are actively maintained.
+ALERT_EVENT = "event"  # default: one-shot occurrences (errors, fills, user actions)
+ALERT_CONN = "conn"    # connection lifecycle — cleared as a group on reconnect
+ALERT_TTL = 300        # seconds a non-sticky alert lives; swept on server heartbeats
+_alert_text = ""
+_alert_kind = ""       # kind of the alert currently shown ("" = row empty)
+_alert_sticky = False  # sticky alerts (lockouts, setup gaps) never auto-expire
+_alert_ts = 0.0        # when the current alert was posted
 
 
 def _dash_write(row_offset: int, text: str):
@@ -1362,11 +1506,34 @@ def _dash_set_motd(text: str):
     _dash_write(DASH_ROW_MOTD, text)
 
 
-def _dash_set_alert(text: str):
-    """Update the alert / status line."""
-    global _alert_text
+def _dash_set_alert(text: str, kind: str = ALERT_EVENT, sticky: bool = False,
+                    stamp: bool = True):
+    """Update the alert / status line.
+
+    Non-empty alerts get a dim [HH:MM:SS] stamp (unless stamp=False for
+    animation frames) and expire after ALERT_TTL unless sticky.
+    """
+    global _alert_text, _alert_kind, _alert_sticky, _alert_ts
+    if text and stamp:
+        text = f"  {Style.DIM}[{time.strftime('%H:%M:%S')}]{Style.RESET_ALL}" + text
     _alert_text = text
+    _alert_kind = kind if text else ""
+    _alert_sticky = sticky and bool(text)
+    _alert_ts = time.time()
     _dash_write(DASH_ROW_ALERT, text)
+
+
+def _dash_clear_alert(kind: str | None = None):
+    """Clear the alert row — with kind given, only if the current alert is that kind."""
+    if kind is not None and _alert_kind != kind:
+        return
+    _dash_set_alert("")
+
+
+def _dash_expire_alert():
+    """Drop a stale non-sticky alert; called on each server heartbeat."""
+    if _alert_text and not _alert_sticky and time.time() - _alert_ts > ALERT_TTL:
+        _dash_set_alert("")
 
 
 def _dash_redraw_all():
@@ -1461,6 +1628,8 @@ def status_bar(text):
     inner = width - 2
     dir_indicator = Fore.GREEN + "● TRADE READY" + Fore.CYAN if is_trade_ready() else Fore.RED + "● NOT READY" + Fore.CYAN
     content = f"{text}  ·  {dir_indicator}"
+    if micro_mode:
+        content += f"  ·  {Fore.LIGHTMAGENTA_EX}◆ MICROS{Fore.CYAN}"
     vis = visible_len(content)
     total_pad = max(0, inner - vis)
     left_pad = total_pad // 2
@@ -1504,7 +1673,7 @@ PULSE_FRAMES = ["·", "•", "●", "◉", "●", "•", "·", " "]
 
 
 async def signal_pulse(label="SIGNAL RECEIVED"):
-    _dash_set_alert(Fore.GREEN + f"  ● {label}" + Style.RESET_ALL)
+    _dash_set_alert(Fore.GREEN + f"  ● {label}" + Style.RESET_ALL, stamp=False)
     await asyncio.sleep(0.4)
     _dash_set_alert("")
 
@@ -1581,61 +1750,128 @@ async def prompt_directory():
     awaiting_user_input = False
 
 
-# ---------- Account prompt ----------
-async def prompt_account():
-    global active_account, awaiting_user_input
+# ---------- Copy-trade account selection ----------
+def _account_option_line(index: int, account: dict, leader: str | None, followers: list[str]) -> str:
+    name = account["name"]
+    if name == leader:
+        marker = " ◀ LEADER"
+    elif name in followers:
+        marker = " ＋ FOLLOWER"
+    else:
+        marker = ""
+    return f"{index}. {name}  (${account['cash']:,.2f}){marker}"
+
+
+def _account_menu_rows(accounts: list[dict], leader: str | None, followers: list[str]) -> tuple[list[str], int]:
+    """Return printable account rows and content width for the account picker."""
+    rows = [_account_option_line(i, a, leader, followers) for i, a in enumerate(accounts, 1)]
+    if not rows:
+        return [], 49
+
+    available = max(term_width() - 4, 49)  # left border + two-space indent + right border
+    if len(rows) <= 9 or available < 74:
+        width = min(max(49, max(len(r) for r in rows)), available)
+        return [r[:width] for r in rows], width
+
+    gap = "  "
+    col_width = max(34, min(44, (available - len(gap)) // 2))
+    split_at = (len(rows) + 1) // 2
+    rendered: list[str] = []
+    for i in range(split_at):
+        left = rows[i][:col_width].ljust(col_width)
+        right = rows[i + split_at][:col_width] if i + split_at < len(rows) else ""
+        rendered.append(f"{left}{gap}{right[:col_width]}")
+    return rendered, (col_width * 2) + len(gap)
+
+
+def _print_account_menu(accounts: list[dict], leader: str | None, followers: list[str]) -> None:
+    rows, width = _account_menu_rows(accounts, leader, followers)
+    title = "─ COPY TRADING — LEADER & FOLLOWERS "
+    top = f"┌{title}{'─' * max(0, width + 2 - len(title))}┐"
+    print(Fore.CYAN + "\n" + top + Style.RESET_ALL)
+    if rows:
+        for line in rows:
+            print(Fore.CYAN + f"│  {line[:width].ljust(width)}│" + Style.RESET_ALL)
+    else:
+        print(Fore.CYAN + f"│  {'NinjaTrader ATI unreachable — enter names.'.ljust(width)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  {'Leader trades; followers mimic every signal.'.ljust(width)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  {'Followers: numbers/names, all, or ENTER=none.'.ljust(width)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"└{'─' * (width + 2)}┘" + Style.RESET_ALL)
+
+
+def _parse_follower_tokens(raw: str, names: list[str], leader: str) -> list[str]:
+    """Parse a follower selection string into account names.
+
+    Accepts space/comma-separated 1-based indexes into `names`, the word
+    'all' (every account except the leader), or literal account names.
+    The leader is always excluded and the result is de-duplicated in the
+    order given.
+    """
+    raw = raw.strip()
+    if not raw:
+        return []
+    if raw.lower() == "all":
+        return [n for n in names if n != leader]
+    picked: list[str] = []
+    seen: set[str] = set()
+    for tok in raw.replace(",", " ").split():
+        name = None
+        if tok.isdigit() and 1 <= int(tok) <= len(names):
+            name = names[int(tok) - 1]
+        elif tok in names:
+            name = tok
+        else:
+            name = tok  # allow a manually-typed account name not in the ATI list
+        if name and name != leader and name not in seen:
+            seen.add(name)
+            picked.append(name)
+    return picked
+
+
+async def prompt_accounts():
+    """Select the LEADER account and the FOLLOWERS that mimic its trades.
+
+    Every signal fires on the leader plus each follower. Falls back to the
+    classic single-account flow (leader only, no followers) when the user
+    picks no followers, keeping existing setups unchanged.
+    """
+    global active_account, follower_accounts, awaiting_user_input
     awaiting_user_input = True
     show_cursor()
-    # Try to auto-detect accounts from NinjaTrader ATI
     accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
-    if accounts:
-        print(Fore.CYAN + "\n┌─ CHANGE ACCOUNT ─────────────────────────────────┐" + Style.RESET_ALL)
-        for i, a in enumerate(accounts, 1):
-            marker = " ◀" if a["name"] == active_account else ""
-            line = f"{i}. {a['name']}  (${a['cash']:,.2f}){marker}"
-            print(Fore.CYAN + f"│  {line.ljust(49)}│" + Style.RESET_ALL)
-        print(Fore.CYAN + "│  Enter # to select, or type a name manually.     │" + Style.RESET_ALL)
-        print(Fore.CYAN + "│  Press ENTER to keep current.                     │" + Style.RESET_ALL)
-        print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
-        sys.stdout.write(Fore.WHITE + "  ACCOUNT ▸ " + Style.RESET_ALL)
-        sys.stdout.flush()
-        raw = await asyncio.to_thread(read_line_raw)
-        if raw == "":
-            print(Fore.YELLOW + "  ↩  No change — keeping current account." + Style.RESET_ALL)
-        elif raw.strip().isdigit() and 1 <= int(raw.strip()) <= len(accounts):
-            active_account = accounts[int(raw.strip()) - 1]["name"]
-            cfg = load_config()
-            cfg["account"] = active_account
-            save_config(cfg)
-            print(Fore.GREEN + f"  ✔  Account set → {active_account}" + Style.RESET_ALL)
-        elif raw.strip():
-            active_account = raw.strip()
-            cfg = load_config()
-            cfg["account"] = active_account
-            save_config(cfg)
-            print(Fore.GREEN + f"  ✔  Account set → {active_account}" + Style.RESET_ALL)
-    else:
-        print(Fore.CYAN + "\n┌─ CHANGE ACCOUNT ─────────────────────────────────┐" + Style.RESET_ALL)
-        print(Fore.CYAN + "│  Enter new NinjaTrader account name.              │" + Style.RESET_ALL)
-        print(Fore.CYAN + "│  Press ENTER to keep current.                     │" + Style.RESET_ALL)
-        if active_account:
-            print(Fore.CYAN + f"│  Current: {active_account[:38].ljust(38)}│" + Style.RESET_ALL)
-        print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
-        sys.stdout.write(Fore.WHITE + "  ACCOUNT ▸ " + Style.RESET_ALL)
-        sys.stdout.flush()
-        raw = await asyncio.to_thread(read_line_raw)
-        if raw == "":
-            print(Fore.YELLOW + "  ↩  No change — keeping current account." + Style.RESET_ALL)
-        else:
-            active_account = raw.strip()
-            cfg = load_config()
-            cfg["account"] = active_account
-            save_config(cfg)
-            print(Fore.GREEN + f"  ✔  Account set → {active_account}" + Style.RESET_ALL)
+    names = [a["name"] for a in accounts]
 
-    if not output_directory or not active_account:
-        print()
-        print(status_bar("SESSION ACTIVE  ·  AWAITING SIGNALS"))
+    _print_account_menu(accounts, active_account, follower_accounts)
+
+    # --- Leader ---
+    sys.stdout.write(Fore.WHITE + f"  LEADER [{active_account or 'none'}] ▸ " + Style.RESET_ALL)
+    sys.stdout.flush()
+    raw = (await asyncio.to_thread(read_line_raw)).strip()
+    if raw:
+        if raw.isdigit() and names and 1 <= int(raw) <= len(names):
+            active_account = names[int(raw) - 1]
+        else:
+            active_account = raw
+
+    # --- Followers ---
+    sys.stdout.write(
+        Fore.WHITE + "  FOLLOWERS (numbers/names, 'all', ENTER=none) ▸ " + Style.RESET_ALL)
+    sys.stdout.flush()
+    raw_f = await asyncio.to_thread(read_line_raw)
+    follower_accounts = _parse_follower_tokens(raw_f, names, active_account)
+
+    cfg = load_config()
+    cfg["account"] = active_account
+    cfg["follower_accounts"] = follower_accounts
+    save_config(cfg)
+
+    if follower_accounts:
+        print(Fore.GREEN +
+              f"  ✔  Leader {active_account}  +  {len(follower_accounts)} follower(s): "
+              f"{', '.join(follower_accounts)}" + Style.RESET_ALL)
+    else:
+        print(Fore.GREEN + f"  ✔  Single account → {active_account}" + Style.RESET_ALL)
+    logger.info(f"ACCOUNTS SET  leader={active_account}  followers={follower_accounts}")
     print()
     awaiting_user_input = False
 
@@ -1676,33 +1912,97 @@ async def prompt_port():
 
 
 # ---------- ATM Strategy prompt ----------
+def _strategy_option_line(index: int, name: str, current: str) -> str:
+    marker = " ◀" if name == current else ""
+    return f"{index}. {name}{marker}"
+
+
+def _strategy_page_size() -> int:
+    reserved = _header_lines + 10 if _controls_pinned else 10
+    return max(6, term_height() - reserved)
+
+
+def _strategy_menu_rows(available: list[str], current: str, page: int = 0) -> tuple[list[str], int, int, int]:
+    """Return printable strategy rows, width, current page, and page count."""
+    if not available:
+        return [], 49, 0, 1
+
+    available_width = max(term_width() - 4, 49)
+    max_index_len = len(str(len(available))) + 2  # "83. "
+    longest_name = max([len(n) for n in available] + [len(current)])
+    min_col_width = max(18, min(34, max_index_len + min(longest_name, 24) + 2))
+    columns = max(1, min(4, (available_width + 2) // (min_col_width + 2)))
+    col_width = min(34, (available_width - (columns - 1) * 2) // columns)
+    page_rows = _strategy_page_size()
+    page_size = max(1, page_rows * columns)
+    page_count = max(1, (len(available) + page_size - 1) // page_size)
+    page = max(0, min(page, page_count - 1))
+
+    start = page * page_size
+    items = [
+        _strategy_option_line(start + offset + 1, name, current)[:col_width]
+        for offset, name in enumerate(available[start:start + page_size])
+    ]
+    rendered: list[str] = []
+    for row_idx in range(page_rows):
+        cells = []
+        for col_idx in range(columns):
+            item_idx = (col_idx * page_rows) + row_idx
+            if item_idx < len(items):
+                cells.append(items[item_idx].ljust(col_width))
+        if cells:
+            rendered.append("  ".join(cells).rstrip())
+    width = max(49, min(available_width, (col_width * columns) + ((columns - 1) * 2)))
+    return rendered, width, page, page_count
+
+
+def _print_strategy_menu(available: list[str], current: str, follow_mode: bool, page: int = 0) -> tuple[int, int]:
+    rows, width, page, page_count = _strategy_menu_rows(available, current, page)
+    mode_label = "FOLLOW PUBLISHER" if follow_mode else "LOCKED (override)"
+    title = "─ ATM STRATEGY TEMPLATE "
+    top = f"┌{title}{'─' * max(0, width + 2 - len(title))}┐"
+    print(Fore.CYAN + "\n" + top + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  {('Mode: ' + mode_label).ljust(width)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  {('Fallback: ' + current).ljust(width)[:width]}│" + Style.RESET_ALL)
+    if available:
+        print(Fore.CYAN + f"│  {('Templates: ' + str(len(available)) + ' · Page ' + str(page + 1) + '/' + str(page_count)).ljust(width)}│" + Style.RESET_ALL)
+        for line in rows:
+            print(Fore.CYAN + f"│  {line[:width].ljust(width)}│" + Style.RESET_ALL)
+        hint = "#/name=set · N/P=page · T=mode · ENTER=keep"
+        print(Fore.CYAN + f"│  {hint.ljust(width)[:width]}│" + Style.RESET_ALL)
+    else:
+        print(Fore.CYAN + f"│  {'No templates found in AtmStrategy directory.'.ljust(width)}│" + Style.RESET_ALL)
+        print(Fore.CYAN + f"│  {'Type a strategy name manually.'.ljust(width)}│" + Style.RESET_ALL)
+        print(Fore.CYAN + f"│  {'T=mode · ENTER=keep'.ljust(width)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"└{'─' * (width + 2)}┘" + Style.RESET_ALL)
+    return page, page_count
+
+
 async def prompt_strategy():
     global atm_strategy, follow_publisher_strategy, awaiting_user_input
     awaiting_user_input = True
     show_cursor()
     available = list_atm_strategies()
-    mode_label = "FOLLOW PUBLISHER" if follow_publisher_strategy else "LOCKED (override)"
-    print(Fore.CYAN + "\n┌─ ATM STRATEGY TEMPLATE ───────────────────────────┐" + Style.RESET_ALL)
-    print(Fore.CYAN + f"│  Mode: {mode_label.ljust(43)}│" + Style.RESET_ALL)
-    print(Fore.CYAN + f"│  Fallback: {atm_strategy[:38].ljust(38)}│" + Style.RESET_ALL)
-    print(Fore.CYAN + "│                                                   │" + Style.RESET_ALL)
-    if available:
-        for i, name in enumerate(available, 1):
-            marker = " ◀" if name == atm_strategy else ""
-            line = f"{i}. {name}{marker}"
-            print(Fore.CYAN + f"│  {line.ljust(49)}│" + Style.RESET_ALL)
-        print(Fore.CYAN + "│  # = set fallback · type name manually also OK   │" + Style.RESET_ALL)
-    else:
-        print(Fore.CYAN + "│  No templates found in AtmStrategy directory.     │" + Style.RESET_ALL)
-        print(Fore.CYAN + "│  Type a strategy name manually.                   │" + Style.RESET_ALL)
-    print(Fore.CYAN + "│  Type T+ENTER to toggle mode · ENTER to keep      │" + Style.RESET_ALL)
-    print(Fore.CYAN + "└───────────────────────────────────────────────────┘" + Style.RESET_ALL)
-    sys.stdout.write(Fore.WHITE + "  STRATEGY ▸ " + Style.RESET_ALL)
-    sys.stdout.flush()
-    raw = await asyncio.to_thread(read_line_raw)
-    choice = raw.strip()
 
     cfg = load_config()
+    page = 0
+    while True:
+        page, page_count = _print_strategy_menu(available, atm_strategy, follow_publisher_strategy, page)
+        sys.stdout.write(Fore.WHITE + "  STRATEGY ▸ " + Style.RESET_ALL)
+        sys.stdout.flush()
+        raw = await asyncio.to_thread(read_line_raw)
+        choice = raw.strip()
+
+        if choice.lower() in {"n", "next"} and page_count > 1:
+            page = (page + 1) % page_count
+            _dash_enter_menu()
+            continue
+        if choice.lower() in {"p", "prev", "previous"} and page_count > 1:
+            page = (page - 1) % page_count
+            _dash_enter_menu()
+            continue
+        break
+
     if choice == "":
         print(Fore.YELLOW + "  ↩  No change — keeping current strategy." + Style.RESET_ALL)
     elif choice.lower() == "q":
@@ -1712,8 +2012,7 @@ async def prompt_strategy():
         cfg["follow_publisher_strategy"] = follow_publisher_strategy
         save_config(cfg)
         new_label = "FOLLOW PUBLISHER" if follow_publisher_strategy else "LOCKED (override)"
-        global _alert_text
-        _alert_text = Fore.GREEN + f"  ✔  Strategy mode → {new_label}  ·  Fallback: {atm_strategy}" + Style.RESET_ALL
+        _dash_set_alert(Fore.GREEN + f"  ✔  Strategy mode → {new_label}  ·  Fallback: {atm_strategy}" + Style.RESET_ALL)
         print(Fore.GREEN + f"  ✔  Mode → {new_label}  ·  Fallback: {atm_strategy}" + Style.RESET_ALL)
         logger.info(f"STRATEGY MODE  follow_publisher={follow_publisher_strategy}  fallback={atm_strategy}")
     elif available and choice.isdigit() and 1 <= int(choice) <= len(available):
@@ -1867,12 +2166,17 @@ async def setup_menu():
     print(Fore.CYAN + "\n┌─ SETUP ──────────────────────────────────────────┐" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  1. Server    ({current_server[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  2. Token     ({masked_token[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
-    print(Fore.CYAN + f"│  3. Account   ({(active_account or 'not set')[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
+    acct_label = active_account or "not set"
+    if follower_accounts:
+        acct_label = f"{active_account} +{len(follower_accounts)} copy"
+    print(Fore.CYAN + f"│  3. Accounts  ({acct_label[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     mode_tag = "FOLLOW" if follow_publisher_strategy else "LOCKED"
     strat_label = f"{atm_strategy} · {mode_tag}"
     print(Fore.CYAN + f"│  4. Strategy  ({strat_label[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  5. Directory ({(output_directory or 'not set')[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  6. ATI Port  ({nt_port})" .ljust(53) + "│" + Style.RESET_ALL)
+    micro_label = "ON — NQ→MNQ, ES→MES, …" if micro_mode else "OFF"
+    print(Fore.CYAN + f"│  7. Micros    ({micro_label[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     print(Fore.CYAN + "│  ESC to close                                    │" + Style.RESET_ALL)
     print(Fore.CYAN + "└──────────────────────────────────────────────────┘" + Style.RESET_ALL)
     sys.stdout.write(Fore.WHITE + "  SETUP ▸ " + Style.RESET_ALL)
@@ -1886,13 +2190,20 @@ async def setup_menu():
     elif key == "2":
         await prompt_token()
     elif key == "3":
-        await prompt_account()
+        await prompt_accounts()
     elif key == "4":
         await prompt_strategy()
     elif key == "5":
         await prompt_directory()
     elif key == "6":
         await prompt_port()
+    elif key == "7":
+        if toggle_micro_mode():
+            _dash_set_alert(Fore.GREEN + "  ✔  MICRO MODE ON — signals convert to micros (NQ→MNQ). "
+                            "Toggle while flat." + Style.RESET_ALL)
+        else:
+            _dash_set_alert(Fore.YELLOW + "  ✔  MICRO MODE OFF — instruments sent as-is." + Style.RESET_ALL)
+        refresh_header_status()
     _dash_exit_menu()
 
 
@@ -1913,7 +2224,7 @@ async def show_balances():
     for a in accounts:
         name = a["name"]
         cash = a["cash"]
-        marker = " ◀" if name == active_account else ""
+        marker = " ◀" if name == active_account else (" ＋" if name in follower_accounts else "")
         start = session_start_balances.get(name)
         if start is not None:
             pnl = cash - start
@@ -1942,8 +2253,7 @@ async def show_balances():
         reset_session_pnl()
         logger.info("MANUAL RESET  session P&L reset by user")
         # Alert will be visible after menu exit
-        global _alert_text
-        _alert_text = Fore.GREEN + "  ✔  Session P&L reset — balances re-snapshotted." + Style.RESET_ALL
+        _dash_set_alert(Fore.GREEN + "  ✔  Session P&L reset — balances re-snapshotted." + Style.RESET_ALL)
     _dash_exit_menu()
 
 
@@ -2075,10 +2385,15 @@ async def keyboard_loop():
                         Fore.RED + "  ⛔  Hard stop locked for the session — B→R to reset P&L, or exit to clear." + Style.RESET_ALL)
                     continue
                 paused = not paused
-                soft_stopped = False  # Reset soft stop on manual resume
                 if paused:
                     set_session_state("paused")
                 else:
+                    # Resume: clear every soft (resumable) account lockout so
+                    # those accounts trade again. Hard locks are blocked above.
+                    for a in [k for k, v in account_stops.items() if v == "soft"]:
+                        del account_stops[a]
+                    soft_stopped = False
+                    _recompute_session_lock()
                     set_session_state("ready")
                     _dash_set_alert(
                         Fore.GREEN + "  ▶  SIGNAL OUTPUT RESUMED" + Style.RESET_ALL)
@@ -2090,7 +2405,8 @@ async def keyboard_loop():
                 await prompt_limits()
             elif key.lower() == "r":
                 _dash_set_alert(
-                    Fore.YELLOW + "  🔄  MANUAL RECONNECT REQUESTED" + Style.RESET_ALL)
+                    Fore.YELLOW + "  🔄  MANUAL RECONNECT REQUESTED" + Style.RESET_ALL,
+                    kind=ALERT_CONN)
                 reconnect_event.set()
             elif key.lower() == "c":
                 await close_positions_menu()
@@ -2177,6 +2493,9 @@ async def display_server_message(data: dict, connect_latency: int):
         _dash_set_heartbeat(
             f"{Fore.RED}{Style.DIM}  ♥  [{ts}] heartbeat  ·  {_server_name}{Style.RESET_ALL}")
         logger.info("HEARTBEAT")
+        # Connection is healthy — age out any stale one-shot alert so the
+        # dashboard only shows conditions that are still true.
+        _dash_expire_alert()
 
         # MOTD support: show server message-of-the-day, clear when absent
         motd = data.get("motd", "")
@@ -2192,12 +2511,15 @@ async def display_server_message(data: dict, connect_latency: int):
 
 
 # ---------- File output ----------
-def extract_signal_string(msg: str, account: str, atm: str, follow_publisher: bool = False) -> tuple[str | None, int | None, str | None, str | None]:
+def extract_signal_string(msg: str, account: str, atm: str, follow_publisher: bool = False,
+                          micros: bool = False) -> tuple[str | None, int | None, str | None, str | None]:
     """Parse JSON message and extract the raw signal string, server timestamp, signal ID, and reject reason.
 
     Signal format: PLACE;Account;Instrument;Action;Qty;OrderType;;;TIF;;;AtmStrategy;SignalID
     Index:           0      1        2        3     4      5     678  9  10 11          12
     - Field 1 (account) is replaced with the user's real account.
+    - Field 2 (instrument): if micros is True, translated to its CME micro
+      equivalent (NQ 06-26 → MNQ 06-26) via to_micro_instrument.
     - Field 11 (ATM strategy): if follow_publisher is True and the publisher's
       template exists locally, keep it; otherwise replace with the user's
       chosen strategy (`atm`) as a fallback.
@@ -2232,6 +2554,12 @@ def extract_signal_string(msg: str, account: str, atm: str, follow_publisher: bo
                         logger.info(
                             f"STRATEGY FALLBACK  publisher='{pub_strategy}' not installed → using '{atm}'")
                     parts[11] = atm
+            # Translate the instrument (field 2) to its micro contract.
+            # Runs on every command that carries an instrument (PLACE,
+            # CLOSEPOSITION, REVERSEPOSITION, ...) so exits stay consistent
+            # with micro entries; a blank field stays blank.
+            if micros and len(parts) >= 3 and parts[2]:
+                parts[2] = to_micro_instrument(parts[2])
             return ";".join(parts), ts, signal_id, None
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
@@ -2239,34 +2567,86 @@ def extract_signal_string(msg: str, account: str, atm: str, follow_publisher: bo
 
 
 _ati_write_seq = 0
+_ati_seq_lock = threading.Lock()
 
 
 def _next_ati_filename(prefix: str) -> str:
     """Return a unique incoming-folder filename.
 
     A bare millisecond timestamp isn't unique — two writes in the same
-    millisecond (which happens when the hard-stop loop closes multiple
-    contracts back-to-back) would overwrite each other. Append a
-    process-local monotonic counter to guarantee uniqueness.
+    millisecond (which happens when copy-trading fans one signal out to
+    several accounts, or the hard-stop loop closes multiple contracts
+    back-to-back) would overwrite each other. A process-local monotonic
+    counter guarantees uniqueness, and the lock makes the increment safe
+    if filename generation is called from concurrent paths.
     """
     global _ati_write_seq
-    _ati_write_seq += 1
+    with _ati_seq_lock:
+        _ati_write_seq += 1
+        seq = _ati_write_seq
     ts = time.strftime("%Y%m%d_%H%M%S")
     ms = int((time.time() % 1) * 1000)
-    return f"{prefix}_{ts}_{ms:03d}_{_ati_write_seq:04d}.txt"
+    return f"{prefix}_{ts}_{ms:03d}_{seq:04d}.txt"
 
 
-def write_signal_to_file(signal_text: str):
-    """Write the raw signal string (not JSON) to the output directory."""
+def write_signal_to_file(signal_text: str) -> str | None:
+    """Write the raw signal string (not JSON) to the output directory.
+
+    Returns the absolute path written on success, or None if there was no
+    output directory or the write failed — the caller uses this to verify
+    each copy-trade fan-out leg actually landed a file.
+    """
     if not output_directory:
-        return
+        return None
     filename = _next_ati_filename("oif")
     filepath = os.path.join(output_directory, filename)
     try:
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(signal_text)
+        return filepath
     except Exception as exc:
         _dash_set_alert(Fore.RED + f"  ✖  File write error: {exc}" + Style.RESET_ALL)
+        return None
+
+
+def _with_account(signal_text: str, account: str) -> str:
+    """Return a copy of a processed signal with field 1 (account) swapped.
+
+    The signal that arrives already has the primary account in field 1;
+    copy-trading rewrites just that field per target account, leaving the
+    instrument, action, qty, strategy and signal-id fields untouched so
+    every account trades the identical signal.
+    """
+    parts = signal_text.split(";")
+    if len(parts) >= 2:
+        parts[1] = sanitize_ati(account)
+    return ";".join(parts)
+
+
+async def dispatch_signal(raw_signal: str) -> list[str]:
+    """Fan one signal out to every tradeable account, one order file each.
+
+    Returns the accounts whose file was written successfully; failures are
+    surfaced to the dashboard and logged but don't block the other legs.
+    """
+    accounts = tradeable_accounts()
+    if not accounts:
+        return []
+    written: list[str] = []
+    for acct in accounts:
+        try:
+            res = write_signal_to_file(_with_account(raw_signal, acct))
+        except Exception as exc:
+            res = exc
+        if isinstance(res, Exception) or not res:
+            logger.error(f"DISPATCH FAIL  account={acct}  result={res!r}")
+            _dash_set_alert(
+                Fore.RED + f"  ✖  Copy-trade write failed for {acct}" + Style.RESET_ALL)
+        else:
+            written.append(acct)
+    if len(accounts) > 1:
+        logger.info(f"COPY DISPATCH  wrote={written}  of={accounts}")
+    return written
 
 
 # ---------- Risk management ----------
@@ -2333,8 +2713,8 @@ def fire_cancel_all_orders(account: str):
         _dash_set_alert(Fore.RED + f"  ✖  Cancel-all write error: {exc}" + Style.RESET_ALL)
 
 
-def close_all_open_positions() -> list[str]:
-    """Close every open position on the active account.
+def close_account_positions(account: str) -> list[str]:
+    """Close every open position on one account.
 
     Queries NT for actual positions and closes each one, unioned with
     any contracts tracked in session_contracts as a safety net in case
@@ -2342,31 +2722,46 @@ def close_all_open_positions() -> list[str]:
     Also cancels any working orders first so a pending entry can't
     leak through during the close.
     """
-    if not active_account:
+    if not account:
         return []
 
     # Cancel working orders first so they don't refill after we close
-    fire_cancel_all_orders(active_account)
+    fire_cancel_all_orders(account)
 
     closed: set[str] = set()
 
     try:
-        positions = query_nt_positions(active_account, nt_port)
+        positions = query_nt_positions(account, nt_port)
         for instrument, qty in positions.items():
             if qty != 0 and instrument:
-                fire_close_position(active_account, instrument)
+                fire_close_position(account, instrument)
                 closed.add(instrument)
     except Exception as e:
-        logger.error(f"close_all_open_positions  query error: {e}")
+        logger.error(f"close_account_positions {account}  query error: {e}")
 
     # Safety net: anything tracked in session_contracts that we haven't
     # closed yet (e.g. position query was empty due to fill latency).
     for contract in session_contracts:
         if contract and contract not in closed:
-            fire_close_position(active_account, contract)
+            fire_close_position(account, contract)
             closed.add(contract)
 
     return sorted(closed)
+
+
+def close_all_open_positions() -> list[str]:
+    """Flatten every open position across all copy-trade target accounts.
+
+    Safety-first: a session stop/target or manual close-all flattens every
+    account the signal is copied to, not just the primary. Returns the union
+    of contracts closed across accounts (single-account mode falls back to
+    just the primary via target_accounts()).
+    """
+    all_closed: set[str] = set()
+    for account in target_accounts():
+        for contract in close_account_positions(account):
+            all_closed.add(contract)
+    return sorted(all_closed)
 
 
 def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, action: str, pre_pos: int = 0):
@@ -2448,6 +2843,66 @@ def check_pending_confirms():
         _pending_confirms.extend(still_pending)
 
 
+_TRIP_STATE = {
+    ("stop", "hard"):   ("hard_stop",   Fore.RED,   "⛔", "HARD STOP", "Limit", "⇧X=EXIT"),
+    ("stop", "soft"):   ("soft_stop",   Fore.RED,   "⛔", "STOP HIT",  "Limit", "P to resume"),
+    ("target", "hard"): ("hard_target", Fore.GREEN, "🎯", "TARGET HIT", "Target", "⇧X=EXIT"),
+    ("target", "soft"): ("soft_target", Fore.GREEN, "🎯", "TARGET HIT", "Target", "P to resume"),
+}
+
+
+async def _trip_account(account: str, mode: str, kind: str, pnl: float, limit: float):
+    """Lock one account after its session stop/target is hit and flatten it.
+
+    mode is "hard" (locked for the session) or "soft" (resumable via P).
+    kind is "stop" or "target". Only the tripped account is flattened —
+    other copy-trade accounts keep running. A leading label ("[Sim101] ")
+    is shown when more than one account is in play so the user knows which.
+    """
+    mode = mode if mode in ("hard", "soft") else "soft"
+    account_stops[account] = mode
+    state, colour, icon, title, limit_word, hint = _TRIP_STATE[(kind, mode)]
+
+    closed = close_account_positions(account)
+    close_str = ", ".join(closed) if closed else "none"
+
+    multi = len(target_accounts()) > 1
+    who = f"[{account}] " if multi else ""
+    _dash_set_alert(
+        colour + Style.BRIGHT +
+        f"  {icon}  {who}{title}  P&L: ${pnl:+,.2f}  {limit_word}: ${limit:+,.2f}  "
+        f"Closed: {close_str}  — {hint}" + Style.RESET_ALL,
+        sticky=True)
+    logger.info(
+        f"{title} ({mode})  account={account}  kind={kind}  pnl={pnl:.2f}  "
+        f"limit={limit}  closed={closed}")
+    if mode == "hard":
+        save_session_state()
+
+
+def _recompute_session_lock():
+    """Refresh the session-aggregate lock flags from per-account stops.
+
+    hard_stopped / soft_stopped remain the session-level view the header,
+    keyboard and listen loop read: the session is hard-locked only when
+    EVERY target account is hard-stopped, and once every account has
+    stopped (soft or hard) the whole session pauses and its header state
+    reflects the strongest lock in effect.
+    """
+    global hard_stopped, soft_stopped, paused
+    targets = target_accounts()
+    if not targets:
+        hard_stopped = False
+        soft_stopped = False
+        return
+    all_stopped = all(a in account_stops for a in targets)
+    hard_stopped = all(account_stops.get(a) == "hard" for a in targets)
+    soft_stopped = all_stopped and not hard_stopped
+    if all_stopped:
+        paused = True
+        set_session_state("hard_stop" if hard_stopped else "soft_stop")
+
+
 async def balance_monitor():
     """Periodically check account balance and enforce target/stop."""
     global paused, soft_stopped, hard_stopped
@@ -2497,78 +2952,34 @@ async def balance_monitor():
             if _pending_confirms:
                 await asyncio.to_thread(check_pending_confirms)
 
-            if active_account not in session_start_balances:
-                continue
+            # Per-account risk enforcement: each copy-trade account is
+            # governed independently by its own target/stop limits. One
+            # account tripping only flattens and locks that account; the
+            # others keep trading the signal.
+            for acct in target_accounts():
+                if acct in account_stops:
+                    continue  # already locked (hard) or paused-out (soft)
+                if acct not in session_start_balances:
+                    continue
+                current = session_current_balances.get(acct)
+                if current is None:
+                    continue
+                limits = get_account_limits(acct)
+                if limits["target"] == 0 and limits["stop"] == 0:
+                    continue
 
-            current = session_current_balances.get(active_account)
-            if current is None:
-                continue
+                pnl = current - session_start_balances[acct]
 
-            limits = get_account_limits(active_account)
-            if limits["target"] == 0 and limits["stop"] == 0:
-                continue
+                # Check stop (loss limit)
+                if limits["stop"] != 0 and pnl <= limits["stop"]:
+                    await _trip_account(
+                        acct, limits["stop_mode"], "stop", pnl, limits["stop"])
+                # Check target (profit goal)
+                elif limits["target"] != 0 and pnl >= limits["target"]:
+                    await _trip_account(
+                        acct, limits["target_mode"], "target", pnl, limits["target"])
 
-            start = session_start_balances[active_account]
-            pnl = current - start
-
-            # Check stop (loss limit)
-            if limits["stop"] != 0 and pnl <= limits["stop"]:
-                if limits["stop_mode"] == "hard":
-                    hard_stopped = True
-                    paused = True
-                    set_session_state("hard_stop")
-                    closed = await asyncio.to_thread(close_all_open_positions)
-                    close_str = ", ".join(closed) if closed else "none"
-                    save_session_state()
-                    _dash_set_alert(
-                        Fore.RED + Style.BRIGHT +
-                        f"  ⛔  HARD STOP  P&L: ${pnl:+,.2f}  Limit: ${limits['stop']:+,.2f}  Closed: {close_str}  ⇧X=EXIT" +
-                        Style.RESET_ALL)
-                    logger.info(f"HARD STOP  pnl={pnl:.2f}  limit={limits['stop']}  closed={closed}")
-                elif not soft_stopped:
-                    # Soft stop also flattens — broker-side stops can get
-                    # dropped when multiple orders fire in close succession,
-                    # so leaving positions running on ATM only isn't safe.
-                    soft_stopped = True
-                    paused = True
-                    set_session_state("soft_stop")
-                    closed = await asyncio.to_thread(close_all_open_positions)
-                    close_str = ", ".join(closed) if closed else "none"
-                    _dash_set_alert(
-                        Fore.RED + Style.BRIGHT +
-                        f"  ⛔  STOP HIT  P&L: ${pnl:+,.2f}  Limit: ${limits['stop']:+,.2f}  Closed: {close_str}  — P to resume" +
-                        Style.RESET_ALL)
-                    logger.info(f"SOFT STOP (LOSS)  pnl={pnl:.2f}  stop={limits['stop']}  closed={closed}")
-                continue
-
-            # Check target (profit goal)
-            if limits["target"] != 0 and pnl >= limits["target"]:
-                if limits["target_mode"] == "hard":
-                    hard_stopped = True
-                    paused = True
-                    set_session_state("hard_target")
-                    closed = await asyncio.to_thread(close_all_open_positions)
-                    close_str = ", ".join(closed) if closed else "none"
-                    save_session_state()
-                    _dash_set_alert(
-                        Fore.GREEN + Style.BRIGHT +
-                        f"  🎯  TARGET HIT  P&L: ${pnl:+,.2f}  Target: ${limits['target']:+,.2f}  Closed: {close_str}  ⇧X=EXIT" +
-                        Style.RESET_ALL)
-                    logger.info(f"HARD STOP (TARGET)  pnl={pnl:.2f}  target={limits['target']}  closed={closed}")
-                elif not soft_stopped:
-                    # Soft target also flattens for the same reason — let
-                    # the user lock in the win rather than risking a
-                    # dropped broker stop giving it back.
-                    soft_stopped = True
-                    paused = True
-                    set_session_state("soft_target")
-                    closed = await asyncio.to_thread(close_all_open_positions)
-                    close_str = ", ".join(closed) if closed else "none"
-                    _dash_set_alert(
-                        Fore.GREEN + Style.BRIGHT +
-                        f"  🎯  TARGET HIT  P&L: ${pnl:+,.2f}  Target: ${limits['target']:+,.2f}  Closed: {close_str}  — P to resume" +
-                        Style.RESET_ALL)
-                    logger.info(f"SOFT STOP (TARGET)  pnl={pnl:.2f}  target={limits['target']}  closed={closed}")
+            _recompute_session_lock()
         except Exception as e:
             logger.error(f"balance_monitor error: {e}")
 
@@ -2673,12 +3084,16 @@ async def prompt_limits():
             print(Fore.YELLOW + f"  ⚠  Invalid mode — keeping {stop_mode}." + Style.RESET_ALL)
 
     set_account_limits(active_account, target, target_mode, stop, stop_mode)
-    soft_stopped = False  # Reset soft stop when limits change
+    # Changing the leader's limits lifts its soft (resumable) lockout so it
+    # re-arms against the new numbers; a hard lock stays until reset/exit.
+    if account_stops.get(active_account) == "soft":
+        del account_stops[active_account]
+    soft_stopped = False
+    _recompute_session_lock()
     t_label = f"${target:+,.2f} ({target_mode})" if target else "off"
     s_label = f"${stop:+,.2f} ({stop_mode})" if stop else "off"
     # Will be visible on alert line after menu exit
-    global _alert_text
-    _alert_text = Fore.GREEN + f"  ✔  {active_account} → Target: {t_label}  ·  Stop: {s_label}" + Style.RESET_ALL
+    _dash_set_alert(Fore.GREEN + f"  ✔  {active_account} → Target: {t_label}  ·  Stop: {s_label}" + Style.RESET_ALL)
 
     awaiting_user_input = False
     _dash_exit_menu()
@@ -2704,11 +3119,19 @@ def fmt_wait(seconds: int) -> str:
 async def listen(token: str):
     global signal_count
     fib_prev, fib_curr = 60, 60  # Start at 1m, 1m → 2m → 3m → 5m → ...
+    ever_connected = False       # distinguishes first boot from a reconnect
+    conn_lost_at = None          # when the current outage began
 
     await boot_sequence()
 
     while not shutdown.is_set():
         manual_reconnect = False
+        hb_reason = "CONNECTION LOST"  # heartbeat-row label while waiting to retry
+        # Header + heartbeat row reflect the attempt in progress
+        note_connection_down(reconnecting=ever_connected)
+        _dash_set_heartbeat(
+            Fore.CYAN + ("  ↻  Reconnecting to server..." if ever_connected
+                         else "  ↻  Connecting to server...") + Style.RESET_ALL)
         try:
             # Re-read config each loop so server/token changes via Setup take effect
             cfg = load_config()
@@ -2724,6 +3147,13 @@ async def listen(token: str):
                 baseline_latency = None  # First signal sets the baseline
                 fib_prev, fib_curr = 60, 60  # Reset on successful connection
 
+                # How we got here: first boot, or recovery from an outage.
+                was_reconnect = ever_connected
+                outage_secs = int(time.time() - conn_lost_at) if conn_lost_at is not None else None
+                ever_connected = True
+                conn_lost_at = None
+                note_connection_up()
+
                 # Restore persisted session if still in the same trading session
                 restored = restore_session_state()
 
@@ -2737,7 +3167,10 @@ async def listen(token: str):
                         session_start_balances[a["name"]] = a["cash"]
                     session_current_balances[a["name"]] = a["cash"]
 
-                if restored:
+                # Only announce a restore on first boot — mid-run reconnects
+                # re-apply state that never left memory, and the row is
+                # better spent confirming the reconnect below.
+                if restored and not was_reconnect:
                     pnl_parts = []
                     for name in session_start_balances:
                         cur = session_current_balances.get(name)
@@ -2758,13 +3191,22 @@ async def listen(token: str):
                 if not validate_strategy(atm_strategy):
                     missing.append(f"S = strategy '{atm_strategy}' not found")
 
+                _dash_set_heartbeat(
+                    Fore.GREEN + f"  ✔  Connected  ·  Account: {active_account or 'not set'}  ·  Handshake: {connect_latency}ms" + Style.RESET_ALL)
+                logger.info(f"CONNECTED  account={active_account}  handshake={connect_latency}ms  strategy={atm_strategy}")
                 if missing:
                     _dash_set_alert(
-                        Fore.YELLOW + f"  ⚠  Setup incomplete: {', '.join(missing)}" + Style.RESET_ALL)
+                        Fore.YELLOW + f"  ⚠  Setup incomplete: {', '.join(missing)}" + Style.RESET_ALL,
+                        sticky=True)
+                elif was_reconnect:
+                    down = f"  ·  down {fmt_wait(outage_secs)}" if outage_secs else ""
+                    _dash_set_alert(
+                        Fore.GREEN + f"  ✔  Reconnected{down}" + Style.RESET_ALL,
+                        kind=ALERT_CONN)
+                    logger.info(f"RECONNECTED  downtime={outage_secs or 0}s")
                 else:
-                    _dash_set_heartbeat(
-                        Fore.GREEN + f"  ✔  Connected  ·  Account: {active_account}  ·  Handshake: {connect_latency}ms" + Style.RESET_ALL)
-                    logger.info(f"CONNECTED  account={active_account}  handshake={connect_latency}ms  strategy={atm_strategy}")
+                    # Clean first connect: drop any lingering connection alert
+                    _dash_clear_alert(kind=ALERT_CONN)
                 reconnect_event.clear()
 
                 while not shutdown.is_set():
@@ -2773,14 +3215,16 @@ async def listen(token: str):
                         reconnect_event.clear()
                         fib_prev, fib_curr = 60, 60  # Reset backoff on manual reconnect
                         manual_reconnect = True
+                        conn_lost_at = time.time()
                         _dash_set_alert(
-                            Fore.YELLOW + "  🔄  Dropping connection for reconnect..." + Style.RESET_ALL)
+                            Fore.YELLOW + "  🔄  Dropping connection for reconnect..." + Style.RESET_ALL,
+                            kind=ALERT_CONN)
                         break
 
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=1)
                         raw_signal, server_ts, sig_id, reject_reason = extract_signal_string(
-                            msg, active_account, atm_strategy, follow_publisher_strategy)
+                            msg, active_account, atm_strategy, follow_publisher_strategy, micro_mode)
                         if raw_signal:
                             # Compute latency once — used by all paths below
                             lat_str = ""
@@ -2823,6 +3267,9 @@ async def listen(token: str):
                                 tag = "PAUSED"
                             elif not is_trade_ready():
                                 tag = "BLOCKED"
+                            elif not tradeable_accounts():
+                                # Every target account soft-stopped for the session
+                                tag = "LOCKED"
 
                             if tag:
                                 _dash_add_signal(format_signal(raw_signal, signal_count, lat_str, tag=tag))
@@ -2840,8 +3287,10 @@ async def listen(token: str):
                             if len(sig_parts) >= 3 and sig_parts[2] and len(session_contracts) < MAX_SESSION_CONTRACTS:
                                 session_contracts.add(sig_parts[2])
 
-                            # Snapshot position BEFORE writing file so
-                            # fast fills don't make pre/post look identical
+                            # Snapshot the LEADER's position BEFORE writing so
+                            # fast fills don't make pre/post look identical.
+                            # Fill confirmation tracks the leader; followers
+                            # mirror the same signal.
                             instrument = sig_parts[2] if len(sig_parts) >= 3 else ""
                             action = sig_parts[3] if len(sig_parts) >= 4 else ""
                             pre_positions = await asyncio.to_thread(query_nt_positions, active_account, nt_port)
@@ -2850,17 +3299,26 @@ async def listen(token: str):
                             # have fired a soft/hard stop while we were querying NT.
                             # Without this, a signal in-flight during a stop can race
                             # the close and open a new position right after flatten.
-                            if hard_stopped or paused:
-                                late_tag = "LOCKED" if hard_stopped else "PAUSED"
+                            if paused or not tradeable_accounts():
+                                late_tag = "PAUSED" if paused else "LOCKED"
                                 _dash_add_signal(format_signal(raw_signal, signal_count, lat_str, tag=late_tag))
                                 logger.info(f"SIGNAL #{signal_count} ({late_tag} post-query)  {raw_signal}")
                                 continue
-                            write_signal_to_file(raw_signal)
-                            # Register for fill confirmation with pre-snapshot
-                            add_pending_confirm(raw_signal, sig_id, instrument, action, pre_pos)
-                            _dash_add_signal(format_signal(raw_signal, signal_count, lat_str))
+                            # Fan the signal out to the leader + every tradeable
+                            # follower.
+                            written = await dispatch_signal(raw_signal)
+                            if not written:
+                                _dash_add_signal(format_signal(raw_signal, signal_count, lat_str, tag="BLOCKED"))
+                                logger.warning(f"SIGNAL #{signal_count} (NO WRITE)  {raw_signal}")
+                                continue
+                            # Register fill confirmation on the leader if it fired
+                            if active_account in written:
+                                add_pending_confirm(raw_signal, sig_id, instrument, action, pre_pos)
+                            copy_note = f"  → {len(written)} accts" if len(written) > 1 else ""
+                            _dash_add_signal(format_signal(
+                                raw_signal, signal_count, (lat_str + copy_note).strip()))
                             await signal_pulse("SIGNAL RECEIVED")
-                            logger.info(f"SIGNAL #{signal_count}  {raw_signal}")
+                            logger.info(f"SIGNAL #{signal_count}  accounts={written}  {raw_signal}")
                         else:
                             # Non-signal message (server info, heartbeat, etc.)
                             if not paused:
@@ -2873,10 +3331,14 @@ async def listen(token: str):
                         continue
 
         except websockets.exceptions.InvalidURI:
-            _dash_set_alert(Fore.RED + "  ⛔  INVALID SERVER URI" + Style.RESET_ALL)
+            _dash_set_alert(Fore.RED + "  ⛔  INVALID SERVER URI" + Style.RESET_ALL,
+                            sticky=True)
             return "shutdown"
 
         except Exception as e:
+            if conn_lost_at is None:
+                conn_lost_at = time.time()
+
             # Check for HTTP status rejection (old and new websockets lib)
             http_status = getattr(e, "status_code", None) or getattr(e, "status", None)
 
@@ -2887,24 +3349,30 @@ async def listen(token: str):
                 ws_code = getattr(ws_code, "code", None)
 
             if http_status is not None and int(http_status) in (401, 403):
-                _dash_set_alert(Fore.RED + f"  ⛔  AUTH FAILED (HTTP {http_status})" + Style.RESET_ALL)
+                _dash_set_alert(Fore.RED + f"  ⛔  AUTH FAILED (HTTP {http_status})" + Style.RESET_ALL,
+                                sticky=True)
                 logger.warning(f"AUTH FAILED  http={http_status}")
                 return "auth_failed"
             elif ws_code == 1008:
-                _dash_set_alert(Fore.RED + "  ⛔  AUTH FAILED (invalid token)" + Style.RESET_ALL)
+                _dash_set_alert(Fore.RED + "  ⛔  AUTH FAILED (invalid token)" + Style.RESET_ALL,
+                                sticky=True)
                 logger.warning("AUTH FAILED  ws_code=1008")
                 return "auth_failed"
-            elif http_status is not None:
-                _dash_set_heartbeat(
-                    Fore.RED + f"  ⛔  CONNECTION ERROR (HTTP {http_status})  ·  Retrying in {fmt_wait(fib_curr)}..." + Style.RESET_ALL)
-                logger.warning(f"CONNECTION ERROR  http={http_status}  retry={fmt_wait(fib_curr)}")
             elif shutdown.is_set():
                 break
+
+            # Retryable failure. Ongoing state goes on the header (RECONNECTING)
+            # and heartbeat row (live countdown in the wait loop below); the
+            # drop itself is recorded as a timestamped event on the alert row.
+            note_connection_down()
+            if http_status is not None:
+                hb_reason = f"CONNECTION ERROR (HTTP {http_status})"
+                logger.warning(f"CONNECTION ERROR  http={http_status}  retry={fmt_wait(fib_curr)}")
             else:
-                _dash_set_heartbeat(
-                    Fore.RED + f"  ⛔  CONNECTION LOST  ·  {e}" + Style.RESET_ALL)
+                err = (str(e).strip() or type(e).__name__)[:60]
                 _dash_set_alert(
-                    Fore.YELLOW + f"  ↻  Reconnecting in {fmt_wait(fib_curr)}..." + Style.RESET_ALL)
+                    Fore.RED + f"  ⛔  Connection lost: {err}" + Style.RESET_ALL,
+                    kind=ALERT_CONN)
                 logger.warning(f"CONNECTION LOST  error={e}  retry={fmt_wait(fib_curr)}")
 
         if shutdown.is_set():
@@ -2915,8 +3383,10 @@ async def listen(token: str):
             await asyncio.sleep(3)
             continue
 
-        # Fibonacci backoff wait (interruptible by shutdown or manual reconnect)
+        # Fibonacci backoff wait (interruptible by shutdown or manual
+        # reconnect) with a live countdown on the heartbeat row.
         wait_end = time.time() + fib_curr
+        last_countdown = None
         while time.time() < wait_end:
             if shutdown.is_set():
                 return "shutdown"
@@ -2924,8 +3394,14 @@ async def listen(token: str):
                 reconnect_event.clear()
                 fib_prev, fib_curr = 60, 60
                 _dash_set_alert(
-                    Fore.YELLOW + "  🔄  Manual reconnect — resetting backoff." + Style.RESET_ALL)
+                    Fore.YELLOW + "  🔄  Manual reconnect — resetting backoff." + Style.RESET_ALL,
+                    kind=ALERT_CONN)
                 break
+            remaining = max(0, int(wait_end - time.time()))
+            if remaining != last_countdown:
+                last_countdown = remaining
+                _dash_set_heartbeat(
+                    Fore.RED + f"  ⛔  {hb_reason}  ·  retry in {fmt_wait(remaining)}" + Style.RESET_ALL)
             await asyncio.sleep(0.5)
 
         fib_prev, fib_curr = fib_backoff(fib_prev, fib_curr)
@@ -3050,11 +3526,15 @@ def setup() -> tuple[str, dict]:
 # ---------- Main ----------
 async def main():
     global output_directory, active_account, atm_strategy, follow_publisher_strategy, nt_port
+    global follower_accounts, micro_mode, micro_map
 
     token, cfg = setup()
     active_account = cfg.get("account", "")
+    follower_accounts = [a for a in cfg.get("follower_accounts", []) if a and a != active_account]
     atm_strategy = cfg.get("atm_strategy", "NQ_Med")
     follow_publisher_strategy = bool(cfg.get("follow_publisher_strategy", False))
+    micro_mode = bool(cfg.get("micro_mode", False))
+    micro_map = load_micro_map(cfg)
     nt_port = cfg.get("nt_port", 36973)
 
     if cfg.get("output_directory"):

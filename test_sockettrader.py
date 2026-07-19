@@ -4,9 +4,12 @@ Run: pytest test_sockettrader.py -v
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -48,7 +51,22 @@ def reset_session_state():
     st.hard_stopped = False
     st.signal_count = 0
     st._recent_signal_ids.clear()
+    st.active_account = None
+    st.follower_accounts = []
+    st.account_stops.clear()
+    st.micro_mode = False
+    st.micro_map = dict(st.MICRO_MAP)
+    st._micro_unmapped_warned.clear()
+    st._session_state = "ready"
+    st._state_before_conn = "ready"
+    st._alert_text = ""
+    st._alert_kind = ""
+    st._alert_sticky = False
+    st._alert_ts = 0.0
     yield
+    st.active_account = None
+    st.follower_accounts = []
+    st.account_stops.clear()
 
 
 # ── sanitize_ati ──────────────────────────────────────────────────────
@@ -498,6 +516,98 @@ class TestSessionState:
             assert st._session_state == state
 
 
+# ── Connection state notes (header restore across outages) ───────────
+
+
+class TestConnectionStateNotes:
+    def test_down_then_up_restores_prior_state(self):
+        st.set_session_state("paused")
+        st.note_connection_down()
+        assert st._session_state == "reconnecting"
+        st.note_connection_up()
+        assert st._session_state == "paused"
+
+    def test_first_boot_uses_connecting(self):
+        st.note_connection_down(reconnecting=False)
+        assert st._session_state == "connecting"
+        st.note_connection_up()
+        assert st._session_state == "ready"
+
+    def test_repeated_down_keeps_original_state(self):
+        st.set_session_state("soft_stop")
+        st.note_connection_down()
+        st.note_connection_down()  # retry during the same outage
+        st.note_connection_up()
+        assert st._session_state == "soft_stop"
+
+    def test_up_leaves_state_changed_mid_outage(self):
+        st.note_connection_down()
+        st.set_session_state("hard_stop")  # stop tripped while disconnected
+        st.note_connection_up()
+        assert st._session_state == "hard_stop"
+
+    def test_up_without_down_is_noop(self):
+        st.set_session_state("paused")
+        st.note_connection_up()
+        assert st._session_state == "paused"
+
+
+# ── Alert row lifecycle ───────────────────────────────────────────────
+
+
+class TestAlertLifecycle:
+    def test_alert_gets_timestamp(self):
+        st._dash_set_alert("  ✖  something failed")
+        assert "something failed" in st._alert_text
+        assert "[" in st._alert_text and ":" in st._alert_text
+        assert st._alert_kind == st.ALERT_EVENT
+        assert st._alert_sticky is False
+        assert st._alert_ts > 0
+
+    def test_stamp_disabled_for_animation_frames(self):
+        st._dash_set_alert("  ● SIGNAL RECEIVED", stamp=False)
+        assert st._alert_text == "  ● SIGNAL RECEIVED"
+
+    def test_empty_alert_clears_metadata(self):
+        st._dash_set_alert("  ⚠  warn", sticky=True)
+        st._dash_set_alert("")
+        assert st._alert_text == ""
+        assert st._alert_kind == ""
+        assert st._alert_sticky is False
+
+    def test_clear_by_matching_kind(self):
+        st._dash_set_alert("  ↻  Reconnecting...", kind=st.ALERT_CONN)
+        st._dash_clear_alert(kind=st.ALERT_CONN)
+        assert st._alert_text == ""
+
+    def test_clear_skips_other_kinds(self):
+        st._dash_set_alert("  ⛔  STOP HIT", sticky=True)
+        st._dash_clear_alert(kind=st.ALERT_CONN)
+        assert "STOP HIT" in st._alert_text
+
+    def test_clear_unconditional(self):
+        st._dash_set_alert("  ⛔  STOP HIT", sticky=True)
+        st._dash_clear_alert()
+        assert st._alert_text == ""
+
+    def test_expire_drops_old_event(self):
+        st._dash_set_alert("  ✖  old error")
+        st._alert_ts -= st.ALERT_TTL + 1
+        st._dash_expire_alert()
+        assert st._alert_text == ""
+
+    def test_expire_keeps_fresh_event(self):
+        st._dash_set_alert("  ✖  fresh error")
+        st._dash_expire_alert()
+        assert "fresh error" in st._alert_text
+
+    def test_expire_keeps_sticky_alert(self):
+        st._dash_set_alert("  ⛔  HARD STOP", sticky=True)
+        st._alert_ts -= st.ALERT_TTL + 1
+        st._dash_expire_alert()
+        assert "HARD STOP" in st._alert_text
+
+
 # ── Trade readiness gate ──────────────────────────────────────────────
 
 
@@ -788,3 +898,505 @@ class TestSessionLockoutNotPersisted:
         assert "hard_stopped" not in saved
         assert "soft_stopped" not in saved
         assert "lock_state" not in saved
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Copy trading: leader/follower fan-out
+# ══════════════════════════════════════════════════════════════════════
+
+# ── target_accounts / tradeable_accounts / session_hard_locked ────────
+class TestTargetAccounts:
+    def test_no_leader_no_followers_is_empty(self):
+        st.active_account = None
+        st.follower_accounts = []
+        assert st.target_accounts() == []
+
+    def test_leader_only_single_account_mode(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = []
+        assert st.target_accounts() == ["Sim101"]
+
+    def test_leader_first_then_followers(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102", "Sim103"]
+        assert st.target_accounts() == ["Sim101", "Sim102", "Sim103"]
+
+    def test_follower_duplicating_leader_is_deduped(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim101", "Sim102"]
+        assert st.target_accounts() == ["Sim101", "Sim102"]
+
+    def test_duplicate_followers_deduped(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102", "Sim102"]
+        assert st.target_accounts() == ["Sim101", "Sim102"]
+
+    def test_empty_names_ignored(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["", "Sim102"]
+        assert st.target_accounts() == ["Sim101", "Sim102"]
+
+
+class TestTradeableAccounts:
+    def test_all_tradeable_when_no_stops(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        assert st.tradeable_accounts() == ["Sim101", "Sim102"]
+
+    def test_stopped_account_excluded(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102", "Sim103"]
+        st.account_stops["Sim102"] = "hard"
+        assert st.tradeable_accounts() == ["Sim101", "Sim103"]
+
+    def test_all_stopped_is_empty(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.account_stops["Sim101"] = "soft"
+        st.account_stops["Sim102"] = "hard"
+        assert st.tradeable_accounts() == []
+
+
+class TestSessionHardLocked:
+    def test_not_locked_when_tradeable(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.account_stops["Sim101"] = "hard"
+        assert st.session_hard_locked() is False  # Sim102 still tradeable
+
+    def test_locked_when_all_hard(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.account_stops["Sim101"] = "hard"
+        st.account_stops["Sim102"] = "hard"
+        assert st.session_hard_locked() is True
+
+    def test_not_locked_when_a_stop_is_soft(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.account_stops["Sim101"] = "hard"
+        st.account_stops["Sim102"] = "soft"
+        assert st.session_hard_locked() is False
+
+    def test_no_targets_not_locked(self):
+        st.active_account = None
+        st.follower_accounts = []
+        assert st.session_hard_locked() is False
+
+
+# ── _with_account ─────────────────────────────────────────────────────
+class TestWithAccount:
+    def test_replaces_account_field_only(self):
+        sig = "PLACE;OLD;NQ 06-26;BUY;1;MARKET;;;DAY;;;NQ_Med;42"
+        out = st._with_account(sig, "Sim102")
+        parts = out.split(";")
+        assert parts[1] == "Sim102"
+        assert parts[0] == "PLACE"
+        assert parts[2] == "NQ 06-26"
+        assert parts[-1] == "42"
+
+    def test_sanitizes_account_name(self):
+        sig = "PLACE;OLD;NQ;BUY;1;MARKET;;;DAY;;;NQ_Med;42"
+        out = st._with_account(sig, "Bad;Name")
+        # sanitize strips the embedded semicolon so field count is preserved
+        assert out.split(";")[1] == "BadName"
+        assert len(out.split(";")) == len(sig.split(";"))
+
+    def test_short_signal_untouched(self):
+        assert st._with_account("PLACE", "Sim102") == "PLACE"
+
+
+# ── _next_ati_filename thread safety ──────────────────────────────────
+class TestFilenameThreadSafety:
+    def test_concurrent_names_are_unique(self):
+        names: list[str] = []
+        lock = threading.Lock()
+
+        def worker():
+            n = st._next_ati_filename("oif")
+            with lock:
+                names.append(n)
+
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            futures = [ex.submit(worker) for _ in range(500)]
+            for f in futures:
+                f.result()
+
+        assert len(names) == 500
+        assert len(set(names)) == 500  # no collisions under concurrency
+
+
+# ── dispatch_signal fan-out ───────────────────────────────────────────
+class TestDispatchSignal:
+    def test_writes_one_file_per_account(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102", "Sim103", "Sim104"]
+        sig = "PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;NQ_Med;42"
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            written = asyncio.run(st.dispatch_signal(sig))
+
+        assert set(written) == {"Sim101", "Sim102", "Sim103", "Sim104"}
+        files = list(tmp_output_dir.glob("oif_*.txt"))
+        assert len(files) == 4
+        accounts_written = {f.read_text().split(";")[1] for f in files}
+        assert accounts_written == {"Sim101", "Sim102", "Sim103", "Sim104"}
+
+    def test_each_file_keeps_identical_signal_except_account(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102", "Sim103", "Sim104"]
+        sig = "PLACE;Sim101;NQ 06-26;BUY;3;MARKET;;;DAY;oco-1;ord-1;NQ_Med;99"
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            asyncio.run(st.dispatch_signal(sig))
+        bodies = [f.read_text() for f in tmp_output_dir.glob("oif_*.txt")]
+        stripped = {
+            ";".join([p if i != 1 else "" for i, p in enumerate(b.split(";"))])
+            for b in bodies
+        }
+
+        assert len(bodies) == 4
+        assert len(stripped) == 1  # only the account differs
+
+    def test_single_account_mode_keeps_signal_unchanged(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.follower_accounts = []
+        sig = "PLACE;Sim101;NQ;BUY;1;MARKET;;;DAY;oco-1;ord-1;NQ_Med;42"
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            written = asyncio.run(st.dispatch_signal(sig))
+        files = list(tmp_output_dir.glob("oif_*.txt"))
+
+        assert written == ["Sim101"]
+        assert len(files) == 1
+        assert files[0].read_text() == sig
+
+    def test_stopped_account_gets_no_file(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.account_stops["Sim102"] = "hard"
+        sig = "PLACE;Sim101;NQ;BUY;1;MARKET;;;DAY;;;NQ_Med;42"
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            written = asyncio.run(st.dispatch_signal(sig))
+        assert written == ["Sim101"]
+        assert len(list(tmp_output_dir.glob("oif_*.txt"))) == 1
+
+    def test_no_tradeable_accounts_writes_nothing(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.follower_accounts = []
+        st.account_stops["Sim101"] = "hard"
+        sig = "PLACE;Sim101;NQ;BUY;1;MARKET;;;DAY;;;NQ_Med;42"
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            written = asyncio.run(st.dispatch_signal(sig))
+        assert written == []
+        assert list(tmp_output_dir.glob("oif_*.txt")) == []
+
+    def test_single_account_mode_still_works(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.follower_accounts = []
+        sig = "PLACE;Sim101;NQ;BUY;1;MARKET;;;DAY;;;NQ_Med;42"
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            written = asyncio.run(st.dispatch_signal(sig))
+        assert written == ["Sim101"]
+        assert len(list(tmp_output_dir.glob("oif_*.txt"))) == 1
+
+
+# ── close_all_open_positions across accounts ──────────────────────────
+class TestCloseAllMultiAccount:
+    def test_flattens_every_target_account(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+
+        def fake_positions(account, port=None):
+            return {"NQ 06-26": 2} if account in ("Sim101", "Sim102") else {}
+
+        with patch.object(st, "output_directory", str(tmp_output_dir)), \
+             patch.object(st, "query_nt_positions", side_effect=fake_positions):
+            closed = st.close_all_open_positions()
+
+        assert closed == ["NQ 06-26"]
+        # One CLOSEPOSITION per account (2) + one CANCELALLORDERS per account (2)
+        close_files = list(tmp_output_dir.glob("close_*.txt"))
+        cancel_files = list(tmp_output_dir.glob("cancelall_*.txt"))
+        assert len(close_files) == 2
+        assert len(cancel_files) == 2
+        closed_accounts = {f.read_text().split(";")[1] for f in close_files}
+        assert closed_accounts == {"Sim101", "Sim102"}
+
+    def test_single_account_only_closes_leader(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.follower_accounts = []
+        with patch.object(st, "output_directory", str(tmp_output_dir)), \
+             patch.object(st, "query_nt_positions", return_value={"NQ 06-26": 1}):
+            st.close_all_open_positions()
+        close_files = list(tmp_output_dir.glob("close_*.txt"))
+        assert len(close_files) == 1
+        assert close_files[0].read_text().split(";")[1] == "Sim101"
+
+
+# ── _parse_follower_tokens ────────────────────────────────────────────
+class TestParseFollowerTokens:
+    NAMES = ["Sim101", "Sim102", "Sim103"]
+
+    def test_empty_is_none(self):
+        assert st._parse_follower_tokens("", self.NAMES, "Sim101") == []
+
+    def test_numbers_map_to_names(self):
+        assert st._parse_follower_tokens("2 3", self.NAMES, "Sim101") == ["Sim102", "Sim103"]
+
+    def test_comma_separated(self):
+        assert st._parse_follower_tokens("2,3", self.NAMES, "Sim101") == ["Sim102", "Sim103"]
+
+    def test_all_excludes_leader(self):
+        assert st._parse_follower_tokens("all", self.NAMES, "Sim101") == ["Sim102", "Sim103"]
+
+    def test_leader_index_is_excluded(self):
+        assert st._parse_follower_tokens("1 2", self.NAMES, "Sim101") == ["Sim102"]
+
+    def test_dedup(self):
+        assert st._parse_follower_tokens("2 2 3", self.NAMES, "Sim101") == ["Sim102", "Sim103"]
+
+    def test_literal_names_allowed(self):
+        assert st._parse_follower_tokens("Sim102", self.NAMES, "Sim101") == ["Sim102"]
+
+
+class TestAccountMenuRows:
+    def test_more_than_nine_accounts_render_in_columns(self, monkeypatch):
+        monkeypatch.setattr(st, "term_width", lambda: 100)
+        accounts = [
+            {"name": f"Sim{i:03d}", "cash": 10000.0 + i}
+            for i in range(1, 13)
+        ]
+
+        rows, width = st._account_menu_rows(accounts, "Sim001", ["Sim010", "Sim012"])
+        rendered = "\n".join(rows)
+
+        assert width > 49
+        assert len(rows) == 6
+        assert "10. Sim010" in rendered
+        assert "12. Sim012" in rendered
+        assert "＋ FOLLOWER" in rendered
+
+    def test_narrow_terminals_still_include_two_digit_accounts(self, monkeypatch):
+        monkeypatch.setattr(st, "term_width", lambda: 60)
+        accounts = [
+            {"name": f"Sim{i:03d}", "cash": 10000.0 + i}
+            for i in range(1, 12)
+        ]
+
+        rows, _ = st._account_menu_rows(accounts, "Sim001", [])
+
+        assert len(rows) == 11
+        assert any(row.startswith("10. Sim010") for row in rows)
+        assert any(row.startswith("11. Sim011") for row in rows)
+
+
+class TestStrategyMenuRows:
+    def test_large_strategy_list_is_paged_and_columnized(self, monkeypatch):
+        monkeypatch.setattr(st, "term_width", lambda: 120)
+        monkeypatch.setattr(st, "term_height", lambda: 30)
+        monkeypatch.setattr(st, "_controls_pinned", True)
+        monkeypatch.setattr(st, "_header_lines", 8)
+        strategies = [f"Strategy_{i:02d}" for i in range(1, 85)]
+
+        rows, width, page, page_count = st._strategy_menu_rows(strategies, "Strategy_01", 0)
+        rendered = "\n".join(rows)
+
+        assert width > 49
+        assert page == 0
+        assert page_count > 1
+        assert len(rows) <= st._strategy_page_size()
+        assert "1. Strategy_01" in rendered
+
+    def test_later_strategy_page_contains_high_numbered_items(self, monkeypatch):
+        monkeypatch.setattr(st, "term_width", lambda: 120)
+        monkeypatch.setattr(st, "term_height", lambda: 30)
+        monkeypatch.setattr(st, "_controls_pinned", True)
+        monkeypatch.setattr(st, "_header_lines", 8)
+        strategies = [f"Strategy_{i:02d}" for i in range(1, 85)]
+
+        rows, _, page, page_count = st._strategy_menu_rows(strategies, "Strategy_84", 1)
+        rendered = "\n".join(rows)
+
+        assert page == 1
+        assert page_count > 1
+        assert "84. Strategy_84" in rendered
+        assert "◀" in rendered
+
+
+# ── config persistence of followers ───────────────────────────────────
+class TestFollowerConfigPersistence:
+    def test_followers_round_trip(self, tmp_config):
+        cfg = st.load_config()
+        cfg["account"] = "Sim101"
+        cfg["follower_accounts"] = ["Sim102", "Sim103"]
+        st.save_config(cfg)
+        reloaded = st.load_config()
+        assert reloaded["account"] == "Sim101"
+        assert reloaded["follower_accounts"] == ["Sim102", "Sim103"]
+
+
+# ── per-account trip + session-lock recompute ─────────────────────────
+class TestPerAccountRisk:
+    def test_trip_locks_only_that_account(self, tmp_config, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        with patch.object(st, "output_directory", str(tmp_output_dir)), \
+             patch.object(st, "query_nt_positions", return_value={"NQ": 1}):
+            asyncio.run(st._trip_account("Sim102", "hard", "stop", -500.0, -400.0))
+
+        assert st.account_stops == {"Sim102": "hard"}
+        assert st.tradeable_accounts() == ["Sim101"]  # leader still trades
+        # only Sim102 flattened
+        close_files = list(tmp_output_dir.glob("close_*.txt"))
+        assert {f.read_text().split(";")[1] for f in close_files} == {"Sim102"}
+
+    def test_recompute_hard_locks_when_all_hard(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.account_stops["Sim101"] = "hard"
+        st.account_stops["Sim102"] = "hard"
+        st._recompute_session_lock()
+        assert st.hard_stopped is True
+
+    def test_recompute_not_hard_when_one_tradeable(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.account_stops["Sim102"] = "hard"
+        st._recompute_session_lock()
+        assert st.hard_stopped is False
+
+    def test_recompute_soft_when_all_stopped_mixed(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.account_stops["Sim101"] = "soft"
+        st.account_stops["Sim102"] = "hard"
+        st._recompute_session_lock()
+        assert st.hard_stopped is False
+        assert st.soft_stopped is True
+
+# ── micro contract conversion ─────────────────────────────────────────
+
+
+class TestToMicroInstrument:
+    @pytest.mark.parametrize("full,micro", [
+        ("ES 09-26", "MES 09-26"),
+        ("NQ 06-26", "MNQ 06-26"),
+        ("YM 09-26", "MYM 09-26"),
+        ("RTY 09-26", "M2K 09-26"),   # not an M-prefix
+        ("GC 08-26", "MGC 08-26"),
+        ("SI 09-26", "SIL 09-26"),    # not an M-prefix
+        ("HG 09-26", "MHG 09-26"),
+        ("CL 08-26", "MCL 08-26"),
+        ("NG 08-26", "MNG 08-26"),
+        ("BTC 07-26", "MBT 07-26"),
+        ("ETH 07-26", "MET 07-26"),
+        ("6E 09-26", "M6E 09-26"),
+    ])
+    def test_known_roots_convert(self, full, micro):
+        assert st.to_micro_instrument(full) == micro
+
+    def test_bare_root_without_expiry(self):
+        assert st.to_micro_instrument("NQ") == "MNQ"
+
+    def test_already_micro_passes_through(self):
+        assert st.to_micro_instrument("MNQ 06-26") == "MNQ 06-26"
+        assert st.to_micro_instrument("M2K 09-26") == "M2K 09-26"
+
+    def test_already_micro_does_not_warn(self):
+        st.to_micro_instrument("MES 09-26")
+        assert "MES" not in st._micro_unmapped_warned
+
+    def test_unmapped_root_passes_through(self):
+        assert st.to_micro_instrument("ZB 09-26") == "ZB 09-26"
+
+    def test_unmapped_root_warns_once(self):
+        st.to_micro_instrument("ZB 09-26")
+        assert "ZB" in st._micro_unmapped_warned
+
+    def test_lowercase_root_converts(self):
+        assert st.to_micro_instrument("nq 06-26") == "MNQ 06-26"
+
+    def test_empty_instrument_unchanged(self):
+        assert st.to_micro_instrument("") == ""
+
+    def test_self_mapping_opts_out(self):
+        st.micro_map = dict(st.MICRO_MAP, GC="GC")
+        assert st.to_micro_instrument("GC 08-26") == "GC 08-26"
+        assert "GC" not in st._micro_unmapped_warned  # opt-out is silent
+
+
+class TestLoadMicroMap:
+    def test_defaults_without_overrides(self):
+        assert st.load_micro_map({}) == st.MICRO_MAP
+
+    def test_override_extends_defaults(self):
+        merged = st.load_micro_map({"micro_map": {"FDAX": "FDXS"}})
+        assert merged["FDAX"] == "FDXS"
+        assert merged["NQ"] == "MNQ"  # defaults intact
+
+    def test_override_replaces_default(self):
+        merged = st.load_micro_map({"micro_map": {"SI": "SI"}})
+        assert merged["SI"] == "SI"
+
+    def test_override_uppercased(self):
+        merged = st.load_micro_map({"micro_map": {"fdax": "fdxs"}})
+        assert merged["FDAX"] == "FDXS"
+
+    def test_junk_overrides_ignored(self):
+        assert st.load_micro_map({"micro_map": "not a dict"}) == st.MICRO_MAP
+        merged = st.load_micro_map({"micro_map": {"": "MES", "NQ": "", "CL": 5}})
+        assert merged == st.MICRO_MAP
+
+
+class TestExtractSignalMicroMode:
+    MSG = json.dumps({
+        "signal": "PLACE;Sim101;NQ 06-26;BUY;2;MARKET;;;DAY;;;NQ_Med;1044",
+        "ts": 1711000000000,
+    })
+
+    def test_micros_true_converts_instrument(self):
+        result, _, sig_id, reason = st.extract_signal_string(
+            self.MSG, "MyAcct", "NQ_Med", micros=True)
+        assert reason is None
+        parts = result.split(";")
+        assert parts[2] == "MNQ 06-26"
+        assert parts[1] == "MyAcct"   # account swap still applied
+        assert parts[4] == "2"        # quantity untouched
+        assert sig_id == "1044"       # dedup ID untouched
+
+    def test_micros_false_leaves_instrument(self):
+        result, _, _, _ = st.extract_signal_string(self.MSG, "MyAcct", "NQ_Med", micros=False)
+        assert result.split(";")[2] == "NQ 06-26"
+
+    def test_default_is_off(self):
+        result, _, _, _ = st.extract_signal_string(self.MSG, "MyAcct", "NQ_Med")
+        assert result.split(";")[2] == "NQ 06-26"
+
+    def test_closeposition_converts_too(self):
+        msg = json.dumps({"signal": "CLOSEPOSITION;Sim101;NQ 06-26", "ts": 1})
+        result, _, _, reason = st.extract_signal_string(msg, "MyAcct", "NQ_Med", micros=True)
+        assert reason is None
+        assert result.split(";")[2] == "MNQ 06-26"
+
+    def test_unmapped_symbol_sent_unchanged(self):
+        msg = json.dumps({
+            "signal": "PLACE;Sim101;ZB 09-26;BUY;1;MARKET;;;DAY;;;NQ_Med;1050", "ts": 1})
+        result, _, _, reason = st.extract_signal_string(msg, "MyAcct", "NQ_Med", micros=True)
+        assert reason is None
+        assert result.split(";")[2] == "ZB 09-26"
+
+
+class TestToggleMicroMode:
+    def test_toggle_on_persists(self, tmp_config):
+        assert st.micro_mode is False
+        assert st.toggle_micro_mode() is True
+        assert st.micro_mode is True
+        assert st.load_config()["micro_mode"] is True
+
+    def test_toggle_off_persists(self, tmp_config):
+        st.toggle_micro_mode()
+        assert st.toggle_micro_mode() is False
+        assert st.load_config()["micro_mode"] is False
+
+    def test_toggle_reloads_map_overrides(self, tmp_config):
+        st.save_config({"micro_map": {"SI": "SI"}})
+        st.toggle_micro_mode()
+        assert st.micro_map["SI"] == "SI"
