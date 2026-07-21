@@ -28,7 +28,7 @@ try:
 except ImportError:
     pyfiglet = None
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -314,7 +314,9 @@ VALID_ATI_COMMANDS = {
     "CANCELALLORDERS", "FLATTENEVERYTHING",
 }
 VALID_ACTIONS = {"BUY", "SELL"}
-VALID_ORDER_TYPES = {"MARKET", "LIMIT", "STOP", "STOPLIMIT"}
+# Per NT8 docs (Commands and Valid Parameters) the stop type is
+# STOPMARKET — NT rejects "STOP" ("holds invalid order type parameter").
+VALID_ORDER_TYPES = {"MARKET", "LIMIT", "STOPMARKET", "STOPLIMIT"}
 VALID_TIF = {"DAY", "GTC"}
 
 
@@ -323,6 +325,20 @@ def sanitize_ati(value: str) -> str:
     return (value
             .replace('\n', '').replace('\r', '').replace('\x00', '')
             .replace(';', ''))
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def strip_terminal_input(value: str) -> str:
+    """Remove ANSI escape sequences and control chars from typed input.
+
+    Arrow keys pressed at a cooked-mode prompt leak CSI sequences into the
+    line buffer — one produced a garbage account_limits config key like
+    '\\x1b[B\\x1b[B\\x1b[B6'. Applied to every read_line_raw result.
+    """
+    value = _ANSI_ESCAPE_RE.sub("", value)
+    return "".join(c for c in value if c == "\t" or ord(c) >= 32)
 
 
 
@@ -419,9 +435,16 @@ def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                cfg = json.load(f)
         except (json.JSONDecodeError, OSError):
-            pass
+            return {}
+        # Self-heal: drop account_limits keys polluted with terminal control
+        # characters (arrow-key escapes captured before input stripping).
+        limits = cfg.get("account_limits")
+        if isinstance(limits, dict):
+            for key in [k for k in limits if any(ord(c) < 32 for c in k)]:
+                del limits[key]
+        return cfg
     return {}
 
 
@@ -1210,7 +1233,7 @@ if os.name == "nt":  # Windows
         return ""
 
     def read_line_raw():
-        return input().strip()
+        return strip_terminal_input(input().strip())
 
 else:  # POSIX
     import termios
@@ -1265,7 +1288,7 @@ else:  # POSIX
             line = sys.stdin.readline()
         finally:
             pass  # get_key will re-enter raw mode when called
-        return line.strip()
+        return strip_terminal_input(line.strip())
 
 
 # ---------- Terminal helpers ----------
@@ -2698,19 +2721,72 @@ def fire_close_position(account: str, contract: str):
         _dash_set_alert(Fore.RED + f"  ✖  Close position write error: {exc}" + Style.RESET_ALL)
 
 
-def fire_cancel_all_orders(account: str):
-    """Write a CANCELALLORDERS command so no working orders survive a hard stop."""
-    if not output_directory:
+# NT order states that still carry (or may still gain) working exposure
+# and are therefore worth cancelling when flattening an account.
+OPEN_ORDER_STATES = {
+    "Working", "Accepted", "Submitted", "PartFilled",
+    "TriggerPending", "ChangePending", "PendingSubmit", "PendingChange",
+}
+
+
+def query_nt_open_orders(account: str, port: int = 36973) -> list[str]:
+    """Return the NT order IDs currently open on one account.
+
+    The ATI state dump lists Orders|<account> (pipe-joined order IDs) and
+    OrderStatus|<id> per order; only IDs in an open state are returned.
+    """
+    text = _query_ati("POSITIONS", port)
+    if not text:
+        return []
+    ids: list[str] = []
+    status: dict[str, str] = {}
+    for field, key, val in _parse_ati_fields(text):
+        if field == "Orders" and key == account and val:
+            ids = [o for o in val.split("|") if o]
+        elif field == "OrderStatus":
+            status[key] = val
+    return [o for o in ids if status.get(o) in OPEN_ORDER_STATES]
+
+
+def fire_cancel_order(order_id: str):
+    """Write a CANCEL for a single order ID to the incoming folder."""
+    if not output_directory or not order_id:
         return
-    cmd = f"CANCELALLORDERS;{sanitize_ati(account)};;;;;;;;;;;"
-    filename = _next_ati_filename("cancelall")
+    cmd = f"CANCEL;;;;;;;;;;{sanitize_ati(order_id)};;"
+    filename = _next_ati_filename("cancel")
     filepath = os.path.join(output_directory, filename)
     try:
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(cmd)
-        logger.info(f"CANCELALLORDERS  account={account}  file={filename}")
+        logger.info(f"CANCEL  order={order_id}  file={filename}")
     except Exception as exc:
-        _dash_set_alert(Fore.RED + f"  ✖  Cancel-all write error: {exc}" + Style.RESET_ALL)
+        _dash_set_alert(Fore.RED + f"  ✖  Cancel write error: {exc}" + Style.RESET_ALL)
+
+
+def fire_cancel_account_orders(account: str) -> int:
+    """Cancel every open order on ONE account, by order ID.
+
+    Replaces the old CANCELALLORDERS file: per the NT8 OIF docs that
+    command "will cancel all active orders across all accounts and broker
+    connections" (its account field is not even a parameter), so firing it
+    when one copy-trade account trips its stop would strip every OTHER
+    account's ATM stop/target while those accounts keep trading. Instead
+    the account's open orders are enumerated over the ATI TCP dump and
+    cancelled one file each. If the TCP query fails, the CLOSEPOSITION
+    calls that follow in close_account_positions still cancel working
+    orders on each closed instrument (per the OIF docs), so protection
+    degrades per-instrument rather than nuking every account.
+    """
+    try:
+        order_ids = query_nt_open_orders(account, nt_port)
+    except Exception as e:
+        logger.error(f"cancel_account_orders {account}  query error: {e}")
+        return 0
+    for oid in order_ids:
+        fire_cancel_order(oid)
+    if order_ids:
+        logger.info(f"CANCEL ACCOUNT ORDERS  account={account}  count={len(order_ids)}  ids={order_ids}")
+    return len(order_ids)
 
 
 def close_account_positions(account: str) -> list[str]:
@@ -2725,8 +2801,10 @@ def close_account_positions(account: str) -> list[str]:
     if not account:
         return []
 
-    # Cancel working orders first so they don't refill after we close
-    fire_cancel_all_orders(account)
+    # Cancel this account's working orders first so a pending entry can't
+    # refill after we close. Scoped by order ID — never CANCELALLORDERS,
+    # which NT applies globally across all accounts and connections.
+    fire_cancel_account_orders(account)
 
     closed: set[str] = set()
 
@@ -2985,7 +3063,13 @@ async def balance_monitor():
 
 
 async def prompt_limits():
-    """Prompt user to set session target and stop for the active account."""
+    """Prompt user to set session target/stop for any copy-trade account.
+
+    With followers configured, first asks which account the limits apply
+    to — the leader, one follower, or ALL target accounts at once. Before
+    this picker existed, limits could only ever be attached to the leader,
+    so followers ran without any session risk cap.
+    """
     global awaiting_user_input, soft_stopped
     if not active_account:
         _dash_set_alert(Fore.YELLOW + "  ⚠  Set an account first (press A)." + Style.RESET_ALL)
@@ -2994,12 +3078,34 @@ async def prompt_limits():
     _dash_enter_menu()
     awaiting_user_input = True
     show_cursor()
-    limits = get_account_limits(active_account)
-    start_bal = session_start_balances.get(active_account)
-    current_bal = await asyncio.to_thread(query_nt_balance, active_account)
+
+    # Pick the account (leader default). "0" applies the entered limits
+    # to every target account.
+    targets = target_accounts()
+    acct = active_account
+    apply_all = False
+    if len(targets) > 1:
+        print(Fore.CYAN + "\n\r\033[K  Set limits for:" + Style.RESET_ALL)
+        print(Fore.CYAN + "\r\033[K    0. ALL accounts (same limits for each)" + Style.RESET_ALL)
+        for i, a in enumerate(targets, 1):
+            role = "leader" if a == active_account else "follower"
+            print(Fore.CYAN + f"\r\033[K    {i}. {a}  ({role})" + Style.RESET_ALL)
+        sys.stdout.write(Fore.WHITE + f"  ACCOUNT # (ENTER = {active_account}) ▸ " + Style.RESET_ALL)
+        sys.stdout.flush()
+        raw_a = (await asyncio.to_thread(read_line_raw)).strip()
+        if raw_a == "0":
+            apply_all = True
+        elif raw_a.isdigit() and 1 <= int(raw_a) <= len(targets):
+            acct = targets[int(raw_a) - 1]
+        elif raw_a:
+            print(Fore.YELLOW + f"  ⚠  Invalid choice — using {active_account}." + Style.RESET_ALL)
+
+    limits = get_account_limits(acct)
+    start_bal = session_start_balances.get(acct)
+    current_bal = await asyncio.to_thread(query_nt_balance, acct)
 
     _lim_inner = 52
-    _lim_title = f"─ SESSION LIMITS ({active_account}) "
+    _lim_title = f"─ SESSION LIMITS ({'ALL ACCOUNTS' if apply_all else acct}) "
     _lim_top_dashes = _lim_inner - len(_lim_title)
     print(Fore.CYAN + f"\n\r\033[K┌{_lim_title}{'─' * _lim_top_dashes}┐" + Style.RESET_ALL)
     if start_bal is not None and current_bal is not None:
@@ -3083,17 +3189,20 @@ async def prompt_limits():
         elif sm_input:
             print(Fore.YELLOW + f"  ⚠  Invalid mode — keeping {stop_mode}." + Style.RESET_ALL)
 
-    set_account_limits(active_account, target, target_mode, stop, stop_mode)
-    # Changing the leader's limits lifts its soft (resumable) lockout so it
-    # re-arms against the new numbers; a hard lock stays until reset/exit.
-    if account_stops.get(active_account) == "soft":
-        del account_stops[active_account]
+    # Apply to the chosen account, or every target account with "0. ALL".
+    # New limits lift a soft (resumable) lockout so the account re-arms
+    # against the new numbers; a hard lock stays until reset/exit.
+    for a in (targets if apply_all else [acct]):
+        set_account_limits(a, target, target_mode, stop, stop_mode)
+        if account_stops.get(a) == "soft":
+            del account_stops[a]
     soft_stopped = False
     _recompute_session_lock()
     t_label = f"${target:+,.2f} ({target_mode})" if target else "off"
     s_label = f"${stop:+,.2f} ({stop_mode})" if stop else "off"
+    who = "ALL accounts" if apply_all else acct
     # Will be visible on alert line after menu exit
-    _dash_set_alert(Fore.GREEN + f"  ✔  {active_account} → Target: {t_label}  ·  Stop: {s_label}" + Style.RESET_ALL)
+    _dash_set_alert(Fore.GREEN + f"  ✔  {who} → Target: {t_label}  ·  Stop: {s_label}" + Style.RESET_ALL)
 
     awaiting_user_input = False
     _dash_exit_menu()

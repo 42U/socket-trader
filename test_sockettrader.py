@@ -718,6 +718,11 @@ class TestFormatSignalTag:
 
 
 class TestCloseAllOpenPositions:
+    @pytest.fixture(autouse=True)
+    def _no_live_ati(self, monkeypatch):
+        """Keep order-cancel enumeration off the network in tests."""
+        monkeypatch.setattr(st, "query_nt_open_orders", lambda account, port=36973: [])
+
     def test_no_account_returns_empty(self, tmp_output_dir):
         original_acct = st.active_account
         original_dir = st.output_directory
@@ -742,9 +747,8 @@ class TestCloseAllOpenPositions:
             assert set(closed) == {"NQ 06-26", "ES 06-26"}
             close_files = list(tmp_output_dir.glob("close_*.txt"))
             assert len(close_files) == 2
-            # CANCELALLORDERS is written before the closes
-            cancel_files = list(tmp_output_dir.glob("cancelall_*.txt"))
-            assert len(cancel_files) == 1
+            # No global CANCELALLORDERS files — cancels are per-order now
+            assert list(tmp_output_dir.glob("cancelall_*.txt")) == []
             contents = [f.read_text() for f in close_files]
             assert any("NQ 06-26" in c for c in contents)
             assert any("ES 06-26" in c for c in contents)
@@ -821,28 +825,111 @@ class TestCloseAllOpenPositions:
             st.output_directory = original_dir
 
 
-# ── fire_cancel_all_orders ───────────────────────────────────────────
+# ── Scoped per-account order cancellation (v0.3.3) ───────────────────
+# Replaced fire_cancel_all_orders: NT8's CANCELALLORDERS is documented as
+# global ("all accounts and broker connections"), so flattening one
+# copy-trade account must never use it.
 
 
-class TestFireCancelAllOrders:
-    def test_writes_cancelall_file(self, tmp_output_dir):
+class TestScopedCancel:
+    DUMP = (
+        "Orders|Sim101\x00aaa|bbb|ccc\x00"
+        "OrderStatus|aaa\x00Working\x00"
+        "OrderStatus|bbb\x00Filled\x00"
+        "OrderStatus|ccc\x00Accepted\x00"
+        "Orders|Other\x00zzz\x00"
+        "OrderStatus|zzz\x00Working\x00"
+    )
+
+    def test_open_orders_filtered_by_account_and_state(self):
+        with patch.object(st, "_query_ati", return_value=self.DUMP):
+            assert st.query_nt_open_orders("Sim101") == ["aaa", "ccc"]
+
+    def test_open_orders_scoped_to_requested_account(self):
+        with patch.object(st, "_query_ati", return_value=self.DUMP):
+            assert st.query_nt_open_orders("Other") == ["zzz"]
+
+    def test_open_orders_empty_dump(self):
+        with patch.object(st, "_query_ati", return_value=""):
+            assert st.query_nt_open_orders("Sim101") == []
+
+    def test_cancel_account_orders_writes_one_cancel_per_order(self, tmp_output_dir):
         original = st.output_directory
         st.output_directory = str(tmp_output_dir)
         try:
-            st.fire_cancel_all_orders("Sim101")
-            files = list(tmp_output_dir.glob("cancelall_*.txt"))
-            assert len(files) == 1
-            assert files[0].read_text().startswith("CANCELALLORDERS;Sim101")
+            with patch.object(st, "_query_ati", return_value=self.DUMP):
+                n = st.fire_cancel_account_orders("Sim101")
+            assert n == 2
+            files = sorted(tmp_output_dir.glob("cancel_*.txt"))
+            contents = sorted(p.read_text() for p in files)
+            assert contents == ["CANCEL;;;;;;;;;;aaa;;", "CANCEL;;;;;;;;;;ccc;;"]
+            assert list(tmp_output_dir.glob("cancelall_*.txt")) == []
         finally:
             st.output_directory = original
 
-    def test_no_write_without_directory(self):
+    def test_cancel_account_orders_query_failure_returns_zero(self, tmp_output_dir):
         original = st.output_directory
-        st.output_directory = None
+        st.output_directory = str(tmp_output_dir)
         try:
-            st.fire_cancel_all_orders("Sim101")  # should not raise
+            with patch.object(st, "query_nt_open_orders", side_effect=RuntimeError("ATI down")):
+                assert st.fire_cancel_account_orders("Sim101") == 0
+            assert list(tmp_output_dir.iterdir()) == []
         finally:
             st.output_directory = original
+
+    def test_close_account_positions_uses_scoped_cancel(self, tmp_output_dir, monkeypatch):
+        monkeypatch.setattr(st, "query_nt_open_orders", lambda account, port=36973: ["oid1"])
+        with patch.object(st, "output_directory", str(tmp_output_dir)), \
+             patch.object(st, "query_nt_positions", return_value={"NQ 06-26": 1}):
+            closed = st.close_account_positions("Sim101")
+        assert closed == ["NQ 06-26"]
+        cancels = [f.read_text() for f in tmp_output_dir.glob("cancel_*.txt")]
+        assert cancels == ["CANCEL;;;;;;;;;;oid1;;"]
+        assert list(tmp_output_dir.glob("cancelall_*.txt")) == []
+
+    def test_global_cancelallorders_helper_is_gone(self):
+        assert not hasattr(st, "fire_cancel_all_orders")
+
+
+# ── Order types match the NT8 OIF enumeration ────────────────────────
+
+
+class TestOrderTypesMatchNtDocs:
+    def test_set_matches_nt8_enumeration(self):
+        # Official docs list exactly: MARKET, LIMIT, STOPMARKET, STOPLIMIT
+        assert st.VALID_ORDER_TYPES == {"MARKET", "LIMIT", "STOPMARKET", "STOPLIMIT"}
+
+    def test_stopmarket_accepted(self):
+        parts = ["PLACE", "Sim101", "NQ 06-26", "SELL", "1", "STOPMARKET", "", "28500", "DAY", "", "", "", ""]
+        assert st.validate_signal(parts) is None
+
+    def test_legacy_stop_rejected(self):
+        # NT rejects "STOP" ("holds invalid order type parameter") — the
+        # validator must too, so the failure surfaces in OUR log, not NT's.
+        parts = ["PLACE", "Sim101", "NQ 06-26", "SELL", "1", "STOP", "", "28500", "DAY", "", "", "", ""]
+        assert "invalid order type" in st.validate_signal(parts)
+
+
+# ── Terminal input hygiene ───────────────────────────────────────────
+
+
+class TestInputHygiene:
+    def test_strip_arrow_key_escapes(self):
+        assert st.strip_terminal_input("\x1b[B\x1b[B\x1b[B6") == "6"
+
+    def test_plain_text_unchanged(self):
+        assert st.strip_terminal_input("TDFYSL50925850106") == "TDFYSL50925850106"
+
+    def test_control_chars_removed(self):
+        assert st.strip_terminal_input("a\x07b\x00c") == "abc"
+
+    def test_load_config_drops_garbage_limit_keys(self, tmp_config):
+        st.save_config({"account_limits": {
+            "\x1b[B\x1b[B\x1b[B6": {"target": 1000.0},
+            "Sim101": {"target": 500.0},
+        }})
+        loaded = st.load_config()
+        assert list(loaded["account_limits"]) == ["Sim101"]
 
 
 # ── Session persistence: lockout flags are NOT persisted ──────────
@@ -1100,6 +1187,10 @@ class TestDispatchSignal:
 
 # ── close_all_open_positions across accounts ──────────────────────────
 class TestCloseAllMultiAccount:
+    @pytest.fixture(autouse=True)
+    def _no_live_ati(self, monkeypatch):
+        monkeypatch.setattr(st, "query_nt_open_orders", lambda account, port=36973: [])
+
     def test_flattens_every_target_account(self, tmp_output_dir):
         st.active_account = "Sim101"
         st.follower_accounts = ["Sim102"]
@@ -1112,11 +1203,10 @@ class TestCloseAllMultiAccount:
             closed = st.close_all_open_positions()
 
         assert closed == ["NQ 06-26"]
-        # One CLOSEPOSITION per account (2) + one CANCELALLORDERS per account (2)
+        # One CLOSEPOSITION per account (2); no global CANCELALLORDERS
         close_files = list(tmp_output_dir.glob("close_*.txt"))
-        cancel_files = list(tmp_output_dir.glob("cancelall_*.txt"))
         assert len(close_files) == 2
-        assert len(cancel_files) == 2
+        assert list(tmp_output_dir.glob("cancelall_*.txt")) == []
         closed_accounts = {f.read_text().split(";")[1] for f in close_files}
         assert closed_accounts == {"Sim101", "Sim102"}
 
@@ -1235,6 +1325,10 @@ class TestFollowerConfigPersistence:
 
 # ── per-account trip + session-lock recompute ─────────────────────────
 class TestPerAccountRisk:
+    @pytest.fixture(autouse=True)
+    def _no_live_ati(self, monkeypatch):
+        monkeypatch.setattr(st, "query_nt_open_orders", lambda account, port=36973: [])
+
     def test_trip_locks_only_that_account(self, tmp_config, tmp_output_dir):
         st.active_account = "Sim101"
         st.follower_accounts = ["Sim102"]
