@@ -28,7 +28,7 @@ try:
 except ImportError:
     pyfiglet = None
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -2632,17 +2632,39 @@ def write_signal_to_file(signal_text: str) -> str | None:
         return None
 
 
-def _with_account(signal_text: str, account: str) -> str:
-    """Return a copy of a processed signal with field 1 (account) swapped.
+# OIF fields that hold identifiers NinjaTrader resolves across the WHOLE
+# platform instance, not per account: OCO id (9), order id (10) and ATM
+# strategy id (12). CLOSESTRATEGY / CANCEL / CHANGE carry no account field
+# at all — the id alone picks the target — so two accounts can never share
+# one. When copy-trading reused the leader's strategy id verbatim, NT
+# rejected the follower's PLACE with "strategy id 'X' already in use" and
+# the follower silently missed the trade (see NT log 2026-07-23 05:10:18).
+_ATI_GLOBAL_ID_FIELDS = (9, 10, 12)
 
-    The signal that arrives already has the primary account in field 1;
-    copy-trading rewrites just that field per target account, leaving the
-    instrument, action, qty, strategy and signal-id fields untouched so
-    every account trades the identical signal.
+
+def _with_account(signal_text: str, account: str) -> str:
+    """Return a copy of a processed signal re-addressed to `account`.
+
+    Field 1 (account) is swapped. When the swap re-addresses the signal to
+    a DIFFERENT account than it arrived for — a copy-trade follower leg —
+    every instance-global id field (OCO id, order id, strategy id) gets a
+    "~<account>" suffix so the leg can't collide with the leader's ids.
+    The leader's copy keeps the publisher's ids verbatim. Because the same
+    transform runs on every fanned-out command, a later CLOSESTRATEGY /
+    CANCEL / CHANGE naming the publisher's id still resolves per account:
+    the leader leg matches the original id, each follower leg matches its
+    own suffixed one.
     """
     parts = signal_text.split(";")
-    if len(parts) >= 2:
-        parts[1] = sanitize_ati(account)
+    if len(parts) < 2:
+        return signal_text
+    acct = sanitize_ati(account)
+    is_follower_leg = parts[1] != acct
+    parts[1] = acct
+    if is_follower_leg:
+        for i in _ATI_GLOBAL_ID_FIELDS:
+            if len(parts) > i and parts[i]:
+                parts[i] = f"{parts[i]}~{acct}"
     return ";".join(parts)
 
 

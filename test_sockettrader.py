@@ -1073,14 +1073,18 @@ class TestSessionHardLocked:
 
 # ── _with_account ─────────────────────────────────────────────────────
 class TestWithAccount:
-    def test_replaces_account_field_only(self):
+    def test_replaces_account_and_keeps_trade_fields(self):
         sig = "PLACE;OLD;NQ 06-26;BUY;1;MARKET;;;DAY;;;NQ_Med;42"
         out = st._with_account(sig, "Sim102")
         parts = out.split(";")
         assert parts[1] == "Sim102"
         assert parts[0] == "PLACE"
         assert parts[2] == "NQ 06-26"
-        assert parts[-1] == "42"
+        assert parts[3] == "BUY" and parts[4] == "1" and parts[5] == "MARKET"
+        assert parts[11] == "NQ_Med"
+        # Re-addressed to a different account ⇒ strategy id is made
+        # per-account so NT's instance-global id check can't reject it.
+        assert parts[-1] == "42~Sim102"
 
     def test_sanitizes_account_name(self):
         sig = "PLACE;OLD;NQ;BUY;1;MARKET;;;DAY;;;NQ_Med;42"
@@ -1091,6 +1095,54 @@ class TestWithAccount:
 
     def test_short_signal_untouched(self):
         assert st._with_account("PLACE", "Sim102") == "PLACE"
+
+    def test_same_account_keeps_ids_verbatim(self):
+        # The leader leg is a re-address to the SAME account: the
+        # publisher's oco/order/strategy ids must pass through untouched.
+        sig = "PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;oco-1;ord-1;NQ_Med;ent:x:2026"
+        assert st._with_account(sig, "Sim101") == sig
+
+    def test_follower_leg_gets_unique_strategy_id(self):
+        # NT resolves ATM strategy ids across the whole instance; a follower
+        # reusing the leader's id is rejected with "strategy id already in
+        # use". The follower leg must carry a per-account id.
+        sig = "PLACE;Sim101;NQ 06-26;SELL;1;MARKET;;;DAY;;;NQ_Goopi;ent:x:2026"
+        parts = st._with_account(sig, "Sim102").split(";")
+        assert parts[1] == "Sim102"
+        assert parts[12] == "ent:x:2026~Sim102"
+
+    def test_follower_leg_suffixes_oco_and_order_ids(self):
+        sig = "PLACE;Sim101;NQ 06-26;BUY;2;LIMIT;100;;GTC;oco-1;ord-1;NQ_Med;99"
+        parts = st._with_account(sig, "Sim102").split(";")
+        assert parts[9] == "oco-1~Sim102"
+        assert parts[10] == "ord-1~Sim102"
+        assert parts[12] == "99~Sim102"
+
+    def test_follower_leg_leaves_empty_ids_empty(self):
+        sig = "CLOSEPOSITION;Sim101;NQ 09-26;;;;;;;;;NQ_Goopi;"
+        out = st._with_account(sig, "Sim102")
+        parts = out.split(";")
+        assert parts[1] == "Sim102"
+        assert parts[9] == "" and parts[10] == "" and parts[12] == ""
+        assert len(parts) == len(sig.split(";"))
+
+    def test_closestrategy_follower_id_matches_its_entry_id(self):
+        # A publisher CLOSESTRATEGY names the id it used on PLACE. The same
+        # transform on both commands must yield matching per-account ids so
+        # each account's close resolves to its own ATM instance.
+        entry = "PLACE;Sim101;NQ 06-26;SELL;1;MARKET;;;DAY;;;NQ_Goopi;ent:x:2026"
+        close = "CLOSESTRATEGY;Sim101;;;;;;;;;;;ent:x:2026"
+        entry_id = st._with_account(entry, "Sim102").split(";")[12]
+        close_id = st._with_account(close, "Sim102").split(";")[12]
+        assert entry_id == close_id == "ent:x:2026~Sim102"
+
+    def test_two_followers_get_distinct_ids(self):
+        sig = "PLACE;Sim101;NQ 06-26;SELL;1;MARKET;;;DAY;;;NQ_Goopi;ent:x:2026"
+        ids = {
+            st._with_account(sig, a).split(";")[12]
+            for a in ("Sim101", "Sim102", "Sim103")
+        }
+        assert len(ids) == 3  # leader + each follower all unique
 
 
 # ── _next_ati_filename thread safety ──────────────────────────────────
@@ -1128,20 +1180,30 @@ class TestDispatchSignal:
         accounts_written = {f.read_text().split(";")[1] for f in files}
         assert accounts_written == {"Sim101", "Sim102", "Sim103", "Sim104"}
 
-    def test_each_file_keeps_identical_signal_except_account(self, tmp_output_dir):
+    def test_each_file_keeps_identical_signal_except_account_and_ids(self, tmp_output_dir):
         st.active_account = "Sim101"
         st.follower_accounts = ["Sim102", "Sim103", "Sim104"]
         sig = "PLACE;Sim101;NQ 06-26;BUY;3;MARKET;;;DAY;oco-1;ord-1;NQ_Med;99"
         with patch.object(st, "output_directory", str(tmp_output_dir)):
             asyncio.run(st.dispatch_signal(sig))
         bodies = [f.read_text() for f in tmp_output_dir.glob("oif_*.txt")]
+        # Trade-defining fields (instrument/action/qty/type/TIF/ATM) are
+        # identical on every leg; account and the instance-global id fields
+        # (oco/order/strategy id) are per-account by design.
         stripped = {
-            ";".join([p if i != 1 else "" for i, p in enumerate(b.split(";"))])
+            ";".join([p if i not in (1, 9, 10, 12) else ""
+                      for i, p in enumerate(b.split(";"))])
             for b in bodies
         }
-
         assert len(bodies) == 4
-        assert len(stripped) == 1  # only the account differs
+        assert len(stripped) == 1
+
+        # Every leg's strategy id is unique across the NT instance, and the
+        # leader's leg keeps the publisher's id verbatim.
+        by_account = {b.split(";")[1]: b.split(";") for b in bodies}
+        assert by_account["Sim101"][12] == "99"
+        ids = {p[12] for p in by_account.values()}
+        assert len(ids) == 4
 
     def test_single_account_mode_keeps_signal_unchanged(self, tmp_output_dir):
         st.active_account = "Sim101"
