@@ -389,15 +389,21 @@ Press **`O`** in the terminal to submit your own order: side (long/short), instr
 
 A **web UI** starts automatically with the app and prints its address at launch (default `http://127.0.0.1:8720`; it binds to localhost only). It's built for clicking, not typing — everything below is a button, chip, or stepper:
 
+It is a **trading companion**, not a replacement for the terminal: it does two jobs — place trades and manage accounts — and does them without making you type.
+
 | Panel | What you can do |
 |---|---|
-| **Order ticket** | BUY/SELL toggle, instrument chips (auto-filled from your open positions and session instruments), `−`/`+` contract stepper with 1/2/3/5/10 quick picks, MARKET/LIMIT toggle, ATM dropdown, one big submit button that reads back the order |
-| **Controls** | Pause/resume, reconnect, micro toggle, reset session P&L, flatten all |
-| **Open positions** | Every managed account's live positions with a per-position **CLOSE** button — the web equivalent of the terminal's `C` menu |
-| **Accounts** | Role, P&L, profile summary, and stop status per account; the rotation line shows who's owed a turn. **Click any row** to edit that account |
-| **Account editor** | Risk limits (target/stop with OFF/SOFT/HARD buttons) and the full trade profile — symbol filter chips, entries on/off, size, contracts mode + cap, direction, delay/jitter, stagger, ATM override — all clickable |
-| **Accounts / Strategy / Micro map** | Assign leader, followers, and the round-robin pool by clicking roles against NinjaTrader's account list; pick the session ATM template and locked/follow mode; edit micro-contract mappings |
+| **Top bar** | Session state, READY, **NT LINKED/OFFLINE**, ATM template, micro mode, signal count — plus **PAUSE** and **FLATTEN ALL**, always visible wherever you are on the page |
+| **Order ticket** | BUY/SELL toggle · a real **instrument picker** (25 CME products grouped by asset class, searchable, with micro twins and pinnable ★ favourites — populated before you've traded anything) · `−`/`+` contract stepper with 1/2/3/5/10 quick picks · MARKET/LIMIT · ATM dropdown · a submit button that reads back the exact order |
+| **Accounts — live from NinjaTrader** | **Every account NT reports**, not just configured ones: cash, NT's realized P&L, session P&L, open positions with average entry, and working-order count. Role buttons (**L/F/R/–**) reassign leader, follower, round-robin or off in one click; **FLAT** flattens that account; click the name to edit it |
+| **Open positions** | Every account's live positions with side, size, average entry, and a per-position **CLOSE** |
+| **Account editor** | Risk limits (target/stop with OFF/SOFT/HARD buttons) and the trade profile — symbol filter chips, entries on/off, size, contracts mode + cap, direction, delay, stagger, ATM override — all clickable |
+| **Session** | Reconnect, micro toggle, reset P&L, session ATM strategy, and the live round-robin rotation state |
 | **Activity** | The same signal and alert feed shown in the terminal dashboard |
+
+**The account grid is real, live NinjaTrader data.** NinjaTrader answers `ACCOUNTS`, `POSITIONS` and `ORDERS` with the same full state dump, so the app takes one ATI round-trip every two seconds and parses it into accounts, positions and working orders (cached briefly so several browser tabs share a single poll) rather than querying per account.
+
+**The instrument picker never depends on history.** Contract months are computed per product family — quarterly (Mar/Jun/Sep/Dec) for equity index, rates and FX; every month for energy; Feb/Apr/Jun/Aug/Dec for gold; Mar/May/Jul/Sep/Dec for silver and copper — and rendered as `ROOT MM-YY` (e.g. `NQ 09-26`), the form the OIF signals use. Anything unusual can still be typed.
 
 Config keys: `webui_enabled` (default `true`, set `false` to disable) and `webui_port` (default `8720`; if busy, an ephemeral port is used and logged). The connection bootstrap (server, token, incoming directory) still happens in the terminal on first run, and **AI gates are terminal-only** — see below.
 
