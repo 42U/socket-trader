@@ -41,7 +41,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -5758,14 +5758,57 @@ async def _web_toggle_pause(pause: bool) -> tuple[bool, str]:
     return True, "resumed"
 
 
+FLATTEN_VERIFY_DELAY = 1.5   # seconds to let NinjaTrader fill the closes
+FLATTEN_VERIFY_TRIES = 3
+
+
+async def verify_flat(accounts: list[str]) -> list[dict]:
+    """Re-query NinjaTrader and return positions still open on `accounts`.
+
+    "Close sent" is not "closed". A flatten that lands on some accounts and
+    fails on others is worse than no flatten at all: it turns one hedged
+    group into an unbalanced one, and prop firms judge cross-account
+    direction, not intent. Topstep says so explicitly — a hedge is
+    "prohibited even if the overlap is brief or unintentional" and "cannot
+    be appealed". So the close is confirmed, not assumed.
+    """
+    remaining: list[dict] = []
+    for attempt in range(FLATTEN_VERIFY_TRIES):
+        await asyncio.sleep(FLATTEN_VERIFY_DELAY)
+        try:
+            snap = await asyncio.to_thread(nt_snapshot, nt_port)
+        except Exception as exc:
+            logger.error(f"FLATTEN VERIFY  snapshot failed: {exc}")
+            return []
+        remaining = [p for p in snap["positions"] if p["account"] in accounts]
+        if not remaining:
+            return []
+        logger.info(f"FLATTEN VERIFY  attempt {attempt + 1}: still open {remaining}")
+    return remaining
+
+
 async def _web_close_all() -> tuple[bool, str]:
+    accounts = target_accounts()
     closed = await asyncio.to_thread(close_all_open_positions)
     logger.info(f"WEB CLOSE ALL  contracts={closed}")
-    if closed:
-        _dash_set_alert(Fore.RED + f"  ⛔  WEB CLOSE ALL → {', '.join(closed)}"
-                        + Style.RESET_ALL)
-        return True, f"close sent for {', '.join(closed)}"
-    return True, "no open positions tracked — nothing closed"
+    if not closed:
+        return True, "no open positions tracked — nothing closed"
+    _dash_set_alert(Fore.RED + f"  ⛔  WEB CLOSE ALL → {', '.join(closed)}"
+                    + Style.RESET_ALL)
+    still = await verify_flat(accounts)
+    _live_cache["data"] = None
+    if still:
+        detail = ", ".join(f"{p['account']} {p['qty']:+d} {p['instrument']}"
+                           for p in still)
+        logger.warning(f"FLATTEN INCOMPLETE  {detail}")
+        _dash_set_alert(
+            Fore.RED + f"  ⛔  FLATTEN INCOMPLETE — still open: {detail}"
+            + Style.RESET_ALL, sticky=True)
+        return False, (f"FLATTEN INCOMPLETE — still open: {detail}. "
+                       "Close these in NinjaTrader now: a group left part "
+                       "flat and part in the market is how a cross-account "
+                       "hedge gets created.")
+    return True, f"flat — closes confirmed for {', '.join(closed)}"
 
 
 async def _web_toggle_micro() -> tuple[bool, str]:

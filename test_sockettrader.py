@@ -2906,6 +2906,45 @@ class TestCrossAccountHedgeDetection:
         assert st._hedge_conflicts(rows) == []
 
 
+class TestFlattenVerification:
+    """'Close sent' is not 'closed' — a partial flatten manufactures a
+    cross-account hedge, which prop firms judge on direction, not intent."""
+
+    def _arm(self, monkeypatch, remaining):
+        st.active_account = "LEAD"
+        st.follower_accounts = ["F1"]
+        monkeypatch.setattr(st, "close_all_open_positions", lambda: ["MNQ 09-26"])
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_DELAY", 0)
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_TRIES", 1)
+        monkeypatch.setattr(st, "nt_snapshot", lambda port=None, timeout=3.0: {
+            "ok": True, "accounts": {}, "positions": remaining,
+            "working": {}, "ts": 0.0})
+
+    def test_confirms_when_everything_closed(self, monkeypatch):
+        self._arm(monkeypatch, [])
+        ok, msg = asyncio.run(st._web_close_all())
+        assert ok is True and "confirmed" in msg
+
+    def test_reports_failure_when_a_leg_survives(self, monkeypatch):
+        self._arm(monkeypatch, [{"account": "F1", "instrument": "MNQ 09-26",
+                                 "qty": 2, "avg_price": 1.0}])
+        ok, msg = asyncio.run(st._web_close_all())
+        assert ok is False
+        assert "INCOMPLETE" in msg and "F1" in msg
+
+    def test_ignores_positions_on_unmanaged_accounts(self, monkeypatch):
+        self._arm(monkeypatch, [{"account": "SomeoneElse", "instrument": "ES 09-26",
+                                 "qty": 1, "avg_price": 1.0}])
+        ok, _ = asyncio.run(st._web_close_all())
+        assert ok is True
+
+    def test_nothing_open_skips_verification(self, monkeypatch):
+        self._arm(monkeypatch, [])
+        monkeypatch.setattr(st, "close_all_open_positions", lambda: [])
+        ok, msg = asyncio.run(st._web_close_all())
+        assert ok is True and "nothing closed" in msg
+
+
 class TestFlattenOrdering:
     def test_leader_is_flattened_first(self, monkeypatch):
         # Rithmic: flattening a follower before the leader can leave the
