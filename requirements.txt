@@ -1,6 +1,9 @@
 websockets>=14.0,<17
 colorama>=0.4.6,<0.5
 pyfiglet>=1.0.0,<2
+# Windows has no IANA time zone database, so zoneinfo cannot resolve
+# America/New_York (used for the futures session reset) without this.
+tzdata>=2024.1; sys_platform == "win32"
 # Optional — AI signal gate providers (Setup → 8 → AI gate):
 #   "anthropic" provider:            pip install anthropic
 #   "openai" / "ollama" / "custom":  no extra packages (stdlib HTTP)

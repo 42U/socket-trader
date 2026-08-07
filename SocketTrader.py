@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 from colorama import init, Fore, Style
 
@@ -176,7 +176,19 @@ hard_stopped = False                              # True if hard stop triggered
 BALANCE_POLL_INTERVAL = 3                         # seconds between balance checks
 
 # Auto-reset: futures session ends ~4:15 PM ET, reset P&L at 4:20 PM ET
-ET = ZoneInfo("America/New_York")  # Eastern Time (handles EST/EDT automatically)
+try:
+    ET = ZoneInfo("America/New_York")  # Eastern Time (handles EST/EDT automatically)
+except ZoneInfoNotFoundError as exc:  # pragma: no cover — host tzdata dependent
+    # Windows ships no IANA time zone database, so zoneinfo needs the tzdata
+    # package there. A fixed UTC offset would silently mis-time the 4:20 PM ET
+    # session reset across DST changes, so fail loudly rather than trade to a
+    # clock that is quietly an hour off half the year.
+    raise SystemExit(
+        "\n  SocketTrader needs the IANA time zone database to track the futures\n"
+        "  session (America/New_York) — Windows does not ship one.\n\n"
+        "  Fix:  pip install tzdata\n\n"
+        f"  (zoneinfo reported: {exc})\n"
+    )
 SESSION_RESET_HOUR = 16
 SESSION_RESET_MINUTE = 20
 # If launching after the reset time, mark today as already reset so we don't
