@@ -18,6 +18,7 @@ import re
 import platform
 import threading
 import http.server
+import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -674,7 +675,14 @@ _leg_tasks: set[asyncio.Task] = set()    # in-flight deferred legs (delay/AI/sta
 
 
 def _coerce_ai(raw: dict) -> dict | None:
-    """Sanitize an AI-gate config dict from disk/editor; None if unusable."""
+    """Sanitize an AI-gate config dict from disk/editor; None if unusable.
+
+    The endpoint must be http/https and the key env var must look like an
+    env var name: an AI gate makes an outbound request carrying an API key,
+    so a malformed URL or a stray env name here would leak a secret to the
+    wrong place. AI gates are configured from the terminal only — the web
+    API refuses to set them (see _web_set_profiles).
+    """
     provider = str(raw.get("provider", "")).strip().lower()
     if provider not in AI_PROVIDERS:
         return None
@@ -683,11 +691,21 @@ def _coerce_ai(raw: dict) -> dict | None:
         timeout_ms = int(raw.get("timeout_ms", 8000))
     except (TypeError, ValueError):
         timeout_ms = 8000
+    endpoint = str(raw.get("endpoint") or defaults["endpoint"]).strip()
+    if endpoint:
+        parsed = urllib.parse.urlparse(endpoint)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            logger.warning(f"AI GATE  rejected endpoint '{endpoint[:80]}' — need http(s) URL")
+            return None
+    key_env = str(raw.get("api_key_env") or defaults["key_env"]).strip()
+    if key_env and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", key_env):
+        logger.warning(f"AI GATE  rejected api_key_env '{key_env[:40]}'")
+        return None
     return {
         "provider": provider,
         "model": str(raw.get("model") or defaults["model"]).strip(),
-        "endpoint": str(raw.get("endpoint") or defaults["endpoint"]).strip(),
-        "api_key_env": str(raw.get("api_key_env") or defaults["key_env"]).strip(),
+        "endpoint": endpoint,
+        "api_key_env": key_env,
         "timeout_ms": max(1000, min(timeout_ms, 60_000)),
         "on_error": "allow" if str(raw.get("on_error", "skip")).lower() == "allow" else "skip",
         "instructions": str(raw.get("instructions", ""))[:2000],
@@ -5506,6 +5524,9 @@ def web_state() -> dict:
                "remaining": list(_rr_remaining), "last": _rr_last},
         "signal_count": signal_count,
         "session_contracts": sorted(session_contracts),
+        "last_manual": dict(_last_manual),
+        "micro_map": dict(micro_map),
+        "rule_defaults": dict(DEFAULT_RULE),
         "events": list(_web_events),
         "profiles": account_profiles,
         "server": _server_name,
@@ -5552,6 +5573,8 @@ async def _web_toggle_micro() -> tuple[bool, str]:
 
 async def _web_set_accounts(leader, followers, robins) -> tuple[bool, str]:
     global active_account, follower_accounts, roundrobin_accounts
+    if hard_stopped:
+        return False, "session hard-locked — settings are frozen"
     lead = sanitize_ati(str(leader or "").strip())
     if not lead:
         return False, "leader account required"
@@ -5563,7 +5586,7 @@ async def _web_set_accounts(leader, followers, robins) -> tuple[bool, str]:
     active_account = lead
     follower_accounts = fols
     roundrobin_accounts = sanitize_roundrobin(
-        [str(r).strip() for r in (robins or [])], lead, fols)
+        [sanitize_ati(str(r).strip()) for r in (robins or [])], lead, fols)
     _rr_reset_rotation()
     cfg = load_config()
     cfg["account"] = active_account
@@ -5579,6 +5602,8 @@ async def _web_set_accounts(leader, followers, robins) -> tuple[bool, str]:
 
 async def _web_set_strategy(name, follow_publisher=None) -> tuple[bool, str]:
     global atm_strategy, follow_publisher_strategy
+    if hard_stopped:
+        return False, "session hard-locked — settings are frozen"
     cfg = load_config()
     msg_bits = []
     if name is not None:
@@ -5601,27 +5626,133 @@ async def _web_set_strategy(name, follow_publisher=None) -> tuple[bool, str]:
 
 
 async def _web_set_limits(account, target, target_mode, stop, stop_mode) -> tuple[bool, str]:
+    # Risk limits are a safety control: a hard-locked session freezes them so
+    # they cannot be weakened while a lockout is in force.
+    if hard_stopped:
+        return False, "session hard-locked — limits are frozen"
     acct = sanitize_ati(str(account or "").strip())
     if not acct:
         return False, "account required"
+    modes = {"off", "soft", "hard"}
+    t_mode = str(target_mode or "off").strip().lower()
+    s_mode = str(stop_mode or "off").strip().lower()
+    if t_mode not in modes or s_mode not in modes:
+        return False, "mode must be off, soft or hard"
     try:
-        set_account_limits(acct, float(target or 0), str(target_mode or "off"),
-                           float(stop or 0), str(stop_mode or "off"))
+        set_account_limits(acct, float(target or 0), t_mode, float(stop or 0), s_mode)
     except (TypeError, ValueError) as exc:
         return False, f"invalid limits: {exc}"
     logger.info(f"WEB LIMITS  {acct}  target={target}/{target_mode}  stop={stop}/{stop_mode}")
     return True, f"limits saved for {acct}"
 
 
+def _strip_ai_config(raw):
+    """Remove every `ai` key from a profiles payload arriving over HTTP.
+
+    An AI gate names an outbound endpoint and an environment variable whose
+    value is sent as a bearer token, so accepting one over the web API would
+    turn a single request into "POST my API key to this host". AI gates are
+    configured from the terminal editor only; existing ones are preserved
+    untouched by _web_set_profiles.
+    """
+    if isinstance(raw, dict):
+        return {k: _strip_ai_config(v) for k, v in raw.items() if k != "ai"}
+    if isinstance(raw, list):
+        return [_strip_ai_config(v) for v in raw]
+    return raw
+
+
+def _restore_ai_config(cleaned: dict, previous: dict) -> dict:
+    """Carry each rule's existing AI gate across a web profile update."""
+    for acct, prof in cleaned.items():
+        old = previous.get(acct, {})
+        if old.get("default", {}).get("ai") and prof.get("default") is not None:
+            prof["default"]["ai"] = old["default"]["ai"]
+        old_rules = old.get("rules", [])
+        for i, rule in enumerate(prof.get("rules", [])):
+            if i < len(old_rules) and old_rules[i].get("ai"):
+                rule["ai"] = old_rules[i]["ai"]
+    return cleaned
+
+
 async def _web_set_profiles(raw) -> tuple[bool, str]:
+    if hard_stopped:
+        return False, "session hard-locked — settings are frozen"
     if not isinstance(raw, dict):
         return False, "profiles must be a JSON object keyed by account"
-    cleaned = load_account_profiles({"account_profiles": raw})
+    previous = {a: json.loads(json.dumps(p)) for a, p in account_profiles.items()}
+    cleaned = load_account_profiles({"account_profiles": _strip_ai_config(raw)})
+    cleaned = _restore_ai_config(cleaned, previous)
     account_profiles.clear()
     account_profiles.update(cleaned)
     save_account_profiles()
     refresh_header_status()
     return True, f"profiles saved for {', '.join(sorted(cleaned)) or 'no accounts'}"
+
+
+async def _web_reset_pnl() -> tuple[bool, str]:
+    # Same path as the terminal's B → R: re-snapshot from the balances the
+    # balance monitor already keeps current.
+    reset_session_pnl()
+    refresh_header_status()
+    _dash_set_alert(Fore.GREEN + "  ↺  SESSION P&L RESET from web UI" + Style.RESET_ALL)
+    logger.info("WEB RESET P&L")
+    return True, "session P&L reset — balances re-snapshotted"
+
+
+def _web_positions() -> list[dict]:
+    """Open positions across every managed account (for the web panel)."""
+    out: list[dict] = []
+    for account in target_accounts():
+        try:
+            for instrument, qty in query_nt_positions(account, nt_port).items():
+                if qty:
+                    out.append({"account": account, "instrument": instrument,
+                                "qty": qty})
+        except Exception as exc:
+            logger.error(f"WEB POSITIONS  {account}  {exc}")
+    return out
+
+
+async def _web_close_position(account, instrument) -> tuple[bool, str]:
+    acct = sanitize_ati(str(account or "").strip())
+    instr = sanitize_ati(str(instrument or "").strip())
+    if not acct or not instr:
+        return False, "account and instrument required"
+    if acct not in target_accounts():
+        return False, f"{acct} is not a managed account"
+    await asyncio.to_thread(fire_close_position, acct, instr)
+    _dash_set_alert(Fore.RED + f"  ⛔  CLOSE {instr} on {acct} (web)" + Style.RESET_ALL)
+    return True, f"close sent — {instr} on {acct}"
+
+
+async def _web_set_micro_map(raw) -> tuple[bool, str]:
+    """Persist micro-contract overrides ({"GC": "MGC"} style) from the web UI."""
+    if hard_stopped:
+        return False, "session hard-locked — settings are frozen"
+    if not isinstance(raw, dict):
+        return False, "micro map must be a JSON object"
+    global micro_map
+    cfg = load_config()
+    overrides = {}
+    for k, v in raw.items():
+        key = sanitize_ati(str(k).strip().upper())
+        val = sanitize_ati(str(v).strip().upper())
+        if key and val:
+            overrides[key] = val
+    cfg["micro_map"] = overrides
+    save_config(cfg)
+    micro_map = load_micro_map(cfg)
+    return True, f"{len(overrides)} micro override(s) saved"
+
+
+def _web_nt_accounts() -> list[str]:
+    """Account names NinjaTrader reports, for click-to-pick in the web UI."""
+    try:
+        return [a["name"] for a in query_nt_accounts(nt_port)]
+    except Exception as exc:
+        logger.error(f"WEB NT ACCOUNTS  {exc}")
+        return []
 
 
 def _web_run(coro, timeout: float = 20.0):
@@ -5631,7 +5762,28 @@ def _web_run(coro, timeout: float = 20.0):
     return asyncio.run_coroutine_threadsafe(coro, _web_loop).result(timeout)
 
 
+# The web UI controls real money, so the loopback bind is NOT treated as the
+# security boundary — a browser on this machine can be driven to it by any
+# page the user visits. Three checks gate every request:
+#   Host   — must be loopback, so a rebound DNS name can't reach the API
+#   Origin — when present it must be our own origin (blocks cross-site POSTs)
+#   Token  — a per-process secret embedded in the page and echoed in a custom
+#            request header, which a cross-origin caller cannot set without a
+#            preflight the server never approves
+_web_token = ""
+_WEB_TOKEN_HEADER = "X-ST-Token"
+
+
+def _web_allowed_hosts() -> set[str]:
+    port = _web_httpd.server_address[1] if _web_httpd else 0
+    hosts = {"127.0.0.1", "localhost", "[::1]", "::1"}
+    return hosts | {f"{h}:{port}" for h in hosts}
+
+
 class _WebHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "SocketTrader"
+    sys_version = ""
+
     def log_message(self, *args):  # keep the TUI clean
         pass
 
@@ -5640,6 +5792,13 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+            "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(body)
 
@@ -5647,14 +5806,42 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
         self._reply(code, json.dumps(obj).encode("utf-8"),
                     "application/json; charset=utf-8")
 
+    def _host_ok(self) -> bool:
+        """Reject DNS-rebinding: the Host must name loopback, not a domain."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        return host in _web_allowed_hosts()
+
+    def _origin_ok(self) -> bool:
+        """A cross-site page's POST carries a foreign Origin — refuse it."""
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return True  # same-origin fetch/XHR may omit it; token still required
+        try:
+            netloc = urllib.parse.urlparse(origin).netloc.lower()
+        except ValueError:
+            return False
+        return netloc in _web_allowed_hosts()
+
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
         try:
+            if not self._host_ok():
+                self._json({"ok": False, "message": "forbidden host"}, 403)
+                return
             if path == "/":
-                self._reply(200, WEB_UI_HTML.encode("utf-8"),
-                            "text/html; charset=utf-8")
+                page = WEB_UI_HTML.replace("__ST_TOKEN__", _web_token)
+                self._reply(200, page.encode("utf-8"), "text/html; charset=utf-8")
             elif path == "/api/state":
+                if not self._token_ok():
+                    self._json({"ok": False, "message": "forbidden"}, 403)
+                    return
                 self._json(web_state())
+            elif path == "/api/positions":
+                if not self._token_ok():
+                    self._json({"ok": False, "message": "forbidden"}, 403)
+                    return
+                self._json({"positions": _web_positions(),
+                            "nt_accounts": _web_nt_accounts()})
             else:
                 self._json({"ok": False, "message": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -5662,14 +5849,31 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             logger.error(f"WEB GET {path}  {exc}")
             try:
-                self._json({"ok": False, "message": str(exc)}, 500)
+                self._json({"ok": False, "message": "internal error"}, 500)
             except OSError:
                 pass
 
+    def _token_ok(self) -> bool:
+        sent = self.headers.get(_WEB_TOKEN_HEADER) or ""
+        return bool(_web_token) and secrets.compare_digest(sent, _web_token)
+
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        if not self._host_ok():
+            self._json({"ok": False, "message": "forbidden host"}, 403)
+            return
+        if not self._origin_ok() or not self._token_ok():
+            logger.warning(f"WEB POST {path}  rejected — bad origin or token")
+            self._json({"ok": False, "message": "forbidden"}, 403)
+            return
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype != "application/json":
+            self._json({"ok": False, "message": "content-type must be application/json"}, 415)
+            return
         try:
             length = int(self.headers.get("Content-Length") or 0)
+            if length > 1_000_000:
+                raise ValueError("body too large")
             data = json.loads(self.rfile.read(length) or b"{}") if length else {}
             if not isinstance(data, dict):
                 raise ValueError("body must be a JSON object")
@@ -5686,11 +5890,18 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
                 ok, msg = _web_run(_web_toggle_pause(data.get("paused", True)))
             elif path == "/api/close_all":
                 ok, msg = _web_run(_web_close_all(), timeout=30.0)
+            elif path == "/api/close_position":
+                ok, msg = _web_run(_web_close_position(
+                    data.get("account"), data.get("instrument")), timeout=30.0)
+            elif path == "/api/reset_pnl":
+                ok, msg = _web_run(_web_reset_pnl())
             elif path == "/api/reconnect":
                 _web_loop.call_soon_threadsafe(reconnect_event.set)
                 ok, msg = True, "reconnect requested"
             elif path == "/api/micro":
                 ok, msg = _web_run(_web_toggle_micro())
+            elif path == "/api/micro_map":
+                ok, msg = _web_run(_web_set_micro_map(data.get("map")))
             elif path == "/api/accounts":
                 ok, msg = _web_run(_web_set_accounts(
                     data.get("leader"), data.get("followers"),
@@ -5714,14 +5925,14 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             logger.error(f"WEB POST {path}  {exc}")
             try:
-                self._json({"ok": False, "message": str(exc)}, 500)
+                self._json({"ok": False, "message": "internal error"}, 500)
             except OSError:
                 pass
 
 
 def start_web_ui(loop: asyncio.AbstractEventLoop, cfg: dict) -> str | None:
     """Start the localhost web UI. Returns the URL, or None when disabled."""
-    global _web_loop, _web_httpd, _web_url
+    global _web_loop, _web_httpd, _web_url, _web_token
     if not bool(cfg.get("webui_enabled", True)):
         return None
     try:
@@ -5729,6 +5940,7 @@ def start_web_ui(loop: asyncio.AbstractEventLoop, cfg: dict) -> str | None:
     except (TypeError, ValueError):
         port = 8720
     _web_loop = loop
+    _web_token = secrets.token_urlsafe(32)
     try:
         httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), _WebHandler)
     except OSError as exc:
@@ -5762,204 +5974,670 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SocketTrader</title>
 <style>
-:root{--bg:#0b0e14;--panel:#12161f;--edge:#1f2633;--fg:#d7dde8;--dim:#7a8598;
---green:#3fb68b;--red:#e05561;--yellow:#d7a65f;--cyan:#4db3c8;--acc:#4db3c8}
+:root{
+--bg:#0a0d13;--panel:#111621;--panel2:#161c2a;--edge:#222b3d;--edge2:#2e3a52;
+--fg:#dbe2ee;--dim:#7d8aa3;--mute:#4d5769;
+--green:#33c48d;--green-d:#123a2c;--red:#ef5f6b;--red-d:#3d1418;
+--yellow:#e0b15c;--cyan:#4fb6d4;--violet:#8b7fd4;--acc:#4fb6d4;
+--shadow:0 6px 24px rgba(0,0,0,.45);
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--fg);font:14px/1.45 ui-monospace,Menlo,Consolas,monospace;padding:14px}
-h1{font-size:16px;letter-spacing:2px}
-h2{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
-.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));margin-top:12px}
-.panel{background:var(--panel);border:1px solid var(--edge);border-radius:8px;padding:12px}
-.wide{grid-column:1/-1}
-.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-.chip{border:1px solid var(--edge);border-radius:999px;padding:2px 10px;font-size:12px;color:var(--dim)}
-.chip.on{color:var(--green);border-color:var(--green)}
-.chip.warn{color:var(--yellow);border-color:var(--yellow)}
-.chip.bad{color:var(--red);border-color:var(--red)}
-button{background:#1a2130;border:1px solid var(--edge);color:var(--fg);border-radius:6px;
-padding:7px 12px;font:inherit;cursor:pointer}
-button:hover{border-color:var(--acc)}
-button.buy{border-color:var(--green);color:var(--green)}
-button.sell{border-color:var(--red);color:var(--red)}
-button.danger{border-color:var(--red);color:var(--red)}
-button.sel{background:var(--acc);color:#08222a;border-color:var(--acc)}
-button.sel.buy{background:var(--green);color:#04140d;border-color:var(--green)}
-button.sel.sell{background:var(--red);color:#1c0507;border-color:var(--red)}
-input,select,textarea{background:#0e1320;border:1px solid var(--edge);color:var(--fg);
-border-radius:6px;padding:6px 8px;font:inherit;width:100%}
-label{font-size:11px;color:var(--dim);display:block;margin:8px 0 3px;text-transform:uppercase}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{color:var(--dim);text-align:left;font-weight:normal;border-bottom:1px solid var(--edge);padding:4px 6px}
-td{padding:5px 6px;border-bottom:1px solid #161c28}
+body{background:var(--bg);color:var(--fg);padding:0 0 40px;
+font:13.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:var(--edge2);border-radius:5px}
+::-webkit-scrollbar-track{background:transparent}
+
+/* ---------- top bar ---------- */
+#top{position:sticky;top:0;z-index:20;background:rgba(10,13,19,.96);
+border-bottom:1px solid var(--edge);padding:9px 14px;
+display:flex;gap:10px;align-items:center;flex-wrap:wrap;backdrop-filter:blur(6px)}
+.brand{font-weight:700;letter-spacing:3px;font-size:14px;color:var(--fg)}
+.brand span{color:var(--acc)}
+.spacer{flex:1}
+.chip{border:1px solid var(--edge2);border-radius:999px;padding:3px 11px;font-size:11.5px;
+color:var(--dim);white-space:nowrap;letter-spacing:.4px}
+.chip.on{color:var(--green);border-color:#1e6b4f;background:var(--green-d)}
+.chip.warn{color:var(--yellow);border-color:#6b5622;background:#302713}
+.chip.bad{color:var(--red);border-color:#7a2830;background:var(--red-d)}
+.chip.info{color:var(--cyan);border-color:#255f72;background:#0e2b34}
+
+/* ---------- layout ---------- */
+.wrap{padding:14px;display:grid;gap:13px;
+grid-template-columns:minmax(340px,1.05fr) minmax(380px,1.5fr)}
+@media(max-width:900px){.wrap{grid-template-columns:1fr}}
+.col{display:grid;gap:13px;align-content:start}
+.card{background:var(--panel);border:1px solid var(--edge);border-radius:11px;
+padding:13px;box-shadow:var(--shadow)}
+.card>h2{font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:1.6px;
+margin-bottom:11px;display:flex;align-items:center;gap:8px}
+.card>h2 .hint{margin-left:auto;text-transform:none;letter-spacing:0;font-size:11px;color:var(--mute)}
+
+/* ---------- buttons ---------- */
+button{background:var(--panel2);border:1px solid var(--edge2);color:var(--fg);
+border-radius:8px;padding:9px 13px;font:inherit;cursor:pointer;transition:.12s;white-space:nowrap}
+button:hover{border-color:var(--acc);background:#1b2434}
+button:active{transform:translateY(1px)}
+button.sm{padding:5px 9px;font-size:12px;border-radius:6px}
+button.tiny{padding:3px 7px;font-size:11px;border-radius:5px}
+button.wide{width:100%}
+button.on{background:var(--acc);border-color:var(--acc);color:#06222c;font-weight:700}
+button.buy.on{background:var(--green);border-color:var(--green);color:#04150e}
+button.sell.on{background:var(--red);border-color:var(--red);color:#1b0407}
+button.danger{color:var(--red);border-color:#5c2129}
+button.danger:hover{background:var(--red-d);border-color:var(--red)}
+button.ghost{background:transparent;color:var(--dim)}
+button.ghost:hover{color:var(--fg)}
+button:disabled{opacity:.4;cursor:not-allowed}
+.btnrow{display:flex;gap:7px;flex-wrap:wrap}
+.seg{display:flex;gap:0;border:1px solid var(--edge2);border-radius:8px;overflow:hidden}
+.seg button{border:0;border-radius:0;flex:1;background:transparent}
+.seg button+button{border-left:1px solid var(--edge2)}
+
+/* ---------- inputs ---------- */
+label{font-size:10px;color:var(--dim);display:block;margin:10px 0 4px;
+text-transform:uppercase;letter-spacing:1.2px}
+input,select{background:#0c111b;border:1px solid var(--edge2);color:var(--fg);
+border-radius:8px;padding:9px 10px;font:inherit;width:100%}
+input:focus,select:focus{outline:0;border-color:var(--acc)}
+input:disabled{opacity:.35}
+.stepper{display:flex;gap:7px;align-items:center}
+.stepper input{text-align:center;font-size:19px;font-weight:700;padding:7px}
+.stepper button{width:44px;font-size:18px;padding:6px 0;text-align:center}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.row3{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}
+
+/* ---------- ticket ---------- */
+#ticket.buy{border-color:#1e6b4f}
+#ticket.sell{border-color:#7a2830}
+#submit{width:100%;padding:15px;font-size:15px;font-weight:700;letter-spacing:1.4px;margin-top:12px}
+#submit.buy{background:var(--green);border-color:var(--green);color:#04150e}
+#submit.sell{background:var(--red);border-color:var(--red);color:#1b0407}
+#submit:hover{filter:brightness(1.12)}
+#tSummary{text-align:center;color:var(--dim);font-size:11.5px;margin-top:8px;min-height:16px}
+
+/* ---------- tables ---------- */
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{color:var(--dim);text-align:left;font-weight:400;font-size:10px;letter-spacing:1.1px;
+text-transform:uppercase;border-bottom:1px solid var(--edge);padding:5px 7px}
+td{padding:7px;border-bottom:1px solid #151b28;vertical-align:middle}
+tr:last-child td{border-bottom:0}
+tr.clickable{cursor:pointer}
+tr.clickable:hover td{background:#141b28}
 .pos{color:var(--green)}.neg{color:var(--red)}.dim{color:var(--dim)}
-#feed{max-height:340px;overflow-y:auto;font-size:12.5px}
-#feed div{padding:2px 0;border-bottom:1px solid #141a26}
-#toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:#1a2130;
-border:1px solid var(--acc);border-radius:8px;padding:10px 16px;display:none;max-width:90vw;z-index:9}
-#toast.bad{border-color:var(--red);color:var(--red)}
-.row{display:flex;gap:8px}.row>*{flex:1}
-details summary{cursor:pointer;color:var(--dim);margin-bottom:8px}
-textarea{font-size:12px;min-height:170px;white-space:pre}
-small{color:var(--dim)}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.tag{font-size:10px;padding:2px 7px;border-radius:4px;border:1px solid var(--edge2);color:var(--dim)}
+.tag.lead{color:var(--cyan);border-color:#255f72}
+.tag.fol{color:var(--violet);border-color:#453d78}
+.tag.rr{color:var(--yellow);border-color:#6b5622}
+
+/* ---------- feed ---------- */
+#feed{max-height:270px;overflow-y:auto;font-size:12px}
+#feed div{padding:3px 2px;border-bottom:1px solid #141a26;display:flex;gap:9px}
+#feed div:last-child{border-bottom:0}
+#feed .t{color:var(--mute);flex-shrink:0}
+.empty{color:var(--mute);font-size:12px;padding:10px 2px;text-align:center}
+
+/* ---------- modal ---------- */
+#veil{position:fixed;inset:0;background:rgba(4,6,10,.78);display:none;z-index:50;
+padding:22px;overflow-y:auto;backdrop-filter:blur(3px)}
+#veil.show{display:block}
+#modal{max-width:640px;margin:0 auto;background:var(--panel);border:1px solid var(--edge2);
+border-radius:13px;padding:17px;box-shadow:var(--shadow)}
+#modal h3{font-size:13px;letter-spacing:1.4px;margin-bottom:3px}
+#modal .sub{color:var(--dim);font-size:11.5px;margin-bottom:13px}
+.fieldset{border-top:1px solid var(--edge);padding-top:11px;margin-top:13px}
+.fieldset:first-of-type{border-top:0;margin-top:0}
+.chiplist{display:flex;gap:6px;flex-wrap:wrap;margin-top:5px}
+.pick{border:1px solid var(--edge2);border-radius:7px;padding:5px 10px;cursor:pointer;
+font-size:12px;background:var(--panel2);color:var(--dim);transition:.12s}
+.pick:hover{border-color:var(--acc);color:var(--fg)}
+.pick.on{background:var(--acc);border-color:var(--acc);color:#06222c;font-weight:700}
+.pick.on.g{background:var(--green);border-color:var(--green);color:#04150e}
+.pick.on.r{background:var(--red);border-color:var(--red);color:#1b0407}
+
+#toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#18202e;
+border:1px solid var(--acc);border-radius:9px;padding:11px 17px;display:none;
+max-width:92vw;z-index:99;box-shadow:var(--shadow);font-size:12.5px}
+#toast.bad{border-color:var(--red);color:#ffb9be}
+#toast.good{border-color:var(--green);color:#a9edcf}
 </style></head><body>
-<div class="bar">
-<h1>SOCKET TRADER <span id="ver" class="dim"></span></h1>
-<span class="chip" id="chState">…</span>
-<span class="chip" id="chReady">…</span>
-<span class="chip" id="chMicro">micros</span>
-<span class="chip" id="chAtm">…</span>
-<span class="chip dim" id="chCount"></span>
+
+<div id="top">
+  <div class="brand">SOCKET<span>TRADER</span></div>
+  <span class="chip" id="chState">connecting…</span>
+  <span class="chip" id="chReady"></span>
+  <span class="chip" id="chAtm"></span>
+  <span class="chip" id="chMicro"></span>
+  <div class="spacer"></div>
+  <span class="chip dim" id="chCount"></span>
+  <span class="chip dim" id="chVer"></span>
 </div>
-<div class="grid">
-<div class="panel">
-<h2>Actions</h2>
-<div class="bar">
-<button id="btnPause"></button>
-<button class="danger" onclick="closeAll()">CLOSE ALL</button>
-<button onclick="post('/api/reconnect',{})">RECONNECT</button>
-<button onclick="post('/api/micro',{})">MICRO TOGGLE</button>
+
+<div class="wrap">
+  <div class="col">
+
+    <div class="card" id="ticket">
+      <h2>Order ticket <span class="hint" id="tFan"></span></h2>
+      <div class="row2">
+        <button class="buy" id="sideB" data-side="long">BUY / LONG</button>
+        <button class="sell" id="sideS" data-side="short">SELL / SHORT</button>
+      </div>
+
+      <label>Instrument</label>
+      <div class="chiplist" id="instrChips"></div>
+      <input id="tInstr" placeholder="NQ 09-26" style="margin-top:7px">
+
+      <label>Contracts</label>
+      <div class="stepper">
+        <button id="qtyMinus">&minus;</button>
+        <input id="tQty" type="number" min="1" max="1000" value="1">
+        <button id="qtyPlus">+</button>
+      </div>
+      <div class="chiplist" id="qtyChips"></div>
+
+      <div class="row2">
+        <div>
+          <label>Type</label>
+          <div class="seg">
+            <button id="typeM" data-type="market">MARKET</button>
+            <button id="typeL" data-type="limit">LIMIT</button>
+          </div>
+        </div>
+        <div>
+          <label>Limit price</label>
+          <input id="tPrice" type="number" step="0.25" disabled placeholder="—">
+        </div>
+      </div>
+
+      <label>ATM template</label>
+      <select id="tAtm"></select>
+
+      <button id="submit" class="buy">SUBMIT</button>
+      <div id="tSummary"></div>
+    </div>
+
+    <div class="card">
+      <h2>Controls</h2>
+      <div class="btnrow">
+        <button id="btnPause"></button>
+        <button class="sm" id="btnReconnect">RECONNECT</button>
+        <button class="sm" id="btnMicro">MICROS</button>
+        <button class="sm" id="btnResetPnl">RESET P&amp;L</button>
+        <button class="sm danger" id="btnFlatten">FLATTEN ALL</button>
+      </div>
+      <div class="btnrow" style="margin-top:9px">
+        <button class="sm ghost" id="btnAccounts">ACCOUNTS…</button>
+        <button class="sm ghost" id="btnStrategy">STRATEGY…</button>
+        <button class="sm ghost" id="btnMicroMap">MICRO MAP…</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Open positions <span class="hint" id="posHint"></span></h2>
+      <div id="posWrap"></div>
+    </div>
+
+  </div>
+
+  <div class="col">
+
+    <div class="card">
+      <h2>Accounts <span class="hint">click a row to edit profile &amp; limits</span></h2>
+      <div id="acctWrap"></div>
+      <div id="rrline" class="dim" style="margin-top:8px;font-size:11.5px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Activity</h2>
+      <div id="feed"></div>
+    </div>
+
+  </div>
 </div>
-</div>
-<div class="panel">
-<h2>Manual order</h2>
-<div class="row">
-<button class="buy" id="sideB" onclick="setSide('long')">BUY / LONG</button>
-<button class="sell" id="sideS" onclick="setSide('short')">SELL / SHORT</button>
-</div>
-<div class="row">
-<div><label>Instrument</label><input id="tInstr" placeholder="NQ 09-26"></div>
-<div><label>Contracts</label><input id="tQty" type="number" min="1" value="1"></div>
-</div>
-<div class="row">
-<div><label>Type</label><select id="tType" onchange="typeChanged()">
-<option value="market">MARKET</option><option value="limit">LIMIT</option></select></div>
-<div><label>Limit price</label><input id="tPrice" type="number" step="0.25" disabled></div>
-</div>
-<label>ATM template</label><select id="tAtm"></select>
-<div style="margin-top:10px"><button onclick="trade()" style="width:100%">SUBMIT ORDER</button></div>
-</div>
-<div class="panel wide">
-<h2>Accounts</h2>
-<table><thead><tr><th>Account</th><th>Role</th><th>Profile</th><th>Start</th>
-<th>Now</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody id="accts"></tbody></table>
-<div id="rrline" class="dim" style="margin-top:6px"></div>
-</div>
-<div class="panel wide">
-<h2>Feed</h2>
-<div id="feed"></div>
-</div>
-<div class="panel wide"><details><summary>Settings — accounts · strategy · limits · profiles</summary>
-<div class="grid" style="margin-top:0">
-<div>
-<h2>Accounts</h2>
-<label>Leader</label><input id="aLeader">
-<label>Followers (space separated)</label><input id="aFollowers">
-<label>Round-robin pool (space separated)</label><input id="aRobins">
-<div style="margin-top:8px"><button onclick="saveAccounts()">SAVE ACCOUNTS</button></div>
-</div>
-<div>
-<h2>Strategy</h2>
-<label>Session ATM strategy</label><select id="sAtm"></select>
-<label><input type="checkbox" id="sFollow" style="width:auto"> follow publisher's strategy</label>
-<div style="margin-top:8px"><button onclick="saveStrategy()">SAVE STRATEGY</button></div>
-<h2 style="margin-top:14px">Limits</h2>
-<label>Account</label><select id="lAcct"></select>
-<div class="row">
-<div><label>Target</label><input id="lTarget" type="number" step="1"></div>
-<div><label>Mode</label><input id="lTargetMode" placeholder="off / $ / %"></div>
-</div>
-<div class="row">
-<div><label>Stop</label><input id="lStop" type="number" step="1"></div>
-<div><label>Mode</label><input id="lStopMode" placeholder="off / $ / %"></div>
-</div>
-<div style="margin-top:8px"><button onclick="saveLimits()">SAVE LIMITS</button></div>
-</div>
-<div>
-<h2>Profiles (JSON)</h2>
-<textarea id="pJson" spellcheck="false"></textarea>
-<div style="margin-top:8px"><button onclick="saveProfiles()">SAVE PROFILES</button>
-<small> — same schema as account_profiles in config</small></div>
-</div>
-</div></details></div>
-</div>
+
+<div id="veil"><div id="modal"></div></div>
 <div id="toast"></div>
+
 <script>
-let S=null,side='long',editing=false;
+"use strict";
+const TOKEN="__ST_TOKEN__";
 const $=id=>document.getElementById(id);
-document.addEventListener('focusin',e=>{if(e.target.closest('details'))editing=true});
-function toast(m,bad){const t=$('toast');t.textContent=m;t.className=bad?'bad':'';
-t.style.display='block';clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',5000)}
-async function post(p,body){try{const r=await fetch(p,{method:'POST',
-headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-const j=await r.json();toast(j.message,!j.ok);refresh();return j}
-catch(e){toast('request failed: '+e,true)}}
-function setSide(s){side=s;$('sideB').classList.toggle('sel',s==='long');
-$('sideS').classList.toggle('sel',s==='short')}
-function typeChanged(){$('tPrice').disabled=$('tType').value!=='limit'}
-function trade(){const q=$('tQty').value,i=$('tInstr').value;
-if(!i.trim())return toast('instrument required',true);
-const t=$('tType').value,msg=side.toUpperCase()+' '+q+' '+i+' '+t.toUpperCase()+
-(t==='limit'?' @ '+$('tPrice').value:'');
-if(!confirm('Submit '+msg+' (fans out to copy/round-robin accounts)?'))return;
-post('/api/trade',{side:side,instrument:i,qty:q,order_type:t,
-limit_price:$('tPrice').value,atm:$('tAtm').value})}
-function closeAll(){if(confirm('Flatten ALL positions on every managed account?'))
-post('/api/close_all',{})}
-function saveAccounts(){post('/api/accounts',{leader:$('aLeader').value,
-followers:$('aFollowers').value.split(/[\s,]+/).filter(Boolean),
-roundrobin:$('aRobins').value.split(/[\s,]+/).filter(Boolean)});editing=false}
-function saveStrategy(){post('/api/strategy',{name:$('sAtm').value,
-follow_publisher:$('sFollow').checked});editing=false}
-function saveLimits(){post('/api/limits',{account:$('lAcct').value,
-target:$('lTarget').value,target_mode:$('lTargetMode').value,
-stop:$('lStop').value,stop_mode:$('lStopMode').value});editing=false}
-function saveProfiles(){let p;try{p=JSON.parse($('pJson').value||'{}')}
-catch(e){return toast('invalid JSON: '+e,true)}
-post('/api/profiles',{profiles:p});editing=false}
-function fmt(v){return v==null?'—':(+v).toLocaleString(undefined,{maximumFractionDigits:2})}
-function fillSel(sel,opts,cur){const el=$(sel);
-if(document.activeElement===el)return;el.innerHTML='';
-opts.forEach(o=>{const x=document.createElement('option');x.value=x.textContent=o;el.appendChild(x)});
-if(cur&&!opts.includes(cur)){const x=document.createElement('option');
-x.value=x.textContent=cur;el.appendChild(x)}if(cur)el.value=cur}
-function render(){if(!S)return;$('ver').textContent='v'+S.version;
-const st=$('chState');st.textContent=S.status_text||S.state;
-st.className='chip '+(S.hard_stopped?'bad':S.paused?'warn':'on');
-const rd=$('chReady');rd.textContent=S.trade_ready?'READY':'NOT READY';
-rd.className='chip '+(S.trade_ready?'on':'bad');
-const mc=$('chMicro');mc.textContent=S.micro_mode?'MICROS ON':'micros off';
-mc.className='chip '+(S.micro_mode?'on':'');
-$('chAtm').textContent='ATM '+(S.atm_strategy||'—')+(S.follow_publisher_strategy?' (follow)':'');
-$('chCount').textContent=S.signal_count+' signals';
-$('btnPause').textContent=S.paused?'RESUME':'PAUSE';
-$('btnPause').onclick=()=>post('/api/pause',{paused:!S.paused});
-const tb=$('accts');tb.innerHTML='';
-S.accounts.forEach(a=>{const tr=document.createElement('tr');
-const pnl=a.pnl==null?'—':(a.pnl>=0?'+':'')+fmt(a.pnl);
-tr.innerHTML='<td>'+a.name+'</td><td class="dim">'+a.role+'</td>'+
-'<td class="dim">'+a.profile+'</td><td>'+fmt(a.start)+'</td><td>'+fmt(a.current)+'</td>'+
-'<td class="'+(a.pnl>=0?'pos':'neg')+'">'+pnl+'</td>'+
-'<td>'+(a.stop?'<span class="chip bad">'+a.stop+' stop</span>':'<span class="chip on">active</span>')+'</td>';
-tb.appendChild(tr)});
-$('rrline').textContent=S.rr.pool.length?
-('rotation: '+S.rr.pool.join(' → ')+'   owed this round: '+
-(S.rr.remaining.length?S.rr.remaining.join(', '):'(new round next)')+
-(S.rr.last?'   last: '+S.rr.last:'')):'';
-const fd=$('feed');fd.innerHTML='';[...S.events].reverse().forEach(e=>{
-const d=document.createElement('div');
-d.innerHTML='<span class="dim">'+new Date(e.ts*1000).toLocaleTimeString()+'</span>  '+
-e.text.replace(/</g,'&lt;');fd.appendChild(d)});
-fillSel('tAtm',S.atm_available,S.atm_strategy);
-if(!editing){fillSel('sAtm',S.atm_available,S.atm_strategy);
-$('sFollow').checked=S.follow_publisher_strategy;
-$('aLeader').value=S.leader;$('aFollowers').value=S.followers.join(' ');
-$('aRobins').value=S.rr.pool.join(' ');
-fillSel('lAcct',S.accounts.map(a=>a.name),S.leader);
-$('pJson').value=JSON.stringify(S.profiles,null,2);
-if(!$('tInstr').value&&S.session_contracts.length)$('tInstr').value=S.session_contracts[0]}}
-async function refresh(){try{const r=await fetch('/api/state');S=await r.json();render()}
-catch(e){$('chState').textContent='app offline';$('chState').className='chip bad'}}
-setSide('long');typeChanged();refresh();setInterval(refresh,1500);
+let S=null,POS={positions:[],nt_accounts:[]},side="long",otype="market",modalOpen=false;
+
+/* ---------- safe DOM helpers (never innerHTML with server data) ---------- */
+function el(tag,cls,text){const e=document.createElement(tag);
+  if(cls)e.className=cls; if(text!=null)e.textContent=String(text); return e}
+function clear(n){while(n.firstChild)n.removeChild(n.firstChild)}
+function btn(label,cls,fn){const b=el("button",cls,label);b.onclick=fn;return b}
+
+function toast(msg,kind){const t=$("toast");t.textContent=msg;
+  t.className=kind||"";t.style.display="block";
+  clearTimeout(t._h);t._h=setTimeout(()=>t.style.display="none",5200)}
+
+async function api(path,body){
+  try{
+    const r=await fetch(path,{method:"POST",headers:{
+      "Content-Type":"application/json","X-ST-Token":TOKEN},body:JSON.stringify(body||{})});
+    const j=await r.json();
+    toast(j.message,j.ok?"good":"bad");
+    refresh();
+    return j;
+  }catch(e){toast("request failed: "+e,"bad");return{ok:false}}
+}
+async function get(path){
+  const r=await fetch(path,{headers:{"X-ST-Token":TOKEN}});
+  if(!r.ok)throw new Error(r.status);
+  return r.json();
+}
+
+/* ---------- ticket ---------- */
+function setSide(s){side=s;
+  $("sideB").classList.toggle("on",s==="long");
+  $("sideS").classList.toggle("on",s==="short");
+  const t=$("ticket"),b=$("submit");
+  t.classList.toggle("buy",s==="long");t.classList.toggle("sell",s==="short");
+  b.classList.toggle("buy",s==="long");b.classList.toggle("sell",s==="short");
+  summary()}
+function setType(t){otype=t;
+  $("typeM").classList.toggle("on",t==="market");
+  $("typeL").classList.toggle("on",t==="limit");
+  $("tPrice").disabled=(t!=="limit");
+  if(t!=="limit")$("tPrice").value="";
+  summary()}
+function qty(){return Math.max(1,Math.min(1000,parseInt($("tQty").value||"1",10)||1))}
+function bumpQty(d){$("tQty").value=Math.max(1,Math.min(1000,qty()+d));summary()}
+function summary(){
+  const i=$("tInstr").value.trim()||"—";
+  const p=otype==="limit"&&$("tPrice").value?(" @ "+$("tPrice").value):"";
+  $("submit").textContent=(side==="long"?"BUY ":"SELL ")+qty()+" "+i+p;
+  const n=S?S.accounts.length:0;
+  $("tSummary").textContent=n?("fans out through "+n+" managed account"+(n===1?"":"s")+
+    " · profiles, filters and rotation apply"):""}
+function submitOrder(){
+  const instr=$("tInstr").value.trim();
+  if(!instr)return toast("pick an instrument first","bad");
+  api("/api/trade",{side:side,instrument:instr,qty:qty(),order_type:otype,
+    limit_price:$("tPrice").value,atm:$("tAtm").value})}
+
+/* ---------- modal ---------- */
+function openModal(title,sub,build){
+  modalOpen=true;const m=$("modal");clear(m);
+  m.appendChild(el("h3",null,title));
+  if(sub)m.appendChild(el("div","sub",sub));
+  build(m);
+  const foot=el("div","btnrow");foot.style.marginTop="15px";
+  foot.appendChild(btn("CLOSE","ghost sm",closeModal));
+  m.appendChild(foot);
+  $("veil").classList.add("show")}
+function closeModal(){modalOpen=false;$("veil").classList.remove("show");refresh()}
+$("veil").onclick=e=>{if(e.target===$("veil"))closeModal()};
+
+/* pick-group: clickable choices, returns a live getter */
+function pickGroup(parent,options,current,extraCls){
+  const wrap=el("div","chiplist");const state={value:current};
+  options.forEach(o=>{
+    const b=el("div","pick"+(extraCls?" "+extraCls:""),o.label);
+    if(o.value===current)b.classList.add("on");
+    b.onclick=()=>{state.value=o.value;
+      [...wrap.children].forEach(c=>c.classList.remove("on"));
+      b.classList.add("on");
+      if(o.onpick)o.onpick()};
+    b.dataset.v=o.value;wrap.appendChild(b)});
+  parent.appendChild(wrap);return state}
+
+function labeled(parent,text){parent.appendChild(el("label",null,text));return parent}
+function numField(parent,text,value,min,max){
+  parent.appendChild(el("label",null,text));
+  const i=el("input");i.type="number";i.value=value;
+  if(min!=null)i.min=min; if(max!=null)i.max=max;
+  parent.appendChild(i);return i}
+
+/* ---------- accounts modal ---------- */
+function accountsModal(){
+  openModal("ACCOUNTS","Click to assign each account a role. Leader + followers copy every signal; the round-robin pool rotates one entry at a time.",m=>{
+    const known=[];
+    (POS.nt_accounts||[]).forEach(n=>{if(!known.includes(n))known.push(n)});
+    S.accounts.forEach(a=>{if(!known.includes(a.name))known.push(a.name)});
+    const roles={};
+    known.forEach(n=>{roles[n]=n===S.leader?"leader":
+      (S.followers.includes(n)?"follower":(S.rr.pool.includes(n)?"rr":"off"))});
+    const box=el("div");
+    known.forEach(name=>{
+      const row=el("div","fieldset");
+      row.appendChild(el("div",null,name));
+      pickGroup(row,[
+        {label:"OFF",value:"off"},{label:"LEADER",value:"leader"},
+        {label:"FOLLOWER",value:"follower"},{label:"ROUND-ROBIN",value:"rr"}],
+        roles[name],null).onchange=null;
+      const grp=row.lastChild;
+      [...grp.children].forEach(c=>{
+        c.addEventListener("click",()=>{
+          roles[name]=c.dataset.v;
+          if(c.dataset.v==="leader")
+            known.forEach(o=>{if(o!==name&&roles[o]==="leader")roles[o]="off"});
+        })});
+      box.appendChild(row)});
+    m.appendChild(box);
+    const add=el("div","fieldset");
+    add.appendChild(el("label",null,"Add an account not listed"));
+    const ai=el("input");ai.placeholder="account name";add.appendChild(ai);
+    add.appendChild(btn("ADD","sm",()=>{const v=ai.value.trim();
+      if(v){roles[v]="follower";closeModal();setTimeout(accountsModal,60)}}));
+    m.appendChild(add);
+    const save=el("div","fieldset");
+    save.appendChild(btn("SAVE ACCOUNTS","wide on",()=>{
+      const leader=Object.keys(roles).find(k=>roles[k]==="leader");
+      if(!leader)return toast("pick a leader account","bad");
+      api("/api/accounts",{leader:leader,
+        followers:Object.keys(roles).filter(k=>roles[k]==="follower"),
+        roundrobin:Object.keys(roles).filter(k=>roles[k]==="rr")}).then(closeModal)}));
+    m.appendChild(save)})}
+
+/* ---------- strategy modal ---------- */
+function strategyModal(){
+  openModal("STRATEGY","The ATM template applied to entries. LOCKED always uses yours; FOLLOW keeps the publisher's when it is installed locally.",m=>{
+    const f=el("div","fieldset");
+    f.appendChild(el("label",null,"Session ATM template"));
+    const list=(S.atm_available||[]);
+    let chosen={value:S.atm_strategy};
+    if(list.length){chosen=pickGroup(f,list.map(n=>({label:n,value:n})),S.atm_strategy)}
+    else{const i=el("input");i.value=S.atm_strategy||"";f.appendChild(i);
+      chosen={get value(){return i.value}}}
+    m.appendChild(f);
+    const f2=el("div","fieldset");
+    f2.appendChild(el("label",null,"Publisher strategy"));
+    const mode=pickGroup(f2,[{label:"LOCKED — always mine",value:false},
+      {label:"FOLLOW publisher",value:true}],S.follow_publisher_strategy);
+    m.appendChild(f2);
+    const f3=el("div","fieldset");
+    f3.appendChild(btn("SAVE STRATEGY","wide on",()=>{
+      api("/api/strategy",{name:chosen.value,follow_publisher:mode.value}).then(closeModal)}));
+    m.appendChild(f3)})}
+
+/* ---------- micro map modal ---------- */
+function microMapModal(){
+  openModal("MICRO MAP","Full-size root → micro root. Used by micro mode and per-account micro sizing.",m=>{
+    const f=el("div","fieldset");
+    const rows=[];
+    const tbl=el("table");const tb=el("tbody");
+    Object.keys(S.micro_map||{}).sort().forEach(k=>{
+      const tr=el("tr");
+      tr.appendChild(el("td",null,k));
+      const td=el("td");const i=el("input");i.value=S.micro_map[k];
+      td.appendChild(i);tr.appendChild(td);
+      rows.push({root:k,input:i});tb.appendChild(tr)});
+    tbl.appendChild(tb);f.appendChild(tbl);m.appendChild(f);
+    const f2=el("div","fieldset");
+    f2.appendChild(el("label",null,"Add / override (root and micro root)"));
+    const g=el("div","row2");const a=el("input");a.placeholder="GC";
+    const b=el("input");b.placeholder="MGC";g.appendChild(a);g.appendChild(b);
+    f2.appendChild(g);m.appendChild(f2);
+    const f3=el("div","fieldset");
+    f3.appendChild(btn("SAVE MICRO MAP","wide on",()=>{
+      const map={};rows.forEach(r=>{if(r.input.value.trim())map[r.root]=r.input.value.trim()});
+      if(a.value.trim()&&b.value.trim())map[a.value.trim()]=b.value.trim();
+      api("/api/micro_map",{map:map}).then(closeModal)}));
+    m.appendChild(f3)})}
+
+/* ---------- per-account modal: limits + profile ---------- */
+function accountModal(acct){
+  const prof=(S.profiles&&S.profiles[acct])||{};
+  const rule=Object.assign({},S.rule_defaults,prof.default||{});
+  const lim=acct_of(acct).limits||{};
+  openModal(acct,"Risk limits and trade profile for this account.",m=>{
+
+    /* limits */
+    const L=el("div","fieldset");
+    L.appendChild(el("label",null,"Session target"));
+    const tVal=el("input");tVal.type="number";tVal.value=lim.target||0;L.appendChild(tVal);
+    const tMode=pickGroup(L,[{label:"OFF",value:"off"},{label:"SOFT",value:"soft"},
+      {label:"HARD",value:"hard"}],lim.target_mode||"off");
+    L.appendChild(el("label",null,"Session stop"));
+    const sVal=el("input");sVal.type="number";sVal.value=lim.stop||0;L.appendChild(sVal);
+    const sMode=pickGroup(L,[{label:"OFF",value:"off"},{label:"SOFT",value:"soft"},
+      {label:"HARD",value:"hard"}],lim.stop_mode||"off");
+    L.appendChild(btn("SAVE LIMITS","wide sm",()=>{
+      api("/api/limits",{account:acct,target:tVal.value,target_mode:tMode.value,
+        stop:sVal.value,stop_mode:sMode.value})}));
+    m.appendChild(L);
+
+    /* symbols */
+    const P=el("div","fieldset");
+    P.appendChild(el("label",null,"Symbols this account trades (none = all)"));
+    const allowed=(prof.symbols_allowed||[]).slice();
+    const roots=[];
+    Object.keys(S.micro_map||{}).forEach(r=>{if(!roots.includes(r))roots.push(r)});
+    allowed.forEach(r=>{if(!roots.includes(r))roots.push(r)});
+    const symWrap=el("div","chiplist");
+    roots.sort().forEach(r=>{
+      const b=el("div","pick",r);
+      if(allowed.includes(r))b.classList.add("on");
+      b.onclick=()=>{const i=allowed.indexOf(r);
+        if(i<0)allowed.push(r);else allowed.splice(i,1);
+        b.classList.toggle("on")};
+      symWrap.appendChild(b)});
+    P.appendChild(symWrap);
+
+    /* entries on/off */
+    P.appendChild(el("label",null,"Entries"));
+    const enabled=pickGroup(P,[{label:"ON",value:true},
+      {label:"OFF — exits only",value:false}],rule.enabled!==false);
+
+    /* size */
+    P.appendChild(el("label",null,"Contract size"));
+    const size=pickGroup(P,[{label:"INHERIT",value:"inherit"},
+      {label:"MICROS",value:"micros"},{label:"FULL",value:"full"}],rule.size||"inherit");
+
+    /* qty */
+    P.appendChild(el("label",null,"Contracts"));
+    const qmode=pickGroup(P,[{label:"COPY",value:"copy"},{label:"FIXED",value:"fixed"},
+      {label:"MULTIPLE",value:"multiple"}],rule.qty_mode||"copy");
+    const qv=el("input");qv.type="number";qv.step="0.1";qv.value=rule.qty_value!=null?rule.qty_value:1;
+    qv.style.marginTop="6px";P.appendChild(qv);
+    const cap=numField(P,"Max contracts per entry (0 = no cap)",rule.max_contracts||0,0,1000);
+
+    /* direction */
+    P.appendChild(el("label",null,"Direction"));
+    const dir=pickGroup(P,[{label:"NORMAL",value:"normal"},
+      {label:"INVERT — fade",value:"invert"}],rule.direction||"normal");
+
+    /* delay + stagger */
+    const g=el("div","row2");
+    const dl=el("div"),jt=el("div");g.appendChild(dl);g.appendChild(jt);
+    const delay=numField(dl,"Entry delay ms",rule.delay_ms||0,0,600000);
+    const jitter=numField(jt,"Random jitter ms",rule.delay_jitter_ms||0,0,600000);
+    P.appendChild(g);
+    const g2=el("div","row2");
+    const st=el("div"),si=el("div");g2.appendChild(st);g2.appendChild(si);
+    const tranches=numField(st,"Stagger tranches",rule.stagger_entries||1,1,10);
+    const interval=numField(si,"Tranche interval ms",rule.stagger_interval_ms||1000,0,600000);
+    P.appendChild(g2);
+
+    /* atm override */
+    P.appendChild(el("label",null,"ATM override (blank = session strategy)"));
+    const atmSel=el("select");
+    atmSel.appendChild(el("option","",""));
+    (S.atm_available||[]).forEach(n=>{const o=el("option",null,n);o.value=n;atmSel.appendChild(o)});
+    atmSel.value=rule.atm||"";P.appendChild(atmSel);
+
+    if(rule.ai){
+      const note=el("div","sub");note.style.marginTop="10px";
+      note.textContent="AI gate: "+rule.ai.provider+" · "+(rule.ai.model||"default")+
+        " — configure from the terminal (S → profiles).";
+      P.appendChild(note)}
+
+    P.appendChild(btn("SAVE PROFILE","wide on",()=>{
+      const profiles=JSON.parse(JSON.stringify(S.profiles||{}));
+      const entry=profiles[acct]||{};
+      const d=entry.default||{};
+      d.enabled=enabled.value;d.size=size.value;d.qty_mode=qmode.value;
+      d.qty_value=parseFloat(qv.value||"1");d.max_contracts=parseInt(cap.value||"0",10);
+      d.direction=dir.value;d.delay_ms=parseInt(delay.value||"0",10);
+      d.delay_jitter_ms=parseInt(jitter.value||"0",10);
+      d.stagger_entries=parseInt(tranches.value||"1",10);
+      d.stagger_interval_ms=parseInt(interval.value||"1000",10);
+      if(atmSel.value)d.atm=atmSel.value;else delete d.atm;
+      entry.default=d;
+      if(allowed.length)entry.symbols_allowed=allowed;else delete entry.symbols_allowed;
+      profiles[acct]=entry;
+      api("/api/profiles",{profiles:profiles}).then(closeModal)}));
+
+    const reset=el("div","btnrow");reset.style.marginTop="8px";
+    reset.appendChild(btn("RESET TO DEFAULTS","sm danger",()=>{
+      const profiles=JSON.parse(JSON.stringify(S.profiles||{}));
+      delete profiles[acct];
+      api("/api/profiles",{profiles:profiles}).then(closeModal)}));
+    P.appendChild(reset);
+    m.appendChild(P)})}
+
+function acct_of(name){return (S.accounts||[]).find(a=>a.name===name)||{}}
+
+/* ---------- render ---------- */
+function fmt(v){return v==null?"—":Number(v).toLocaleString(undefined,
+  {minimumFractionDigits:2,maximumFractionDigits:2})}
+
+function renderChips(){
+  const st=$("chState");st.textContent=S.status_text||S.state;
+  st.className="chip "+(S.hard_stopped?"bad":S.paused?"warn":"on");
+  const rd=$("chReady");rd.textContent=S.trade_ready?"READY":"NOT READY";
+  rd.className="chip "+(S.trade_ready?"on":"bad");
+  const mc=$("chMicro");mc.textContent=S.micro_mode?"MICROS ON":"micros off";
+  mc.className="chip "+(S.micro_mode?"info":"");
+  $("chAtm").textContent="ATM "+(S.atm_strategy||"—")+(S.follow_publisher_strategy?" · follow":"");
+  $("chCount").textContent=S.signal_count+" signals";
+  $("chVer").textContent="v"+S.version;
+  const p=$("btnPause");p.textContent=S.paused?"▶ RESUME":"⏸ PAUSE";
+  p.className=S.paused?"on":""}
+
+function renderAccounts(){
+  const w=$("acctWrap");clear(w);
+  if(!S.accounts.length){w.appendChild(el("div","empty","No accounts configured — click ACCOUNTS…"));return}
+  const t=el("table"),h=el("thead"),hr=el("tr");
+  ["Account","Role","P&L","Profile","Status"].forEach((x,i)=>{
+    const th=el("th",i===2?"num":null,x);hr.appendChild(th)});
+  h.appendChild(hr);t.appendChild(h);
+  const tb=el("tbody");
+  S.accounts.forEach(a=>{
+    const tr=el("tr","clickable");tr.onclick=()=>accountModal(a.name);
+    tr.appendChild(el("td",null,a.name));
+    const rt=el("td");
+    rt.appendChild(el("span","tag "+(a.role==="leader"?"lead":a.role==="follower"?"fol":"rr"),
+      a.role==="round-robin"?"RR":a.role.toUpperCase()));
+    tr.appendChild(rt);
+    const pnl=el("td","num "+(a.pnl==null?"dim":a.pnl>=0?"pos":"neg"),
+      a.pnl==null?"—":(a.pnl>=0?"+":"")+fmt(a.pnl));
+    tr.appendChild(pnl);
+    tr.appendChild(el("td","dim",a.profile));
+    const stt=el("td");
+    stt.appendChild(a.stop?el("span","tag bad",a.stop.toUpperCase()+" STOP")
+      :el("span","tag","active"));
+    tr.appendChild(stt);
+    tb.appendChild(tr)});
+  t.appendChild(tb);w.appendChild(t);
+  const rr=$("rrline");
+  if(S.rr.pool.length){
+    rr.textContent="rotation "+S.rr.pool.join(" → ")+
+      "   ·   owed this round: "+(S.rr.remaining.length?S.rr.remaining.join(", "):"(reshuffles next)")+
+      (S.rr.last?"   ·   last: "+S.rr.last:"")}
+  else rr.textContent=""}
+
+function renderPositions(){
+  const w=$("posWrap");clear(w);
+  const list=POS.positions||[];
+  $("posHint").textContent=list.length?(list.length+" open"):"";
+  if(!list.length){w.appendChild(el("div","empty","flat — no open positions"));return}
+  const t=el("table"),tb=el("tbody");
+  list.forEach(p=>{
+    const tr=el("tr");
+    tr.appendChild(el("td",null,p.account));
+    tr.appendChild(el("td",null,p.instrument));
+    tr.appendChild(el("td","num "+(p.qty>0?"pos":"neg"),
+      (p.qty>0?"LONG ":"SHORT ")+Math.abs(p.qty)));
+    const td=el("td");td.style.textAlign="right";
+    td.appendChild(btn("CLOSE","tiny danger",()=>{
+      if(confirm("Close "+p.instrument+" on "+p.account+"?"))
+        api("/api/close_position",{account:p.account,instrument:p.instrument})}));
+    tr.appendChild(td);tb.appendChild(tr)});
+  t.appendChild(tb);w.appendChild(t)}
+
+function renderFeed(){
+  const f=$("feed");clear(f);
+  const ev=(S.events||[]).slice().reverse();
+  if(!ev.length){f.appendChild(el("div","empty","waiting for signals…"));return}
+  ev.forEach(e=>{
+    const d=el("div");
+    d.appendChild(el("span","t",new Date(e.ts*1000).toLocaleTimeString()));
+    d.appendChild(el("span",null,e.text));
+    f.appendChild(d)})}
+
+function renderTicketOptions(){
+  const chips=$("instrChips");clear(chips);
+  const seen=[];
+  (POS.positions||[]).forEach(p=>{if(!seen.includes(p.instrument))seen.push(p.instrument)});
+  (S.session_contracts||[]).forEach(c=>{if(!seen.includes(c))seen.push(c)});
+  if(S.last_manual&&S.last_manual.instrument&&!seen.includes(S.last_manual.instrument))
+    seen.push(S.last_manual.instrument);
+  seen.forEach(c=>{
+    const b=el("div","pick",c);
+    if($("tInstr").value.trim()===c)b.classList.add("on");
+    b.onclick=()=>{$("tInstr").value=c;renderTicketOptions();summary()};
+    chips.appendChild(b)});
+  if(!seen.length)chips.appendChild(el("span","dim","type one below — traded instruments appear here"));
+
+  const q=$("qtyChips");clear(q);
+  [1,2,3,5,10].forEach(n=>{
+    const b=el("div","pick",String(n));
+    if(qty()===n)b.classList.add("on");
+    b.onclick=()=>{$("tQty").value=n;renderTicketOptions();summary()};
+    q.appendChild(b)});
+
+  const sel=$("tAtm");
+  if(document.activeElement!==sel){
+    const cur=sel.value||S.atm_strategy;clear(sel);
+    const opts=(S.atm_available||[]).slice();
+    if(S.atm_strategy&&!opts.includes(S.atm_strategy))opts.unshift(S.atm_strategy);
+    opts.forEach(n=>{const o=el("option",null,n);o.value=n;sel.appendChild(o)});
+    if(cur&&opts.includes(cur))sel.value=cur;else if(S.atm_strategy)sel.value=S.atm_strategy}
+  $("tFan").textContent=S.trade_ready?"":"system not ready";
+  $("submit").disabled=!S.trade_ready||S.hard_stopped}
+
+function render(){if(!S)return;
+  renderChips();renderAccounts();renderFeed();
+  if(!modalOpen){renderTicketOptions();renderPositions()}
+  summary()}
+
+async function refresh(){
+  try{S=await get("/api/state");render()}
+  catch(e){const st=$("chState");st.textContent="app offline";st.className="chip bad"}}
+async function refreshPositions(){
+  try{POS=await get("/api/positions");if(!modalOpen)renderPositions()}catch(e){}}
+
+/* ---------- wiring ---------- */
+$("sideB").onclick=()=>setSide("long");
+$("sideS").onclick=()=>setSide("short");
+$("typeM").onclick=()=>setType("market");
+$("typeL").onclick=()=>setType("limit");
+$("qtyMinus").onclick=()=>bumpQty(-1);
+$("qtyPlus").onclick=()=>bumpQty(1);
+$("tQty").oninput=summary;$("tInstr").oninput=summary;$("tPrice").oninput=summary;
+$("submit").onclick=submitOrder;
+$("btnPause").onclick=()=>api("/api/pause",{paused:!S.paused});
+$("btnReconnect").onclick=()=>api("/api/reconnect",{});
+$("btnMicro").onclick=()=>api("/api/micro",{});
+$("btnResetPnl").onclick=()=>{if(confirm("Reset session P&L and re-snapshot balances?"))
+  api("/api/reset_pnl",{})};
+$("btnFlatten").onclick=()=>{if(confirm("Flatten ALL positions on every managed account?"))
+  api("/api/close_all",{})};
+$("btnAccounts").onclick=()=>{if(S)accountsModal()};
+$("btnStrategy").onclick=()=>{if(S)strategyModal()};
+$("btnMicroMap").onclick=()=>{if(S)microMapModal()};
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&modalOpen)closeModal()});
+
+setSide("long");setType("market");
+refresh();refreshPositions();
+setInterval(refresh,1500);
+setInterval(refreshPositions,5000);
 </script></body></html>
 """
 

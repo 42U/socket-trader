@@ -376,14 +376,29 @@ Accounts without a profile behave exactly as before — identical copy of the le
 
 Press **`O`** in the terminal to submit your own order: side (long/short), instrument, contracts, market or limit (with price), and ATM template (ENTER = session strategy). A manual order is dispatched through the **same pipeline as a publisher signal** — it fans out to the leader, followers, and the round-robin rotation, and every per-account profile (symbol filter, micros/full sizing, contract count, ATM override, AI gate) applies. Manual orders always carry an ATM template so stops/targets are attached, and a unique `man…` signal id. Session hard/soft locks block manual trading; **pause does not** — pause mutes the publisher, not you.
 
-A **web UI** starts automatically with the app and prints its address at launch (default `http://127.0.0.1:8720`; it binds to localhost only). It drives the exact same functions as the keyboard:
+A **web UI** starts automatically with the app and prints its address at launch (default `http://127.0.0.1:8720`; it binds to localhost only). It's built for clicking, not typing — everything below is a button, chip, or stepper:
 
-- Live dashboard — status chips, per-account balances/P&L/stops, profiles, rotation state, and the signal/alert feed
-- Manual order ticket (side, instrument, qty, market/limit, ATM)
-- Pause/resume, **close all**, reconnect, micro toggle
-- Settings: leader/followers/round-robin pool, session strategy (locked/follow), per-account risk limits, and the full profiles JSON
+| Panel | What you can do |
+|---|---|
+| **Order ticket** | BUY/SELL toggle, instrument chips (auto-filled from your open positions and session instruments), `−`/`+` contract stepper with 1/2/3/5/10 quick picks, MARKET/LIMIT toggle, ATM dropdown, one big submit button that reads back the order |
+| **Controls** | Pause/resume, reconnect, micro toggle, reset session P&L, flatten all |
+| **Open positions** | Every managed account's live positions with a per-position **CLOSE** button — the web equivalent of the terminal's `C` menu |
+| **Accounts** | Role, P&L, profile summary, and stop status per account; the rotation line shows who's owed a turn. **Click any row** to edit that account |
+| **Account editor** | Risk limits (target/stop with OFF/SOFT/HARD buttons) and the full trade profile — symbol filter chips, entries on/off, size, contracts mode + cap, direction, delay/jitter, stagger, ATM override — all clickable |
+| **Accounts / Strategy / Micro map** | Assign leader, followers, and the round-robin pool by clicking roles against NinjaTrader's account list; pick the session ATM template and locked/follow mode; edit micro-contract mappings |
+| **Activity** | The same signal and alert feed shown in the terminal dashboard |
 
-Config keys: `webui_enabled` (default `true`, set `false` to disable) and `webui_port` (default `8720`; if busy, an ephemeral port is used and logged). The connection bootstrap (server, token, incoming directory) still happens in the terminal on first run.
+Config keys: `webui_enabled` (default `true`, set `false` to disable) and `webui_port` (default `8720`; if busy, an ephemeral port is used and logged). The connection bootstrap (server, token, incoming directory) still happens in the terminal on first run, and **AI gates are terminal-only** — see below.
+
+### Web UI security
+
+The web UI can submit orders and flatten accounts, so the localhost bind is deliberately **not** treated as the security boundary — a browser on this machine can be pointed at it by any page you visit. Every request is checked three ways:
+
+- **Token** — a random per-process secret is embedded in the page and echoed back in an `X-ST-Token` header. Requests without it are refused, so another site cannot drive your trading API, and it forces a CORS preflight that a cross-origin caller cannot satisfy.
+- **Origin** — a request carrying a foreign `Origin` is rejected outright.
+- **Host** — only loopback hostnames are accepted, which defeats DNS rebinding (a hostile domain re-resolved to `127.0.0.1`).
+
+Requests must be `application/json`; the page is served with a strict CSP and `X-Frame-Options: DENY`. A hard-stopped session freezes settings changes, so risk limits can't be weakened while a lockout is in force. **AI gates cannot be configured over HTTP** — an AI gate names an outbound endpoint and an environment variable whose value is sent as a bearer token, so it's terminal-only; existing gates are preserved untouched when you edit a profile from the browser.
 
 ---
 
@@ -562,6 +577,10 @@ Settings persist in `~/.voidorigin_config.json`:
 ## Security
 
 SocketTrader communicates with NinjaTrader over a local TCP socket as designed by the ATI. Always run on a trusted machine.
+
+The embedded web UI controls real orders, so it is not defended by its localhost bind alone — it requires a per-process token, rejects foreign origins, and validates the `Host` header against DNS rebinding. AI gates (which make outbound calls carrying an API key) can only be configured from the terminal. See [Web UI security](#web-ui-security).
+
+Incoming signals are validated field-by-field before anything is written to NinjaTrader's `incoming/` folder, control characters and `;` separators are stripped from every field, and manual orders go through the same validation. Order files are written under generated names — no untrusted input reaches a filesystem path.
 
 ---
 

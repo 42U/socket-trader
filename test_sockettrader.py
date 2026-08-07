@@ -2707,7 +2707,9 @@ class TestWebState:
         assert st._web_events[-1]["kind"] == "signal"
 
 
-class TestWebServer:
+class _WebClient:
+    """Starts the real web server on an ephemeral port and speaks to it."""
+
     @pytest.fixture
     def web(self, monkeypatch):
         monkeypatch.setattr(st, "list_atm_strategies", lambda: [])
@@ -2722,19 +2724,34 @@ class TestWebServer:
         loop.call_soon_threadsafe(loop.stop)
         t.join(timeout=2)
 
-    def _post(self, url, payload):
+    def _post(self, url, payload, headers=None, token=True):
         import urllib.request as ur
+        hdrs = {"Content-Type": "application/json"}
+        if token:
+            hdrs["X-ST-Token"] = st._web_token
+        hdrs.update(headers or {})
         req = ur.Request(url, data=json.dumps(payload).encode(),
-                         headers={"Content-Type": "application/json"},
-                         method="POST")
+                         headers=hdrs, method="POST")
         return json.loads(ur.urlopen(req, timeout=5).read())
 
-    def test_serves_page_and_state(self, web):
+    def _get(self, url, token=True, headers=None):
         import urllib.request as ur
-        html = ur.urlopen(web + "/", timeout=5).read().decode()
-        assert "SOCKET TRADER" in html and "/api/state" in html
-        state = json.loads(ur.urlopen(web + "/api/state", timeout=5).read())
+        hdrs = {"X-ST-Token": st._web_token} if token else {}
+        hdrs.update(headers or {})
+        return ur.urlopen(ur.Request(url, headers=hdrs), timeout=5)
+
+
+class TestWebServer(_WebClient):
+    def test_serves_page_and_state(self, web):
+        html = self._get(web + "/").read().decode()
+        assert "<title>SocketTrader</title>" in html and "/api/state" in html
+        state = json.loads(self._get(web + "/api/state").read())
         assert state["version"] == st.__version__
+
+    def test_page_carries_a_fresh_token(self, web):
+        html = self._get(web + "/").read().decode()
+        assert st._web_token and st._web_token in html
+        assert "__ST_TOKEN__" not in html
 
     def test_trade_rejected_when_hard_locked(self, web):
         st.hard_stopped = True
@@ -2758,7 +2775,108 @@ class TestWebServer:
         assert st.roundrobin_accounts == ["RR1"]  # follower conflict dropped
 
     def test_unknown_path_404(self, web):
-        import urllib.error, urllib.request as ur
+        import urllib.error
         with pytest.raises(urllib.error.HTTPError) as e:
-            ur.urlopen(web + "/api/nope", timeout=5)
+            self._get(web + "/api/nope")
         assert e.value.code == 404
+
+
+class TestWebSecurity(_WebClient):
+    """The web API controls real money — loopback is not the boundary."""
+
+    def _expect_status(self, fn, code):
+        import urllib.error
+        with pytest.raises(urllib.error.HTTPError) as e:
+            fn()
+        assert e.value.code == code
+
+    def test_post_without_token_rejected(self, web):
+        self._expect_status(
+            lambda: self._post(web + "/api/close_all", {}, token=False), 403)
+
+    def test_post_with_wrong_token_rejected(self, web):
+        self._expect_status(
+            lambda: self._post(web + "/api/close_all", {},
+                               headers={"X-ST-Token": "nope"}, token=False), 403)
+
+    def test_state_read_requires_token(self, web):
+        self._expect_status(lambda: self._get(web + "/api/state", token=False), 403)
+
+    def test_cross_site_origin_rejected(self, web):
+        self._expect_status(
+            lambda: self._post(web + "/api/trade",
+                               {"side": "long", "instrument": "NQ 09-26", "qty": 1},
+                               headers={"Origin": "https://evil.example"}), 403)
+
+    def test_non_json_content_type_rejected(self, web):
+        # the CSRF-friendly simple-request content type must not be parsed
+        self._expect_status(
+            lambda: self._post(web + "/api/close_all", {},
+                               headers={"Content-Type": "text/plain"}), 415)
+
+    def test_rebound_host_header_rejected(self, web):
+        self._expect_status(
+            lambda: self._get(web + "/api/state",
+                              headers={"Host": "evil.example"}), 403)
+
+    def test_loopback_host_allowed(self, web):
+        port = web.rsplit(":", 1)[1]
+        assert self._get(web + "/api/state",
+                         headers={"Host": f"localhost:{port}"}).status == 200
+
+    def test_ai_gate_cannot_be_set_over_http(self, web):
+        resp = self._post(web + "/api/profiles", {"profiles": {"Sim101": {"rules": [
+            {"symbols": ["NQ"], "ai": {"provider": "custom",
+                                       "endpoint": "http://attacker.example/x",
+                                       "api_key_env": "ANTHROPIC_API_KEY"}}]}}})
+        assert resp["ok"] is True
+        rules = st.account_profiles.get("Sim101", {}).get("rules", [])
+        assert rules and rules[0].get("ai") is None
+
+    def test_existing_ai_gate_survives_a_web_profile_edit(self, web):
+        st.account_profiles["Sim101"] = {"default": {
+            "ai": {"provider": "ollama", "model": "llama3.2",
+                   "endpoint": "http://localhost:11434/api/chat",
+                   "api_key_env": "", "timeout_ms": 8000,
+                   "on_error": "skip", "instructions": ""}}}
+        resp = self._post(web + "/api/profiles",
+                          {"profiles": {"Sim101": {"default": {"qty_mode": "fixed",
+                                                               "qty_value": 2}}}})
+        assert resp["ok"] is True
+        default = st.account_profiles["Sim101"]["default"]
+        assert default["qty_mode"] == "fixed"
+        assert default["ai"]["provider"] == "ollama"  # preserved, not dropped
+
+    def test_hard_lock_freezes_risk_limits(self, web):
+        st.hard_stopped = True
+        resp = self._post(web + "/api/limits", {"account": "Sim101", "target": 0,
+                                                "target_mode": "off", "stop": 0,
+                                                "stop_mode": "off"})
+        assert resp["ok"] is False and "frozen" in resp["message"]
+
+    def test_limits_reject_unknown_mode(self, web, tmp_config):
+        resp = self._post(web + "/api/limits", {"account": "Sim101", "target": 100,
+                                                "target_mode": "sideways",
+                                                "stop": 50, "stop_mode": "hard"})
+        assert resp["ok"] is False
+
+
+class TestAiConfigValidation:
+    def test_rejects_non_http_endpoint(self):
+        assert st._coerce_ai({"provider": "custom", "model": "m",
+                              "endpoint": "file:///etc/passwd"}) is None
+
+    def test_rejects_bogus_key_env_name(self):
+        assert st._coerce_ai({"provider": "openai", "model": "m",
+                              "api_key_env": "PATH; rm -rf /"}) is None
+
+    def test_accepts_normal_config(self):
+        cfg = st._coerce_ai({"provider": "ollama", "model": "llama3.2"})
+        assert cfg and cfg["provider"] == "ollama"
+
+    def test_strip_ai_config_is_recursive(self):
+        raw = {"A": {"default": {"ai": {"provider": "custom"}, "size": "micros"},
+                     "rules": [{"symbols": ["NQ"], "ai": {"provider": "custom"}}]}}
+        out = st._strip_ai_config(raw)
+        assert out["A"]["default"] == {"size": "micros"}
+        assert out["A"]["rules"][0] == {"symbols": ["NQ"]}
