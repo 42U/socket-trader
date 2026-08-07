@@ -41,7 +41,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -7489,6 +7489,18 @@ let S=null,L=null,side="long",otype="market",instrument="",modalOpen=false,busy=
 function el(tag,cls,text){const e=document.createElement(tag);
   if(cls)e.className=cls; if(text!=null)e.textContent=String(text); return e}
 function clear(n){while(n.firstChild)n.removeChild(n.firstChild)}
+
+/* Panels are rebuilt from scratch rather than diffed, so re-rendering on
+   every poll would tear the DOM down twice a second: buttons visibly
+   flicker, hover is lost, and an open inline editor disappears mid-use.
+   Each panel therefore renders only when its own data actually changed. */
+const _sig={};
+function changed(key,data){
+  const s=JSON.stringify(data);
+  if(_sig[key]===s)return false;
+  _sig[key]=s; return true}
+function invalidate(key){delete _sig[key]}
+let sizeEditOpen=false;
 function btn(label,cls,fn){const b=el("button",cls,label);b.onclick=fn;return b}
 function td(cls,text){return el("td",cls,text)}
 
@@ -7651,15 +7663,18 @@ function sizeCell(a){
   span.title="click to change this account's contract sizing";
   span.onclick=()=>{
     clear(cell);
+    sizeEditOpen=true;   // freeze the table so the poll can't wipe this
     const box=el("div","chiplist");
+    const close=()=>{sizeEditOpen=false;invalidate("accounts");renderAccounts()};
     const opt=(label,mode,value)=>{
       const b=el("div","pick",label);
-      b.onclick=()=>api("/api/sizing",{account:a.name,mode:mode,value:value});
+      b.onclick=()=>{sizeEditOpen=false;
+        api("/api/sizing",{account:a.name,mode:mode,value:value})};
       box.appendChild(b)};
     opt("copy","copy",0);
     [0.5,1,2,3].forEach(m=>opt("×"+m,"multiple",m));
     [1,2,3,5].forEach(n=>opt(String(n),"fixed",n));
-    const x=el("div","pick","✕");x.onclick=()=>renderAccounts();
+    const x=el("div","pick","✕");x.onclick=close;
     box.appendChild(x);
     cell.appendChild(box)};
   cell.appendChild(span);
@@ -7668,6 +7683,7 @@ function sizeCell(a){
 const SYNC_LED={"in-sync":"g","out-of-sync":"y","leader":"g","rotation":"d","":"d"};
 
 function renderTiles(){
+  if(!changed("tiles",L&&L.totals))return;
   const box=$("tiles");clear(box);
   const w=$("syncWarn");clear(w);
   if(!L||!L.totals)return;
@@ -7709,13 +7725,14 @@ function renderTiles(){
     w.appendChild(b)}}
 
 function renderAccounts(){
+  if(sizeEditOpen)return;                 // never yank an open inline editor
+  if(!changed("accounts",[L&&L.ok,L&&L.accounts,S&&S.profiles]))return;
   const w=$("acctWrap");clear(w);
   if(!L){w.appendChild(el("div","empty","connecting to NinjaTrader…"));return}
   if(!L.ok){w.appendChild(el("div","empty",
     "NinjaTrader ATI not reachable — check NT is running and the ATI port"));return}
   if(!L.accounts.length){w.appendChild(el("div","empty","no accounts reported"));return}
   $("acctHint").textContent=L.accounts.length+" accounts";
-  $("liveHint").textContent="updated "+new Date(L.ts*1000).toLocaleTimeString();
 
   const t=el("table"),h=el("thead"),hr=el("tr");
   [["Account",""],["Role",""],["Size","num"],["Sync",""],["Cash","num"],
@@ -7775,6 +7792,7 @@ function renderAccounts(){
   t.appendChild(tb);w.appendChild(t)}
 
 function renderPositions(){
+  if(!changed("positions",L&&L.positions))return;
   const w=$("posWrap");clear(w);
   const list=(L&&L.positions)||[];
   $("posHint").textContent=list.length?(list.length+" open"):"";
@@ -7941,6 +7959,7 @@ function renderChips(){
       (S.rr.remaining.length?S.rr.remaining.join(", "):"(reshuffles next)")):""}
 
 function renderFeed(){
+  if(!changed("feed",S.events))return;
   const f=$("feed");clear(f);
   const ev=(S.events||[]).slice().reverse();
   if(!ev.length){f.appendChild(el("div","empty","waiting for signals…"));return}
@@ -7971,9 +7990,13 @@ async function refresh(){
 
 async function refreshLive(force){
   try{L=await get("/api/live");
+    // Outside the panel guards: the tables only redraw when their data
+    // changes, but this timestamp must keep ticking so a frozen table is
+    // visibly "unchanged" rather than "stopped".
+    $("liveHint").textContent="updated "+new Date(L.ts*1000).toLocaleTimeString();
     if(!modalOpen){renderTiles();renderAccounts();renderPositions()}
     if(S)renderChips()}
-  catch(e){}}
+  catch(e){$("liveHint").textContent="NinjaTrader link lost"}}
 
 /* ---- wiring ---- */
 $("sideB").onclick=()=>setSide("long");
