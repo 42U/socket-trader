@@ -41,7 +41,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -4628,6 +4628,16 @@ def close_all_open_positions() -> list[str]:
     account the signal is copied to, not just the primary. Returns the union
     of contracts closed across accounts (single-account mode falls back to
     just the primary via target_accounts()).
+
+    ORDER IS LOAD-BEARING — the leader is flattened FIRST, sequentially.
+    target_accounts() puts the leader at the head of the list; do not
+    reorder it and do not parallelise this loop. Rithmic's trade copier
+    documents the hazard verbatim ("Always cancel the orders from the
+    Leader Account first... If an order is canceled from a Follower
+    account before canceling from the Leader Account, it may result in an
+    unintended reverse position"), and an unintended position on one
+    account while others sit the other way is exactly the cross-account
+    hedge prop firms liquidate for.
     """
     all_closed: set[str] = set()
     for account in target_accounts():
@@ -6068,11 +6078,43 @@ def _annotate_sync(rows: list[dict]):
             r["sync"] = ""
 
 
+def _hedge_conflicts(rows: list[dict]) -> list[dict]:
+    """Managed accounts holding the same underlying on OPPOSITE sides.
+
+    Prop firms treat this as hedging and liquidate for it: Apex requires
+    all funded accounts trade the same direction and bans offsetting
+    positions on the same or correlated instruments; Take Profit Trader's
+    rule 6 bans opposite positions across any accounts outright. The check
+    is at the UNDERLYING level because MyFunded Futures states plainly
+    that E-mini NQ and Micro NQ are the same underlying — so a long MNQ
+    against a short NQ is a hedge, not two unrelated trades.
+
+    _position_shape already folds micro into full-size, so comparing
+    shapes across accounts gives the underlying-level view for free.
+    """
+    sides: dict[str, dict[int, list[str]]] = {}
+    for r in rows:
+        if not r["managed"]:
+            continue
+        for root, direction in _position_shape(r["positions"]):
+            sides.setdefault(root, {}).setdefault(direction, []).append(r["name"])
+    conflicts = []
+    for root, by_dir in sorted(sides.items()):
+        if len(by_dir) > 1:
+            conflicts.append({
+                "root": root,
+                "long": sorted(by_dir.get(1, [])),
+                "short": sorted(by_dir.get(-1, [])),
+            })
+    return conflicts
+
+
 def _live_totals(rows: list[dict]) -> dict:
     """Roll-up tiles: exposure and copy health across managed accounts."""
     managed = [r for r in rows if r["managed"]]
     followers = [r for r in managed if r["role"] == "follower"]
     return {
+        "hedges": _hedge_conflicts(rows),
         "accounts": len(managed),
         "realized": sum(r["realized"] or 0 for r in managed),
         "session_pnl": sum(r["session_pnl"] or 0 for r in managed
@@ -6918,7 +6960,10 @@ function renderTiles(){
   const tile=(k,v,cls)=>{const d=el("div","tile"+(cls?" "+cls:""));
     d.appendChild(el("div","k",k));d.appendChild(el("div","v",v));box.appendChild(d)};
 
-  // The number every copy trader wants and no copier on the market shows.
+  // Hedge first: prop firms liquidate for opposite positions across
+  // accounts, so it outranks every other number on the panel.
+  const hedges=T.hedges||[];
+  if(hedges.length)tile("HEDGE",hedges.length,"bad");
   const syncOk=T.followers===0||T.in_sync===T.followers;
   tile("In sync",T.followers?(T.in_sync+" / "+T.followers):"n/a",
     syncOk?"good":"bad");
@@ -6928,6 +6973,14 @@ function renderTiles(){
   tile("Contracts",T.contracts||"flat");
   tile("Working",T.working||"—");
 
+  hedges.forEach(h=>{
+    const b=el("div","banner");
+    b.appendChild(el("b","","⚠ OPPOSITE POSITIONS — "+h.root+": "));
+    b.appendChild(el("span",null,
+      "long on "+(h.long.join(", ")||"—")+" · short on "+(h.short.join(", ")||"—")+
+      ". Prop firms treat offsetting positions across accounts as hedging and "+
+      "may liquidate for it — micro and full-size count as the same underlying."));
+    w.appendChild(b)});
   if(T.out_of_sync&&T.out_of_sync.length){
     const b=el("div","banner");
     b.appendChild(el("b","","OUT OF SYNC: "));

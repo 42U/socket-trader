@@ -2861,6 +2861,66 @@ class TestWebSecurity(_WebClient):
         assert resp["ok"] is False
 
 
+class TestCrossAccountHedgeDetection:
+    """Prop firms liquidate for opposite positions across accounts, and they
+    judge it at the underlying level (NQ and MNQ are one instrument)."""
+
+    def _rows(self, *positions):
+        st.active_account = "LEAD"
+        st.follower_accounts = ["F1"]
+        by_acct = {}
+        for acct, instrument, qty in positions:
+            by_acct.setdefault(acct, []).append(
+                {"account": acct, "instrument": instrument, "qty": qty,
+                 "avg_price": 1.0})
+        return [{"name": n, "managed": True, "positions": by_acct.get(n, [])}
+                for n in ("LEAD", "F1", "RR1")]
+
+    def test_same_direction_is_clean(self):
+        rows = self._rows(("LEAD", "MNQ 09-26", -2), ("F1", "MNQ 09-26", -1))
+        assert st._hedge_conflicts(rows) == []
+
+    def test_opposite_sides_same_symbol_flagged(self):
+        rows = self._rows(("LEAD", "NQ 09-26", -2), ("F1", "NQ 09-26", 1))
+        assert st._hedge_conflicts(rows) == [
+            {"root": "NQ", "long": ["F1"], "short": ["LEAD"]}]
+
+    def test_micro_against_full_is_the_same_underlying(self):
+        # MyFunded Futures: "E-Mini NQ and Micro NQ have the same underlying"
+        rows = self._rows(("LEAD", "MNQ 09-26", -2), ("F1", "NQ 09-26", 1))
+        assert st._hedge_conflicts(rows)[0]["root"] == "NQ"
+
+    def test_different_underlyings_are_not_a_hedge(self):
+        rows = self._rows(("LEAD", "NQ 09-26", 2), ("F1", "ES 09-26", -2))
+        assert st._hedge_conflicts(rows) == []
+
+    def test_unmanaged_accounts_ignored(self):
+        rows = self._rows(("LEAD", "NQ 09-26", 2))
+        rows.append({"name": "Other", "managed": False, "positions": [
+            {"account": "Other", "instrument": "NQ 09-26", "qty": -2,
+             "avg_price": 1.0}]})
+        assert st._hedge_conflicts(rows) == []
+
+    def test_flat_account_is_not_a_side(self):
+        rows = self._rows(("LEAD", "NQ 09-26", 2), ("F1", "NQ 09-26", 0))
+        assert st._hedge_conflicts(rows) == []
+
+
+class TestFlattenOrdering:
+    def test_leader_is_flattened_first(self, monkeypatch):
+        # Rithmic: flattening a follower before the leader can leave the
+        # follower in an unintended reverse position.
+        st.active_account = "LEAD"
+        st.follower_accounts = ["F1", "F2"]
+        st.roundrobin_accounts = ["RR1"]
+        order = []
+        monkeypatch.setattr(st, "close_account_positions",
+                            lambda a: order.append(a) or [])
+        st.close_all_open_positions()
+        assert order[0] == "LEAD"
+        assert set(order) == {"LEAD", "F1", "F2", "RR1"}
+
+
 class TestAiConfigValidation:
     def test_rejects_non_http_endpoint(self):
         assert st._coerce_ai({"provider": "custom", "model": "m",
