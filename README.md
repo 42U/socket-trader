@@ -7,6 +7,7 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/42U/socket-trader/actions/workflows/ci.yml"><img src="https://github.com/42U/socket-trader/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
   <a href="#"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue" alt="Platform"></a>
@@ -95,6 +96,16 @@ pip install -r requirements.txt
 ```
 
 **Requirements:** Python 3.10+ &nbsp;·&nbsp; NinjaTrader 8 (Windows) or any target directory (Linux)
+
+### Running the tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest test_sockettrader.py -q      # full suite
+python scripts/check_webui.py       # embedded web UI guards (needs node for the JS check)
+```
+
+Both run in CI on every push and pull request, across Python 3.10–3.13 on Linux and Windows. The web UI guards catch what the Python suite structurally cannot: a JavaScript syntax error inside the embedded page, a field the dashboard reads that the backend stopped sending, a re-introduced `innerHTML` sink, or a removed request-gating control.
 
 ---
 
