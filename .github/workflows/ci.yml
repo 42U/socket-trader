@@ -77,3 +77,40 @@ jobs:
 
       - name: Check embedded web UI
         run: python scripts/check_webui.py
+
+  installer:
+    # The Windows installer is what non-technical users actually run, and it
+    # cannot be tested anywhere except Windows — so CI runs it end to end on a
+    # clean runner rather than trusting that it parses.
+    name: Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint the installer
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }
+          Write-Host "install.ps1 parses cleanly"
+
+      - name: Run the installer end to end
+        shell: pwsh
+        run: ./install.ps1 -InstallDir "$env:RUNNER_TEMP\st-install"
+
+      - name: Verify what it produced
+        shell: pwsh
+        run: |
+          $dir = "$env:RUNNER_TEMP\st-install"
+          foreach ($f in @('SocketTrader.py', 'requirements.txt', 'SocketTrader.cmd')) {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "missing: $f" }
+          }
+          if (-not (Get-ChildItem (Join-Path $dir 'strategy') -Filter *.xml)) {
+            throw 'strategy templates were not installed'
+          }
+          # the whole point is that the app actually starts on a clean machine
+          python -c "import sys; sys.path.insert(0, r'$dir'); import SocketTrader; print('imports OK, v' + SocketTrader.__version__)"
+          Write-Host "installer output verified"
