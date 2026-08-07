@@ -65,6 +65,80 @@ namespace NinjaTrader.NinjaScript.AddOns
         // whole broadcast thread and starve every live client.
         private const int WriteTimeoutMs = 750;
 
+        // ---------- Authentication ----------
+        // This socket streams account balances and accepts a FLATTEN
+        // command, so an unauthenticated peer could both read the book and
+        // close every position. It must bind beyond loopback (SocketTrader
+        // commonly runs under WSL and reaches the host over its NAT
+        // subnet), so a network boundary alone cannot be the control.
+        //
+        // SocketTrader writes a random secret next to NT's user data and
+        // sends it as the first line of every connection. No valid token,
+        // no snapshot and no commands.
+        private const string TokenFileName = "SocketTraderBridge.token";
+        private const int AuthTimeoutMs = 3000;
+        private string sharedToken;
+
+        private string TokenPath()
+        {
+            try
+            {
+                return Path.Combine(NinjaTrader.Core.Globals.UserDataDir, TokenFileName);
+            }
+            catch { return null; }
+        }
+
+        private void LoadToken()
+        {
+            sharedToken = null;
+            try
+            {
+                var path = TokenPath();
+                if (path != null && File.Exists(path))
+                    sharedToken = File.ReadAllText(path).Trim();
+            }
+            catch (Exception ex)
+            {
+                NinjaTrader.Code.Output.Process(
+                    $"SocketTraderBridge: could not read token: {ex.Message}",
+                    PrintTo.OutputTab1);
+            }
+        }
+
+        /// <summary>Length-constant compare so a wrong token leaks no timing.</summary>
+        private static bool TokensMatch(string a, string b)
+        {
+            if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return false;
+            if (a.Length != b.Length) return false;
+            int diff = 0;
+            for (int i = 0; i < a.Length; i++) diff |= a[i] ^ b[i];
+            return diff == 0;
+        }
+
+        /// <summary>
+        /// Read one newline-terminated line with a hard deadline, without
+        /// consuming anything past it (a StreamReader would buffer ahead
+        /// and swallow the first command).
+        /// </summary>
+        private static string ReadLineWithTimeout(TcpClient client, int timeoutMs)
+        {
+            var sb = new StringBuilder();
+            var stream = client.GetStream();
+            client.ReceiveTimeout = timeoutMs;
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            var one = new byte[1];
+            while (DateTime.UtcNow < deadline && sb.Length < 512)
+            {
+                int n;
+                try { n = stream.Read(one, 0, 1); }
+                catch { return null; }
+                if (n <= 0) return null;
+                if (one[0] == (byte)'\n') return sb.ToString().Trim();
+                sb.Append((char)one[0]);
+            }
+            return null;
+        }
+
         // ---------- State ----------
         private TcpListener listener;
         private Thread acceptThread;
@@ -110,6 +184,13 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             try
             {
+                LoadToken();
+                if (string.IsNullOrEmpty(sharedToken))
+                    NinjaTrader.Code.Output.Process(
+                        "SocketTraderBridge: no token file yet — connections will be " +
+                        "refused until SocketTrader writes one (Setup > 9). " +
+                        $"Expected at {TokenPath()}",
+                        PrintTo.OutputTab1);
                 listener = new TcpListener(BindAddress, ListenPort);
                 listener.Start();
                 acceptThread = new Thread(AcceptLoop) { IsBackground = true, Name = "STB-Accept" };
@@ -152,6 +233,31 @@ namespace NinjaTrader.NinjaScript.AddOns
                 try { client.NoDelay = true; } catch { }
                 try { client.SendTimeout = WriteTimeoutMs; } catch { }
                 try { client.ReceiveTimeout = WriteTimeoutMs; } catch { }
+
+                // AUTHENTICATE BEFORE ANYTHING IS SENT. The snapshot carries
+                // account balances and open positions, so it must not go out
+                // to an unverified peer — the client speaks first here.
+                if (string.IsNullOrEmpty(sharedToken))
+                {
+                    NinjaTrader.Code.Output.Process(
+                        "SocketTraderBridge: refusing connection — no token file. " +
+                        "Enable the live monitor in SocketTrader (Setup > 9) to create it.",
+                        PrintTo.OutputTab1);
+                    try { client.Close(); } catch { }
+                    continue;
+                }
+                var hello = ReadLineWithTimeout(client, AuthTimeoutMs);
+                var offered = ExtractJsonString(hello ?? "", "auth");
+                if (!TokensMatch(offered, sharedToken))
+                {
+                    string peer = "?";
+                    try { peer = client.Client.RemoteEndPoint.ToString(); } catch { }
+                    NinjaTrader.Code.Output.Process(
+                        $"SocketTraderBridge: rejected unauthenticated client {peer}",
+                        PrintTo.OutputTab1);
+                    try { client.Close(); } catch { }
+                    continue;
+                }
 
                 // Build + send the initial snapshot DIRECTLY to the new
                 // client. Doing this here (before adding to `clients`) means

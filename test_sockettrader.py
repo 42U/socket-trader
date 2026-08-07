@@ -3092,6 +3092,65 @@ class TestFlattenOrdering:
         assert set(order) == {"LEAD", "F1", "F2", "RR1"}
 
 
+class TestBridgeAuth:
+    """The AddOn socket streams balances and accepts FLATTEN, and cannot be
+    loopback-only (SocketTrader reaches it across WSL's NAT), so the token
+    is the actual access control — not the network boundary."""
+
+    def test_token_is_generated_and_persisted(self, tmp_config):
+        st.save_config({})
+        t1 = st.bridge_token()
+        assert len(t1) >= 32
+        assert st.load_config()["live_bridge_token"] == t1
+        assert st.bridge_token() == t1          # stable across calls
+
+    def test_auth_line_is_newline_delimited_json(self, tmp_config):
+        st.save_config({"live_bridge_token": "SECRET"})
+        line = st.bridge_auth_line()
+        assert line.endswith(b"\n")
+        assert json.loads(line.decode())["auth"] == "SECRET"
+
+    def test_token_written_where_the_addon_reads_it(self, tmp_config, tmp_path,
+                                                    monkeypatch):
+        st.save_config({"live_bridge_token": "SECRET"})
+        monkeypatch.setattr(st, "_nt_base", lambda: tmp_path)
+        path = st.write_bridge_token()
+        assert path == tmp_path / st.BRIDGE_TOKEN_FILE
+        assert path.read_text().strip() == "SECRET"
+
+    def test_rewrite_is_idempotent_but_follows_rotation(self, tmp_config, tmp_path,
+                                                        monkeypatch):
+        monkeypatch.setattr(st, "_nt_base", lambda: tmp_path)
+        st.save_config({"live_bridge_token": "ONE"})
+        st.write_bridge_token()
+        st.save_config({"live_bridge_token": "TWO"})
+        assert st.write_bridge_token().read_text().strip() == "TWO"
+
+    def test_no_nt_folder_is_handled(self, tmp_config, monkeypatch):
+        st.save_config({"live_bridge_token": "SECRET"})
+        monkeypatch.setattr(st, "_nt_base", lambda: None)
+        assert st.write_bridge_token() is None
+
+    def test_command_sender_authenticates_before_the_command(self, tmp_config,
+                                                             monkeypatch):
+        st.save_config({"live_bridge_token": "SECRET"})
+        sent = []
+
+        class FakeSock:
+            def settimeout(self, *_): pass
+            def connect(self, *_): pass
+            def sendall(self, b): sent.append(b)
+            def close(self): pass
+
+        monkeypatch.setattr(st.socket, "socket", lambda *a, **k: FakeSock())
+        monkeypatch.setattr(st, "live_bridge_enabled", True)
+        monkeypatch.setattr(st, "_live_bridge_connected", True)
+        monkeypatch.setattr(st, "_nt_host", lambda p: "127.0.0.1")
+        assert st.bridge_send_command({"cmd": "flatten", "account": "A"}) is True
+        assert json.loads(sent[0].decode())["auth"] == "SECRET"   # auth is FIRST
+        assert json.loads(sent[1].decode())["cmd"] == "flatten"
+
+
 class TestAiConfigValidation:
     def test_rejects_non_http_endpoint(self):
         assert st._coerce_ai({"provider": "custom", "model": "m",

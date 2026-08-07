@@ -41,7 +41,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.9.2"
+__version__ = "0.10.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -2240,6 +2240,53 @@ def invalidate_nt_host_cache() -> None:
     _nt_host_cache.clear()
 
 
+BRIDGE_TOKEN_FILE = "SocketTraderBridge.token"
+
+
+def bridge_token() -> str:
+    """The shared secret guarding the AddOn socket, creating it if absent.
+
+    Kept in config AND written next to NinjaTrader's user data, because the
+    two processes have no other channel: SocketTrader owns the value, the
+    AddOn reads the file at startup. Without this the socket would stream
+    account balances and accept a FLATTEN from anyone who could reach the
+    port — and it cannot be loopback-only, since SocketTrader usually runs
+    under WSL and connects across the host's NAT subnet.
+    """
+    cfg = load_config()
+    token = str(cfg.get("live_bridge_token") or "").strip()
+    if not token:
+        token = secrets.token_urlsafe(32)
+        cfg["live_bridge_token"] = token
+        save_config(cfg)
+        logger.info("live bridge token generated")
+    return token
+
+
+def write_bridge_token(token: str | None = None) -> Path | None:
+    """Publish the token where the AddOn reads it. Returns the path written."""
+    token = token or bridge_token()
+    base = _nt_base()
+    if not base:
+        return None
+    path = Path(base) / BRIDGE_TOKEN_FILE
+    try:
+        existing = path.read_text(encoding="utf-8").strip() if path.exists() else None
+        if existing != token:
+            path.write_text(token, encoding="utf-8")
+            logger.info(f"live bridge token written → {path} "
+                        "(restart or recompile the AddOn to pick it up)")
+        return path
+    except OSError as exc:
+        logger.error(f"could not write bridge token to {path}: {exc}")
+        return None
+
+
+def bridge_auth_line() -> bytes:
+    """The first line every bridge client must send."""
+    return (json.dumps({"auth": bridge_token()}) + "\n").encode("utf-8")
+
+
 def probe_live_bridge(host: str, port: int, timeout: float = 2.5) -> bool:
     """Probe the optional SocketTraderBridge AddOn. See _probe_live_bridge_detail."""
     ok, _reason = _probe_live_bridge_detail(host, port, timeout)
@@ -2265,6 +2312,12 @@ def _probe_live_bridge_detail(host: str, port: int, timeout: float = 2.5) -> tup
         return False, "TCP connect timed out"
     except OSError as e:
         return False, f"connect error: {e}"
+    try:
+        # The AddOn now speaks only to authenticated peers and sends
+        # nothing until it has seen the token.
+        s.sendall(bridge_auth_line())
+    except OSError as e:
+        return False, f"auth send failed: {e}"
     try:
         buf = b""
         while b"\n" not in buf:
@@ -5004,6 +5057,7 @@ def bridge_send_command(cmd: dict, timeout: float = 2.0) -> bool:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         s.connect((host, live_bridge_port))
+        s.sendall(bridge_auth_line())
         payload = (json.dumps(cmd) + "\n").encode("utf-8")
         s.sendall(payload)
         s.close()
@@ -5536,6 +5590,19 @@ async def live_bridge_task():
                 asyncio.open_connection(host, port), timeout=3.0)
         except (OSError, asyncio.TimeoutError):
             _live_bridge_connected = False
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+            continue
+
+        try:
+            writer.write(bridge_auth_line())
+            await writer.drain()
+        except OSError:
+            _live_bridge_connected = False
+            try:
+                writer.close()
+            except OSError:
+                pass
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
             continue
@@ -6243,6 +6310,10 @@ def install_live_bridge_addon(nt_base: Path) -> tuple[bool, str]:
     source = SCRIPT_DIR / "addon" / "SocketTraderBridge.cs"
     if not source.is_file():
         return False, "addon/SocketTraderBridge.cs not found in repo."
+    # Publish the shared secret alongside the AddOn — it refuses every
+    # connection until this file exists, so installing one without the
+    # other yields a listener that never talks to anyone.
+    write_bridge_token()
     dest_dir = nt_base / "bin" / "Custom" / "AddOns"
     dest = dest_dir / "SocketTraderBridge.cs"
     try:
@@ -8092,6 +8163,11 @@ async def main():
         logger.info(f"PROFILES LOADED  accounts={sorted(account_profiles)}")
     global live_bridge_enabled, live_bridge_port, nt_host_override
     live_bridge_enabled = bool(cfg.get("live_bridge_enabled", False))
+    if live_bridge_enabled:
+        # Refresh the token file on every start: the AddOn refuses all
+        # connections without it, and NT's folder can be moved or restored
+        # independently of this config.
+        write_bridge_token()
     live_bridge_port = int(cfg.get("live_bridge_port", 36984))
     nt_host_override = str(cfg.get("nt_host", "") or "").strip()
 
