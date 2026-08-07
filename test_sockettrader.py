@@ -2861,6 +2861,93 @@ class TestWebSecurity(_WebClient):
         assert resp["ok"] is False
 
 
+class TestHedgeGuard:
+    """A per-account `direction: invert` applied to some accounts and not
+    others hedges the group against itself on every single signal."""
+
+    ENTRY = "PLACE;LEAD;NQ 09-26;BUY;2;MARKET;;;DAY;;;NQ_Med;77"
+
+    @pytest.fixture(autouse=True)
+    def _arm(self, monkeypatch):
+        monkeypatch.setattr(st, "validate_strategy", lambda n: True)
+        monkeypatch.setattr(st, "hedge_guard_mode", lambda: "block")
+        st.active_account = "LEAD"
+        st.follower_accounts = ["F1"]
+
+    def _actions(self, sig=None):
+        plans, skipped = st.plan_signal_legs(sig or self.ENTRY)
+        return ({p["account"]: p["signal"].split(";")[3] for p in plans}, skipped)
+
+    def test_inconsistent_invert_is_blocked(self):
+        st.account_profiles["LEAD"] = {"default": {"direction": "invert"}}
+        acts, skipped = self._actions()
+        assert acts == {}
+        assert all("hedge guard" in r for _, r in skipped)
+
+    def test_consistent_invert_is_allowed(self):
+        for a in ("LEAD", "F1"):
+            st.account_profiles[a] = {"default": {"direction": "invert"}}
+        acts, skipped = self._actions()
+        assert acts == {"LEAD": "SELL", "F1": "SELL"} and not skipped
+
+    def test_no_invert_is_allowed(self):
+        acts, _ = self._actions()
+        assert acts == {"LEAD": "BUY", "F1": "BUY"}
+
+    def test_micro_and_full_are_the_same_underlying(self):
+        # F1 sized to micros still collides with the leader's full-size NQ
+        st.account_profiles["LEAD"] = {"default": {"direction": "invert"}}
+        st.account_profiles["F1"] = {"default": {"size": "micros"}}
+        acts, skipped = self._actions()
+        assert acts == {} and skipped
+
+    def test_different_symbols_do_not_collide(self):
+        # F1 only trades gold, so it never takes the NQ entry at all
+        st.account_profiles["LEAD"] = {"default": {"direction": "invert"}}
+        st.account_profiles["F1"] = {"symbols_allowed": ["GC"]}
+        acts, skipped = self._actions()
+        assert acts == {"LEAD": "SELL"}
+        assert [r for a, r in skipped if a == "F1" and "symbol" in r]
+
+    def test_exits_are_never_blocked(self):
+        st.account_profiles["LEAD"] = {"default": {"direction": "invert"}}
+        plans, _ = st.plan_signal_legs("CLOSEPOSITION;LEAD;NQ 09-26;;;;;;;;;;")
+        assert [p["account"] for p in plans] == ["LEAD", "F1"]
+        assert all(p["command"] == "CLOSEPOSITION" for p in plans)
+
+    def test_warn_mode_fires_but_flags(self, monkeypatch):
+        monkeypatch.setattr(st, "hedge_guard_mode", lambda: "warn")
+        st.account_profiles["LEAD"] = {"default": {"direction": "invert"}}
+        acts, skipped = self._actions()
+        assert acts == {"LEAD": "SELL", "F1": "BUY"} and not skipped
+
+    def test_off_mode_disables_the_guard(self, monkeypatch):
+        monkeypatch.setattr(st, "hedge_guard_mode", lambda: "off")
+        st.account_profiles["LEAD"] = {"default": {"direction": "invert"}}
+        acts, _ = self._actions()
+        assert acts == {"LEAD": "SELL", "F1": "BUY"}
+
+
+class TestHedgeGuardMode:
+    """Mode resolution — no autouse patch here, this reads real config."""
+
+    def test_defaults_to_warn_when_unset(self, tmp_config):
+        st.save_config({})
+        assert st.hedge_guard_mode() == "warn"
+
+    def test_falls_back_to_warn_on_junk(self, tmp_config):
+        st.save_config({"hedge_guard": "banana"})
+        assert st.hedge_guard_mode() == "warn"
+
+    def test_reads_block_from_config(self, tmp_config):
+        st.save_config({"hedge_guard": "block"})
+        assert st.hedge_guard_mode() == "block"
+
+    def test_reads_off_from_config(self, tmp_config):
+        st.save_config({"hedge_guard": "off"})
+        assert st.hedge_guard_mode() == "off"
+
+
 class TestCrossAccountHedgeDetection:
     """Prop firms liquidate for opposite positions across accounts, and they
     judge it at the underlying level (NQ and MNQ are one instrument)."""

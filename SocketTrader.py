@@ -41,7 +41,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.7.1"
+__version__ = "0.8.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -1227,7 +1227,82 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = ""
             "note": meta["note"],
             "rr_pick": is_rr_pick,
         })
+    plans = apply_hedge_guard(plans, skipped)
     return plans, skipped
+
+
+def _entry_direction_conflict(plans: list[dict]) -> dict[str, dict[str, list[str]]]:
+    """Entry legs that would open OPPOSITE sides of one underlying.
+
+    A per-account `direction: invert` that is not applied to every account
+    makes this happen on every signal, deterministically: the publisher
+    says BUY, the inverted account sells, the rest buy, and the group is
+    hedged the moment both fill. Prop firms judge the resulting positions,
+    not the intent — Apex bans opposing positions "across multiple
+    accounts" on pain of account closure, and Topstep treats a hedge as
+    unappealable "even if the overlap is brief or unintentional".
+
+    Keyed by underlying root (micro and full-size fold together) so a long
+    MNQ against a short NQ counts, which is how those firms read it.
+    """
+    by_root: dict[str, dict[str, list[str]]] = {}
+    for p in plans:
+        if p["command"] != "PLACE":
+            continue
+        action = (p["action"] or "").strip().upper()
+        if action not in ("BUY", "SELL"):
+            continue
+        root = _instrument_root(to_full_instrument(p["instrument"]))
+        if root:
+            by_root.setdefault(root, {}).setdefault(action, []).append(p["account"])
+    return {root: sides for root, sides in by_root.items() if len(sides) > 1}
+
+
+def hedge_guard_mode() -> str:
+    """warn (default) | block | off — how to treat a manufactured hedge.
+
+    Defaults to `warn`, not `block`, because inverting one account against
+    the others is a supported strategy (fading the leader) on ordinary
+    broker accounts, and silently refusing to send orders someone has
+    configured is the wrong default. Prop-funded traders should set
+    "hedge_guard": "block" in config — for them an opposite position
+    across accounts is an account-closure event, not a strategy.
+    """
+    mode = str(load_config().get("hedge_guard", "warn")).strip().lower()
+    return mode if mode in ("block", "warn", "off") else "warn"
+
+
+def apply_hedge_guard(plans: list[dict], skipped: list[tuple[str, str]]
+                      ) -> list[dict]:
+    """Refuse an entry fan-out that would hedge the group against itself.
+
+    Entries only. Exits and reversals are never blocked — stranding a live
+    position is its own hazard, and the exit-priority rule that governs the
+    rest of the app applies here too.
+    """
+    conflicts = _entry_direction_conflict(plans)
+    if not conflicts:
+        return plans
+    detail = "; ".join(
+        f"{root}: " + " vs ".join(f"{side} {','.join(accts)}"
+                                  for side, accts in sorted(sides.items()))
+        for root, sides in sorted(conflicts.items()))
+    mode = hedge_guard_mode()
+    logger.warning(f"HEDGE GUARD ({mode})  entry legs would open opposite sides — {detail}")
+    if mode == "off":
+        return plans
+    if mode == "warn":
+        _dash_set_alert(
+            Fore.YELLOW + f"  ⚠  HEDGE WARNING — opposite entries: {detail}"
+            + Style.RESET_ALL, sticky=True)
+        return plans
+    _dash_set_alert(
+        Fore.RED + f"  ⛔  HEDGE BLOCKED — {detail}. Check per-account "
+        "'direction: invert'." + Style.RESET_ALL, sticky=True)
+    for p in plans:
+        if p["command"] == "PLACE":
+            skipped.append((p["account"], "hedge guard: opposite entries across accounts"))
+    return [p for p in plans if p["command"] != "PLACE"]
 
 
 def _note_contract(signal_text: str):

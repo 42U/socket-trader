@@ -245,6 +245,24 @@ Followers are saved to `~/.voidorigin_config.json` (`follower_accounts`) and res
 
 ---
 
+### Cross-account hedging
+
+Setting `direction: invert` on **some** accounts and not others makes the fan-out hedge itself: the publisher says BUY, the inverted account sells, the rest buy, and the group holds both sides of the same market the moment they fill. That is deliberate and useful when you're fading the leader on your own broker account — and an account-closure event on a funded one. Prop firms judge the resulting positions, not the intent: Apex bans opposing positions *"across multiple accounts"*, and Topstep treats a hedge as prohibited *"even if the overlap is brief or unintentional"* and *"cannot be appealed"*.
+
+SocketTrader checks this **before** any order is written, comparing at the underlying level so a long MNQ against a short NQ counts as one hedge. Behaviour is set by `hedge_guard`:
+
+| Mode | Behaviour |
+|---|---|
+| `warn` *(default)* | Orders fire; a sticky alert names the conflicting accounts and sides |
+| `block` | The **entry** legs are refused entirely and logged as skipped — **use this on prop-funded accounts** |
+| `off` | No check |
+
+Two things are never affected: **exits and reversals always flow** regardless of mode (stranding a live position is its own hazard), and a fan-out where *every* account inverts is not a conflict — the whole group simply fades the publisher together.
+
+The web UI additionally shows a **hedge alarm** for positions that already exist, whatever their cause, since a rejected entry or an exit that failed on one account can produce the same shape without any invert setting.
+
+---
+
 ## Round-Robin Mode
 
 Copy trading gives every account every trade. **Round-robin** spreads trades across accounts instead: link accounts into a pool, and each **entry signal** fires on exactly **one** pool member — drawn randomly, with no account hit twice until every pool account has traded once. Then a fresh random round starts, never opening with the account that just traded, so two consecutive signals never land on the same account.
@@ -583,6 +601,7 @@ Settings persist in `~/.voidorigin_config.json`:
 | `nt_port` | NinjaTrader AT Interface port |
 | `account_limits` | Per-account risk management settings |
 | `account_profiles` | Per-account trade profiles — allowed-symbols filter (`symbols_allowed`), size, contracts, direction, delay, stagger, ATM override, AI gate (see [Per-Account Profiles](#per-account-profiles)) |
+| `hedge_guard` | What to do when an entry fan-out would open **opposite sides** of one underlying across accounts — `warn` (default), `block`, or `off`. See [Cross-account hedging](#cross-account-hedging) |
 | `webui_enabled` | Start the localhost web UI with the app (default `true`) |
 | `webui_port` | Web UI port (default `8720`, localhost only) |
 | `roundrobin_accounts` | Accounts in the rotation pool — each entry signal goes to one of them in random no-repeat rounds (see [Round-Robin Mode](#round-robin-mode)) |
