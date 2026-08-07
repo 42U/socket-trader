@@ -5,6 +5,7 @@ import websockets
 import json
 import logging
 import logging.handlers
+import math
 import shutil
 import socket
 import subprocess
@@ -16,6 +17,10 @@ import os
 import re
 import platform
 import threading
+import http.server
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -28,7 +33,14 @@ try:
 except ImportError:
     pyfiglet = None
 
-__version__ = "0.3.4"
+# Official Anthropic SDK — optional; only needed when a per-account AI gate
+# uses provider "anthropic" (pip install anthropic).
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+
+__version__ = "0.5.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -72,6 +84,12 @@ output_directory = None
 active_account = None          # LEADER account: drives status bar / display and is always traded.
 follower_accounts: list[str] = []  # FOLLOWERS that mimic the leader. Every signal fires on the
                                    # leader plus each follower. Empty = single-account mode.
+roundrobin_accounts: list[str] = []  # ROUND-ROBIN pool: each entry signal goes to exactly ONE of
+                                     # these, rotating randomly with no repeats until every pool
+                                     # account has traded once. An account is a follower OR in the
+                                     # pool, never both; the leader is always copy-traded.
+_rr_remaining: list[str] = []   # accounts still owed a trade this round (shuffled)
+_rr_last: str | None = None     # last account drawn — next round never starts with it
 account_stops: dict[str, str] = {}  # account -> "hard" | "soft" once its session limit trips.
                                     # Absent = tradeable. NOT persisted (session-local lockout).
 atm_strategy = "NQ_Med"        # ATM strategy template name (fallback)
@@ -226,6 +244,9 @@ def save_session_state():
         "start_balances": dict(session_start_balances),
         "contracts": list(session_contracts),
         "signal_count": signal_count,
+        "rr": {"pool": sorted(roundrobin_accounts),
+               "remaining": list(_rr_remaining),
+               "last": _rr_last},
     }
     save_config(cfg)
 
@@ -251,11 +272,19 @@ def restore_session_state() -> bool:
 
     current_session = get_session_id()
     if current_session and saved.get("id") == current_session:
-        global signal_count
+        global signal_count, _rr_remaining, _rr_last
         for name, bal in saved.get("start_balances", {}).items():
             session_start_balances[name] = bal
         session_contracts.update(saved.get("contracts", []))
         signal_count = saved.get("signal_count", 0)
+        # Resume the round-robin rotation only if the pool is unchanged —
+        # a different pool starts a fresh round instead.
+        rr_saved = saved.get("rr") or {}
+        if rr_saved.get("pool") == sorted(roundrobin_accounts):
+            _rr_remaining = [a for a in rr_saved.get("remaining", [])
+                             if a in roundrobin_accounts]
+            last = rr_saved.get("last")
+            _rr_last = last if isinstance(last, str) else None
         return True
 
     # Different session or outside hours — clear stale data
@@ -429,6 +458,46 @@ if not IS_WINDOWS:
 # Track recent signal IDs (the unique number at the end of each signal)
 _recent_signal_ids: deque[str] = deque(maxlen=100)
 
+# ---------- Post-reconnect replay guard ----------
+# Observed 2026-08-07 04:21:58: after an unclean disconnect ("no close frame
+# received") the server re-delivered the last signals on reconnect. The PLACE
+# was caught by id dedup, but CLOSEPOSITION signals from the publisher carry
+# NO signal id, so the replayed close fired again and flattened a live
+# position opened 100s earlier. Defense: remember the exact text of recently
+# fired signals; an ID-LESS signal that byte-matches one fired within
+# REPLAY_LOOKBACK_S and arrives within REPLAY_GRACE_S of a (re)connect is a
+# replay and is dropped. Outside the post-connect window identical closes
+# always fire — a genuine re-close mid-session is never suppressed.
+REPLAY_GRACE_S = 45        # how long after a (re)connect replays can arrive
+REPLAY_LOOKBACK_S = 900    # how far back a fired signal can match
+_MAX_FIRED_KEYS = 64
+_recent_fired: dict[str, float] = {}   # canonical signal text -> monotonic ts
+_last_connect_mono: float | None = None
+
+
+def _note_fired_signal(signal_text: str):
+    """Remember a signal we actually dispatched (for the replay guard)."""
+    _recent_fired[signal_text] = time.monotonic()
+    while len(_recent_fired) > _MAX_FIRED_KEYS:
+        _recent_fired.pop(next(iter(_recent_fired)))
+
+
+def note_connected():
+    """Mark a successful (re)connect — starts the replay-guard window."""
+    global _last_connect_mono
+    _last_connect_mono = time.monotonic()
+
+
+def _is_idless_replay(signal_text: str) -> bool:
+    """True when an id-less signal is a server replay of one already fired."""
+    if _last_connect_mono is None:
+        return False
+    now = time.monotonic()
+    if now - _last_connect_mono > REPLAY_GRACE_S:
+        return False
+    fired_at = _recent_fired.get(signal_text)
+    return fired_at is not None and now - fired_at <= REPLAY_LOOKBACK_S
+
 
 def load_config() -> dict:
     """Load saved config from disk, or return empty dict."""
@@ -537,6 +606,980 @@ def toggle_micro_mode() -> bool:
     return micro_mode
 
 
+def to_full_instrument(instrument: str) -> str:
+    """Translate a micro instrument back to full size: "MNQ 06-26" → "NQ 06-26".
+
+    Reverse lookup of the active micro table; symbols a user opted out with a
+    self-mapping ("GC": "GC") are excluded so they never flip. Instruments
+    already full-size (or unknown) pass through unchanged.
+    """
+    root, sep, rest = instrument.partition(" ")
+    key = root.strip().upper()
+    reverse = {v: k for k, v in micro_map.items() if v != k}
+    full = reverse.get(key)
+    if full:
+        return full + sep + rest
+    return instrument
+
+
+# ---------- Per-account trade profiles ----------
+# Every copy-trade account (the leader included) can carry a *profile*: a
+# default rule plus optional rules scoped by symbol and/or the publisher's
+# strategy name (fields 2 and 11 of the incoming signal). A rule reshapes how
+# THAT account trades a signal — contract size (micros/full), quantity,
+# direction inversion, entry delay, staggered entry, ATM template override,
+# and an optional AI gate — independently of the leader and of the global
+# micro toggle. A profile can also carry `symbols_allowed`, an account-wide
+# market filter: the account only ENTERS trades on those roots (micro/full
+# twins included) and simply sits out signals for anything else, while still
+# participating fully — copy or round-robin — in the markets it does trade.
+#
+# Hard safety principle: EXITS ARE NEVER BLOCKED, DELAYED, OR AI-GATED.
+# CLOSEPOSITION / CLOSESTRATEGY / CANCEL always flow immediately; a
+# REVERSEPOSITION that a rule won't take as a new entry is downgraded to a
+# CLOSEPOSITION so the old position still exits. The only exception is
+# CHANGE on an inverted account, which is dropped because the publisher's
+# price levels are for the opposite side (the account's own ATM template
+# manages its stops).
+
+DEFAULT_RULE = {
+    "enabled": True,            # False blocks NEW entries only — exits still flow
+    "size": "inherit",          # inherit (global micro toggle) | micros | full
+    "qty_mode": "copy",         # copy | fixed | multiple
+    "qty_value": 1.0,           # contracts (fixed) or multiplier (multiple)
+    "max_contracts": 0,         # hard cap on any single entry; 0 = no cap
+    "direction": "normal",      # normal | invert (fade the publisher)
+    "delay_ms": 0,              # wait before entering (entries only)
+    "delay_jitter_ms": 0,       # + random 0..N ms on top of delay_ms
+    "stagger_entries": 1,       # split an entry into N tranches (1 = off)
+    "stagger_interval_ms": 1000,  # pause between tranches
+    "atm": "",                  # per-account ATM template ("" = session default)
+    "ai": None,                 # AI gate config dict, or None (see AI section)
+}
+
+RULE_CLAMPS = {
+    "qty_value": (0.0, 1000.0),
+    "max_contracts": (0, 1000),
+    "delay_ms": (0, 600_000),
+    "delay_jitter_ms": (0, 600_000),
+    "stagger_entries": (1, 10),
+    "stagger_interval_ms": (0, 600_000),
+}
+
+account_profiles: dict[str, dict] = {}   # account -> {"default": rule, "rules": [rule...]}
+_atm_override_warned: set[str] = set()   # missing ATM templates already warned about
+_stagger_placed: dict[tuple[str, str], int] = {}  # (account, ati id) -> tranches placed
+_MAX_STAGGER_KEYS = 512
+_leg_tasks: set[asyncio.Task] = set()    # in-flight deferred legs (delay/AI/stagger)
+
+
+def _coerce_ai(raw: dict) -> dict | None:
+    """Sanitize an AI-gate config dict from disk/editor; None if unusable."""
+    provider = str(raw.get("provider", "")).strip().lower()
+    if provider not in AI_PROVIDERS:
+        return None
+    defaults = AI_PROVIDERS[provider]
+    try:
+        timeout_ms = int(raw.get("timeout_ms", 8000))
+    except (TypeError, ValueError):
+        timeout_ms = 8000
+    return {
+        "provider": provider,
+        "model": str(raw.get("model") or defaults["model"]).strip(),
+        "endpoint": str(raw.get("endpoint") or defaults["endpoint"]).strip(),
+        "api_key_env": str(raw.get("api_key_env") or defaults["key_env"]).strip(),
+        "timeout_ms": max(1000, min(timeout_ms, 60_000)),
+        "on_error": "allow" if str(raw.get("on_error", "skip")).lower() == "allow" else "skip",
+        "instructions": str(raw.get("instructions", ""))[:2000],
+    }
+
+
+def _coerce_rule(raw: dict, scoped: bool = False) -> dict:
+    """Sanitize one rule dict from disk/editor. Unknown keys are dropped,
+    known keys are type-coerced and clamped; only keys present in `raw`
+    appear in the result (absent = inherit)."""
+    out: dict = {}
+    if not isinstance(raw, dict):
+        return out
+    if scoped:
+        for key in ("symbols", "strategies"):
+            vals = raw.get(key)
+            if isinstance(vals, str):
+                vals = vals.replace(",", " ").split()
+            if isinstance(vals, list):
+                cleaned = [str(v).strip() for v in vals if str(v).strip()]
+                if cleaned:
+                    out[key] = cleaned
+    if "enabled" in raw:
+        out["enabled"] = bool(raw["enabled"])
+    size = str(raw.get("size", "")).strip().lower()
+    if size in ("inherit", "micros", "full"):
+        out["size"] = size
+    qty_mode = str(raw.get("qty_mode", "")).strip().lower()
+    if qty_mode in ("copy", "fixed", "multiple"):
+        out["qty_mode"] = qty_mode
+    if "qty_value" in raw:
+        try:
+            lo, hi = RULE_CLAMPS["qty_value"]
+            out["qty_value"] = max(lo, min(float(raw["qty_value"]), hi))
+        except (TypeError, ValueError):
+            pass
+    for key in ("max_contracts", "delay_ms", "delay_jitter_ms",
+                "stagger_entries", "stagger_interval_ms"):
+        if key in raw:
+            try:
+                lo, hi = RULE_CLAMPS[key]
+                out[key] = max(lo, min(int(raw[key]), hi))
+            except (TypeError, ValueError):
+                pass
+    direction = str(raw.get("direction", "")).strip().lower()
+    if direction in ("normal", "invert"):
+        out["direction"] = direction
+    if "atm" in raw and isinstance(raw["atm"], str):
+        out["atm"] = sanitize_ati(raw["atm"].strip())
+    if "ai" in raw:
+        out["ai"] = _coerce_ai(raw["ai"]) if isinstance(raw["ai"], dict) else None
+    return out
+
+
+def load_account_profiles(cfg: dict) -> dict[str, dict]:
+    """Load and sanitize the "account_profiles" config section."""
+    out: dict[str, dict] = {}
+    raw = cfg.get("account_profiles")
+    if not isinstance(raw, dict):
+        return out
+    for acct, prof in raw.items():
+        if not isinstance(acct, str) or not acct.strip() or not isinstance(prof, dict):
+            continue
+        entry: dict = {}
+        default = _coerce_rule(prof.get("default", {}))
+        if default:
+            entry["default"] = default
+        rules = []
+        raw_rules = prof.get("rules", [])
+        if isinstance(raw_rules, list):
+            for raw_rule in raw_rules:
+                rule = _coerce_rule(raw_rule, scoped=True)
+                if rule:
+                    rules.append(rule)
+        if rules:
+            entry["rules"] = rules
+        allowed = prof.get("symbols_allowed")
+        if isinstance(allowed, str):
+            allowed = allowed.replace(",", " ").split()
+        if isinstance(allowed, list):
+            cleaned = []
+            for sym in allowed:
+                name = str(sym).strip().upper()
+                if name and name not in cleaned:
+                    cleaned.append(name)
+            if cleaned:
+                entry["symbols_allowed"] = cleaned
+        if entry:
+            out[acct.strip()] = entry
+    return out
+
+
+def save_account_profiles():
+    """Prune empty profiles and persist account_profiles to config."""
+    global account_profiles
+    pruned: dict[str, dict] = {}
+    for acct, prof in account_profiles.items():
+        entry: dict = {}
+        if prof.get("default"):
+            entry["default"] = prof["default"]
+        rules = [r for r in prof.get("rules", []) if r]
+        if rules:
+            entry["rules"] = rules
+        if prof.get("symbols_allowed"):
+            entry["symbols_allowed"] = prof["symbols_allowed"]
+        if entry:
+            pruned[acct] = entry
+    account_profiles = pruned
+    cfg = load_config()
+    if pruned:
+        cfg["account_profiles"] = pruned
+    else:
+        cfg.pop("account_profiles", None)
+    save_config(cfg)
+    logger.info(f"PROFILES SAVED  accounts={sorted(pruned)}")
+
+
+def _instrument_root(instrument: str) -> str:
+    return instrument.partition(" ")[0].strip().upper()
+
+
+def _symbol_matches(rule_symbols: list[str], root: str) -> bool:
+    """True when `root` matches any rule symbol or its micro/full twin.
+
+    A rule written as ["NQ"] is meant to cover that market — it matches both
+    NQ and MNQ regardless of the global micro toggle or per-account sizing.
+    """
+    if not root:
+        return False
+    reverse = {v: k for k, v in micro_map.items()}
+    targets: set[str] = set()
+    for sym in rule_symbols:
+        key = str(sym).strip().upper()
+        if not key:
+            continue
+        targets.add(key)
+        if key in micro_map:
+            targets.add(micro_map[key])
+        if key in reverse:
+            targets.add(reverse[key])
+    return root in targets
+
+
+def account_trades_symbol(account: str, instrument: str) -> bool:
+    """Per-account symbol filter: does `account` trade this instrument at all?
+
+    An account whose profile carries `symbols_allowed` (e.g. ["GC"]) only
+    ENTERS trades on those markets — micro/full twins included, so "GC"
+    covers MGC and "NQ" covers MNQ. An empty or absent filter trades
+    everything. Signals without an instrument (CLOSESTRATEGY/CANCEL by id)
+    pass — the filter gates entries, and exits are never blocked anyway.
+    """
+    allowed = account_profiles.get(account, {}).get("symbols_allowed") or []
+    if not allowed:
+        return True
+    root = _instrument_root(instrument)
+    if not root:
+        return True
+    return _symbol_matches(allowed, root)
+
+
+def resolve_rule(account: str, instrument: str = "", pub_strategy: str = "") -> dict:
+    """Effective rule for (account, signal): defaults ← account default ←
+    first matching scoped rule. Scoped rules are evaluated in config order;
+    a rule matches when its symbols AND strategies filters both pass (an
+    empty filter passes everything)."""
+    rule = dict(DEFAULT_RULE)
+    prof = account_profiles.get(account)
+    if not prof:
+        return rule
+    for key, val in prof.get("default", {}).items():
+        if key in DEFAULT_RULE:
+            rule[key] = val
+    root = _instrument_root(instrument)
+    strat = (pub_strategy or "").strip().lower()
+    for scoped in prof.get("rules", []):
+        symbols = scoped.get("symbols") or []
+        strategies = scoped.get("strategies") or []
+        if symbols and not _symbol_matches(symbols, root):
+            continue
+        if strategies and strat not in {str(s).strip().lower() for s in strategies}:
+            continue
+        for key, val in scoped.items():
+            if key in DEFAULT_RULE:
+                rule[key] = val
+        break
+    return rule
+
+
+def profiles_active() -> bool:
+    return bool(account_profiles)
+
+
+def _qty_label(rule: dict) -> str:
+    if rule["qty_mode"] == "fixed":
+        return f"fixed {int(rule['qty_value'])}"
+    if rule["qty_mode"] == "multiple":
+        return f"x{rule['qty_value']:g}"
+    return "copy"
+
+
+def profile_summary(account: str) -> str:
+    """One-line profile description for menus/status."""
+    prof = account_profiles.get(account)
+    if not prof:
+        return "default"
+    base = {**DEFAULT_RULE, **prof.get("default", {})}
+    bits: list[str] = []
+    if prof.get("symbols_allowed"):
+        bits.append(f"only {','.join(prof['symbols_allowed'])}")
+    if not base["enabled"]:
+        bits.append("ENTRIES OFF")
+    if base["size"] != "inherit":
+        bits.append(base["size"])
+    if base["qty_mode"] != "copy":
+        bits.append(_qty_label(base))
+    if base["max_contracts"]:
+        bits.append(f"cap {base['max_contracts']}")
+    if base["direction"] == "invert":
+        bits.append("INVERT")
+    if base["delay_ms"] or base["delay_jitter_ms"]:
+        jit = f"+~{base['delay_jitter_ms']}" if base["delay_jitter_ms"] else ""
+        bits.append(f"delay {base['delay_ms']}{jit}ms")
+    if base["stagger_entries"] > 1:
+        bits.append(f"{base['stagger_entries']}×{base['stagger_interval_ms']}ms")
+    if base["atm"]:
+        bits.append(f"ATM:{base['atm']}")
+    if base["ai"]:
+        bits.append(f"AI:{base['ai']['provider']}")
+    n_rules = len(prof.get("rules", []))
+    if n_rules:
+        bits.append(f"{n_rules} scoped rule{'s' if n_rules > 1 else ''}")
+    return " · ".join(bits) or "default"
+
+
+def _flip_action(action: str) -> str:
+    up = action.strip().upper()
+    if up == "BUY":
+        return "SELL"
+    if up == "SELL":
+        return "BUY"
+    return action
+
+
+def _apply_size(instrument: str, mode: str) -> str:
+    if mode == "micros":
+        return to_micro_instrument(instrument)
+    if mode == "full":
+        return to_full_instrument(instrument)
+    return instrument
+
+
+def _rule_qty(orig_qty: int, rule: dict) -> int:
+    """Contracts this account should trade; 0 means skip the entry."""
+    mode = rule["qty_mode"]
+    if mode == "fixed":
+        qty = int(rule["qty_value"])
+    elif mode == "multiple":
+        # round half up — round() banker's-rounds 0.5 down to 0
+        qty = math.floor(orig_qty * float(rule["qty_value"]) + 0.5)
+    else:
+        qty = orig_qty
+    cap = int(rule.get("max_contracts") or 0)
+    if cap > 0:
+        qty = min(qty, cap)
+    return max(qty, 0)
+
+
+def _apply_atm_override(parts: list[str], rule: dict):
+    """Swap field 11 to the rule's ATM template when it exists locally."""
+    name = rule.get("atm") or ""
+    if not name or len(parts) < 12:
+        return
+    if validate_strategy(name):
+        parts[11] = name
+    elif name not in _atm_override_warned:
+        _atm_override_warned.add(name)
+        logger.warning(f"ATM OVERRIDE  template '{name}' not installed — using '{parts[11]}'")
+        _dash_set_alert(
+            Fore.YELLOW + f"  ⚠  Profile ATM '{name}' not found — using {parts[11]}" + Style.RESET_ALL)
+
+
+def transform_signal_for_account(signal_text: str, account: str, rule: dict
+                                 ) -> tuple[str | None, str | None, dict]:
+    """Reshape one canonical signal for one account per its resolved rule.
+
+    Returns (final_signal, skip_reason, meta). final_signal is None when the
+    leg is skipped (reason set). meta carries the final instrument / action /
+    qty and a human note when a command was downgraded. Exits always come
+    back as a signal — never as a skip — except CHANGE on an inverted
+    account (see module docstring).
+    """
+    parts = signal_text.split(";")
+    cmd = parts[0].strip().upper() if parts else ""
+    meta = {"instrument": "", "action": "", "qty": 0, "note": ""}
+
+    if cmd == "CHANGE" and rule["direction"] == "invert":
+        return None, "CHANGE dropped (inverted account)", meta
+
+    if len(parts) >= 3 and parts[2]:
+        parts[2] = _apply_size(parts[2], rule["size"])
+        meta["instrument"] = parts[2]
+
+    def _close_instead(why: str) -> tuple[str, None, dict]:
+        instrument = parts[2] if len(parts) >= 3 else ""
+        meta["note"] = f"downgraded to CLOSEPOSITION ({why})"
+        close = f"CLOSEPOSITION;{parts[1] if len(parts) >= 2 else ''};{instrument};;;;;;;;;;"
+        return _with_account(close, account), None, meta
+
+    if cmd in ("PLACE", "REVERSEPOSITION"):
+        order_type = parts[5].strip().upper() if len(parts) > 5 else ""
+        inverted_nonmarket = (rule["direction"] == "invert"
+                              and order_type not in ("", "MARKET"))
+        try:
+            orig_qty = int(parts[4])
+        except (IndexError, ValueError):
+            orig_qty = None
+        qty = _rule_qty(orig_qty, rule) if orig_qty is not None else None
+
+        symbol_ok = account_trades_symbol(
+            account, parts[2] if len(parts) >= 3 else "")
+        if cmd == "PLACE":
+            if not symbol_ok:
+                return None, f"symbol filtered ({_instrument_root(parts[2])})", meta
+            if not rule["enabled"]:
+                return None, "entries disabled", meta
+            if inverted_nonmarket:
+                return None, f"inverted {order_type} entry skipped", meta
+            if qty is not None and qty < 1:
+                return None, "sized to 0 contracts", meta
+        else:  # REVERSEPOSITION — exit priority: never skip, downgrade instead
+            if not symbol_ok:
+                return _close_instead("symbol filtered")
+            if not rule["enabled"]:
+                return _close_instead("entries disabled")
+            if inverted_nonmarket:
+                return _close_instead("inverted non-market reversal")
+            if qty is not None and qty < 1:
+                return _close_instead("sized to 0 contracts")
+
+        if rule["direction"] == "invert" and len(parts) > 3:
+            parts[3] = _flip_action(parts[3])
+        if qty is not None:
+            parts[4] = str(qty)
+            meta["qty"] = qty
+        _apply_atm_override(parts, rule)
+        meta["action"] = parts[3] if len(parts) > 3 else ""
+
+    return _with_account(";".join(parts), account), None, meta
+
+
+def split_qty(total: int, tranches: int) -> list[int]:
+    """Split contracts across tranches, front-loaded: 5 into 3 → [2, 2, 1]."""
+    n = max(1, min(int(tranches), total))
+    base, rem = divmod(total, n)
+    return [base + 1 if i < rem else base for i in range(n)]
+
+
+def _tranche_signal(signal_text: str, qty: int, tranche_idx: int) -> str:
+    """Per-tranche copy of an entry: qty swapped; tranche 2+ gets ~T<k> id
+    suffixes so NT never sees two orders sharing one instance-global id."""
+    parts = signal_text.split(";")
+    if len(parts) > 4 and parts[4]:
+        parts[4] = str(qty)
+    if tranche_idx > 0:
+        for field in _ATI_GLOBAL_ID_FIELDS:
+            if len(parts) > field and parts[field]:
+                parts[field] = f"{parts[field]}~T{tranche_idx + 1}"
+    return ";".join(parts)
+
+
+def _record_stagger(signal_text: str, account: str, count: int):
+    """Remember how many tranches an entry's ids were fanned into so a later
+    CLOSESTRATEGY / CANCEL / CHANGE can target every tranche."""
+    parts = signal_text.split(";")
+    for field in _ATI_GLOBAL_ID_FIELDS:
+        if len(parts) > field and parts[field]:
+            _stagger_placed[(account, parts[field])] = count
+    while len(_stagger_placed) > _MAX_STAGGER_KEYS:
+        _stagger_placed.pop(next(iter(_stagger_placed)))
+
+
+def _max_profile_stagger(account: str) -> int:
+    """Largest stagger an account's profile can produce (restart fallback)."""
+    prof = account_profiles.get(account)
+    if not prof:
+        return 1
+    n = int(prof.get("default", {}).get("stagger_entries", 1) or 1)
+    for rule in prof.get("rules", []):
+        n = max(n, int(rule.get("stagger_entries", 1) or 1))
+    return max(1, min(n, RULE_CLAMPS["stagger_entries"][1]))
+
+
+def _expand_exit_ids(signal_text: str, account: str) -> list[str]:
+    """Fan an id-targeted command (CLOSESTRATEGY/CANCEL/CHANGE) to every
+    tranche this account placed under that id. Uses the recorded tranche
+    count; falls back to the profile's max stagger after a restart. Extra
+    variants targeting ids that never existed are rejected by NT harmlessly."""
+    parts = signal_text.split(";")
+    cmd = parts[0].strip().upper() if parts else ""
+    id_field = 12 if cmd == "CLOSESTRATEGY" else 10
+    base_id = parts[id_field] if len(parts) > id_field else ""
+    if not base_id:
+        return [signal_text]
+    count = _stagger_placed.get((account, base_id))
+    if count is None:
+        count = _max_profile_stagger(account)
+    if count <= 1:
+        return [signal_text]
+    out = [signal_text]
+    for k in range(2, count + 1):
+        variant = list(parts)
+        for field in _ATI_GLOBAL_ID_FIELDS:
+            if len(variant) > field and variant[field]:
+                variant[field] = f"{variant[field]}~T{k}"
+        out.append(";".join(variant))
+    return out
+
+
+def publisher_strategy_of(msg: str) -> str:
+    """Publisher's ATM strategy name (field 11) from the raw ws message —
+    extract_signal_string overwrites it, and profile rules scope on it."""
+    try:
+        data = json.loads(msg)
+        parts = str(data.get("signal", "")).split(";")
+        return sanitize_ati(parts[11].strip()) if len(parts) >= 12 else ""
+    except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+        return ""
+
+
+def plan_signal_legs(signal_text: str, pub_strategy: str = ""
+                     ) -> tuple[list[dict], list[tuple[str, str]]]:
+    """Resolve one canonical signal into per-account leg plans.
+
+    Returns (plans, skipped). Each plan: account, rule, final signal, files
+    to write now (exit-id fan-out included), deferred flag (delay/AI/stagger
+    entries run as a background task), and display metadata. With no
+    profiles configured every leg is an instant identical copy — the classic
+    fan-out.
+    """
+    plans: list[dict] = []
+    skipped: list[tuple[str, str]] = []
+    parts = signal_text.split(";")
+    cmd = parts[0].strip().upper() if parts else ""
+    instrument = parts[2] if len(parts) >= 3 else ""
+
+    # Which account gets which canonical signal. Copy-trade accounts always
+    # get the signal as-is. Round-robin accounts rotate: entries go to ONE
+    # pool member; exits fan to the whole pool (only the holder's position/
+    # ids match — the rest are rejected by NT harmlessly). REVERSEPOSITION
+    # sends the reversal to the rotation pick and a CLOSEPOSITION to every
+    # other pool member, so whoever holds the old position still exits.
+    # Per-account symbol filters compose with both: a filtered copy account
+    # skips the entry in its transform below; a filtered pool account is
+    # never drawn for that instrument (_rr_next passes over it, slot kept).
+    legs: list[tuple[str, str, bool]] = [  # (account, canonical signal, is_rr_pick)
+        (a, signal_text, False)
+        for a in copy_trade_accounts() if a not in account_stops]
+    rr_pick: str | None = None
+    if roundrobin_accounts:
+        if cmd == "PLACE":
+            rr_pick = _rr_next(instrument)
+            if rr_pick:
+                legs.append((rr_pick, signal_text, True))
+        elif cmd == "REVERSEPOSITION":
+            rr_pick = _rr_next(instrument)
+            synth_close = (f"CLOSEPOSITION;{parts[1] if len(parts) >= 2 else ''};"
+                           f"{instrument};;;;;;;;;;")
+            for a in _rr_pool():
+                if a == rr_pick:
+                    legs.append((a, signal_text, True))
+                else:
+                    logger.info(f"RR REVERSE  account={a}  gets close-only leg")
+                    legs.append((a, synth_close, False))
+        else:
+            legs += [(a, signal_text, False) for a in _rr_pool()]
+        if rr_pick:
+            logger.info(f"ROUND-ROBIN  pick={rr_pick}  remaining={_rr_remaining}")
+
+    for account, canonical, is_rr_pick in legs:
+        rule = resolve_rule(account, instrument, pub_strategy)
+        final, skip_reason, meta = transform_signal_for_account(canonical, account, rule)
+        if final is None:
+            skipped.append((account, skip_reason or "skipped"))
+            logger.info(f"LEG SKIPPED  account={account}  reason={skip_reason}  signal={canonical}")
+            continue
+        final_parts = final.split(";")
+        final_cmd = final_parts[0].strip().upper() if final_parts else ""
+        deferred = final_cmd == "PLACE" and (
+            rule["delay_ms"] > 0 or rule["delay_jitter_ms"] > 0
+            or rule["stagger_entries"] > 1 or bool(rule["ai"]))
+        files = [final]
+        if final_cmd in ("CLOSESTRATEGY", "CANCEL", "CHANGE"):
+            files = _expand_exit_ids(final, account)
+        if meta["note"]:
+            logger.info(f"LEG NOTE  account={account}  {meta['note']}  signal={canonical}")
+        plans.append({
+            "account": account,
+            "rule": rule,
+            "signal": final,
+            "files": files,
+            "deferred": deferred,
+            "command": final_cmd,
+            "instrument": meta["instrument"] or (final_parts[2] if len(final_parts) >= 3 else ""),
+            "action": meta["action"],
+            "qty": meta["qty"],
+            "note": meta["note"],
+            "rr_pick": is_rr_pick,
+        })
+    return plans, skipped
+
+
+def _note_contract(signal_text: str):
+    """Track a leg's (possibly account-specific) instrument for the hard-stop
+    close safety net."""
+    parts = signal_text.split(";")
+    if len(parts) >= 3 and parts[2] and len(session_contracts) < MAX_SESSION_CONTRACTS:
+        session_contracts.add(parts[2])
+
+
+def _leg_blocked(account: str) -> str | None:
+    """Why a pending leg must abort right now, or None to proceed."""
+    if shutdown.is_set():
+        return "shutdown"
+    if hard_stopped:
+        return "session hard stop"
+    if paused:
+        return "signals paused"
+    if account in account_stops:
+        return "account stop/target hit"
+    return None
+
+
+async def _interruptible_sleep(seconds: float, account: str) -> bool:
+    """Sleep in small steps, bailing early (False) if the leg gets blocked."""
+    end = time.monotonic() + max(0.0, seconds)
+    while True:
+        if _leg_blocked(account):
+            return False
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            return True
+        await asyncio.sleep(min(0.25, remaining))
+
+
+async def execute_plans(plans: list[dict], sig_id: str | None = None) -> list[str]:
+    """Write instant legs now; launch deferred legs (delay/AI/stagger) as
+    background tasks. Returns the accounts whose files were written NOW —
+    deferred accounts report via alerts/log when they land."""
+    written: list[str] = []
+    for plan in plans:
+        if plan["deferred"]:
+            task = asyncio.create_task(_run_deferred_leg(plan, sig_id))
+            _leg_tasks.add(task)
+            task.add_done_callback(_leg_tasks.discard)
+            continue
+        account = plan["account"]
+        wrote_any = False
+        for sig in plan["files"]:
+            try:
+                res = write_signal_to_file(sig)
+            except Exception as exc:
+                res = None
+                logger.error(f"DISPATCH FAIL  account={account}  error={exc!r}")
+            if res:
+                wrote_any = True
+                _note_contract(sig)
+            else:
+                logger.error(f"DISPATCH FAIL  account={account}  result=None")
+                _dash_set_alert(
+                    Fore.RED + f"  ✖  Copy-trade write failed for {account}" + Style.RESET_ALL)
+        if wrote_any:
+            written.append(account)
+            if plan["command"] == "PLACE":
+                _record_stagger(plan["signal"], account, 1)
+    return written
+
+
+async def _run_deferred_leg(plan: dict, sig_id: str | None = None):
+    """Background execution of one account's entry: delay → AI gate →
+    staggered tranche writes, re-checking stops/pause before every write."""
+    account, rule = plan["account"], plan["rule"]
+    label = f"[{account}] " if len(target_accounts()) > 1 else ""
+    try:
+        delay_s = (rule["delay_ms"]
+                   + (random.uniform(0, rule["delay_jitter_ms"]) if rule["delay_jitter_ms"] else 0)
+                   ) / 1000.0
+        if delay_s > 0 and not await _interruptible_sleep(delay_s, account):
+            logger.info(f"LEG ABORTED  account={account}  during=delay  reason={_leg_blocked(account)}")
+            return
+        reason = _leg_blocked(account)
+        if reason:
+            logger.info(f"LEG ABORTED  account={account}  reason={reason}")
+            return
+
+        qty = plan["qty"]
+        if rule["ai"]:
+            verdict = await asyncio.to_thread(ai_consult, rule["ai"], _ai_context(plan))
+            if verdict.get("error"):
+                policy = rule["ai"].get("on_error", "skip")
+                logger.warning(f"AI GATE ERROR  account={account}  policy={policy}  error={verdict['error']}")
+                if policy != "allow":
+                    _dash_set_alert(
+                        Fore.YELLOW + f"  ⚠  {label}AI gate error — entry skipped "
+                        f"({verdict['error'][:50]})" + Style.RESET_ALL)
+                    return
+            elif verdict["decision"] == "skip":
+                _dash_set_alert(
+                    Fore.YELLOW + f"  ⚠  {label}AI vetoed entry: "
+                    f"{(verdict.get('reason') or 'no reason')[:60]}" + Style.RESET_ALL)
+                logger.info(f"AI VETO  account={account}  reason={verdict.get('reason')}  signal={plan['signal']}")
+                return
+            else:
+                ai_qty = verdict.get("qty")
+                if isinstance(ai_qty, int) and 0 < ai_qty < qty:
+                    logger.info(f"AI RESIZE  account={account}  {qty} → {ai_qty} contracts")
+                    qty = ai_qty
+
+        tranches = split_qty(qty, rule["stagger_entries"]) if qty >= 1 else [qty]
+        interval_s = rule["stagger_interval_ms"] / 1000.0
+        placed = 0
+        for i, tranche_qty in enumerate(tranches):
+            if i > 0 and interval_s > 0 and not await _interruptible_sleep(interval_s, account):
+                logger.info(f"LEG ABORTED  account={account}  during=stagger {i + 1}/{len(tranches)}")
+                break
+            reason = _leg_blocked(account)
+            if reason:
+                logger.info(f"LEG ABORTED  account={account}  at tranche {i + 1}/{len(tranches)}  reason={reason}")
+                break
+            sig = _tranche_signal(plan["signal"], tranche_qty, i)
+            leader_first = (i == 0 and account == active_account)
+            pre_pos = 0
+            if leader_first:
+                try:
+                    pre = await asyncio.to_thread(query_nt_positions, account, nt_port)
+                    pre_pos = pre.get(plan["instrument"], 0)
+                except Exception:
+                    pre_pos = 0
+            path = write_signal_to_file(sig)
+            if not path:
+                logger.error(f"LEG WRITE FAIL  account={account}  tranche={i + 1}  signal={sig}")
+                _dash_set_alert(
+                    Fore.RED + f"  ✖  {label}entry write failed" + Style.RESET_ALL)
+                break
+            placed += 1
+            _note_contract(sig)
+            if leader_first:
+                add_pending_confirm(sig, sig_id, plan["instrument"], plan["action"], pre_pos)
+        if placed:
+            _record_stagger(plan["signal"], account, placed)
+            detail = f" {placed}/{len(tranches)} tranches" if len(tranches) > 1 else ""
+            timing = f" after {rule['delay_ms']}ms" if rule["delay_ms"] else ""
+            _dash_set_alert(
+                Fore.GREEN + f"  ✔  {label}entry placed{detail}{timing}" + Style.RESET_ALL)
+            logger.info(
+                f"LEG DONE  account={account}  tranches={placed}/{len(tranches)}  "
+                f"qty={qty}  signal={plan['signal']}")
+    except asyncio.CancelledError:
+        logger.info(f"LEG CANCELLED  account={account}")
+        raise
+    except Exception as exc:
+        logger.error(f"deferred leg error  account={account}  error={exc}")
+
+
+# ---------- AI signal gate ----------
+# A rule may route new entries through an AI before they fire. The model
+# receives the proposed order plus session context and must answer with a
+# strict JSON verdict: allow / skip, an optional DOWNWARD contract resize,
+# and a short reason. Exits never pass through the gate. On any error or
+# timeout the rule's on_error policy decides (default: skip — fail closed).
+
+AI_PROVIDERS = {
+    "anthropic": {"model": "claude-opus-5", "key_env": "ANTHROPIC_API_KEY",
+                  "endpoint": ""},
+    "openai":    {"model": "gpt-4o-mini", "key_env": "OPENAI_API_KEY",
+                  "endpoint": "https://api.openai.com/v1/chat/completions"},
+    "ollama":    {"model": "llama3.2", "key_env": "",
+                  "endpoint": "http://localhost:11434/api/chat"},
+    "custom":    {"model": "", "key_env": "",
+                  "endpoint": ""},  # any OpenAI-compatible /chat/completions
+}
+
+AI_GATE_SYSTEM = (
+    "You are a pre-trade risk gate for automated futures copy-trading. You "
+    "receive one proposed order and the account's session context. Decide "
+    "whether THIS account should take the trade right now.\n\n"
+    "Respond with ONLY a JSON object, no prose:\n"
+    '{"decision": "allow" or "skip", "qty": <integer or null>, '
+    '"reason": "<one short sentence>"}\n\n'
+    "- \"allow\" places the order; \"skip\" drops it for this account only.\n"
+    "- \"qty\" may REDUCE the contract count; it can never increase it. "
+    "Use null to keep the proposed size.\n"
+    "- Exits are never routed through you; you only gate new entries.\n"
+    "- If the context is ambiguous or concerning, prefer \"skip\"."
+)
+
+AI_DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["allow", "skip"]},
+        "qty": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+        "reason": {"type": "string"},
+    },
+    "required": ["decision", "qty", "reason"],
+    "additionalProperties": False,
+}
+
+
+def _ai_context(plan: dict) -> dict:
+    """Compact JSON context handed to the gate model (runs in a thread)."""
+    now = datetime.now(ET)
+    account = plan["account"]
+    sig_parts = plan["signal"].split(";")
+    ctx = {
+        "time_et": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "weekday": now.strftime("%A"),
+        "account": account,
+        "command": plan["command"],
+        "instrument": plan["instrument"],
+        "action": plan["action"],
+        "contracts": plan["qty"],
+        "atm_strategy": sig_parts[11] if len(sig_parts) >= 12 else "",
+        "signals_this_session": signal_count,
+    }
+    start = session_start_balances.get(account)
+    current = session_current_balances.get(account)
+    if start is not None and current is not None:
+        ctx["session_pnl_usd"] = round(current - start, 2)
+    try:
+        positions = query_nt_positions(account, nt_port)
+        ctx["open_position_this_instrument"] = positions.get(plan["instrument"], 0)
+        if positions:
+            ctx["open_positions"] = positions
+    except Exception:
+        pass
+    return ctx
+
+
+def _ai_parse_decision(text: str) -> dict:
+    """Parse the model's JSON verdict; tolerate prose around the object."""
+    obj = None
+    try:
+        obj = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end > start:
+            try:
+                obj = json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+    if not isinstance(obj, dict):
+        raise ValueError(f"unparseable AI response: {text[:120]!r}")
+    decision = str(obj.get("decision", "")).strip().lower()
+    if decision not in ("allow", "skip"):
+        raise ValueError(f"bad decision {obj.get('decision')!r}")
+    qty = obj.get("qty")
+    if isinstance(qty, bool) or not isinstance(qty, (int, float)) or int(qty) < 1:
+        qty = None
+    else:
+        qty = int(qty)
+    return {"decision": decision, "qty": qty,
+            "reason": str(obj.get("reason", ""))[:300]}
+
+
+def _ai_http_json(url: str, payload: dict, headers: dict, timeout_s: float) -> dict:
+    """POST JSON, return parsed JSON. Raises on HTTP/network errors."""
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", **headers}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {exc.code}: {body or exc.reason}") from exc
+
+
+def _ai_call_anthropic(ai_cfg: dict, system_prompt: str, user_payload: str,
+                       timeout_s: float) -> str:
+    """Consult Claude via the official SDK. Structured output keeps the
+    verdict machine-parseable; falls back to plain prompting on SDKs or
+    models that don't support it."""
+    if anthropic is None:
+        raise RuntimeError("anthropic SDK not installed — pip install anthropic")
+    key = os.environ.get(ai_cfg.get("api_key_env") or "ANTHROPIC_API_KEY")
+    kwargs: dict = {"timeout": timeout_s, "max_retries": 0}
+    if key:
+        kwargs["api_key"] = key
+    client = anthropic.Anthropic(**kwargs)
+    request = dict(
+        model=ai_cfg.get("model") or AI_PROVIDERS["anthropic"]["model"],
+        max_tokens=2048,  # hard cap covers thinking + the small JSON verdict
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_payload}],
+    )
+    try:
+        resp = client.messages.create(
+            **request,
+            output_config={"format": {"type": "json_schema",
+                                      "schema": AI_DECISION_SCHEMA}})
+    except TypeError:
+        # SDK predates output_config — the prompt already demands JSON
+        resp = client.messages.create(**request)
+    except anthropic.BadRequestError:
+        # model doesn't support structured outputs — plain prompting
+        resp = client.messages.create(**request)
+    if getattr(resp, "stop_reason", None) == "refusal":
+        raise RuntimeError("model refused the request")
+    for block in resp.content:
+        if getattr(block, "type", "") == "text":
+            return block.text
+    raise RuntimeError("no text block in model response")
+
+
+def _ai_call_openai_compat(ai_cfg: dict, system_prompt: str, user_payload: str,
+                           timeout_s: float) -> str:
+    """OpenAI or any OpenAI-compatible /v1/chat/completions endpoint
+    (LM Studio, vLLM, llama.cpp server, LocalAI, ...)."""
+    url = ai_cfg.get("endpoint") or AI_PROVIDERS["openai"]["endpoint"]
+    if not url:
+        raise RuntimeError("no endpoint configured")
+    headers = {}
+    key_env = ai_cfg.get("api_key_env")
+    key = os.environ.get(key_env) if key_env else None
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    body = {
+        "model": ai_cfg.get("model") or AI_PROVIDERS["openai"]["model"],
+        "messages": [{"role": "system", "content": system_prompt},
+                     {"role": "user", "content": user_payload}],
+        "max_tokens": 512,
+    }
+    data = _ai_http_json(url, body, headers, timeout_s)
+    return data["choices"][0]["message"]["content"]
+
+
+def _ai_call_ollama(ai_cfg: dict, system_prompt: str, user_payload: str,
+                    timeout_s: float) -> str:
+    """Local Ollama chat endpoint with JSON-constrained output."""
+    url = ai_cfg.get("endpoint") or AI_PROVIDERS["ollama"]["endpoint"]
+    body = {
+        "model": ai_cfg.get("model") or AI_PROVIDERS["ollama"]["model"],
+        "messages": [{"role": "system", "content": system_prompt},
+                     {"role": "user", "content": user_payload}],
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0},
+    }
+    data = _ai_http_json(url, body, {}, timeout_s)
+    return data["message"]["content"]
+
+
+def ai_consult(ai_cfg: dict, ctx: dict) -> dict:
+    """Ask the configured AI whether to take an entry. Never raises.
+
+    Returns {"decision", "qty", "reason"} on success or {"decision": "skip",
+    "error": ...} on any failure — the caller applies the rule's on_error
+    policy. Runs synchronously; call via asyncio.to_thread.
+    """
+    system_prompt = AI_GATE_SYSTEM
+    instructions = ai_cfg.get("instructions") or ""
+    if instructions:
+        system_prompt += "\n\nAccount owner's guidance:\n" + instructions
+    user_payload = json.dumps(ctx, indent=2)
+    timeout_s = ai_cfg.get("timeout_ms", 8000) / 1000.0
+    provider = ai_cfg.get("provider", "")
+    started = time.time()
+    try:
+        if provider == "anthropic":
+            text = _ai_call_anthropic(ai_cfg, system_prompt, user_payload, timeout_s)
+        elif provider == "ollama":
+            text = _ai_call_ollama(ai_cfg, system_prompt, user_payload, timeout_s)
+        elif provider in ("openai", "custom"):
+            text = _ai_call_openai_compat(ai_cfg, system_prompt, user_payload, timeout_s)
+        else:
+            return {"decision": "skip", "error": f"unknown provider {provider!r}"}
+        verdict = _ai_parse_decision(text)
+        latency_ms = int((time.time() - started) * 1000)
+        logger.info(
+            f"AI GATE  provider={provider}  model={ai_cfg.get('model')}  "
+            f"decision={verdict['decision']}  qty={verdict['qty']}  "
+            f"latency={latency_ms}ms  reason={verdict['reason'][:120]}")
+        return verdict
+    except Exception as exc:
+        return {"decision": "skip",
+                "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+
+
 # ---------- Strategy template helpers ----------
 def _nt_base() -> Path | None:
     """Return the NinjaTrader 8 root directory (parent of incoming/)."""
@@ -576,21 +1619,106 @@ def is_trade_ready() -> bool:
 
 
 # ---------- Copy-trade account fan-out ----------
-def target_accounts() -> list[str]:
-    """Every account a signal fires on: the leader first, then each follower.
+def _dedup_accounts(*groups: list) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for group in groups:
+        for a in group:
+            if a and a not in seen:
+                seen.add(a)
+                out.append(a)
+    return out
+
+
+def copy_trade_accounts() -> list[str]:
+    """The always-trade set: the leader first, then each follower.
 
     The leader (active_account) is always traded. Followers mimic it. The
     list is de-duplicated with the leader kept first, so a follower that
     also names the leader can't get two order files for one signal. With no
     followers this is just [leader] — classic single-account mode.
     """
-    seen: set[str] = set()
+    return _dedup_accounts([active_account], follower_accounts)
+
+
+def target_accounts() -> list[str]:
+    """Every account this session manages: leader, followers, and the
+    round-robin pool. Risk limits, session locks, and flatten-all act on
+    all of them; per-signal dispatch is decided in plan_signal_legs."""
+    return _dedup_accounts([active_account], follower_accounts, roundrobin_accounts)
+
+
+def sanitize_roundrobin(raw, leader: str | None, followers: list[str]) -> list[str]:
+    """Clean a round-robin account list: strings only, no leader, no overlap
+    with followers (copy-trade wins a conflict), de-duplicated in order."""
+    if not isinstance(raw, list):
+        return []
     out: list[str] = []
-    for a in ([active_account] + list(follower_accounts)):
-        if a and a not in seen:
-            seen.add(a)
-            out.append(a)
+    seen: set[str] = set()
+    for a in raw:
+        if not isinstance(a, str):
+            continue
+        name = a.strip()
+        if name and name != leader and name not in followers and name not in seen:
+            seen.add(name)
+            out.append(name)
     return out
+
+
+def _rr_pool() -> list[str]:
+    """Round-robin members currently allowed to trade (not stopped out)."""
+    return [a for a in roundrobin_accounts if a not in account_stops]
+
+
+def _rr_next(instrument: str = "") -> str | None:
+    """Draw the next round-robin account for an entry on `instrument`.
+
+    Random without repeats inside a round: a shuffled round of the pool is
+    consumed one account per entry signal; a fresh round never starts with
+    the account that just traded, so two consecutive signals never hit the
+    same account (pool size > 1). Locked accounts (session stop/target)
+    forfeit their slot when reached. An account whose symbol filter
+    excludes this instrument is passed over but KEEPS its slot — it is
+    still owed a trade on a market it does accept, and the entry goes to
+    the next eligible account instead. When no remaining slot can take
+    this instrument, the pool members not already owed a slot are shuffled
+    in as a fresh round. Returns None when no pool member trades this
+    instrument (copy-trade legs are unaffected).
+    """
+    global _rr_last
+    pool = _rr_pool()
+    eligible = {a for a in pool if account_trades_symbol(a, instrument)}
+    if not eligible:
+        return None
+    for _ in range(2):  # pass 2 runs after the top-up below, which
+        i = 0           # guarantees an eligible slot exists
+        while i < len(_rr_remaining):
+            account = _rr_remaining[i]
+            if account not in pool:          # locked/removed — forfeits slot
+                _rr_remaining.pop(i)
+                continue
+            if account not in eligible:      # symbol-filtered — keeps slot
+                i += 1
+                continue
+            _rr_remaining.pop(i)
+            _rr_last = account
+            return account
+        fresh = [a for a in pool if a not in _rr_remaining]
+        if not fresh:
+            return None
+        random.shuffle(fresh)
+        if not _rr_remaining and len(fresh) > 1 and _rr_last and fresh[0] == _rr_last:
+            swap = random.randrange(1, len(fresh))
+            fresh[0], fresh[swap] = fresh[swap], fresh[0]
+        _rr_remaining.extend(fresh)
+    return None
+
+
+def _rr_reset_rotation():
+    """Restart the rotation (pool membership changed)."""
+    global _rr_remaining, _rr_last
+    _rr_remaining = []
+    _rr_last = None
 
 
 def tradeable_accounts() -> list[str]:
@@ -1324,7 +2452,7 @@ def show_cursor():
 _controls_pinned = False
 _header_lines = 0  # Number of lines the pinned header occupies
 _status_bar_row = 0  # Terminal row where the status bar starts
-CONTROLS_TEXT = "P=PAUSE  B=BAL  T=LIMITS  C=CLOSE  R=RECONN  S=SETUP  ⇧X=EXIT"
+CONTROLS_TEXT = "O=ORDER  P=PAUSE  B=BAL  T=LIMITS  C=CLOSE  R=RECONN  S=SETUP  ⇧X=EXIT"
 
 
 def _build_controls_line():
@@ -1503,6 +2631,7 @@ def _dash_separator(row_offset: int):
 def _dash_add_signal(text: str):
     """Add a formatted signal line to the rolling buffer and redraw."""
     _signal_buffer.append(text)
+    _web_note("signal", text)
     _redraw_signals()
 
 
@@ -1538,6 +2667,7 @@ def _dash_set_alert(text: str, kind: str = ALERT_EVENT, sticky: bool = False,
     """
     global _alert_text, _alert_kind, _alert_sticky, _alert_ts
     if text and stamp:
+        _web_note("alert", text)
         text = f"  {Style.DIM}[{time.strftime('%H:%M:%S')}]{Style.RESET_ALL}" + text
     _alert_text = text
     _alert_kind = kind if text else ""
@@ -1653,6 +2783,8 @@ def status_bar(text):
     content = f"{text}  ·  {dir_indicator}"
     if micro_mode:
         content += f"  ·  {Fore.LIGHTMAGENTA_EX}◆ MICROS{Fore.CYAN}"
+    if profiles_active():
+        content += f"  ·  {Fore.LIGHTCYAN_EX}◆ PROFILES{Fore.CYAN}"
     vis = visible_len(content)
     total_pad = max(0, inner - vis)
     left_pad = total_pad // 2
@@ -1774,20 +2906,24 @@ async def prompt_directory():
 
 
 # ---------- Copy-trade account selection ----------
-def _account_option_line(index: int, account: dict, leader: str | None, followers: list[str]) -> str:
+def _account_option_line(index: int, account: dict, leader: str | None, followers: list[str],
+                         robins: list[str] | None = None) -> str:
     name = account["name"]
     if name == leader:
         marker = " ◀ LEADER"
     elif name in followers:
         marker = " ＋ FOLLOWER"
+    elif robins and name in robins:
+        marker = " ⟳ ROBIN"
     else:
         marker = ""
     return f"{index}. {name}  (${account['cash']:,.2f}){marker}"
 
 
-def _account_menu_rows(accounts: list[dict], leader: str | None, followers: list[str]) -> tuple[list[str], int]:
+def _account_menu_rows(accounts: list[dict], leader: str | None, followers: list[str],
+                       robins: list[str] | None = None) -> tuple[list[str], int]:
     """Return printable account rows and content width for the account picker."""
-    rows = [_account_option_line(i, a, leader, followers) for i, a in enumerate(accounts, 1)]
+    rows = [_account_option_line(i, a, leader, followers, robins) for i, a in enumerate(accounts, 1)]
     if not rows:
         return [], 49
 
@@ -1807,9 +2943,10 @@ def _account_menu_rows(accounts: list[dict], leader: str | None, followers: list
     return rendered, (col_width * 2) + len(gap)
 
 
-def _print_account_menu(accounts: list[dict], leader: str | None, followers: list[str]) -> None:
-    rows, width = _account_menu_rows(accounts, leader, followers)
-    title = "─ COPY TRADING — LEADER & FOLLOWERS "
+def _print_account_menu(accounts: list[dict], leader: str | None, followers: list[str],
+                        robins: list[str] | None = None) -> None:
+    rows, width = _account_menu_rows(accounts, leader, followers, robins)
+    title = "─ ACCOUNTS — LEADER · FOLLOWERS · ROUND-ROBIN "
     top = f"┌{title}{'─' * max(0, width + 2 - len(title))}┐"
     print(Fore.CYAN + "\n" + top + Style.RESET_ALL)
     if rows:
@@ -1817,8 +2954,9 @@ def _print_account_menu(accounts: list[dict], leader: str | None, followers: lis
             print(Fore.CYAN + f"│  {line[:width].ljust(width)}│" + Style.RESET_ALL)
     else:
         print(Fore.CYAN + f"│  {'NinjaTrader ATI unreachable — enter names.'.ljust(width)}│" + Style.RESET_ALL)
-    print(Fore.CYAN + f"│  {'Leader trades; followers mimic every signal.'.ljust(width)}│" + Style.RESET_ALL)
-    print(Fore.CYAN + f"│  {'Followers: numbers/names, all, or ENTER=none.'.ljust(width)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  {'Leader + followers copy every signal.'.ljust(width)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  {'Round-robin: each entry rotates to ONE pool account.'.ljust(width)[:width]}│" + Style.RESET_ALL)
+    print(Fore.CYAN + f"│  {'Pick with numbers/names, the word all, or ENTER=none.'.ljust(width)[:width]}│" + Style.RESET_ALL)
     print(Fore.CYAN + f"└{'─' * (width + 2)}┘" + Style.RESET_ALL)
 
 
@@ -1852,19 +2990,21 @@ def _parse_follower_tokens(raw: str, names: list[str], leader: str) -> list[str]
 
 
 async def prompt_accounts():
-    """Select the LEADER account and the FOLLOWERS that mimic its trades.
+    """Select the LEADER, the FOLLOWERS that copy it, and the ROUND-ROBIN pool.
 
-    Every signal fires on the leader plus each follower. Falls back to the
-    classic single-account flow (leader only, no followers) when the user
-    picks no followers, keeping existing setups unchanged.
+    Leader + followers fire on every signal (classic copy trading). The
+    round-robin pool receives each ENTRY on exactly one member, rotating
+    randomly with no repeats until the whole pool has traded a round; exits
+    fan to the whole pool. An account is a follower or in the pool — never
+    both. ENTER everywhere keeps the classic single-account flow unchanged.
     """
-    global active_account, follower_accounts, awaiting_user_input
+    global active_account, follower_accounts, roundrobin_accounts, awaiting_user_input
     awaiting_user_input = True
     show_cursor()
     accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
     names = [a["name"] for a in accounts]
 
-    _print_account_menu(accounts, active_account, follower_accounts)
+    _print_account_menu(accounts, active_account, follower_accounts, roundrobin_accounts)
 
     # --- Leader ---
     sys.stdout.write(Fore.WHITE + f"  LEADER [{active_account or 'none'}] ▸ " + Style.RESET_ALL)
@@ -1876,25 +3016,44 @@ async def prompt_accounts():
         else:
             active_account = raw
 
-    # --- Followers ---
+    # --- Followers (copy trade) ---
     sys.stdout.write(
-        Fore.WHITE + "  FOLLOWERS (numbers/names, 'all', ENTER=none) ▸ " + Style.RESET_ALL)
+        Fore.WHITE + "  FOLLOWERS — copy trade (numbers/names, 'all', ENTER=none) ▸ " + Style.RESET_ALL)
     sys.stdout.flush()
     raw_f = await asyncio.to_thread(read_line_raw)
     follower_accounts = _parse_follower_tokens(raw_f, names, active_account)
 
+    # --- Round-robin pool ---
+    sys.stdout.write(
+        Fore.WHITE + "  ROUND-ROBIN pool (numbers/names, 'all', ENTER=none) ▸ " + Style.RESET_ALL)
+    sys.stdout.flush()
+    raw_rr = await asyncio.to_thread(read_line_raw)
+    rr_tokens = _parse_follower_tokens(raw_rr, names, active_account)
+    overlap = [a for a in rr_tokens if a in follower_accounts]
+    roundrobin_accounts = sanitize_roundrobin(rr_tokens, active_account, follower_accounts)
+    if overlap and raw_rr.strip().lower() != "all":
+        print(Fore.YELLOW + "  ⚠  Copy-trade and round-robin are exclusive — kept as "
+              f"followers: {', '.join(overlap)}" + Style.RESET_ALL)
+    _rr_reset_rotation()
+
     cfg = load_config()
     cfg["account"] = active_account
     cfg["follower_accounts"] = follower_accounts
+    cfg["roundrobin_accounts"] = roundrobin_accounts
     save_config(cfg)
 
-    if follower_accounts:
-        print(Fore.GREEN +
-              f"  ✔  Leader {active_account}  +  {len(follower_accounts)} follower(s): "
-              f"{', '.join(follower_accounts)}" + Style.RESET_ALL)
+    if follower_accounts or roundrobin_accounts:
+        parts_desc = []
+        if follower_accounts:
+            parts_desc.append(f"{len(follower_accounts)} copy ({', '.join(follower_accounts)})")
+        if roundrobin_accounts:
+            parts_desc.append(f"{len(roundrobin_accounts)} round-robin ({', '.join(roundrobin_accounts)})")
+        print(Fore.GREEN + f"  ✔  Leader {active_account}  +  {'  ·  '.join(parts_desc)}"
+              + Style.RESET_ALL)
     else:
         print(Fore.GREEN + f"  ✔  Single account → {active_account}" + Style.RESET_ALL)
-    logger.info(f"ACCOUNTS SET  leader={active_account}  followers={follower_accounts}")
+    logger.info(f"ACCOUNTS SET  leader={active_account}  followers={follower_accounts}  "
+                f"roundrobin={roundrobin_accounts}")
     print()
     awaiting_user_input = False
 
@@ -2057,6 +3216,398 @@ async def prompt_strategy():
     awaiting_user_input = False
 
 
+# ---------- Per-account profiles editor ----------
+_PROF_INNER = 56  # inner width of profile editor boxes
+
+_SIZE_LABELS = {"inherit": "inherit global micros toggle",
+                "micros": "micros", "full": "full-size"}
+
+
+def _prof_box(title: str, lines: list[str], footer: list[str] | None = None):
+    """Draw a profile-editor box in the house style."""
+    top = f"┌─ {title} "
+    print(Fore.CYAN + "\n\r\033[K" + top + "─" * max(0, _PROF_INNER + 3 - len(top)) + "┐" + Style.RESET_ALL)
+    for line in lines:
+        print(Fore.CYAN + f"\r\033[K│  {line[:_PROF_INNER].ljust(_PROF_INNER)}│" + Style.RESET_ALL)
+    for line in footer or []:
+        print(Fore.CYAN + "\r\033[K│  " + Style.DIM
+              + line[:_PROF_INNER].ljust(_PROF_INNER) + Style.NORMAL + "│" + Style.RESET_ALL)
+    print(Fore.CYAN + "\r\033[K└" + "─" * (_PROF_INNER + 2) + "┘" + Style.RESET_ALL)
+
+
+async def _ask_line(prompt: str) -> str:
+    sys.stdout.write(Fore.WHITE + f"  {prompt} ▸ " + Style.RESET_ALL)
+    sys.stdout.flush()
+    return (await asyncio.to_thread(read_line_raw)).strip()
+
+
+async def _ask_int(prompt: str, current: int, lo: int, hi: int) -> int:
+    """Integer prompt with ENTER=keep and range clamping."""
+    raw = await _ask_line(f"{prompt} (current: {current})")
+    if not raw:
+        return current
+    try:
+        val = int(float(raw))
+    except ValueError:
+        print(Fore.YELLOW + "  ⚠  Not a number — keeping current." + Style.RESET_ALL)
+        return current
+    if val < lo or val > hi:
+        clamped = max(lo, min(val, hi))
+        print(Fore.YELLOW + f"  ⚠  Clamped to {clamped} (allowed {lo}-{hi})." + Style.RESET_ALL)
+        return clamped
+    return val
+
+
+async def _edit_rule_scope(rule: dict):
+    """Prompt for a scoped rule's symbol / publisher-strategy filters."""
+    raw = await _ask_line("SYMBOLS it applies to, e.g. 'NQ ES' (ENTER = any)")
+    symbols = [t.upper() for t in raw.replace(",", " ").split() if t.strip()]
+    if symbols:
+        rule["symbols"] = symbols
+    else:
+        rule.pop("symbols", None)
+    raw = await _ask_line("PUBLISHER STRATEGIES, e.g. 'NQ_Med' (ENTER = any)")
+    strategies = [t for t in raw.replace(",", " ").split() if t.strip()]
+    if strategies:
+        rule["strategies"] = strategies
+    else:
+        rule.pop("strategies", None)
+
+
+async def _edit_ai_gate(rule: dict):
+    """Configure (or clear) a rule's AI entry gate."""
+    current = rule.get("ai")
+    cur_label = current["provider"] if current else "off"
+    raw = (await _ask_line(
+        f"AI PROVIDER [off/anthropic/openai/ollama/custom] (current: {cur_label})")).lower()
+    if not raw:
+        return
+    if raw in ("off", "none", "0"):
+        rule["ai"] = None
+        print(Fore.GREEN + "  ✔  AI gate off." + Style.RESET_ALL)
+        return
+    if raw not in AI_PROVIDERS:
+        print(Fore.YELLOW + "  ⚠  Unknown provider — unchanged." + Style.RESET_ALL)
+        return
+    defaults = AI_PROVIDERS[raw]
+    base = current if current and current.get("provider") == raw else {}
+    model = (await _ask_line(
+        f"MODEL (ENTER = {base.get('model') or defaults['model'] or 'required'})")
+        or base.get("model") or defaults["model"])
+    endpoint = base.get("endpoint") or defaults["endpoint"]
+    if raw in ("ollama", "custom"):
+        endpoint = (await _ask_line(
+            f"ENDPOINT URL (ENTER = {endpoint or 'required'})") or endpoint)
+    key_env = base.get("api_key_env") or defaults["key_env"]
+    if raw != "ollama":
+        key_env = (await _ask_line(
+            f"API KEY ENV VAR (ENTER = {key_env or 'none'})") or key_env)
+    timeout_ms = await _ask_int("TIMEOUT ms", int(base.get("timeout_ms", 8000)), 1000, 60_000)
+    on_error_raw = (await _ask_line(
+        f"IF AI UNREACHABLE [skip/allow] (current: {base.get('on_error', 'skip')})")).lower()
+    if on_error_raw.startswith("a"):
+        on_error = "allow"
+    elif on_error_raw.startswith("s"):
+        on_error = "skip"
+    else:
+        on_error = base.get("on_error", "skip")
+    instructions = (await _ask_line("EXTRA GUIDANCE for the model (ENTER = keep/none)")
+                    or base.get("instructions", ""))
+    ai_cfg = _coerce_ai({"provider": raw, "model": model, "endpoint": endpoint,
+                         "api_key_env": key_env, "timeout_ms": timeout_ms,
+                         "on_error": on_error, "instructions": instructions})
+    if not ai_cfg or (raw == "custom" and not ai_cfg["endpoint"]):
+        print(Fore.YELLOW + "  ⚠  Incomplete AI config — gate unchanged." + Style.RESET_ALL)
+        return
+    rule["ai"] = ai_cfg
+    if raw == "anthropic" and anthropic is None:
+        print(Fore.YELLOW + "  ⚠  anthropic SDK not installed — run: pip install anthropic" + Style.RESET_ALL)
+    if ai_cfg["api_key_env"] and not os.environ.get(ai_cfg["api_key_env"]):
+        print(Fore.YELLOW + f"  ⚠  ${ai_cfg['api_key_env']} is not set in this environment." + Style.RESET_ALL)
+    print(Fore.GREEN + f"  ✔  AI gate → {raw} · {ai_cfg['model'] or 'default model'} · "
+          f"on error: {ai_cfg['on_error']}" + Style.RESET_ALL)
+
+
+async def _edit_rule_menu(rule: dict, title: str, scoped: bool):
+    """Edit one rule dict in place. Keys absent from `rule` inherit (from
+    the account default, then app defaults) and show without a '*'."""
+    field_keys = {1: ("enabled",), 2: ("size",),
+                  3: ("qty_mode", "qty_value", "max_contracts"),
+                  4: ("direction",), 5: ("delay_ms", "delay_jitter_ms"),
+                  6: ("stagger_entries", "stagger_interval_ms"),
+                  7: ("atm",), 8: ("ai",)}
+    while True:
+        eff = {**DEFAULT_RULE, **{k: v for k, v in rule.items() if k in DEFAULT_RULE}}
+
+        def mark(*keys):
+            return "*" if any(k in rule for k in keys) else " "
+
+        if eff["delay_ms"] or eff["delay_jitter_ms"]:
+            delay_label = f"{eff['delay_ms']}ms" + (
+                f" + 0..{eff['delay_jitter_ms']}ms jitter" if eff["delay_jitter_ms"] else "")
+        else:
+            delay_label = "off"
+        stagger_label = ("off" if eff["stagger_entries"] <= 1 else
+                         f"{eff['stagger_entries']} tranches × {eff['stagger_interval_ms']}ms")
+        qty_label = _qty_label(eff) + (
+            f" · cap {eff['max_contracts']}" if eff["max_contracts"] else "")
+        ai = eff["ai"]
+        ai_label = "off" if not ai else f"{ai['provider']} · {ai['model'] or 'default'}"
+        lines = [
+            f"1.{mark('enabled')} Entries       {'on' if eff['enabled'] else 'OFF — exits only'}",
+            f"2.{mark('size')} Size          {_SIZE_LABELS[eff['size']]}",
+            f"3.{mark('qty_mode', 'qty_value', 'max_contracts')} Contracts     {qty_label}",
+            f"4.{mark('direction')} Direction     {'INVERTED' if eff['direction'] == 'invert' else 'normal'}",
+            f"5.{mark('delay_ms', 'delay_jitter_ms')} Entry delay   {delay_label}",
+            f"6.{mark('stagger_entries', 'stagger_interval_ms')} Stagger       {stagger_label}",
+            f"7.{mark('atm')} ATM override  {eff['atm'] or 'inherit'}",
+            f"8.{mark('ai')} AI gate       {ai_label}",
+        ]
+        if scoped:
+            scope = (f"{', '.join(rule.get('symbols', [])) or 'any symbol'} · "
+                     f"{', '.join(rule.get('strategies', [])) or 'any strategy'}")
+            lines.append(f"9.  Scope         {scope[:40]}")
+        _prof_box(title, lines, [
+            "* = set here · number = edit · -number = reset field",
+            "Exits are never blocked, delayed, or AI-gated.",
+            "ENTER = done",
+        ])
+        raw = (await _ask_line("FIELD")).lower()
+        if raw in ("", "q"):
+            return
+        reset = raw.startswith("-")
+        num = raw.lstrip("-")
+        if not num.isdigit():
+            continue
+        n = int(num)
+        if reset:
+            for key in field_keys.get(n, ()):
+                rule.pop(key, None)
+            continue
+        if n == 1:
+            rule["enabled"] = not eff["enabled"]
+            if not rule["enabled"]:
+                print(Fore.YELLOW + "  ⚠  New entries blocked for this scope — exits still flow."
+                      + Style.RESET_ALL)
+        elif n == 2:
+            raw_s = (await _ask_line("SIZE [i]nherit / [m]icros / [f]ull")).lower()
+            if raw_s.startswith("i"):
+                rule["size"] = "inherit"
+            elif raw_s.startswith("m"):
+                rule["size"] = "micros"
+            elif raw_s.startswith("f"):
+                rule["size"] = "full"
+            elif raw_s:
+                print(Fore.YELLOW + "  ⚠  Unknown size — unchanged." + Style.RESET_ALL)
+        elif n == 3:
+            raw_q = (await _ask_line(
+                "CONTRACTS ('copy', fixed count '2', or multiplier 'x0.5')"
+            )).lower().replace(" ", "")
+            if raw_q == "copy":
+                rule["qty_mode"] = "copy"
+                rule.pop("qty_value", None)
+            elif raw_q and (raw_q.startswith("x") or raw_q.endswith("x")):
+                try:
+                    mult = float(raw_q.strip("x"))
+                    rule["qty_mode"] = "multiple"
+                    rule["qty_value"] = max(0.0, min(mult, RULE_CLAMPS["qty_value"][1]))
+                except ValueError:
+                    print(Fore.YELLOW + "  ⚠  Invalid multiplier — unchanged." + Style.RESET_ALL)
+            elif raw_q:
+                try:
+                    fixed = int(raw_q)
+                    rule["qty_mode"] = "fixed"
+                    rule["qty_value"] = float(max(0, min(fixed, 1000)))
+                except ValueError:
+                    print(Fore.YELLOW + "  ⚠  Invalid count — unchanged." + Style.RESET_ALL)
+            cap = await _ask_int("MAX CONTRACTS hard cap (0 = none)",
+                                 eff["max_contracts"], *RULE_CLAMPS["max_contracts"])
+            if cap != eff["max_contracts"] or "max_contracts" in rule:
+                rule["max_contracts"] = cap
+        elif n == 4:
+            rule["direction"] = "invert" if eff["direction"] == "normal" else "normal"
+            if rule["direction"] == "invert":
+                print(Fore.YELLOW + "  ⚠  INVERTED — BUY↔SELL flipped. Non-market entries are"
+                      + Style.RESET_ALL)
+                print(Fore.YELLOW + "     skipped and publisher CHANGE orders are dropped."
+                      + Style.RESET_ALL)
+        elif n == 5:
+            rule["delay_ms"] = await _ask_int(
+                "DELAY ms before entries (0 = off)", eff["delay_ms"], *RULE_CLAMPS["delay_ms"])
+            rule["delay_jitter_ms"] = await _ask_int(
+                "RANDOM JITTER ms on top (0 = off)", eff["delay_jitter_ms"],
+                *RULE_CLAMPS["delay_jitter_ms"])
+        elif n == 6:
+            rule["stagger_entries"] = await _ask_int(
+                "TRANCHES per entry (1 = off, max 10)", eff["stagger_entries"],
+                *RULE_CLAMPS["stagger_entries"])
+            if rule["stagger_entries"] > 1:
+                rule["stagger_interval_ms"] = await _ask_int(
+                    "INTERVAL ms between tranches", eff["stagger_interval_ms"],
+                    *RULE_CLAMPS["stagger_interval_ms"])
+        elif n == 7:
+            available = list_atm_strategies()
+            if available:
+                shown = ", ".join(available[:8]) + (" …" if len(available) > 8 else "")
+                print(Fore.CYAN + f"\r\033[K  Installed: {shown}" + Style.RESET_ALL)
+            name = await _ask_line("ATM TEMPLATE (ENTER = inherit session strategy)")
+            if not name:
+                rule.pop("atm", None)
+            else:
+                rule["atm"] = sanitize_ati(name)
+                if not validate_strategy(rule["atm"]):
+                    print(Fore.YELLOW + f"  ⚠  '{rule['atm']}' not in templates/AtmStrategy — "
+                          "legs fall back to the session strategy until installed."
+                          + Style.RESET_ALL)
+        elif n == 8:
+            await _edit_ai_gate(rule)
+        elif n == 9 and scoped:
+            await _edit_rule_scope(rule)
+
+
+async def _edit_scoped_rules(account: str):
+    """List / add / edit / delete an account's scoped rules."""
+    while True:
+        prof = account_profiles.setdefault(account, {})
+        rules = prof.setdefault("rules", [])
+        lines = []
+        for i, r in enumerate(rules, 1):
+            scope = (f"{','.join(r.get('symbols', [])) or 'any sym'} · "
+                     f"{','.join(r.get('strategies', [])) or 'any strat'}")
+            overrides = ", ".join(k for k in r if k in DEFAULT_RULE) or "no overrides"
+            lines.append(f"{i}. [{scope[:26]}]  {overrides[:24]}")
+        if not rules:
+            lines.append("No scoped rules — the DEFAULT rule covers everything.")
+        _prof_box(f"SCOPED RULES — {account}", lines, [
+            "First matching rule wins and overrides the default rule.",
+            "A = add · number = edit · D number = delete · ENTER = back",
+        ])
+        raw = (await _ask_line("RULES")).lower()
+        if raw in ("", "q"):
+            if not rules:
+                prof.pop("rules", None)
+            save_account_profiles()
+            return
+        if raw == "a":
+            rule: dict = {}
+            await _edit_rule_scope(rule)
+            await _edit_rule_menu(rule, f"NEW RULE — {account}", scoped=True)
+            if rule:
+                rules.append(rule)
+                print(Fore.GREEN + "  ✔  Rule added." + Style.RESET_ALL)
+            save_account_profiles()
+        elif raw.startswith("d") and raw[1:].strip().isdigit():
+            idx = int(raw[1:].strip())
+            if 1 <= idx <= len(rules):
+                rules.pop(idx - 1)
+                print(Fore.GREEN + f"  ✔  Rule {idx} deleted." + Style.RESET_ALL)
+            save_account_profiles()
+        elif raw.isdigit() and 1 <= int(raw) <= len(rules):
+            await _edit_rule_menu(rules[int(raw) - 1], f"RULE {raw} — {account}", scoped=True)
+            save_account_profiles()
+
+
+async def _edit_account_profile(account: str):
+    while True:
+        prof_now = account_profiles.get(account, {})
+        n_rules = len(prof_now.get("rules", []))
+        allowed = prof_now.get("symbols_allowed", [])
+        sym_label = ", ".join(allowed) if allowed else "all symbols"
+        _prof_box(f"PROFILE — {account}", [
+            f"Now: {profile_summary(account)}"[:_PROF_INNER],
+            "",
+            f"S. Symbols        — trades {sym_label}"[:_PROF_INNER],
+            "D. Default rule   — applies to every signal",
+            f"R. Scoped rules   — {n_rules} configured (per symbol/strategy)",
+            "X. Reset          — remove this account's profile",
+        ], ["ENTER = back"])
+        raw = (await _ask_line("OPTION")).lower()
+        if raw in ("", "q"):
+            return
+        if raw == "s":
+            raw_s = await _ask_line(
+                "ALLOWED SYMBOLS e.g. 'GC' or 'NQ ES' (ENTER = all symbols)")
+            prof = account_profiles.setdefault(account, {})
+            symbols = []
+            for tok in raw_s.replace(",", " ").split():
+                name = tok.strip().upper()
+                if name and name not in symbols:
+                    symbols.append(name)
+            if symbols:
+                prof["symbols_allowed"] = symbols
+                print(Fore.GREEN + f"  ✔  {account} only enters {', '.join(symbols)} "
+                      "(micro twins included) — other signals are ignored;" + Style.RESET_ALL)
+                print(Fore.GREEN + "     round-robin passes it over without losing its turn."
+                      + Style.RESET_ALL)
+            else:
+                prof.pop("symbols_allowed", None)
+                if not prof:
+                    account_profiles.pop(account, None)
+                print(Fore.GREEN + f"  ✔  {account} trades all symbols." + Style.RESET_ALL)
+            save_account_profiles()
+        elif raw == "d":
+            prof = account_profiles.setdefault(account, {})
+            rule = prof.setdefault("default", {})
+            await _edit_rule_menu(rule, f"DEFAULT RULE — {account}", scoped=False)
+            save_account_profiles()
+        elif raw == "r":
+            await _edit_scoped_rules(account)
+        elif raw == "x":
+            confirm = (await _ask_line(f"Remove profile for {account}? [y/N]")).lower()
+            if confirm == "y":
+                account_profiles.pop(account, None)
+                save_account_profiles()
+                print(Fore.GREEN + f"  ✔  {account} back to defaults." + Style.RESET_ALL)
+
+
+async def prompt_profiles():
+    """Per-account trade profiles: size, contracts, direction, delay,
+    stagger, ATM override, and AI gating — per account, scoped by symbol
+    and/or publisher strategy."""
+    global awaiting_user_input
+    awaiting_user_input = True
+    show_cursor()
+    try:
+        nt_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
+        names: list[str] = []
+        for name in target_accounts() + [a["name"] for a in nt_accounts] + sorted(account_profiles):
+            if name and name not in names:
+                names.append(name)
+        if not names:
+            print(Fore.YELLOW + "\n  ⚠  No accounts known — set accounts first (S → 3)."
+                  + Style.RESET_ALL)
+            return
+        while True:
+            lines = []
+            for i, name in enumerate(names, 1):
+                if name == active_account:
+                    role = "◀ leader"
+                elif name in follower_accounts:
+                    role = "＋ follower"
+                else:
+                    role = ""
+                lines.append(f"{i}. {name[:13].ljust(13)} {role.ljust(10)} "
+                             f"{profile_summary(name)[:29]}")
+            _prof_box("ACCOUNT PROFILES", lines, [
+                "Per-account: symbol filter, micros/full, contracts,",
+                "invert, delay, stagger, ATM override, AI gate.",
+                "ACCOUNT number or name to edit · ENTER = close",
+            ])
+            raw = await _ask_line("ACCOUNT")
+            if not raw:
+                break
+            if raw.isdigit() and 1 <= int(raw) <= len(names):
+                acct = names[int(raw) - 1]
+            else:
+                acct = raw
+                if acct not in names:
+                    names.append(acct)  # allow pre-configuring an offline account
+            await _edit_account_profile(acct)
+    finally:
+        awaiting_user_input = False
+        refresh_header_status()
+
+
 # ---------- Server selector ----------
 MAX_SAVED_SERVERS = 10  # cap saved server list
 
@@ -2190,8 +3741,12 @@ async def setup_menu():
     print(Fore.CYAN + f"│  1. Server    ({current_server[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  2. Token     ({masked_token[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     acct_label = active_account or "not set"
-    if follower_accounts:
-        acct_label = f"{active_account} +{len(follower_accounts)} copy"
+    if follower_accounts or roundrobin_accounts:
+        acct_label = active_account or "?"
+        if follower_accounts:
+            acct_label += f" +{len(follower_accounts)} copy"
+        if roundrobin_accounts:
+            acct_label += f" +{len(roundrobin_accounts)} rr"
     print(Fore.CYAN + f"│  3. Accounts  ({acct_label[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     mode_tag = "FOLLOW" if follow_publisher_strategy else "LOCKED"
     strat_label = f"{atm_strategy} · {mode_tag}"
@@ -2200,6 +3755,9 @@ async def setup_menu():
     print(Fore.CYAN + f"│  6. ATI Port  ({nt_port})" .ljust(53) + "│" + Style.RESET_ALL)
     micro_label = "ON — NQ→MNQ, ES→MES, …" if micro_mode else "OFF"
     print(Fore.CYAN + f"│  7. Micros    ({micro_label[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
+    n_profiles = len(account_profiles)
+    prof_label = f"{n_profiles} account{'s' if n_profiles != 1 else ''} customized" if n_profiles else "none"
+    print(Fore.CYAN + f"│  8. Profiles  ({prof_label[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     print(Fore.CYAN + "│  ESC to close                                    │" + Style.RESET_ALL)
     print(Fore.CYAN + "└──────────────────────────────────────────────────┘" + Style.RESET_ALL)
     sys.stdout.write(Fore.WHITE + "  SETUP ▸ " + Style.RESET_ALL)
@@ -2227,6 +3785,8 @@ async def setup_menu():
         else:
             _dash_set_alert(Fore.YELLOW + "  ✔  MICRO MODE OFF — instruments sent as-is." + Style.RESET_ALL)
         refresh_header_status()
+    elif key == "8":
+        await prompt_profiles()
     _dash_exit_menu()
 
 
@@ -2247,7 +3807,14 @@ async def show_balances():
     for a in accounts:
         name = a["name"]
         cash = a["cash"]
-        marker = " ◀" if name == active_account else (" ＋" if name in follower_accounts else "")
+        if name == active_account:
+            marker = " ◀"
+        elif name in follower_accounts:
+            marker = " ＋"
+        elif name in roundrobin_accounts:
+            marker = " ⟳"
+        else:
+            marker = ""
         start = session_start_balances.get(name)
         if start is not None:
             pnl = cash - start
@@ -2433,6 +4000,8 @@ async def keyboard_loop():
                 reconnect_event.set()
             elif key.lower() == "c":
                 await close_positions_menu()
+            elif key.lower() == "o":
+                await manual_trade_menu()
             elif key == "X":  # Shift+X only
                 unpin_layout()
                 clear()
@@ -2453,6 +4022,9 @@ SIGNAL_TAG_COLOURS = {
     "BLOCKED":  Fore.RED,
     "DUPE":     Fore.LIGHTBLACK_EX,
     "REJECTED": Fore.RED,
+    "SKIPPED":  Fore.YELLOW,
+    "REPLAY":   Fore.LIGHTBLACK_EX,
+    "MANUAL":   Fore.LIGHTCYAN_EX,
 }
 
 
@@ -2668,29 +4240,21 @@ def _with_account(signal_text: str, account: str) -> str:
     return ";".join(parts)
 
 
-async def dispatch_signal(raw_signal: str) -> list[str]:
-    """Fan one signal out to every tradeable account, one order file each.
+async def dispatch_signal(raw_signal: str, pub_strategy: str = "") -> list[str]:
+    """Fan one signal out to every tradeable account through its profile.
 
-    Returns the accounts whose file was written successfully; failures are
-    surfaced to the dashboard and logged but don't block the other legs.
+    With no profiles configured this is the classic copy-trade fan-out: one
+    identical order file per account, written immediately. Profiles can
+    reshape a leg (size/qty/direction/ATM), defer it (delay, AI gate,
+    staggered entry — those run as background tasks), or skip it. Returns
+    the accounts whose file was written NOW; deferred legs report via the
+    dashboard and log when they land.
     """
-    accounts = tradeable_accounts()
-    if not accounts:
-        return []
-    written: list[str] = []
-    for acct in accounts:
-        try:
-            res = write_signal_to_file(_with_account(raw_signal, acct))
-        except Exception as exc:
-            res = exc
-        if isinstance(res, Exception) or not res:
-            logger.error(f"DISPATCH FAIL  account={acct}  result={res!r}")
-            _dash_set_alert(
-                Fore.RED + f"  ✖  Copy-trade write failed for {acct}" + Style.RESET_ALL)
-        else:
-            written.append(acct)
-    if len(accounts) > 1:
-        logger.info(f"COPY DISPATCH  wrote={written}  of={accounts}")
+    plans, skipped = plan_signal_legs(raw_signal, pub_strategy)
+    written = await execute_plans(plans)
+    deferred = [p["account"] for p in plans if p["deferred"]]
+    if len(target_accounts()) > 1 or deferred or skipped:
+        logger.info(f"COPY DISPATCH  wrote={written}  deferred={deferred}  skipped={skipped}")
     return written
 
 
@@ -2862,6 +4426,182 @@ def close_all_open_positions() -> list[str]:
         for contract in close_account_positions(account):
             all_closed.add(contract)
     return sorted(all_closed)
+
+
+# ---------- Manual trading (terminal O key + web UI) ----------
+# A manual order is a locally-built PLACE signal pushed through the SAME
+# pipeline as a publisher signal: plan_signal_legs → per-account profiles
+# (symbol filter, size, qty, ATM override, AI gate) → copy-trade fan-out and
+# the round-robin rotation all apply. Manual orders always carry an ATM
+# template and a unique signal id, and they respect session locks — but NOT
+# pause, which only mutes the publisher: typing an order is deliberate.
+_manual_seq = 0
+_last_manual: dict = {"instrument": "", "qty": 1}
+
+
+def build_manual_signal(side, instrument, qty, order_type: str = "market",
+                        limit_price=None, atm: str = ""
+                        ) -> tuple[str | None, str | None]:
+    """Build a canonical manual PLACE signal. Returns (signal, error)."""
+    global _manual_seq
+    side_l = str(side or "").strip().lower()
+    if side_l in ("long", "buy", "b"):
+        action = "BUY"
+    elif side_l in ("short", "sell", "s"):
+        action = "SELL"
+    else:
+        return None, f"unknown side '{side}' — use long/short"
+    instr = sanitize_ati(str(instrument or "").strip().upper())
+    if not instr or " " not in instr:
+        return None, "instrument needs an expiry, e.g. 'NQ 09-26'"
+    try:
+        qty_i = int(str(qty).strip())
+    except (TypeError, ValueError):
+        return None, f"invalid contract count '{qty}'"
+    if not 1 <= qty_i <= 1000:
+        return None, "contracts must be 1-1000"
+    otype_l = str(order_type or "").strip().lower()
+    limit_field = ""
+    if otype_l in ("market", "m", "mkt"):
+        otype = "MARKET"
+    elif otype_l in ("limit", "l", "lmt"):
+        otype = "LIMIT"
+        try:
+            price = float(str(limit_price).strip())
+        except (TypeError, ValueError):
+            return None, "limit orders need a price"
+        if price <= 0:
+            return None, "limit price must be positive"
+        limit_field = f"{price:.10g}"
+    else:
+        return None, f"unknown order type '{order_type}' — use market/limit"
+    atm_name = sanitize_ati(str(atm or atm_strategy or "").strip())
+    if not atm_name:
+        return None, "no ATM template — set the session strategy first"
+    if not validate_strategy(atm_name):
+        return None, f"ATM template '{atm_name}' not installed"
+    if micro_mode:
+        instr = to_micro_instrument(instr)
+    _manual_seq += 1
+    sig_id = f"man{time.strftime('%H%M%S')}n{_manual_seq}"
+    parts = ["PLACE", active_account or "", instr, action, str(qty_i), otype,
+             limit_field, "", "DAY", "", "", atm_name, sig_id]
+    err = validate_signal(parts)
+    if err:
+        return None, err
+    return ";".join(parts), None
+
+
+async def submit_manual_trade(side, instrument, qty, order_type: str = "market",
+                              limit_price=None, atm: str = ""
+                              ) -> tuple[bool, str]:
+    """Fire a manual order through the normal dispatch pipeline.
+
+    Returns (ok, message) for the terminal and web UI alike. Session locks
+    block it; pause does not (pause mutes the publisher, not the trader).
+    """
+    global signal_count
+    if hard_stopped:
+        return False, "session hard-locked — manual trading disabled"
+    if not tradeable_accounts():
+        return False, "every account is stopped for the session"
+    if not is_trade_ready():
+        return False, "system not ready — check directory, account and strategy"
+    signal, err = build_manual_signal(side, instrument, qty, order_type,
+                                      limit_price, atm)
+    if err:
+        return False, err
+    plans, skipped = plan_signal_legs(signal)
+    if not plans:
+        why = ", ".join(f"{a}: {r}" for a, r in skipped[:3]) or "no eligible accounts"
+        return False, f"no legs to fire — {why}"
+    signal_count += 1
+    _dash_add_signal(format_signal(signal, signal_count, tag="MANUAL"))
+    sig_id = signal.split(";")[-1]
+    leader_plan = next((p for p in plans if p["account"] == active_account), None)
+    pre_pos = 0
+    if leader_plan and not leader_plan["deferred"]:
+        try:
+            pre_positions = await asyncio.to_thread(
+                query_nt_positions, active_account, nt_port)
+            pre_pos = pre_positions.get(leader_plan["instrument"], 0)
+        except Exception:
+            pre_pos = 0
+    written = await execute_plans(plans, sig_id)
+    scheduled = [p["account"] for p in plans if p["deferred"]]
+    if not written and not scheduled:
+        return False, "no order file written — check the output directory"
+    _note_contract(signal)
+    if leader_plan and not leader_plan["deferred"] and active_account in written:
+        add_pending_confirm(leader_plan["signal"], sig_id,
+                            leader_plan["instrument"], leader_plan["action"], pre_pos)
+    p = signal.split(";")
+    desc = f"MANUAL {p[3]} {p[4]} {p[2]} {p[5]}" + (f" @ {p[6]}" if p[6] else "")
+    bits = [f"→ {len(written)} account{'s' if len(written) != 1 else ''}"]
+    if scheduled:
+        bits.append(f"{len(scheduled)} deferred")
+    if skipped:
+        bits.append(f"{len(skipped)} skipped")
+    msg = f"{desc}  {' · '.join(bits)}"
+    logger.info(f"{msg}  written={written}  deferred={scheduled}  skipped={skipped}")
+    _dash_set_alert(Fore.GREEN + f"  ✔  {msg}" + Style.RESET_ALL)
+    return True, msg
+
+
+async def manual_trade_menu():
+    """Terminal manual-order ticket (O key)."""
+    global awaiting_user_input
+    if hard_stopped:
+        _dash_set_alert(Fore.RED + "  ⛔  Hard stop locked — manual trading disabled."
+                        + Style.RESET_ALL)
+        return
+    awaiting_user_input = True
+    show_cursor()
+    try:
+        micro_note = "micros ON — instrument auto-converts" if micro_mode else "micros off"
+        _prof_box("MANUAL ORDER", [
+            f"Leader {active_account or '—'} + copy/round-robin fan-out",
+            f"ATM default: {atm_strategy or '—'} · {micro_note}",
+            "Profiles (symbol filter, size, qty, AI) still apply.",
+        ], ["ENTER on SIDE cancels."])
+        raw_side = (await _ask_line("SIDE  [b]uy-long / [s]ell-short")).lower()
+        if not raw_side:
+            print(Fore.WHITE + Style.DIM + "  Cancelled." + Style.RESET_ALL)
+            return
+        default_instr = _last_manual["instrument"] or next(iter(sorted(session_contracts)), "")
+        hint = f" [{default_instr}]" if default_instr else " e.g. NQ 09-26"
+        instr = (await _ask_line(f"INSTRUMENT{hint}")) or default_instr
+        qty = (await _ask_line(f"CONTRACTS [{_last_manual['qty']}]")) or _last_manual["qty"]
+        otype = (await _ask_line("TYPE  [m]arket / [l]imit  [m]")).lower() or "m"
+        price = None
+        if otype.startswith("l"):
+            price = await _ask_line("LIMIT PRICE")
+        atm = (await _ask_line(f"ATM TEMPLATE [{atm_strategy}]")) or ""
+        preview, err = build_manual_signal(raw_side, instr, qty, otype, price, atm)
+        if err:
+            print(Fore.YELLOW + f"  ⚠  {err}" + Style.RESET_ALL)
+            return
+        pp = preview.split(";")
+        n_extra = len(target_accounts()) - 1
+        fan = f" (+{n_extra} more account{'s' if n_extra != 1 else ''})" if n_extra else ""
+        confirm = (await _ask_line(
+            f"SUBMIT {pp[3]} {pp[4]} {pp[2]} {pp[5]}"
+            + (f" @ {pp[6]}" if pp[6] else "") + f" · ATM {pp[11]}{fan}? [y/N]")).lower()
+        if confirm != "y":
+            print(Fore.WHITE + Style.DIM + "  Cancelled." + Style.RESET_ALL)
+            return
+        ok, msg = await submit_manual_trade(raw_side, instr, qty, otype, price, atm)
+        if ok:
+            _last_manual["instrument"] = str(instr).strip().upper()
+            try:
+                _last_manual["qty"] = max(1, int(str(qty).strip()))
+            except ValueError:
+                pass
+            print(Fore.GREEN + f"  ✔  {msg}" + Style.RESET_ALL)
+        else:
+            print(Fore.YELLOW + f"  ⚠  {msg}" + Style.RESET_ALL)
+    finally:
+        awaiting_user_input = False
 
 
 def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, action: str, pre_pos: int = 0):
@@ -3110,7 +4850,14 @@ async def prompt_limits():
         print(Fore.CYAN + "\n\r\033[K  Set limits for:" + Style.RESET_ALL)
         print(Fore.CYAN + "\r\033[K    0. ALL accounts (same limits for each)" + Style.RESET_ALL)
         for i, a in enumerate(targets, 1):
-            role = "leader" if a == active_account else "follower"
+            if a == active_account:
+                role = "leader"
+            elif a in follower_accounts:
+                role = "follower"
+            elif a in roundrobin_accounts:
+                role = "round-robin"
+            else:
+                role = "account"
             print(Fore.CYAN + f"\r\033[K    {i}. {a}  ({role})" + Style.RESET_ALL)
         sys.stdout.write(Fore.WHITE + f"  ACCOUNT # (ENTER = {active_account}) ▸ " + Style.RESET_ALL)
         sys.stdout.flush()
@@ -3284,6 +5031,7 @@ async def listen(token: str):
                 ever_connected = True
                 conn_lost_at = None
                 note_connection_up()
+                note_connected()  # arm the id-less replay guard window
 
                 # Restore persisted session if still in the same trading session
                 restored = restore_session_state()
@@ -3388,6 +5136,20 @@ async def listen(token: str):
                             if sig_id:
                                 _recent_signal_ids.append(sig_id)
 
+                            # Id-less replay guard: after a reconnect the server
+                            # re-delivers recent signals; commands without a
+                            # signal id (publisher CLOSEPOSITIONs) would bypass
+                            # id dedup and fire twice — see 2026-08-07 04:21:58.
+                            if not sig_id and _is_idless_replay(raw_signal):
+                                signal_count += 1
+                                _dash_add_signal(format_signal(raw_signal, signal_count, lat_str, tag="REPLAY"))
+                                _dash_set_alert(
+                                    Fore.YELLOW + "  ⚠  Post-reconnect replay blocked — id-less signal "
+                                    "already fired. Press C to close manually if it was real."
+                                    + Style.RESET_ALL)
+                                logger.warning(f"REPLAY BLOCKED  {raw_signal}")
+                                continue
+
                             signal_count += 1
 
                             # Non-trade states still show the signal in the dashboard, tagged
@@ -3413,19 +5175,32 @@ async def listen(token: str):
                                     logger.info(f"SIGNAL #{signal_count} ({tag})  {raw_signal}")
                                 continue
 
-                            # Track traded contracts for hard stop
-                            sig_parts = raw_signal.split(";")
-                            if len(sig_parts) >= 3 and sig_parts[2] and len(session_contracts) < MAX_SESSION_CONTRACTS:
-                                session_contracts.add(sig_parts[2])
+                            # Resolve per-account legs. With no profiles this
+                            # is one identical leg per account (classic copy
+                            # trading); profiles can reshape, defer, or skip
+                            # individual accounts' legs.
+                            pub_strategy = publisher_strategy_of(msg)
+                            plans, skipped_legs = plan_signal_legs(raw_signal, pub_strategy)
+                            if not plans:
+                                _dash_add_signal(format_signal(raw_signal, signal_count, lat_str, tag="SKIPPED"))
+                                why = ", ".join(f"{a}: {r}" for a, r in skipped_legs[:3]) or "no tradeable accounts"
+                                _dash_set_alert(
+                                    Fore.YELLOW + f"  ⚠  Signal skipped by profiles — {why}" + Style.RESET_ALL)
+                                logger.info(f"SIGNAL #{signal_count} (ALL LEGS SKIPPED)  {skipped_legs}  {raw_signal}")
+                                continue
 
                             # Snapshot the LEADER's position BEFORE writing so
                             # fast fills don't make pre/post look identical.
-                            # Fill confirmation tracks the leader; followers
-                            # mirror the same signal.
-                            instrument = sig_parts[2] if len(sig_parts) >= 3 else ""
-                            action = sig_parts[3] if len(sig_parts) >= 4 else ""
-                            pre_positions = await asyncio.to_thread(query_nt_positions, active_account, nt_port)
-                            pre_pos = pre_positions.get(instrument, 0)
+                            # Uses the leader's TRANSFORMED instrument — its
+                            # profile may size it differently. Deferred leader
+                            # legs snapshot inside their own task instead.
+                            leader_plan = next(
+                                (p for p in plans if p["account"] == active_account), None)
+                            pre_pos = 0
+                            if leader_plan and not leader_plan["deferred"]:
+                                pre_positions = await asyncio.to_thread(
+                                    query_nt_positions, active_account, nt_port)
+                                pre_pos = pre_positions.get(leader_plan["instrument"], 0)
                             # Re-check state after the await — balance_monitor could
                             # have fired a soft/hard stop while we were querying NT.
                             # Without this, a signal in-flight during a stop can race
@@ -3435,21 +5210,40 @@ async def listen(token: str):
                                 _dash_add_signal(format_signal(raw_signal, signal_count, lat_str, tag=late_tag))
                                 logger.info(f"SIGNAL #{signal_count} ({late_tag} post-query)  {raw_signal}")
                                 continue
-                            # Fan the signal out to the leader + every tradeable
-                            # follower.
-                            written = await dispatch_signal(raw_signal)
-                            if not written:
+                            written = await execute_plans(plans, sig_id)
+                            scheduled = [p["account"] for p in plans if p["deferred"]]
+                            if not written and not scheduled:
                                 _dash_add_signal(format_signal(raw_signal, signal_count, lat_str, tag="BLOCKED"))
                                 logger.warning(f"SIGNAL #{signal_count} (NO WRITE)  {raw_signal}")
                                 continue
-                            # Register fill confirmation on the leader if it fired
-                            if active_account in written:
-                                add_pending_confirm(raw_signal, sig_id, instrument, action, pre_pos)
-                            copy_note = f"  → {len(written)} accts" if len(written) > 1 else ""
+                            _note_fired_signal(raw_signal)  # replay-guard memory
+                            # Register fill confirmation on the leader if its leg
+                            # fired now (deferred leader legs register in-task).
+                            if (leader_plan and not leader_plan["deferred"]
+                                    and active_account in written):
+                                add_pending_confirm(
+                                    leader_plan["signal"], sig_id,
+                                    leader_plan["instrument"], leader_plan["action"], pre_pos)
+                            total_legs = len(written) + len(scheduled)
+                            note_bits = []
+                            if total_legs > 1:
+                                note_bits.append(f"→ {total_legs} accts")
+                            rr_account = next(
+                                (p["account"] for p in plans if p.get("rr_pick")), None)
+                            if rr_account:
+                                note_bits.append(f"RR→{rr_account}")
+                            if scheduled:
+                                note_bits.append(f"{len(scheduled)} deferred")
+                            if skipped_legs:
+                                note_bits.append(f"{len(skipped_legs)} skip")
+                            copy_note = ("  " + " · ".join(note_bits)) if note_bits else ""
+                            display_sig = leader_plan["signal"] if leader_plan else raw_signal
                             _dash_add_signal(format_signal(
-                                raw_signal, signal_count, (lat_str + copy_note).strip()))
+                                display_sig, signal_count, (lat_str + copy_note).strip()))
                             await signal_pulse("SIGNAL RECEIVED")
-                            logger.info(f"SIGNAL #{signal_count}  accounts={written}  {raw_signal}")
+                            logger.info(
+                                f"SIGNAL #{signal_count}  accounts={written}  "
+                                f"deferred={scheduled}  skipped={skipped_legs}  {raw_signal}")
                         else:
                             # Non-signal message (server info, heartbeat, etc.)
                             if not paused:
@@ -3654,22 +5448,548 @@ def setup() -> tuple[str, dict]:
     return cfg["token"], cfg
 
 
+# ---------- Embedded web UI ----------
+# A localhost-only control panel started alongside the terminal UI. It is a
+# stdlib ThreadingHTTPServer (no new dependencies): GET /api/state polls a
+# JSON snapshot of the session; every mutating POST hops onto the asyncio
+# main loop via run_coroutine_threadsafe so all trading state stays
+# single-threaded. Manual orders, pause/resume, flatten, reconnect, micro
+# toggle, accounts, strategy, limits and profiles all drive the exact same
+# functions as the keyboard.
+_WEB_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_web_loop: asyncio.AbstractEventLoop | None = None
+_web_httpd = None
+_web_url: str | None = None
+_web_events: deque[dict] = deque(maxlen=80)
+
+
+def _web_note(kind: str, text: str):
+    """Mirror a dashboard line into the web event feed (ANSI stripped)."""
+    plain = _WEB_ANSI_RE.sub("", text).strip()
+    if plain:
+        _web_events.append({"ts": time.time(), "kind": kind, "text": plain})
+
+
+def web_state() -> dict:
+    """JSON-safe snapshot of everything the web dashboard shows."""
+    accounts = []
+    for name in target_accounts():
+        if name == active_account:
+            role = "leader"
+        elif name in follower_accounts:
+            role = "follower"
+        else:
+            role = "round-robin"
+        start = session_start_balances.get(name)
+        current = session_current_balances.get(name)
+        pnl = (current - start) if (start is not None and current is not None) else None
+        accounts.append({
+            "name": name, "role": role, "start": start, "current": current,
+            "pnl": pnl, "stop": account_stops.get(name),
+            "profile": profile_summary(name),
+            "limits": get_account_limits(name),
+        })
+    return {
+        "version": __version__,
+        "state": _session_state,
+        "status_text": _WEB_ANSI_RE.sub("", get_session_status_text()),
+        "paused": paused, "hard_stopped": hard_stopped, "soft_stopped": soft_stopped,
+        "trade_ready": is_trade_ready(),
+        "micro_mode": micro_mode,
+        "atm_strategy": atm_strategy,
+        "follow_publisher_strategy": follow_publisher_strategy,
+        "atm_available": list_atm_strategies(),
+        "accounts": accounts,
+        "leader": active_account or "",
+        "followers": list(follower_accounts),
+        "rr": {"pool": list(roundrobin_accounts),
+               "remaining": list(_rr_remaining), "last": _rr_last},
+        "signal_count": signal_count,
+        "session_contracts": sorted(session_contracts),
+        "events": list(_web_events),
+        "profiles": account_profiles,
+        "server": _server_name,
+        "output_directory": output_directory or "",
+        "ts": time.time(),
+    }
+
+
+async def _web_toggle_pause(pause: bool) -> tuple[bool, str]:
+    global paused, soft_stopped
+    if hard_stopped:
+        return False, "session hard-locked — exit to clear"
+    if bool(pause) == paused:
+        return True, "paused" if paused else "running"
+    paused = bool(pause)
+    if paused:
+        set_session_state("paused")
+        _dash_set_alert(Fore.YELLOW + "  ⏸  PAUSED from web UI" + Style.RESET_ALL)
+        return True, "paused"
+    for a in [k for k, v in account_stops.items() if v == "soft"]:
+        del account_stops[a]
+    soft_stopped = False
+    _recompute_session_lock()
+    set_session_state("ready")
+    _dash_set_alert(Fore.GREEN + "  ▶  RESUMED from web UI" + Style.RESET_ALL)
+    return True, "resumed"
+
+
+async def _web_close_all() -> tuple[bool, str]:
+    closed = await asyncio.to_thread(close_all_open_positions)
+    logger.info(f"WEB CLOSE ALL  contracts={closed}")
+    if closed:
+        _dash_set_alert(Fore.RED + f"  ⛔  WEB CLOSE ALL → {', '.join(closed)}"
+                        + Style.RESET_ALL)
+        return True, f"close sent for {', '.join(closed)}"
+    return True, "no open positions tracked — nothing closed"
+
+
+async def _web_toggle_micro() -> tuple[bool, str]:
+    on = toggle_micro_mode()
+    refresh_header_status()
+    return True, f"micro mode {'ON' if on else 'off'}"
+
+
+async def _web_set_accounts(leader, followers, robins) -> tuple[bool, str]:
+    global active_account, follower_accounts, roundrobin_accounts
+    lead = sanitize_ati(str(leader or "").strip())
+    if not lead:
+        return False, "leader account required"
+    fols: list[str] = []
+    for f in (followers or []):
+        name = sanitize_ati(str(f).strip())
+        if name and name != lead and name not in fols:
+            fols.append(name)
+    active_account = lead
+    follower_accounts = fols
+    roundrobin_accounts = sanitize_roundrobin(
+        [str(r).strip() for r in (robins or [])], lead, fols)
+    _rr_reset_rotation()
+    cfg = load_config()
+    cfg["account"] = active_account
+    cfg["follower_accounts"] = follower_accounts
+    cfg["roundrobin_accounts"] = roundrobin_accounts
+    save_config(cfg)
+    refresh_header_status()
+    logger.info(f"WEB ACCOUNTS SET  leader={lead}  followers={fols}  "
+                f"roundrobin={roundrobin_accounts}")
+    return True, (f"leader {lead} · {len(fols)} follower(s) · "
+                  f"{len(roundrobin_accounts)} round-robin")
+
+
+async def _web_set_strategy(name, follow_publisher=None) -> tuple[bool, str]:
+    global atm_strategy, follow_publisher_strategy
+    cfg = load_config()
+    msg_bits = []
+    if name is not None:
+        atm = sanitize_ati(str(name).strip())
+        if not atm:
+            return False, "strategy name required"
+        if not validate_strategy(atm):
+            return False, f"template '{atm}' not in templates/AtmStrategy"
+        atm_strategy = atm
+        cfg["atm_strategy"] = atm
+        msg_bits.append(f"strategy {atm}")
+    if follow_publisher is not None:
+        follow_publisher_strategy = bool(follow_publisher)
+        cfg["follow_publisher_strategy"] = follow_publisher_strategy
+        msg_bits.append("FOLLOW publisher" if follow_publisher_strategy else "LOCKED")
+    save_config(cfg)
+    refresh_header_status()
+    logger.info(f"WEB STRATEGY  {'; '.join(msg_bits)}")
+    return True, " · ".join(msg_bits) or "no change"
+
+
+async def _web_set_limits(account, target, target_mode, stop, stop_mode) -> tuple[bool, str]:
+    acct = sanitize_ati(str(account or "").strip())
+    if not acct:
+        return False, "account required"
+    try:
+        set_account_limits(acct, float(target or 0), str(target_mode or "off"),
+                           float(stop or 0), str(stop_mode or "off"))
+    except (TypeError, ValueError) as exc:
+        return False, f"invalid limits: {exc}"
+    logger.info(f"WEB LIMITS  {acct}  target={target}/{target_mode}  stop={stop}/{stop_mode}")
+    return True, f"limits saved for {acct}"
+
+
+async def _web_set_profiles(raw) -> tuple[bool, str]:
+    if not isinstance(raw, dict):
+        return False, "profiles must be a JSON object keyed by account"
+    cleaned = load_account_profiles({"account_profiles": raw})
+    account_profiles.clear()
+    account_profiles.update(cleaned)
+    save_account_profiles()
+    refresh_header_status()
+    return True, f"profiles saved for {', '.join(sorted(cleaned)) or 'no accounts'}"
+
+
+def _web_run(coro, timeout: float = 20.0):
+    """Run a coroutine on the app loop from a web server thread."""
+    if _web_loop is None or _web_loop.is_closed():
+        raise RuntimeError("app loop not running")
+    return asyncio.run_coroutine_threadsafe(coro, _web_loop).result(timeout)
+
+
+class _WebHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):  # keep the TUI clean
+        pass
+
+    def _reply(self, code: int, body: bytes, ctype: str):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj, code: int = 200):
+        self._reply(code, json.dumps(obj).encode("utf-8"),
+                    "application/json; charset=utf-8")
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        try:
+            if path == "/":
+                self._reply(200, WEB_UI_HTML.encode("utf-8"),
+                            "text/html; charset=utf-8")
+            elif path == "/api/state":
+                self._json(web_state())
+            else:
+                self._json({"ok": False, "message": "not found"}, 404)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            logger.error(f"WEB GET {path}  {exc}")
+            try:
+                self._json({"ok": False, "message": str(exc)}, 500)
+            except OSError:
+                pass
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            data = json.loads(self.rfile.read(length) or b"{}") if length else {}
+            if not isinstance(data, dict):
+                raise ValueError("body must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._json({"ok": False, "message": f"bad request: {exc}"}, 400)
+            return
+        try:
+            if path == "/api/trade":
+                ok, msg = _web_run(submit_manual_trade(
+                    data.get("side"), data.get("instrument"), data.get("qty"),
+                    data.get("order_type", "market"), data.get("limit_price"),
+                    data.get("atm", "")))
+            elif path == "/api/pause":
+                ok, msg = _web_run(_web_toggle_pause(data.get("paused", True)))
+            elif path == "/api/close_all":
+                ok, msg = _web_run(_web_close_all(), timeout=30.0)
+            elif path == "/api/reconnect":
+                _web_loop.call_soon_threadsafe(reconnect_event.set)
+                ok, msg = True, "reconnect requested"
+            elif path == "/api/micro":
+                ok, msg = _web_run(_web_toggle_micro())
+            elif path == "/api/accounts":
+                ok, msg = _web_run(_web_set_accounts(
+                    data.get("leader"), data.get("followers"),
+                    data.get("roundrobin")))
+            elif path == "/api/strategy":
+                ok, msg = _web_run(_web_set_strategy(
+                    data.get("name"), data.get("follow_publisher")))
+            elif path == "/api/limits":
+                ok, msg = _web_run(_web_set_limits(
+                    data.get("account"), data.get("target"),
+                    data.get("target_mode"), data.get("stop"),
+                    data.get("stop_mode")))
+            elif path == "/api/profiles":
+                ok, msg = _web_run(_web_set_profiles(data.get("profiles")))
+            else:
+                self._json({"ok": False, "message": "not found"}, 404)
+                return
+            self._json({"ok": bool(ok), "message": msg})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as exc:
+            logger.error(f"WEB POST {path}  {exc}")
+            try:
+                self._json({"ok": False, "message": str(exc)}, 500)
+            except OSError:
+                pass
+
+
+def start_web_ui(loop: asyncio.AbstractEventLoop, cfg: dict) -> str | None:
+    """Start the localhost web UI. Returns the URL, or None when disabled."""
+    global _web_loop, _web_httpd, _web_url
+    if not bool(cfg.get("webui_enabled", True)):
+        return None
+    try:
+        port = int(cfg.get("webui_port", 8720))
+    except (TypeError, ValueError):
+        port = 8720
+    _web_loop = loop
+    try:
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), _WebHandler)
+    except OSError as exc:
+        logger.warning(f"WEB UI  port {port} busy ({exc}) — trying an ephemeral port")
+        try:
+            httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _WebHandler)
+        except OSError as exc2:
+            logger.error(f"WEB UI  failed to start: {exc2}")
+            return None
+    httpd.daemon_threads = True
+    _web_httpd = httpd
+    threading.Thread(target=httpd.serve_forever, name="webui", daemon=True).start()
+    _web_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    logger.info(f"WEB UI  serving at {_web_url}")
+    return _web_url
+
+
+def stop_web_ui():
+    global _web_httpd
+    if _web_httpd is not None:
+        try:
+            _web_httpd.shutdown()
+            _web_httpd.server_close()
+        except Exception:
+            pass
+        _web_httpd = None
+
+
+WEB_UI_HTML = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SocketTrader</title>
+<style>
+:root{--bg:#0b0e14;--panel:#12161f;--edge:#1f2633;--fg:#d7dde8;--dim:#7a8598;
+--green:#3fb68b;--red:#e05561;--yellow:#d7a65f;--cyan:#4db3c8;--acc:#4db3c8}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.45 ui-monospace,Menlo,Consolas,monospace;padding:14px}
+h1{font-size:16px;letter-spacing:2px}
+h2{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));margin-top:12px}
+.panel{background:var(--panel);border:1px solid var(--edge);border-radius:8px;padding:12px}
+.wide{grid-column:1/-1}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.chip{border:1px solid var(--edge);border-radius:999px;padding:2px 10px;font-size:12px;color:var(--dim)}
+.chip.on{color:var(--green);border-color:var(--green)}
+.chip.warn{color:var(--yellow);border-color:var(--yellow)}
+.chip.bad{color:var(--red);border-color:var(--red)}
+button{background:#1a2130;border:1px solid var(--edge);color:var(--fg);border-radius:6px;
+padding:7px 12px;font:inherit;cursor:pointer}
+button:hover{border-color:var(--acc)}
+button.buy{border-color:var(--green);color:var(--green)}
+button.sell{border-color:var(--red);color:var(--red)}
+button.danger{border-color:var(--red);color:var(--red)}
+button.sel{background:var(--acc);color:#08222a;border-color:var(--acc)}
+button.sel.buy{background:var(--green);color:#04140d;border-color:var(--green)}
+button.sel.sell{background:var(--red);color:#1c0507;border-color:var(--red)}
+input,select,textarea{background:#0e1320;border:1px solid var(--edge);color:var(--fg);
+border-radius:6px;padding:6px 8px;font:inherit;width:100%}
+label{font-size:11px;color:var(--dim);display:block;margin:8px 0 3px;text-transform:uppercase}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{color:var(--dim);text-align:left;font-weight:normal;border-bottom:1px solid var(--edge);padding:4px 6px}
+td{padding:5px 6px;border-bottom:1px solid #161c28}
+.pos{color:var(--green)}.neg{color:var(--red)}.dim{color:var(--dim)}
+#feed{max-height:340px;overflow-y:auto;font-size:12.5px}
+#feed div{padding:2px 0;border-bottom:1px solid #141a26}
+#toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:#1a2130;
+border:1px solid var(--acc);border-radius:8px;padding:10px 16px;display:none;max-width:90vw;z-index:9}
+#toast.bad{border-color:var(--red);color:var(--red)}
+.row{display:flex;gap:8px}.row>*{flex:1}
+details summary{cursor:pointer;color:var(--dim);margin-bottom:8px}
+textarea{font-size:12px;min-height:170px;white-space:pre}
+small{color:var(--dim)}
+</style></head><body>
+<div class="bar">
+<h1>SOCKET TRADER <span id="ver" class="dim"></span></h1>
+<span class="chip" id="chState">…</span>
+<span class="chip" id="chReady">…</span>
+<span class="chip" id="chMicro">micros</span>
+<span class="chip" id="chAtm">…</span>
+<span class="chip dim" id="chCount"></span>
+</div>
+<div class="grid">
+<div class="panel">
+<h2>Actions</h2>
+<div class="bar">
+<button id="btnPause"></button>
+<button class="danger" onclick="closeAll()">CLOSE ALL</button>
+<button onclick="post('/api/reconnect',{})">RECONNECT</button>
+<button onclick="post('/api/micro',{})">MICRO TOGGLE</button>
+</div>
+</div>
+<div class="panel">
+<h2>Manual order</h2>
+<div class="row">
+<button class="buy" id="sideB" onclick="setSide('long')">BUY / LONG</button>
+<button class="sell" id="sideS" onclick="setSide('short')">SELL / SHORT</button>
+</div>
+<div class="row">
+<div><label>Instrument</label><input id="tInstr" placeholder="NQ 09-26"></div>
+<div><label>Contracts</label><input id="tQty" type="number" min="1" value="1"></div>
+</div>
+<div class="row">
+<div><label>Type</label><select id="tType" onchange="typeChanged()">
+<option value="market">MARKET</option><option value="limit">LIMIT</option></select></div>
+<div><label>Limit price</label><input id="tPrice" type="number" step="0.25" disabled></div>
+</div>
+<label>ATM template</label><select id="tAtm"></select>
+<div style="margin-top:10px"><button onclick="trade()" style="width:100%">SUBMIT ORDER</button></div>
+</div>
+<div class="panel wide">
+<h2>Accounts</h2>
+<table><thead><tr><th>Account</th><th>Role</th><th>Profile</th><th>Start</th>
+<th>Now</th><th>P&amp;L</th><th>Status</th></tr></thead><tbody id="accts"></tbody></table>
+<div id="rrline" class="dim" style="margin-top:6px"></div>
+</div>
+<div class="panel wide">
+<h2>Feed</h2>
+<div id="feed"></div>
+</div>
+<div class="panel wide"><details><summary>Settings — accounts · strategy · limits · profiles</summary>
+<div class="grid" style="margin-top:0">
+<div>
+<h2>Accounts</h2>
+<label>Leader</label><input id="aLeader">
+<label>Followers (space separated)</label><input id="aFollowers">
+<label>Round-robin pool (space separated)</label><input id="aRobins">
+<div style="margin-top:8px"><button onclick="saveAccounts()">SAVE ACCOUNTS</button></div>
+</div>
+<div>
+<h2>Strategy</h2>
+<label>Session ATM strategy</label><select id="sAtm"></select>
+<label><input type="checkbox" id="sFollow" style="width:auto"> follow publisher's strategy</label>
+<div style="margin-top:8px"><button onclick="saveStrategy()">SAVE STRATEGY</button></div>
+<h2 style="margin-top:14px">Limits</h2>
+<label>Account</label><select id="lAcct"></select>
+<div class="row">
+<div><label>Target</label><input id="lTarget" type="number" step="1"></div>
+<div><label>Mode</label><input id="lTargetMode" placeholder="off / $ / %"></div>
+</div>
+<div class="row">
+<div><label>Stop</label><input id="lStop" type="number" step="1"></div>
+<div><label>Mode</label><input id="lStopMode" placeholder="off / $ / %"></div>
+</div>
+<div style="margin-top:8px"><button onclick="saveLimits()">SAVE LIMITS</button></div>
+</div>
+<div>
+<h2>Profiles (JSON)</h2>
+<textarea id="pJson" spellcheck="false"></textarea>
+<div style="margin-top:8px"><button onclick="saveProfiles()">SAVE PROFILES</button>
+<small> — same schema as account_profiles in config</small></div>
+</div>
+</div></details></div>
+</div>
+<div id="toast"></div>
+<script>
+let S=null,side='long',editing=false;
+const $=id=>document.getElementById(id);
+document.addEventListener('focusin',e=>{if(e.target.closest('details'))editing=true});
+function toast(m,bad){const t=$('toast');t.textContent=m;t.className=bad?'bad':'';
+t.style.display='block';clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',5000)}
+async function post(p,body){try{const r=await fetch(p,{method:'POST',
+headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+const j=await r.json();toast(j.message,!j.ok);refresh();return j}
+catch(e){toast('request failed: '+e,true)}}
+function setSide(s){side=s;$('sideB').classList.toggle('sel',s==='long');
+$('sideS').classList.toggle('sel',s==='short')}
+function typeChanged(){$('tPrice').disabled=$('tType').value!=='limit'}
+function trade(){const q=$('tQty').value,i=$('tInstr').value;
+if(!i.trim())return toast('instrument required',true);
+const t=$('tType').value,msg=side.toUpperCase()+' '+q+' '+i+' '+t.toUpperCase()+
+(t==='limit'?' @ '+$('tPrice').value:'');
+if(!confirm('Submit '+msg+' (fans out to copy/round-robin accounts)?'))return;
+post('/api/trade',{side:side,instrument:i,qty:q,order_type:t,
+limit_price:$('tPrice').value,atm:$('tAtm').value})}
+function closeAll(){if(confirm('Flatten ALL positions on every managed account?'))
+post('/api/close_all',{})}
+function saveAccounts(){post('/api/accounts',{leader:$('aLeader').value,
+followers:$('aFollowers').value.split(/[\s,]+/).filter(Boolean),
+roundrobin:$('aRobins').value.split(/[\s,]+/).filter(Boolean)});editing=false}
+function saveStrategy(){post('/api/strategy',{name:$('sAtm').value,
+follow_publisher:$('sFollow').checked});editing=false}
+function saveLimits(){post('/api/limits',{account:$('lAcct').value,
+target:$('lTarget').value,target_mode:$('lTargetMode').value,
+stop:$('lStop').value,stop_mode:$('lStopMode').value});editing=false}
+function saveProfiles(){let p;try{p=JSON.parse($('pJson').value||'{}')}
+catch(e){return toast('invalid JSON: '+e,true)}
+post('/api/profiles',{profiles:p});editing=false}
+function fmt(v){return v==null?'—':(+v).toLocaleString(undefined,{maximumFractionDigits:2})}
+function fillSel(sel,opts,cur){const el=$(sel);
+if(document.activeElement===el)return;el.innerHTML='';
+opts.forEach(o=>{const x=document.createElement('option');x.value=x.textContent=o;el.appendChild(x)});
+if(cur&&!opts.includes(cur)){const x=document.createElement('option');
+x.value=x.textContent=cur;el.appendChild(x)}if(cur)el.value=cur}
+function render(){if(!S)return;$('ver').textContent='v'+S.version;
+const st=$('chState');st.textContent=S.status_text||S.state;
+st.className='chip '+(S.hard_stopped?'bad':S.paused?'warn':'on');
+const rd=$('chReady');rd.textContent=S.trade_ready?'READY':'NOT READY';
+rd.className='chip '+(S.trade_ready?'on':'bad');
+const mc=$('chMicro');mc.textContent=S.micro_mode?'MICROS ON':'micros off';
+mc.className='chip '+(S.micro_mode?'on':'');
+$('chAtm').textContent='ATM '+(S.atm_strategy||'—')+(S.follow_publisher_strategy?' (follow)':'');
+$('chCount').textContent=S.signal_count+' signals';
+$('btnPause').textContent=S.paused?'RESUME':'PAUSE';
+$('btnPause').onclick=()=>post('/api/pause',{paused:!S.paused});
+const tb=$('accts');tb.innerHTML='';
+S.accounts.forEach(a=>{const tr=document.createElement('tr');
+const pnl=a.pnl==null?'—':(a.pnl>=0?'+':'')+fmt(a.pnl);
+tr.innerHTML='<td>'+a.name+'</td><td class="dim">'+a.role+'</td>'+
+'<td class="dim">'+a.profile+'</td><td>'+fmt(a.start)+'</td><td>'+fmt(a.current)+'</td>'+
+'<td class="'+(a.pnl>=0?'pos':'neg')+'">'+pnl+'</td>'+
+'<td>'+(a.stop?'<span class="chip bad">'+a.stop+' stop</span>':'<span class="chip on">active</span>')+'</td>';
+tb.appendChild(tr)});
+$('rrline').textContent=S.rr.pool.length?
+('rotation: '+S.rr.pool.join(' → ')+'   owed this round: '+
+(S.rr.remaining.length?S.rr.remaining.join(', '):'(new round next)')+
+(S.rr.last?'   last: '+S.rr.last:'')):'';
+const fd=$('feed');fd.innerHTML='';[...S.events].reverse().forEach(e=>{
+const d=document.createElement('div');
+d.innerHTML='<span class="dim">'+new Date(e.ts*1000).toLocaleTimeString()+'</span>  '+
+e.text.replace(/</g,'&lt;');fd.appendChild(d)});
+fillSel('tAtm',S.atm_available,S.atm_strategy);
+if(!editing){fillSel('sAtm',S.atm_available,S.atm_strategy);
+$('sFollow').checked=S.follow_publisher_strategy;
+$('aLeader').value=S.leader;$('aFollowers').value=S.followers.join(' ');
+$('aRobins').value=S.rr.pool.join(' ');
+fillSel('lAcct',S.accounts.map(a=>a.name),S.leader);
+$('pJson').value=JSON.stringify(S.profiles,null,2);
+if(!$('tInstr').value&&S.session_contracts.length)$('tInstr').value=S.session_contracts[0]}}
+async function refresh(){try{const r=await fetch('/api/state');S=await r.json();render()}
+catch(e){$('chState').textContent='app offline';$('chState').className='chip bad'}}
+setSide('long');typeChanged();refresh();setInterval(refresh,1500);
+</script></body></html>
+"""
+
+
 # ---------- Main ----------
 async def main():
     global output_directory, active_account, atm_strategy, follow_publisher_strategy, nt_port
-    global follower_accounts, micro_mode, micro_map
+    global follower_accounts, roundrobin_accounts, micro_mode, micro_map
 
     token, cfg = setup()
     active_account = cfg.get("account", "")
     follower_accounts = [a for a in cfg.get("follower_accounts", []) if a and a != active_account]
+    roundrobin_accounts = sanitize_roundrobin(
+        cfg.get("roundrobin_accounts", []), active_account, follower_accounts)
     atm_strategy = cfg.get("atm_strategy", "NQ_Med")
     follow_publisher_strategy = bool(cfg.get("follow_publisher_strategy", False))
     micro_mode = bool(cfg.get("micro_mode", False))
     micro_map = load_micro_map(cfg)
     nt_port = cfg.get("nt_port", 36973)
+    account_profiles.clear()
+    account_profiles.update(load_account_profiles(cfg))
+    if account_profiles:
+        logger.info(f"PROFILES LOADED  accounts={sorted(account_profiles)}")
 
     if cfg.get("output_directory"):
         output_directory = cfg["output_directory"]
+
+    web_url = start_web_ui(asyncio.get_running_loop(), cfg)
+    if web_url:
+        print(Fore.CYAN + f"  🌐  Web UI  →  {web_url}" + Style.RESET_ALL)
 
     while True:
         global _kb_stop
@@ -3690,10 +6010,12 @@ async def main():
         _kb_stop = True
         shutdown.set()
 
-        # Cancel remaining tasks and wait for threads to drain
-        for t in pending:
+        # Cancel remaining tasks — including in-flight deferred profile
+        # legs (delayed/staggered entries) — and wait for threads to drain
+        leg_tasks = list(_leg_tasks)
+        for t in list(pending) + leg_tasks:
             t.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+        await asyncio.gather(*pending, *leg_tasks, return_exceptions=True)
 
         # Check if auth failed
         result = None
@@ -3714,6 +6036,8 @@ async def main():
             continue
         else:
             break
+
+    stop_web_ui()
 
 
 def print_exit_summary():

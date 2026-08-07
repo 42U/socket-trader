@@ -49,6 +49,7 @@ def reset_session_state():
     st.session_contracts.clear()
     st.soft_stopped = False
     st.hard_stopped = False
+    st.paused = False
     st.signal_count = 0
     st._recent_signal_ids.clear()
     st.active_account = None
@@ -57,6 +58,17 @@ def reset_session_state():
     st.micro_mode = False
     st.micro_map = dict(st.MICRO_MAP)
     st._micro_unmapped_warned.clear()
+    st.account_profiles.clear()
+    st._stagger_placed.clear()
+    st._atm_override_warned.clear()
+    st._pending_confirms.clear()
+    st.shutdown.clear()
+    st.roundrobin_accounts = []
+    st._rr_remaining = []
+    st._rr_last = None
+    st._recent_fired.clear()
+    st._last_connect_mono = None
+    st._web_events.clear()
     st._session_state = "ready"
     st._state_before_conn = "ready"
     st._alert_text = ""
@@ -67,6 +79,8 @@ def reset_session_state():
     st.active_account = None
     st.follower_accounts = []
     st.account_stops.clear()
+    st.account_profiles.clear()
+    st._stagger_placed.clear()
 
 
 # ── sanitize_ati ──────────────────────────────────────────────────────
@@ -1556,3 +1570,1195 @@ class TestToggleMicroMode:
         st.save_config({"micro_map": {"SI": "SI"}})
         st.toggle_micro_mode()
         assert st.micro_map["SI"] == "SI"
+
+# ── per-account trade profiles ────────────────────────────────────────
+SIG = "PLACE;Sim101;NQ 06-26;BUY;4;MARKET;;;DAY;;;NQ_Med;77"
+
+
+class TestToFullInstrument:
+    def test_micro_converts_to_full(self):
+        assert st.to_full_instrument("MNQ 06-26") == "NQ 06-26"
+        assert st.to_full_instrument("M2K 09-26") == "RTY 09-26"
+
+    def test_full_passes_through(self):
+        assert st.to_full_instrument("NQ 06-26") == "NQ 06-26"
+
+    def test_unknown_passes_through(self):
+        assert st.to_full_instrument("ZB 09-26") == "ZB 09-26"
+
+    def test_self_mapped_opt_out_never_flips(self):
+        st.micro_map = dict(st.MICRO_MAP, GC="GC")
+        assert st.to_full_instrument("GC 08-26") == "GC 08-26"
+
+    def test_roundtrip(self):
+        assert st.to_full_instrument(st.to_micro_instrument("ES 09-26")) == "ES 09-26"
+
+
+class TestRuleQty:
+    def _rule(self, **kw):
+        return {**st.DEFAULT_RULE, **kw}
+
+    def test_copy_keeps_qty(self):
+        assert st._rule_qty(3, self._rule()) == 3
+
+    def test_fixed(self):
+        assert st._rule_qty(3, self._rule(qty_mode="fixed", qty_value=2.0)) == 2
+
+    def test_multiple_rounds_half_up(self):
+        # 1 × 0.5 = 0.5 → 1 (banker's rounding would drop to 0)
+        assert st._rule_qty(1, self._rule(qty_mode="multiple", qty_value=0.5)) == 1
+        assert st._rule_qty(3, self._rule(qty_mode="multiple", qty_value=0.5)) == 2
+
+    def test_multiple_can_size_to_zero(self):
+        assert st._rule_qty(1, self._rule(qty_mode="multiple", qty_value=0.4)) == 0
+
+    def test_multiple_scales_up(self):
+        assert st._rule_qty(2, self._rule(qty_mode="multiple", qty_value=10)) == 20
+
+    def test_cap_applies_after_mode(self):
+        assert st._rule_qty(2, self._rule(qty_mode="multiple", qty_value=10,
+                                          max_contracts=5)) == 5
+        assert st._rule_qty(9, self._rule(max_contracts=3)) == 3
+
+    def test_zero_cap_means_uncapped(self):
+        assert st._rule_qty(9, self._rule(max_contracts=0)) == 9
+
+
+class TestResolveRule:
+    def test_no_profile_returns_defaults(self):
+        assert st.resolve_rule("Sim102", "NQ 06-26", "NQ_Med") == st.DEFAULT_RULE
+
+    def test_account_default_merges(self):
+        st.account_profiles["Sim102"] = {"default": {"qty_mode": "fixed", "qty_value": 2.0}}
+        rule = st.resolve_rule("Sim102", "NQ 06-26", "")
+        assert rule["qty_mode"] == "fixed"
+        assert rule["qty_value"] == 2.0
+        assert rule["direction"] == "normal"  # untouched keys stay default
+
+    def test_scoped_rule_overrides_default(self):
+        st.account_profiles["Sim102"] = {
+            "default": {"delay_ms": 100},
+            "rules": [{"symbols": ["NQ"], "direction": "invert"}],
+        }
+        rule = st.resolve_rule("Sim102", "NQ 06-26", "")
+        assert rule["direction"] == "invert"
+        assert rule["delay_ms"] == 100  # default still applies underneath
+
+    def test_first_matching_rule_wins(self):
+        st.account_profiles["Sim102"] = {"rules": [
+            {"symbols": ["NQ"], "delay_ms": 111},
+            {"symbols": ["NQ"], "delay_ms": 222},
+        ]}
+        assert st.resolve_rule("Sim102", "NQ 06-26", "")["delay_ms"] == 111
+
+    def test_symbol_rule_matches_micro_twin(self):
+        st.account_profiles["Sim102"] = {"rules": [{"symbols": ["NQ"], "delay_ms": 42}]}
+        assert st.resolve_rule("Sim102", "MNQ 06-26", "")["delay_ms"] == 42
+        st.account_profiles["Sim102"] = {"rules": [{"symbols": ["MNQ"], "delay_ms": 43}]}
+        assert st.resolve_rule("Sim102", "NQ 06-26", "")["delay_ms"] == 43
+
+    def test_strategy_scope_case_insensitive(self):
+        st.account_profiles["Sim102"] = {"rules": [{"strategies": ["nq_med"], "delay_ms": 9}]}
+        assert st.resolve_rule("Sim102", "ES 09-26", "NQ_Med")["delay_ms"] == 9
+        assert st.resolve_rule("Sim102", "ES 09-26", "Other")["delay_ms"] == 0
+
+    def test_both_filters_must_pass(self):
+        st.account_profiles["Sim102"] = {"rules": [
+            {"symbols": ["NQ"], "strategies": ["NQ_Med"], "delay_ms": 5}]}
+        assert st.resolve_rule("Sim102", "NQ 06-26", "NQ_Med")["delay_ms"] == 5
+        assert st.resolve_rule("Sim102", "NQ 06-26", "Other")["delay_ms"] == 0
+        assert st.resolve_rule("Sim102", "ES 09-26", "NQ_Med")["delay_ms"] == 0
+
+
+class TestTransformForAccount:
+    def _t(self, sig, acct, **rule_kw):
+        rule = {**st.DEFAULT_RULE, **rule_kw}
+        return st.transform_signal_for_account(sig, acct, rule)
+
+    def test_default_rule_matches_classic_fanout(self):
+        for acct in ("Sim101", "Sim102"):
+            final, reason, _ = self._t(SIG, acct)
+            assert reason is None
+            assert final == st._with_account(SIG, acct)
+
+    def test_size_micros_on_place_and_close(self):
+        final, _, meta = self._t(SIG, "Sim102", size="micros")
+        assert final.split(";")[2] == "MNQ 06-26"
+        assert meta["instrument"] == "MNQ 06-26"
+        close = "CLOSEPOSITION;Sim101;NQ 06-26;;;;;;;;;;"
+        final_c, _, _ = self._t(close, "Sim102", size="micros")
+        assert final_c.split(";")[2] == "MNQ 06-26"
+
+    def test_size_full_converts_micro_signal(self):
+        micro_sig = SIG.replace("NQ 06-26", "MNQ 06-26")
+        final, _, _ = self._t(micro_sig, "Sim102", size="full")
+        assert final.split(";")[2] == "NQ 06-26"
+
+    def test_invert_flips_market_entry(self):
+        final, reason, meta = self._t(SIG, "Sim102", direction="invert")
+        assert reason is None
+        assert final.split(";")[3] == "SELL"
+        assert meta["action"] == "SELL"
+
+    def test_invert_skips_limit_entry(self):
+        limit_sig = "PLACE;Sim101;NQ 06-26;BUY;1;LIMIT;20000;;DAY;;;NQ_Med;78"
+        final, reason, _ = self._t(limit_sig, "Sim102", direction="invert")
+        assert final is None
+        assert "LIMIT" in reason
+
+    def test_invert_drops_change(self):
+        change = "CHANGE;;;;2;;20000;;;;ord-9;;"
+        final, reason, _ = self._t(change, "Sim102", direction="invert")
+        assert final is None
+        assert "CHANGE" in reason
+
+    def test_normal_account_keeps_change(self):
+        change = "CHANGE;;;;2;;20000;;;;ord-9;;"
+        final, reason, _ = self._t(change, "Sim102")
+        assert reason is None
+        assert final.split(";")[0] == "CHANGE"
+
+    def test_invert_reverse_market_flips(self):
+        rev = "REVERSEPOSITION;Sim101;NQ 06-26;BUY;2;MARKET;;;DAY;;;NQ_Med;80"
+        final, reason, _ = self._t(rev, "Sim102", direction="invert")
+        assert reason is None
+        assert final.split(";")[0] == "REVERSEPOSITION"
+        assert final.split(";")[3] == "SELL"
+
+    def test_invert_reverse_nonmarket_downgrades_to_close(self):
+        rev = "REVERSEPOSITION;Sim101;NQ 06-26;BUY;2;LIMIT;20000;;DAY;;;NQ_Med;80"
+        final, reason, meta = self._t(rev, "Sim102", direction="invert")
+        assert reason is None  # exits always flow
+        parts = final.split(";")
+        assert parts[0] == "CLOSEPOSITION"
+        assert parts[1] == "Sim102"
+        assert parts[2] == "NQ 06-26"
+        assert "downgraded" in meta["note"]
+
+    def test_disabled_blocks_entry_but_not_exit(self):
+        final, reason, _ = self._t(SIG, "Sim102", enabled=False)
+        assert final is None and "disabled" in reason
+        close = "CLOSEPOSITION;Sim101;NQ 06-26;;;;;;;;;;"
+        final_c, reason_c, _ = self._t(close, "Sim102", enabled=False)
+        assert reason_c is None
+        assert final_c.split(";")[0] == "CLOSEPOSITION"
+
+    def test_disabled_reverse_downgrades_to_close(self):
+        rev = "REVERSEPOSITION;Sim101;NQ 06-26;BUY;2;MARKET;;;DAY;;;NQ_Med;80"
+        final, reason, meta = self._t(rev, "Sim102", enabled=False)
+        assert reason is None
+        assert final.split(";")[0] == "CLOSEPOSITION"
+        assert "downgraded" in meta["note"]
+
+    def test_qty_modes_apply(self):
+        final, _, meta = self._t(SIG, "Sim102", qty_mode="fixed", qty_value=2.0)
+        assert final.split(";")[4] == "2" and meta["qty"] == 2
+        final, _, _ = self._t(SIG, "Sim102", qty_mode="multiple", qty_value=0.5)
+        assert final.split(";")[4] == "2"  # 4 × 0.5
+
+    def test_qty_zero_skips_entry(self):
+        one = SIG.replace(";4;", ";1;")
+        final, reason, _ = self._t(one, "Sim102", qty_mode="multiple", qty_value=0.4)
+        assert final is None and "0 contracts" in reason
+
+    def test_atm_override_when_installed(self, monkeypatch):
+        monkeypatch.setattr(st, "validate_strategy", lambda name: name == "MyATM")
+        final, _, _ = self._t(SIG, "Sim102", atm="MyATM")
+        assert final.split(";")[11] == "MyATM"
+
+    def test_atm_override_missing_falls_back(self, monkeypatch):
+        monkeypatch.setattr(st, "validate_strategy", lambda name: False)
+        final, _, _ = self._t(SIG, "Sim102", atm="Ghost")
+        assert final.split(";")[11] == "NQ_Med"
+
+    def test_follower_ids_still_suffixed_after_transform(self):
+        sig = "PLACE;Sim101;NQ 06-26;BUY;4;MARKET;;;DAY;oco-1;ord-1;NQ_Med;99"
+        final, _, _ = self._t(sig, "Sim102", size="micros", qty_mode="fixed", qty_value=1.0)
+        parts = final.split(";")
+        assert parts[9] == "oco-1~Sim102"
+        assert parts[10] == "ord-1~Sim102"
+        assert parts[12] == "99~Sim102"
+
+
+class TestPlanSignalLegs:
+    def test_no_profiles_all_instant_identical(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        plans, skipped = st.plan_signal_legs(SIG)
+        assert skipped == []
+        assert [p["account"] for p in plans] == ["Sim101", "Sim102"]
+        for p in plans:
+            assert p["deferred"] is False
+            assert p["files"] == [st._with_account(SIG, p["account"])]
+
+    @pytest.mark.parametrize("overrides", [
+        {"delay_ms": 100},
+        {"delay_jitter_ms": 50},
+        {"stagger_entries": 3},
+        {"ai": {"provider": "ollama"}},
+    ])
+    def test_entry_features_defer_leg(self, overrides):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.account_profiles["Sim102"] = {"default": st._coerce_rule(overrides)}
+        plans, _ = st.plan_signal_legs(SIG)
+        by_acct = {p["account"]: p for p in plans}
+        assert by_acct["Sim101"]["deferred"] is False
+        assert by_acct["Sim102"]["deferred"] is True
+
+    def test_exits_never_deferred(self):
+        st.active_account = "Sim101"
+        st.account_profiles["Sim101"] = {"default": {"delay_ms": 5000, "stagger_entries": 5}}
+        close = "CLOSEPOSITION;Sim101;NQ 06-26;;;;;;;;;;"
+        plans, _ = st.plan_signal_legs(close)
+        assert plans[0]["deferred"] is False
+
+    def test_disabled_account_reported_skipped(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.account_profiles["Sim102"] = {"default": {"enabled": False}}
+        plans, skipped = st.plan_signal_legs(SIG)
+        assert [p["account"] for p in plans] == ["Sim101"]
+        assert skipped == [("Sim102", "entries disabled")]
+
+    def test_stopped_account_not_planned(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.account_stops["Sim102"] = "hard"
+        plans, skipped = st.plan_signal_legs(SIG)
+        assert [p["account"] for p in plans] == ["Sim101"]
+        assert skipped == []
+
+
+class TestSplitQty:
+    @pytest.mark.parametrize("total,n,expected", [
+        (5, 3, [2, 2, 1]),
+        (4, 2, [2, 2]),
+        (1, 3, [1]),          # tranches clamp to qty
+        (10, 10, [1] * 10),
+        (7, 1, [7]),
+    ])
+    def test_split(self, total, n, expected):
+        result = st.split_qty(total, n)
+        assert result == expected
+        assert sum(result) == total
+
+
+class TestTrancheAndExitFanOut:
+    BASE = "PLACE;Sim102;NQ 06-26;BUY;6;MARKET;;;DAY;oco-1~Sim102;;NQ_Med;99~Sim102"
+
+    def test_first_tranche_keeps_ids(self):
+        sig = st._tranche_signal(self.BASE, 2, 0)
+        parts = sig.split(";")
+        assert parts[4] == "2"
+        assert parts[9] == "oco-1~Sim102"
+        assert parts[12] == "99~Sim102"
+
+    def test_later_tranches_suffix_nonempty_ids_only(self):
+        sig = st._tranche_signal(self.BASE, 2, 1)
+        parts = sig.split(";")
+        assert parts[9] == "oco-1~Sim102~T2"
+        assert parts[10] == ""  # empty id stays empty
+        assert parts[12] == "99~Sim102~T2"
+
+    def test_close_strategy_fans_to_recorded_tranches(self):
+        st._record_stagger(self.BASE, "Sim102", 3)
+        close = "CLOSESTRATEGY;;;;;;;;;;;;99~Sim102"
+        files = st._expand_exit_ids(close, "Sim102")
+        assert len(files) == 3
+        assert files[0].split(";")[12] == "99~Sim102"
+        assert files[1].split(";")[12] == "99~Sim102~T2"
+        assert files[2].split(";")[12] == "99~Sim102~T3"
+
+    def test_cancel_fans_on_order_id(self):
+        placed = "PLACE;Sim102;NQ 06-26;BUY;4;LIMIT;20000;;DAY;;ord-7~Sim102;NQ_Med;99~Sim102"
+        st._record_stagger(placed, "Sim102", 2)
+        cancel = "CANCEL;;;;;;;;;;ord-7~Sim102;;"
+        files = st._expand_exit_ids(cancel, "Sim102")
+        assert len(files) == 2
+        assert files[1].split(";")[10] == "ord-7~Sim102~T2"
+
+    def test_unrecorded_id_falls_back_to_profile_max(self):
+        st.account_profiles["Sim102"] = {"rules": [{"symbols": ["NQ"], "stagger_entries": 4}]}
+        close = "CLOSESTRATEGY;;;;;;;;;;;;55~Sim102"
+        files = st._expand_exit_ids(close, "Sim102")
+        assert len(files) == 4
+
+    def test_single_tranche_single_file(self):
+        st._record_stagger(self.BASE, "Sim102", 1)
+        close = "CLOSESTRATEGY;;;;;;;;;;;;99~Sim102"
+        assert st._expand_exit_ids(close, "Sim102") == [close]
+
+
+def _run_plans(plans, sig_id="77"):
+    """Execute plans and wait for every deferred leg task to finish."""
+    async def go():
+        written = await st.execute_plans(plans, sig_id)
+        while st._leg_tasks:
+            await asyncio.gather(*list(st._leg_tasks), return_exceptions=True)
+        return written
+    return asyncio.run(go())
+
+
+class TestDeferredLegExecution:
+    @pytest.fixture(autouse=True)
+    def _no_live_ati(self, monkeypatch):
+        monkeypatch.setattr(st, "query_nt_positions", lambda account, port=36973: {})
+
+    def _profile(self, acct="Sim102", **rule):
+        st.account_profiles[acct] = {"default": st._coerce_rule(rule)}
+
+    def test_stagger_writes_all_tranches_with_unique_ids(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        self._profile(stagger_entries=3, stagger_interval_ms=0)
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(SIG)
+            written = _run_plans(plans)
+        assert written == ["Sim101"]  # follower leg was deferred
+        files = sorted(tmp_output_dir.glob("oif_*.txt"))
+        assert len(files) == 4  # leader 1 + follower 3 tranches
+        follower = [f.read_text() for f in files if f.read_text().split(";")[1] == "Sim102"]
+        assert len(follower) == 3
+        assert sorted(int(b.split(";")[4]) for b in follower) == [1, 1, 2]
+        ids = {b.split(";")[12] for b in follower}
+        assert ids == {"77~Sim102", "77~Sim102~T2", "77~Sim102~T3"}
+        assert st._stagger_placed[("Sim102", "77~Sim102")] == 3
+
+    def test_stopped_account_aborts_before_write(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        self._profile(stagger_entries=2, stagger_interval_ms=0)
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(SIG)
+            st.account_stops["Sim102"] = "hard"  # trips after planning
+            _run_plans(plans)
+        bodies = [f.read_text() for f in tmp_output_dir.glob("oif_*.txt")]
+        assert all(b.split(";")[1] != "Sim102" for b in bodies)
+
+    def test_deferred_leader_registers_confirm(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.follower_accounts = []
+        self._profile("Sim101", stagger_entries=2, stagger_interval_ms=0)
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(SIG)
+            _run_plans(plans, sig_id="77")
+        assert len(st._pending_confirms) == 1
+        assert st._pending_confirms[0]["instrument"] == "NQ 06-26"
+
+    def test_ai_veto_blocks_entry(self, tmp_output_dir, monkeypatch):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        self._profile(ai={"provider": "ollama"})
+        monkeypatch.setattr(st, "ai_consult", lambda cfg, ctx: {
+            "decision": "skip", "qty": None, "reason": "chop"})
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(SIG)
+            _run_plans(plans)
+        bodies = [f.read_text() for f in tmp_output_dir.glob("oif_*.txt")]
+        assert len(bodies) == 1 and bodies[0].split(";")[1] == "Sim101"
+
+    def test_ai_resize_only_shrinks(self, tmp_output_dir, monkeypatch):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        self._profile(ai={"provider": "ollama"})
+        monkeypatch.setattr(st, "ai_consult", lambda cfg, ctx: {
+            "decision": "allow", "qty": 2, "reason": "half size"})
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(SIG)
+            _run_plans(plans)
+        follower = [f.read_text() for f in tmp_output_dir.glob("oif_*.txt")
+                    if f.read_text().split(";")[1] == "Sim102"]
+        assert follower[0].split(";")[4] == "2"
+
+    def test_ai_resize_up_is_ignored(self, tmp_output_dir, monkeypatch):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        self._profile(ai={"provider": "ollama"})
+        monkeypatch.setattr(st, "ai_consult", lambda cfg, ctx: {
+            "decision": "allow", "qty": 50, "reason": "moon"})
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(SIG)
+            _run_plans(plans)
+        follower = [f.read_text() for f in tmp_output_dir.glob("oif_*.txt")
+                    if f.read_text().split(";")[1] == "Sim102"]
+        assert follower[0].split(";")[4] == "4"  # publisher size kept
+
+    @pytest.mark.parametrize("policy,expect_files", [("skip", 0), ("allow", 1)])
+    def test_ai_error_honors_on_error_policy(self, tmp_output_dir, monkeypatch,
+                                             policy, expect_files):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        self._profile(ai={"provider": "ollama", "on_error": policy})
+        monkeypatch.setattr(st, "ai_consult", lambda cfg, ctx: {
+            "decision": "skip", "error": "ConnectionError: refused"})
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(SIG)
+            _run_plans(plans)
+        follower = [f for f in tmp_output_dir.glob("oif_*.txt")
+                    if f.read_text().split(";")[1] == "Sim102"]
+        assert len(follower) == expect_files
+
+
+class TestAiParseDecision:
+    def test_clean_json(self):
+        v = st._ai_parse_decision('{"decision": "allow", "qty": 2, "reason": "ok"}')
+        assert v == {"decision": "allow", "qty": 2, "reason": "ok"}
+
+    def test_json_wrapped_in_prose(self):
+        v = st._ai_parse_decision('Sure!\n{"decision": "skip", "qty": null, "reason": "news"}\nDone.')
+        assert v["decision"] == "skip" and v["qty"] is None
+
+    def test_unparseable_raises(self):
+        with pytest.raises(ValueError):
+            st._ai_parse_decision("I think you should buy")
+
+    def test_bad_decision_raises(self):
+        with pytest.raises(ValueError):
+            st._ai_parse_decision('{"decision": "maybe"}')
+
+    @pytest.mark.parametrize("qty", [None, 0, -3, True, "two"])
+    def test_invalid_qty_becomes_none(self, qty):
+        v = st._ai_parse_decision(json.dumps(
+            {"decision": "allow", "qty": qty, "reason": ""}))
+        assert v["qty"] is None
+
+
+class TestAiConsult:
+    CFG = {"provider": "openai", "model": "m", "endpoint": "http://x", "api_key_env": "",
+           "timeout_ms": 1000, "on_error": "skip", "instructions": ""}
+
+    def test_unknown_provider_is_error(self):
+        v = st.ai_consult({"provider": "psychic"}, {})
+        assert "error" in v and v["decision"] == "skip"
+
+    def test_provider_exception_becomes_error(self, monkeypatch):
+        def boom(*a, **k):
+            raise RuntimeError("HTTP 500: nope")
+        monkeypatch.setattr(st, "_ai_call_openai_compat", boom)
+        v = st.ai_consult(self.CFG, {"instrument": "NQ"})
+        assert v["decision"] == "skip" and "HTTP 500" in v["error"]
+
+    def test_verdict_flows_through(self, monkeypatch):
+        monkeypatch.setattr(st, "_ai_call_openai_compat",
+                            lambda *a, **k: '{"decision": "allow", "qty": null, "reason": "fine"}')
+        v = st.ai_consult(self.CFG, {})
+        assert v == {"decision": "allow", "qty": None, "reason": "fine"}
+
+    def test_ollama_and_anthropic_paths_are_routed(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(st, "_ai_call_ollama",
+                            lambda *a, **k: calls.append("ollama") or '{"decision":"allow","qty":null,"reason":""}')
+        st.ai_consult({**self.CFG, "provider": "ollama"}, {})
+        monkeypatch.setattr(st, "_ai_call_anthropic",
+                            lambda *a, **k: calls.append("anthropic") or '{"decision":"allow","qty":null,"reason":""}')
+        st.ai_consult({**self.CFG, "provider": "anthropic"}, {})
+        assert calls == ["ollama", "anthropic"]
+
+
+class TestProfilesConfig:
+    def test_coerce_clamps_and_drops_junk(self):
+        loaded = st.load_account_profiles({"account_profiles": {
+            "Sim102": {
+                "default": {"delay_ms": 99999999, "stagger_entries": 99,
+                            "size": "MICROS", "bogus_key": 1, "qty_mode": "fixed",
+                            "qty_value": "3"},
+                "rules": [{"symbols": "NQ, ES", "direction": "invert"},
+                          "not a dict"],
+            },
+            "": {"default": {"delay_ms": 1}},
+            "Sim103": "not a dict",
+        }})
+        prof = loaded["Sim102"]
+        assert prof["default"]["delay_ms"] == 600_000
+        assert prof["default"]["stagger_entries"] == 10
+        assert prof["default"]["size"] == "micros"
+        assert prof["default"]["qty_value"] == 3.0
+        assert "bogus_key" not in prof["default"]
+        assert prof["rules"] == [{"symbols": ["NQ", "ES"], "direction": "invert"}]
+        assert set(loaded) == {"Sim102"}
+
+    def test_ai_config_coercion(self):
+        loaded = st.load_account_profiles({"account_profiles": {
+            "Sim102": {"default": {"ai": {"provider": "OpenAI", "timeout_ms": 100}}}}})
+        ai = loaded["Sim102"]["default"]["ai"]
+        assert ai["provider"] == "openai"
+        assert ai["timeout_ms"] == 1000  # clamped up
+        assert ai["model"] == "gpt-4o-mini"
+        assert ai["api_key_env"] == "OPENAI_API_KEY"
+        bad = st.load_account_profiles({"account_profiles": {
+            "Sim102": {"default": {"ai": {"provider": "skynet"}}}}})
+        assert bad["Sim102"]["default"]["ai"] is None
+
+    def test_save_roundtrip_and_pruning(self, tmp_config):
+        st.account_profiles["Sim102"] = {"default": {"delay_ms": 250}, "rules": []}
+        st.account_profiles["Sim103"] = {"default": {}, "rules": []}  # empty → pruned
+        st.save_account_profiles()
+        cfg = st.load_config()
+        assert cfg["account_profiles"] == {"Sim102": {"default": {"delay_ms": 250}}}
+        assert st.load_account_profiles(cfg)["Sim102"]["default"]["delay_ms"] == 250
+
+    def test_save_removes_section_when_empty(self, tmp_config):
+        st.save_config({"account_profiles": {"Sim102": {"default": {"delay_ms": 1}}}})
+        st.account_profiles.clear()
+        st.save_account_profiles()
+        assert "account_profiles" not in st.load_config()
+
+
+class TestPublisherStrategyOf:
+    def test_extracts_field_11(self):
+        msg = json.dumps({"signal": SIG, "ts": 1})
+        assert st.publisher_strategy_of(msg) == "NQ_Med"
+
+    def test_bad_input_returns_empty(self):
+        assert st.publisher_strategy_of("not json") == ""
+        assert st.publisher_strategy_of(json.dumps({"signal": "PLACE;a;b"})) == ""
+
+
+class TestDispatchWithProfiles:
+    """End-to-end: profiles reshape the classic fan-out per account."""
+
+    def test_follower_trades_micros_at_fixed_size(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.account_profiles["Sim102"] = {"default": {
+            "size": "micros", "qty_mode": "fixed", "qty_value": 2.0}}
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            written = asyncio.run(st.dispatch_signal(SIG))
+        assert set(written) == {"Sim101", "Sim102"}
+        by_acct = {f.read_text().split(";")[1]: f.read_text().split(";")
+                   for f in tmp_output_dir.glob("oif_*.txt")}
+        assert by_acct["Sim101"][2] == "NQ 06-26" and by_acct["Sim101"][4] == "4"
+        assert by_acct["Sim102"][2] == "MNQ 06-26" and by_acct["Sim102"][4] == "2"
+
+    def test_inverted_follower_fades_the_leader(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.account_profiles["Sim102"] = {"default": {"direction": "invert"}}
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            asyncio.run(st.dispatch_signal(SIG))
+        by_acct = {f.read_text().split(";")[1]: f.read_text().split(";")
+                   for f in tmp_output_dir.glob("oif_*.txt")}
+        assert by_acct["Sim101"][3] == "BUY"
+        assert by_acct["Sim102"][3] == "SELL"
+
+    def test_scoped_rule_only_hits_its_symbol(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.account_profiles["Sim102"] = {"rules": [
+            {"symbols": ["ES"], "enabled": False}]}
+        es_sig = SIG.replace("NQ 06-26", "ES 09-26")
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            nq_written = asyncio.run(st.dispatch_signal(SIG))
+            es_written = asyncio.run(st.dispatch_signal(es_sig))
+        assert set(nq_written) == {"Sim101", "Sim102"}
+        assert es_written == ["Sim101"]
+
+# ── round-robin account mode ──────────────────────────────────────────
+class TestRoundRobinDraw:
+    POOL = ["RR1", "RR2", "RR3"]
+
+    def _arm(self, pool=None):
+        st.roundrobin_accounts = list(pool or self.POOL)
+
+    def test_round_covers_every_account_without_repeats(self):
+        self._arm()
+        drawn = [st._rr_next() for _ in range(3)]
+        assert sorted(drawn) == sorted(self.POOL)
+
+    def test_multiple_rounds_stay_balanced(self):
+        self._arm()
+        drawn = [st._rr_next() for _ in range(30)]
+        assert all(drawn.count(a) == 10 for a in self.POOL)
+        for start in range(0, 30, 3):  # every full round covers the pool
+            assert sorted(drawn[start:start + 3]) == sorted(self.POOL)
+
+    def test_no_immediate_repeat_across_round_boundary(self):
+        self._arm(["A", "B"])
+        drawn = [st._rr_next() for _ in range(20)]
+        assert all(drawn[i] != drawn[i + 1] for i in range(19))  # strict alternation
+
+    def test_two_account_pool_alternates(self):
+        self._arm(["A", "B"])
+        first, second = st._rr_next(), st._rr_next()
+        assert {first, second} == {"A", "B"}
+
+    def test_stopped_account_is_passed_over(self):
+        self._arm()
+        st.account_stops["RR2"] = "hard"
+        drawn = {st._rr_next() for _ in range(10)}
+        assert drawn == {"RR1", "RR3"}
+
+    def test_empty_pool_returns_none(self):
+        st.roundrobin_accounts = []
+        assert st._rr_next() is None
+        self._arm(["RR1"])
+        st.account_stops["RR1"] = "hard"
+        assert st._rr_next() is None
+
+    def test_single_account_pool_repeats(self):
+        self._arm(["RR1"])
+        assert st._rr_next() == "RR1"
+        assert st._rr_next() == "RR1"
+
+    def test_membership_change_joins_next_refill(self):
+        self._arm(["A", "B"])
+        st._rr_next(), st._rr_next()          # consume a full round
+        st.roundrobin_accounts.append("C")
+        drawn = [st._rr_next() for _ in range(3)]
+        assert sorted(drawn) == ["A", "B", "C"]
+
+    def test_reset_rotation_clears_state(self):
+        self._arm()
+        st._rr_next()
+        st._rr_reset_rotation()
+        assert st._rr_remaining == [] and st._rr_last is None
+
+
+class TestSanitizeRoundrobin:
+    def test_removes_leader_followers_dupes_and_junk(self):
+        out = st.sanitize_roundrobin(
+            ["Sim101", "Sim102", "RR1", "RR1", " RR2 ", 7, ""],
+            leader="Sim101", followers=["Sim102"])
+        assert out == ["RR1", "RR2"]
+
+    def test_non_list_returns_empty(self):
+        assert st.sanitize_roundrobin("RR1", "L", []) == []
+
+
+class TestTargetAccountsWithRoundRobin:
+    def test_pool_included_in_targets(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.roundrobin_accounts = ["RR1", "RR2"]
+        assert st.target_accounts() == ["Sim101", "Sim102", "RR1", "RR2"]
+        assert st.copy_trade_accounts() == ["Sim101", "Sim102"]
+
+    def test_session_hard_lock_requires_pool_stopped_too(self):
+        st.active_account = "Sim101"
+        st.roundrobin_accounts = ["RR1"]
+        st.account_stops["Sim101"] = "hard"
+        assert st.session_hard_locked() is False
+        st.account_stops["RR1"] = "hard"
+        assert st.session_hard_locked() is True
+
+
+class TestRoundRobinPlanning:
+    def _arm(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.roundrobin_accounts = ["RR1", "RR2"]
+        st._rr_remaining = ["RR1", "RR2"]  # deterministic rotation
+
+    def test_entry_goes_to_copy_set_plus_one_pool_member(self):
+        self._arm()
+        plans, _ = st.plan_signal_legs(SIG)
+        accounts = [p["account"] for p in plans]
+        assert accounts == ["Sim101", "Sim102", "RR1"]
+        assert [p["account"] for p in plans if p["rr_pick"]] == ["RR1"]
+
+    def test_rotation_advances_per_entry(self):
+        self._arm()
+        first, _ = st.plan_signal_legs(SIG)
+        second, _ = st.plan_signal_legs(SIG)
+        picks = [next(p["account"] for p in plans if p["rr_pick"])
+                 for plans in (first, second)]
+        assert picks == ["RR1", "RR2"]
+
+    def test_exits_fan_to_entire_pool(self):
+        self._arm()
+        close = "CLOSEPOSITION;Sim101;NQ 06-26;;;;;;;;;;"
+        plans, _ = st.plan_signal_legs(close)
+        assert [p["account"] for p in plans] == ["Sim101", "Sim102", "RR1", "RR2"]
+        assert all(p["command"] == "CLOSEPOSITION" for p in plans)
+        # exit fan-out consumes no rotation slot
+        assert st._rr_remaining == ["RR1", "RR2"]
+
+    def test_close_strategy_fans_to_pool_with_account_ids(self):
+        self._arm()
+        close = "CLOSESTRATEGY;;;;;;;;;;;;77"
+        plans, _ = st.plan_signal_legs(close)
+        by_acct = {p["account"]: p["signal"].split(";")[12] for p in plans}
+        assert by_acct["RR1"] == "77~RR1" and by_acct["RR2"] == "77~RR2"
+
+    def test_reverse_goes_to_pick_others_get_close(self):
+        self._arm()
+        rev = "REVERSEPOSITION;Sim101;NQ 06-26;BUY;2;MARKET;;;DAY;;;NQ_Med;80"
+        plans, _ = st.plan_signal_legs(rev)
+        by_acct = {p["account"]: p for p in plans}
+        assert by_acct["RR1"]["command"] == "REVERSEPOSITION"
+        assert by_acct["RR1"]["rr_pick"] is True
+        assert by_acct["RR2"]["command"] == "CLOSEPOSITION"
+        assert by_acct["RR2"]["signal"].split(";")[2] == "NQ 06-26"
+        assert by_acct["Sim101"]["command"] == "REVERSEPOSITION"
+        assert by_acct["Sim102"]["command"] == "REVERSEPOSITION"
+
+    def test_stopped_pool_member_not_planned(self):
+        self._arm()
+        st.account_stops["RR1"] = "hard"
+        st._rr_remaining = []  # force refill from tradeable pool
+        plans, _ = st.plan_signal_legs(SIG)
+        accounts = [p["account"] for p in plans]
+        assert "RR1" not in accounts and "RR2" in accounts
+
+    def test_profiles_compose_with_rotation(self):
+        self._arm()
+        st.account_profiles["RR1"] = {"default": {
+            "size": "micros", "qty_mode": "fixed", "qty_value": 3.0}}
+        plans, _ = st.plan_signal_legs(SIG)
+        pick = next(p for p in plans if p["rr_pick"])
+        assert pick["signal"].split(";")[2] == "MNQ 06-26"
+        assert pick["signal"].split(";")[4] == "3"
+
+    def test_no_pool_keeps_classic_behavior(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        plans, _ = st.plan_signal_legs(SIG)
+        assert [p["account"] for p in plans] == ["Sim101", "Sim102"]
+        assert all(not p["rr_pick"] for p in plans)
+
+
+class TestRoundRobinDispatch:
+    def test_consecutive_signals_rotate_through_pool(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.roundrobin_accounts = ["RR1", "RR2"]
+        st._rr_remaining = ["RR1", "RR2"]
+        sig2 = SIG.replace(";77", ";78")
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            first = asyncio.run(st.dispatch_signal(SIG))
+            second = asyncio.run(st.dispatch_signal(sig2))
+        assert set(first) == {"Sim101", "Sim102", "RR1"}
+        assert set(second) == {"Sim101", "Sim102", "RR2"}
+        bodies = [f.read_text() for f in tmp_output_dir.glob("oif_*.txt")]
+        assert len(bodies) == 6
+        rr1 = [b for b in bodies if b.split(";")[1] == "RR1"]
+        assert len(rr1) == 1 and rr1[0].split(";")[12] == "77~RR1"
+
+
+class TestRoundRobinPersistence:
+    def test_save_and_restore_rotation(self, tmp_config, monkeypatch):
+        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: "2026-08-07")
+        st.active_account = "Sim101"
+        st.roundrobin_accounts = ["RR1", "RR2", "RR3"]
+        st.session_start_balances["Sim101"] = 1000.0
+        st._rr_remaining = ["RR3", "RR1"]
+        st._rr_last = "RR2"
+        st.save_session_state()
+        st._rr_remaining, st._rr_last = [], None
+        assert st.restore_session_state() is True
+        assert st._rr_remaining == ["RR3", "RR1"]
+        assert st._rr_last == "RR2"
+
+    def test_pool_change_starts_fresh_round(self, tmp_config, monkeypatch):
+        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: "2026-08-07")
+        st.active_account = "Sim101"
+        st.roundrobin_accounts = ["RR1", "RR2"]
+        st.session_start_balances["Sim101"] = 1000.0
+        st._rr_remaining = ["RR2"]
+        st.save_session_state()
+        st.roundrobin_accounts = ["RR1", "RR9"]  # pool changed between runs
+        st._rr_remaining, st._rr_last = [], None
+        assert st.restore_session_state() is True
+        assert st._rr_remaining == [] and st._rr_last is None
+
+
+# ── per-account symbol filter ─────────────────────────────────────────
+class TestAccountTradesSymbol:
+    def test_no_filter_trades_everything(self):
+        assert st.account_trades_symbol("Sim102", "ES 09-26") is True
+
+    def test_filter_allows_only_named_roots(self):
+        st.account_profiles["Sim102"] = {"symbols_allowed": ["GC"]}
+        assert st.account_trades_symbol("Sim102", "GC 12-26") is True
+        assert st.account_trades_symbol("Sim102", "ES 09-26") is False
+
+    def test_micro_twins_match_both_ways(self):
+        st.account_profiles["Sim102"] = {"symbols_allowed": ["GC"]}
+        assert st.account_trades_symbol("Sim102", "MGC 12-26") is True
+        st.account_profiles["Sim102"] = {"symbols_allowed": ["MNQ"]}
+        assert st.account_trades_symbol("Sim102", "NQ 06-26") is True
+
+    def test_no_instrument_passes(self):
+        st.account_profiles["Sim102"] = {"symbols_allowed": ["GC"]}
+        assert st.account_trades_symbol("Sim102", "") is True
+
+
+class TestSymbolFilterTransform:
+    def _t(self, sig, acct):
+        return st.transform_signal_for_account(sig, acct, dict(st.DEFAULT_RULE))
+
+    def test_place_filtered_out(self):
+        st.account_profiles["Sim102"] = {"symbols_allowed": ["GC"]}
+        final, reason, _ = self._t(SIG, "Sim102")
+        assert final is None
+        assert "symbol filtered" in reason
+
+    def test_place_allowed_passes_unchanged(self):
+        st.account_profiles["Sim102"] = {"symbols_allowed": ["NQ"]}
+        final, reason, _ = self._t(SIG, "Sim102")
+        assert reason is None
+        assert final == st._with_account(SIG, "Sim102")
+
+    def test_reverse_downgrades_to_close(self):
+        st.account_profiles["Sim102"] = {"symbols_allowed": ["GC"]}
+        rev = SIG.replace("PLACE", "REVERSEPOSITION")
+        final, reason, meta = self._t(rev, "Sim102")
+        assert reason is None
+        assert final.split(";")[0] == "CLOSEPOSITION"
+        assert "symbol filtered" in meta["note"]
+
+    def test_exits_never_filtered(self):
+        st.account_profiles["Sim102"] = {"symbols_allowed": ["GC"]}
+        close = "CLOSEPOSITION;Sim101;NQ 06-26;;;;;;;;;;"
+        final, reason, _ = self._t(close, "Sim102")
+        assert reason is None
+        assert final.split(";")[0] == "CLOSEPOSITION"
+
+    def test_filter_composes_with_micro_sizing(self):
+        st.account_profiles["Sim102"] = {"symbols_allowed": ["NQ"],
+                                         "default": {"size": "micros"}}
+        rule = st.resolve_rule("Sim102", "NQ 06-26", "")
+        final, reason, _ = st.transform_signal_for_account(SIG, "Sim102", rule)
+        assert reason is None
+        assert final.split(";")[2] == "MNQ 06-26"
+
+
+class TestRoundRobinSymbolFilter:
+    def _arm(self):
+        st.roundrobin_accounts = ["Gold", "Nas", "Any"]
+        st._rr_remaining = ["Gold", "Nas", "Any"]
+        st.account_profiles["Gold"] = {"symbols_allowed": ["GC"]}
+        st.account_profiles["Nas"] = {"symbols_allowed": ["NQ"]}
+
+    def test_filtered_account_passed_over_keeps_slot(self):
+        self._arm()
+        assert st._rr_next("NQ 06-26") == "Nas"
+        assert st._rr_remaining == ["Gold", "Any"]
+
+    def test_filtered_account_still_gets_its_market(self):
+        self._arm()
+        st._rr_next("NQ 06-26")
+        assert st._rr_next("GC 12-26") == "Gold"
+        assert st._rr_remaining == ["Any"]
+
+    def test_micro_signal_reaches_full_size_filter(self):
+        self._arm()
+        assert st._rr_next("MGC 12-26") == "Gold"
+
+    def test_no_eligible_member_returns_none_consumes_nothing(self):
+        st.roundrobin_accounts = ["Gold"]
+        st._rr_remaining = ["Gold"]
+        st.account_profiles["Gold"] = {"symbols_allowed": ["GC"]}
+        assert st._rr_next("ES 09-26") is None
+        assert st._rr_remaining == ["Gold"]
+
+    def test_top_up_when_no_remaining_slot_is_eligible(self):
+        self._arm()
+        st._rr_remaining = ["Gold"]  # only the gold slot left this round
+        pick = st._rr_next("NQ 06-26")
+        assert pick in ("Nas", "Any")
+        assert "Gold" in st._rr_remaining  # slot survives the top-up
+
+    def test_locked_account_still_forfeits_slot(self):
+        self._arm()
+        st.account_stops["Gold"] = "hard"
+        assert st._rr_next("GC 12-26") == "Any"  # only unfiltered member left
+        assert "Gold" not in st._rr_remaining
+
+
+class TestSymbolFilterPlanning:
+    SIG_ES = SIG.replace("NQ 06-26", "ES 09-26")
+
+    def test_filtered_follower_sits_out_then_rejoins(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.account_profiles["Sim102"] = {"symbols_allowed": ["NQ"]}
+        plans, skipped = st.plan_signal_legs(self.SIG_ES)
+        assert [p["account"] for p in plans] == ["Sim101"]
+        assert skipped[0][0] == "Sim102" and "symbol filtered" in skipped[0][1]
+        plans2, skipped2 = st.plan_signal_legs(SIG)  # NQ — follower participates
+        assert [p["account"] for p in plans2] == ["Sim101", "Sim102"]
+        assert not skipped2
+
+    def test_rr_entry_routes_to_eligible_member(self):
+        st.active_account = "Sim101"
+        st.roundrobin_accounts = ["Gold", "Any"]
+        st._rr_remaining = ["Gold", "Any"]
+        st.account_profiles["Gold"] = {"symbols_allowed": ["GC"]}
+        plans, _ = st.plan_signal_legs(SIG)  # NQ entry
+        assert [p["account"] for p in plans if p["rr_pick"]] == ["Any"]
+        assert "Gold" in st._rr_remaining
+
+    def test_rr_reverse_pick_respects_filter(self):
+        st.active_account = "Sim101"
+        st.roundrobin_accounts = ["Gold", "Any"]
+        st._rr_remaining = ["Gold", "Any"]
+        st.account_profiles["Gold"] = {"symbols_allowed": ["GC"]}
+        rev = "REVERSEPOSITION;Sim101;NQ 06-26;BUY;2;MARKET;;;DAY;;;NQ_Med;80"
+        plans, _ = st.plan_signal_legs(rev)
+        by = {p["account"]: p for p in plans}
+        assert by["Any"]["command"] == "REVERSEPOSITION" and by["Any"]["rr_pick"]
+        assert by["Gold"]["command"] == "CLOSEPOSITION"  # safety close still flows
+
+
+class TestSymbolsAllowedPersistence:
+    def test_load_cleans_dedups_and_uppercases(self):
+        out = st.load_account_profiles({"account_profiles": {
+            "Sim102": {"symbols_allowed": ["gc", " si ", "GC", ""]}}})
+        assert out["Sim102"]["symbols_allowed"] == ["GC", "SI"]
+
+    def test_load_accepts_comma_string(self):
+        out = st.load_account_profiles({"account_profiles": {
+            "Sim102": {"symbols_allowed": "gc, nq"}}})
+        assert out["Sim102"]["symbols_allowed"] == ["GC", "NQ"]
+
+    def test_save_round_trips(self, tmp_config):
+        st.account_profiles["Sim102"] = {"symbols_allowed": ["GC"]}
+        st.save_account_profiles()
+        cfg = st.load_config()
+        assert st.load_account_profiles(cfg)["Sim102"]["symbols_allowed"] == ["GC"]
+
+    def test_summary_shows_filter(self):
+        st.account_profiles["Sim102"] = {"symbols_allowed": ["GC", "SI"]}
+        assert "only GC,SI" in st.profile_summary("Sim102")
+
+
+# ── post-reconnect replay guard ───────────────────────────────────────
+class TestReplayGuard:
+    CLOSE = "CLOSEPOSITION;Sim101;MNQ 09-26;;;;;;;;;NQ_Med;"
+
+    def test_replay_blocked_inside_grace_window(self):
+        st._note_fired_signal(self.CLOSE)
+        st.note_connected()
+        assert st._is_idless_replay(self.CLOSE) is True
+
+    def test_never_blocked_without_recent_connect(self):
+        st._note_fired_signal(self.CLOSE)
+        st._last_connect_mono = None
+        assert st._is_idless_replay(self.CLOSE) is False
+
+    def test_not_blocked_after_grace_expires(self):
+        import time as _t
+        st._note_fired_signal(self.CLOSE)
+        st._last_connect_mono = _t.monotonic() - (st.REPLAY_GRACE_S + 1)
+        assert st._is_idless_replay(self.CLOSE) is False
+
+    def test_unseen_signal_never_blocked(self):
+        st.note_connected()
+        assert st._is_idless_replay(self.CLOSE) is False
+
+    def test_stale_fired_signal_not_blocked(self):
+        import time as _t
+        st._recent_fired[self.CLOSE] = _t.monotonic() - (st.REPLAY_LOOKBACK_S + 1)
+        st.note_connected()
+        assert st._is_idless_replay(self.CLOSE) is False
+
+    def test_different_signal_text_not_blocked(self):
+        st._note_fired_signal(self.CLOSE)
+        st.note_connected()
+        other = self.CLOSE.replace("MNQ", "MES")
+        assert st._is_idless_replay(other) is False
+
+    def test_fired_memory_is_bounded(self):
+        for i in range(st._MAX_FIRED_KEYS + 20):
+            st._note_fired_signal(f"CLOSEPOSITION;A;SYM{i};;;;;;;;;;")
+        assert len(st._recent_fired) == st._MAX_FIRED_KEYS
+
+
+# ── manual trading ────────────────────────────────────────────────────
+class TestBuildManualSignal:
+    def _ready(self, monkeypatch):
+        st.active_account = "Sim101"
+        monkeypatch.setattr(st, "atm_strategy", "NQ_Med")
+        monkeypatch.setattr(st, "validate_strategy", lambda n: True)
+
+    def test_market_buy_layout(self, monkeypatch):
+        self._ready(monkeypatch)
+        sig, err = st.build_manual_signal("long", "NQ 09-26", 2, "market", None, "NQ_Med")
+        assert err is None
+        p = sig.split(";")
+        assert p[0] == "PLACE" and p[1] == "Sim101" and p[2] == "NQ 09-26"
+        assert p[3] == "BUY" and p[4] == "2" and p[5] == "MARKET"
+        assert p[6] == "" and p[8] == "DAY" and p[11] == "NQ_Med"
+        assert p[12].startswith("man")
+
+    def test_limit_sell_carries_price(self, monkeypatch):
+        self._ready(monkeypatch)
+        sig, err = st.build_manual_signal("short", "NQ 09-26", 1, "limit", "23895.25", "NQ_Med")
+        assert err is None
+        p = sig.split(";")
+        assert p[3] == "SELL" and p[5] == "LIMIT" and p[6] == "23895.25"
+
+    def test_limit_requires_price(self, monkeypatch):
+        self._ready(monkeypatch)
+        sig, err = st.build_manual_signal("long", "NQ 09-26", 1, "limit", "", "NQ_Med")
+        assert sig is None and "price" in err
+
+    def test_default_atm_is_session_strategy(self, monkeypatch):
+        self._ready(monkeypatch)
+        sig, err = st.build_manual_signal("long", "NQ 09-26", 1)
+        assert err is None and sig.split(";")[11] == "NQ_Med"
+
+    def test_bad_side_qty_type_rejected(self, monkeypatch):
+        self._ready(monkeypatch)
+        assert st.build_manual_signal("hold", "NQ 09-26", 1)[1]
+        assert st.build_manual_signal("long", "NQ 09-26", 0)[1]
+        assert st.build_manual_signal("long", "NQ 09-26", "x")[1]
+        assert st.build_manual_signal("long", "NQ 09-26", 1, "stop")[1]
+
+    def test_instrument_requires_expiry(self, monkeypatch):
+        self._ready(monkeypatch)
+        sig, err = st.build_manual_signal("long", "NQ", 1)
+        assert sig is None and "expiry" in err
+
+    def test_micro_mode_converts_instrument(self, monkeypatch):
+        self._ready(monkeypatch)
+        st.micro_mode = True
+        sig, err = st.build_manual_signal("long", "NQ 09-26", 1)
+        assert err is None and sig.split(";")[2] == "MNQ 09-26"
+
+    def test_uninstalled_atm_rejected(self, monkeypatch):
+        st.active_account = "Sim101"
+        monkeypatch.setattr(st, "validate_strategy", lambda n: False)
+        sig, err = st.build_manual_signal("long", "NQ 09-26", 1, "market", None, "Nope")
+        assert sig is None and "not installed" in err
+
+    def test_signal_ids_unique(self, monkeypatch):
+        self._ready(monkeypatch)
+        ids = {st.build_manual_signal("long", "NQ 09-26", 1)[0].split(";")[-1]
+               for _ in range(5)}
+        assert len(ids) == 5
+
+
+class TestSubmitManualTrade:
+    def _arm(self, monkeypatch):
+        st.active_account = "Sim101"
+        monkeypatch.setattr(st, "atm_strategy", "NQ_Med")
+        monkeypatch.setattr(st, "validate_strategy", lambda n: True)
+        monkeypatch.setattr(st, "is_trade_ready", lambda: True)
+        monkeypatch.setattr(st, "query_nt_positions", lambda a, p=36973: {})
+
+    def test_hard_lock_blocks(self, monkeypatch):
+        self._arm(monkeypatch)
+        st.hard_stopped = True
+        ok, msg = asyncio.run(st.submit_manual_trade("long", "NQ 09-26", 1))
+        assert ok is False and "hard-locked" in msg
+
+    def test_not_ready_blocks(self, monkeypatch):
+        self._arm(monkeypatch)
+        monkeypatch.setattr(st, "is_trade_ready", lambda: False)
+        ok, msg = asyncio.run(st.submit_manual_trade("long", "NQ 09-26", 1))
+        assert ok is False and "not ready" in msg
+
+    def test_paused_does_not_block(self, tmp_output_dir, monkeypatch):
+        self._arm(monkeypatch)
+        st.paused = True
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            ok, _ = asyncio.run(st.submit_manual_trade("long", "NQ 09-26", 1))
+        assert ok is True
+        assert len(list(tmp_output_dir.glob("oif_*.txt"))) == 1
+
+    def test_fans_out_to_copy_and_rotation(self, tmp_output_dir, monkeypatch):
+        self._arm(monkeypatch)
+        st.follower_accounts = ["Sim102"]
+        st.roundrobin_accounts = ["RR1", "RR2"]
+        st._rr_remaining = ["RR1", "RR2"]
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            ok, msg = asyncio.run(st.submit_manual_trade("long", "NQ 09-26", 2))
+        assert ok is True
+        accts = sorted(f.read_text().split(";")[1]
+                       for f in tmp_output_dir.glob("oif_*.txt"))
+        assert accts == ["RR1", "Sim101", "Sim102"]
+
+    def test_symbol_filtered_account_sits_out(self, tmp_output_dir, monkeypatch):
+        self._arm(monkeypatch)
+        st.follower_accounts = ["GoldOnly"]
+        st.account_profiles["GoldOnly"] = {"symbols_allowed": ["GC"]}
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            ok, msg = asyncio.run(st.submit_manual_trade("long", "NQ 09-26", 1))
+        assert ok is True and "skipped" in msg
+        accts = [f.read_text().split(";")[1] for f in tmp_output_dir.glob("oif_*.txt")]
+        assert accts == ["Sim101"]
+
+
+# ── web UI ────────────────────────────────────────────────────────────
+class TestWebState:
+    def test_snapshot_is_json_safe_and_complete(self, monkeypatch):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.roundrobin_accounts = ["RR1"]
+        st.session_start_balances["Sim101"] = 1000.0
+        st.session_current_balances["Sim101"] = 1250.5
+        monkeypatch.setattr(st, "list_atm_strategies", lambda: ["NQ_Med"])
+        monkeypatch.setattr(st, "get_account_limits", lambda a: {"target": 0})
+        payload = json.loads(json.dumps(st.web_state()))
+        assert payload["leader"] == "Sim101"
+        assert payload["rr"]["pool"] == ["RR1"]
+        roles = {a["name"]: a["role"] for a in payload["accounts"]}
+        assert roles == {"Sim101": "leader", "Sim102": "follower",
+                         "RR1": "round-robin"}
+        sim = next(a for a in payload["accounts"] if a["name"] == "Sim101")
+        assert sim["pnl"] == 250.5
+
+    def test_dashboard_lines_mirrored_to_feed(self):
+        st._dash_add_signal("\x1b[32mSIG #1  PLACE...\x1b[0m")
+        assert st._web_events[-1]["text"] == "SIG #1  PLACE..."
+        assert st._web_events[-1]["kind"] == "signal"
+
+
+class TestWebServer:
+    @pytest.fixture
+    def web(self, monkeypatch):
+        monkeypatch.setattr(st, "list_atm_strategies", lambda: [])
+        monkeypatch.setattr(st, "get_account_limits", lambda a: {})
+        loop = asyncio.new_event_loop()
+        t = threading.Thread(target=loop.run_forever, daemon=True)
+        t.start()
+        url = st.start_web_ui(loop, {"webui_port": 0})
+        assert url
+        yield url
+        st.stop_web_ui()
+        loop.call_soon_threadsafe(loop.stop)
+        t.join(timeout=2)
+
+    def _post(self, url, payload):
+        import urllib.request as ur
+        req = ur.Request(url, data=json.dumps(payload).encode(),
+                         headers={"Content-Type": "application/json"},
+                         method="POST")
+        return json.loads(ur.urlopen(req, timeout=5).read())
+
+    def test_serves_page_and_state(self, web):
+        import urllib.request as ur
+        html = ur.urlopen(web + "/", timeout=5).read().decode()
+        assert "SOCKET TRADER" in html and "/api/state" in html
+        state = json.loads(ur.urlopen(web + "/api/state", timeout=5).read())
+        assert state["version"] == st.__version__
+
+    def test_trade_rejected_when_hard_locked(self, web):
+        st.hard_stopped = True
+        resp = self._post(web + "/api/trade",
+                          {"side": "long", "instrument": "NQ 09-26", "qty": 1})
+        assert resp["ok"] is False and "hard-locked" in resp["message"]
+
+    def test_pause_toggles_through_loop(self, web):
+        resp = self._post(web + "/api/pause", {"paused": True})
+        assert resp["ok"] is True and st.paused is True
+        resp = self._post(web + "/api/pause", {"paused": False})
+        assert resp["ok"] is True and st.paused is False
+
+    def test_accounts_applied_and_sanitized(self, web, tmp_config):
+        resp = self._post(web + "/api/accounts", {
+            "leader": "Sim101", "followers": ["Sim102", "Sim101"],
+            "roundrobin": ["Sim102", "RR1"]})
+        assert resp["ok"] is True
+        assert st.active_account == "Sim101"
+        assert st.follower_accounts == ["Sim102"]
+        assert st.roundrobin_accounts == ["RR1"]  # follower conflict dropped
+
+    def test_unknown_path_404(self, web):
+        import urllib.error, urllib.request as ur
+        with pytest.raises(urllib.error.HTTPError) as e:
+            ur.urlopen(web + "/api/nope", timeout=5)
+        assert e.value.code == 404

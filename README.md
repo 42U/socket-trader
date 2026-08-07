@@ -61,6 +61,10 @@ The sim account is automatically swapped with your real NinjaTrader account name
 |---|---|
 | **Cross-platform** | Windows and Linux support |
 | **Copy trading** | Fan one signal out to a leader account **plus multiple follower accounts** — one order file per account |
+| **Round-robin** | Link accounts into a rotation pool: each **entry** goes to exactly **one** pool account, drawn randomly with no repeats until every pool account has traded a round — alongside copy trading |
+| **Per-account profiles** | Each account can filter which **symbols it trades**, trade micros or full-size, its own contract count, inverted direction, delayed or staggered entries, its own ATM template, and an optional **AI gate** — scoped per symbol / publisher strategy |
+| **Manual trading** | Press `O` (or use the web UI) to submit your own long/short market/limit order with an ATM template — it fans out through copy trading, round-robin, and profiles exactly like a publisher signal |
+| **Web UI** | A localhost control panel starts with the app: live dashboard, manual orders, pause/flatten/reconnect, micro toggle, accounts, strategy, limits, and profiles from the browser |
 | **Micro mode** | One toggle converts every signal to its CME micro contract — NQ→MNQ, ES→MES, RTY→M2K, GC→MGC, … |
 | **ATI integration** | Auto-detect accounts, live balances, and position closing via NinjaTrader ATI |
 | **Auto-detect directory** | Finds NinjaTrader 8 `incoming/` folder on Windows automatically |
@@ -74,6 +78,7 @@ The sim account is automatically swapped with your real NinjaTrader account name
 | **Signal confirmation** | Verifies trade execution via ATI position tracking per instrument |
 | **Trade readiness gate** | Blocks signals when account, directory, or strategy is missing |
 | **Duplicate detection** | Prevents the same signal from firing twice |
+| **Replay protection** | Signals the server re-delivers after a reconnect are blocked — including id-less commands like `CLOSEPOSITION` that plain id-dedup can't catch |
 | **Input validation** | Field length, count, and format checks on all incoming signals |
 | **Atomic config writes** | Crash-safe config persistence via temp file + rename |
 | **Log rotation** | 5 MB per log file, 3 backups kept automatically |
@@ -161,11 +166,12 @@ All settings are saved and loaded automatically on subsequent runs. To change an
 The controls bar is **pinned to the bottom** of the terminal at all times:
 
 ```
-  P=PAUSE  B=BAL  T=LIMITS  C=CLOSE  R=RECONN  S=SETUP  ⇧X=EXIT
+  O=ORDER  P=PAUSE  B=BAL  T=LIMITS  C=CLOSE  R=RECONN  S=SETUP  ⇧X=EXIT
 ```
 
 | Key | Action |
 |:---:|--------|
+| `O` | Submit a manual order — side, instrument, contracts, market/limit, ATM (see [Manual Trading](#manual-trading--web-ui)) |
 | `P` | Pause / resume signal output |
 | `B` | Show live balances and session P&L (press `R` to reset P&L) |
 | `T` | Set session target and stop limits |
@@ -187,6 +193,7 @@ Press `S` to open the Setup menu for all configuration options:
 │  5. Directory (/path/to/incoming)                │
 │  6. ATI Port  (36973)                            │
 │  7. Micros    (OFF)                              │
+│  8. Profiles  (none)                             │
 │  ESC to close                                    │
 └──────────────────────────────────────────────────┘
 ```
@@ -202,24 +209,61 @@ SocketTrader can send **the same signal to multiple NinjaTrader accounts at once
 Press `S` &rarr; `3` to open the account selector:
 
 ```
-┌─ COPY TRADING — LEADER & FOLLOWERS ──────────────┐
+┌─ ACCOUNTS — LEADER · FOLLOWERS · ROUND-ROBIN ─────┐
 │  1. Sim101  ($28,857.02) ◀ LEADER                │
 │  2. Sim102  ($10,000.00) ＋ FOLLOWER              │
-│  3. Sim103  ($10,000.00) ＋ FOLLOWER              │
-│  Leader trades; followers mimic every signal.    │
+│  3. Sim103  ($10,000.00) ⟳ ROBIN                 │
+│  Leader + followers copy every signal.           │
+│  Round-robin: each entry rotates to ONE pool     │
+│  account.                                        │
 └───────────────────────────────────────────────────┘
   LEADER [Sim101] ▸ 1
-  FOLLOWERS (numbers/names, 'all', ENTER=none) ▸ 2 3
+  FOLLOWERS — copy trade (numbers/names, 'all', ENTER=none) ▸ 2
+  ROUND-ROBIN pool (numbers/names, 'all', ENTER=none) ▸ 3 4
 ```
 
-- **Leader** — the primary account; drives the status-bar P&L display and fill confirmation.
+- **Leader** — the primary account; drives the status-bar P&L display and fill confirmation. Always copy-traded.
 - **Followers** — enter the account numbers (or names), the word `all` for every other account, or press `ENTER` for none (single-account mode, the classic behavior).
+- **Round-robin pool** — accounts that *rotate* instead of copying — see [Round-Robin Mode](#round-robin-mode). An account can be a follower **or** in the pool, never both (conflicts stay followers).
 - Each account receives its **own** order-instruction file with only the account field swapped — instrument, action, quantity, strategy, and signal ID are identical across all accounts.
 - Fan-out writes one unique OIF file per account, with filenames guaranteed unique even when several land in the same millisecond.
 - **Risk is enforced per account, independently.** Each account has its own [session target/stop](#risk-management); when one account trips its limit, only that account is flattened and locked out for the session — the leader and other followers keep trading. When *every* account has stopped, the session pauses.
 - The status bar shows the leader with a copy-count badge, e.g. `Sim101+2: $28,857.02 (+$247.50)`.
 
 Followers are saved to `~/.voidorigin_config.json` (`follower_accounts`) and restored on the next run. Works identically on Windows, WSL2, macOS, and Linux.
+
+---
+
+## Round-Robin Mode
+
+Copy trading gives every account every trade. **Round-robin** spreads trades across accounts instead: link accounts into a pool, and each **entry signal** fires on exactly **one** pool member — drawn randomly, with no account hit twice until every pool account has traded once. Then a fresh random round starts, never opening with the account that just traded, so two consecutive signals never land on the same account.
+
+Both modes run side by side. With 4 accounts — 2 copy + 2 round-robin:
+
+```
+Signal 1  →  Sim101 ◀  Sim102 ＋           RR-A ⟳
+Signal 2  →  Sim101 ◀  Sim102 ＋                    RR-B ⟳
+Signal 3  →  Sim101 ◀  Sim102 ＋           RR-B ⟳   (new round, random)
+Signal 4  →  Sim101 ◀  Sim102 ＋   RR-A ⟳
+```
+
+The dashboard notes each draw (`→ 3 accts · RR→RR-A`), and `⟳` marks pool accounts in the balances view.
+
+How the pool handles each command:
+
+| Signal | Round-robin behavior |
+|--------|----------------------|
+| `PLACE` (entry) | Goes to the **next account in rotation** only — this is what advances the round |
+| `CLOSEPOSITION` / `CLOSESTRATEGY` / `CANCEL` / `CHANGE` (exits) | Fan to the **whole pool** — only the account actually holding the position/order matches; the rest are ignored by NinjaTrader. Exits never consume a rotation turn |
+| `REVERSEPOSITION` | The rotation pick gets the reversal (its turn); every **other** pool account gets a `CLOSEPOSITION`, so whichever account holds the old position still exits |
+
+Notes:
+
+- **Copy or round-robin, never both** — the picker keeps a conflicted account as a follower and tells you. The leader is always copy-traded (it anchors P&L display and fill confirmation).
+- **Per-account [profiles](#per-account-profiles) and [risk limits](#risk-management) still apply.** A pool account's turn goes through its own profile (size, qty, AI gate, …); if its profile skips the entry, that turn is consumed — the trade is not re-routed. An account locked by its session stop/target is passed over and forfeits its turn until the pool reshuffles.
+- **Symbol filters re-route instead.** A pool account whose [symbol filter](#per-account-profiles) excludes the signal's market is never drawn for it — the entry goes to the next eligible pool account, and the filtered account **keeps its turn** for a market it does trade. If no pool account trades that market, the rotation simply sits the signal out (copy accounts are unaffected).
+- **The rotation survives restarts** within the same futures session (saved with session state); changing the pool membership starts a fresh round.
+- The pool is saved as `roundrobin_accounts` in config and restored on the next run.
 
 ---
 
@@ -251,6 +295,95 @@ Behavior notes:
 - `CLOSEPOSITION` / `REVERSEPOSITION` signals convert too, so server-driven exits target the micro position you actually hold.
 - **Toggle while flat.** A position opened before flipping the switch keeps its original symbol — an exit signal arriving after the flip targets the micro symbol instead of your old full-size position. Manual close (`C`) and hard-stop flatten always act on the real positions NinjaTrader reports, regardless of this setting.
 - Extend or override the table with a `micro_map` dict in the config file; map a symbol to itself to opt it out (`"GC": "GC"`).
+
+---
+
+## Per-Account Profiles
+
+Copy trading fans identical signals to every account. **Profiles** let each account — the leader included — trade the *same signal its own way*. Press `S` → `8`, pick an account, and shape it:
+
+```
+┌─ DEFAULT RULE — Sim102 ──────────────────────────────────┐
+│  1.  Entries       on                                    │
+│  2.* Size          micros                                │
+│  3.* Contracts     fixed 2 · cap 5                       │
+│  4.  Direction     normal                                │
+│  5.* Entry delay   500ms + 0..250ms jitter               │
+│  6.* Stagger       3 tranches × 2000ms                   │
+│  7.  ATM override  inherit                               │
+│  8.* AI gate       ollama · llama3.2                     │
+│  * = set here · number = edit · -number = reset field    │
+│  Exits are never blocked, delayed, or AI-gated.          │
+│  ENTER = done                                            │
+└──────────────────────────────────────────────────────────┘
+```
+
+Each account has a **default rule** plus optional **scoped rules** keyed by symbol and/or the publisher's strategy name — built for multi-strategy, multi-symbol setups. The first matching scoped rule overrides the default; a rule written for `NQ` automatically covers `MNQ` too. A `◆ PROFILES` badge shows in the header while any profile is active.
+
+**Symbol filter (`S` on the profile screen).** Before any rules apply, an account can be restricted to the only markets it trades — e.g. `GC` for a gold-only account, `NQ ES` for an index account. Signals for anything else are simply ignored *for that account* (shown as a skipped leg), while every other account trades normally — and the filtered account still participates fully, copy-trade or round-robin, in the markets it does accept. Micro twins count as the same market (`GC` covers `MGC`, `NQ` covers `MNQ`). Some publisher strategies are symbol-specific and some trade several markets; the filter makes an account deaf to the markets you didn't give it, whichever strategy fires the signal. Exits are never filtered — if you tighten a filter while a position is open, its closes still flow.
+
+| Rule field | What it does |
+|------------|--------------|
+| **Entries** | `off` blocks **new entries only** for that scope — exits always flow |
+| **Size** | `inherit` the global micro toggle, or force `micros` / `full` for this account regardless of what the leader trades |
+| **Contracts** | `copy` the publisher's quantity, a `fixed` count, or a `multiplier` (`x0.5`, `x10`), plus a hard per-entry `cap` |
+| **Direction** | `invert` fades the signal — BUY↔SELL flipped. Non-market entries are skipped (their price levels are for the other side) and publisher `CHANGE` orders are dropped; the account's own ATM template manages its stops |
+| **Entry delay** | Fixed ms + optional random jitter before entries fire |
+| **Stagger** | Split each entry into up to 10 tranches at an interval (5 contracts in 3 tranches → 2/2/1). Tranche order ids get unique `~T2`, `~T3`… suffixes, and publisher exits (`CLOSESTRATEGY` / `CANCEL` / `CHANGE`) are fanned out to every tranche |
+| **ATM override** | A different ATM template for this account — e.g. a micro-sized stop template for a micro account |
+| **AI gate** | Ask an AI to approve, veto, or shrink each entry (below) |
+
+**Exit priority is absolute.** No profile setting can block, delay, or AI-gate an exit. A `REVERSEPOSITION` a rule won't take as a new entry (disabled scope, inverted limit order, sized to zero) is downgraded to `CLOSEPOSITION` so the old position still closes. Pausing, a session stop, or a hard lock aborts pending delayed/staggered entries before they fire.
+
+### AI Signal Gate
+
+Route an account's entries through an AI before they hit NinjaTrader. The model receives the proposed order plus session context (P&L, open positions, time of day, your custom guidance) and must answer:
+
+```json
+{"decision": "allow" | "skip", "qty": 2, "reason": "size down into FOMC"}
+```
+
+- **Providers:** `anthropic` (official SDK, default model `claude-opus-5` — set `claude-haiku-4-5` for the lowest latency), `openai` (`gpt-4o-mini` default), `ollama` (local, `llama3.2` default), or `custom` — any OpenAI-compatible endpoint (LM Studio, vLLM, llama.cpp server, …).
+- **API keys** are read from environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or your own) — never stored in config.
+- The AI can only **veto or shrink** an entry; it can never increase size, and exits never pass through it.
+- **Fail-closed by default:** if the AI errors or times out (default 8s), the entry is skipped. Set `on error: allow` per rule to trade through outages instead. Every verdict is logged with its latency and reason.
+- Entries gated by AI (or delay/stagger) run in the background — other accounts' legs fire immediately and are never held up.
+
+### Config
+
+Profiles persist in `~/.voidorigin_config.json` under `account_profiles` and are fully hand-editable:
+
+```json
+"account_profiles": {
+  "Sim102": {
+    "default": { "size": "micros", "qty_mode": "fixed", "qty_value": 2, "delay_ms": 500 },
+    "rules": [
+      { "symbols": ["NQ"], "strategies": ["NQ_Med"], "stagger_entries": 3, "stagger_interval_ms": 2000 },
+      { "strategies": ["algoNQmed"], "enabled": false },
+      { "symbols": ["ES"], "direction": "invert",
+        "ai": { "provider": "ollama", "model": "llama3.2", "timeout_ms": 5000, "on_error": "skip",
+                "instructions": "Skip entries in the first 2 minutes after CPI or FOMC releases." } }
+    ]
+  }
+}
+```
+
+Accounts without a profile behave exactly as before — identical copy of the leader's signal.
+
+---
+
+## Manual Trading & Web UI
+
+Press **`O`** in the terminal to submit your own order: side (long/short), instrument, contracts, market or limit (with price), and ATM template (ENTER = session strategy). A manual order is dispatched through the **same pipeline as a publisher signal** — it fans out to the leader, followers, and the round-robin rotation, and every per-account profile (symbol filter, micros/full sizing, contract count, ATM override, AI gate) applies. Manual orders always carry an ATM template so stops/targets are attached, and a unique `man…` signal id. Session hard/soft locks block manual trading; **pause does not** — pause mutes the publisher, not you.
+
+A **web UI** starts automatically with the app and prints its address at launch (default `http://127.0.0.1:8720`; it binds to localhost only). It drives the exact same functions as the keyboard:
+
+- Live dashboard — status chips, per-account balances/P&L/stops, profiles, rotation state, and the signal/alert feed
+- Manual order ticket (side, instrument, qty, market/limit, ATM)
+- Pause/resume, **close all**, reconnect, micro toggle
+- Settings: leader/followers/round-robin pool, session strategy (locked/follow), per-account risk limits, and the full profiles JSON
+
+Config keys: `webui_enabled` (default `true`, set `false` to disable) and `webui_port` (default `8720`; if busy, an ephemeral port is used and logged). The connection bootstrap (server, token, incoming directory) still happens in the terminal on first run.
 
 ---
 
@@ -417,6 +550,10 @@ Settings persist in `~/.voidorigin_config.json`:
 | `output_directory` | Path to NinjaTrader 8 `incoming/` folder |
 | `nt_port` | NinjaTrader AT Interface port |
 | `account_limits` | Per-account risk management settings |
+| `account_profiles` | Per-account trade profiles — allowed-symbols filter (`symbols_allowed`), size, contracts, direction, delay, stagger, ATM override, AI gate (see [Per-Account Profiles](#per-account-profiles)) |
+| `webui_enabled` | Start the localhost web UI with the app (default `true`) |
+| `webui_port` | Web UI port (default `8720`, localhost only) |
+| `roundrobin_accounts` | Accounts in the rotation pool — each entry signal goes to one of them in random no-repeat rounds (see [Round-Robin Mode](#round-robin-mode)) |
 
 > This file contains your authentication token and is excluded from version control via `.gitignore`. On non-Windows systems, file permissions are set to `0600` (owner-only).
 

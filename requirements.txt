@@ -1,3 +1,6 @@
 websockets>=14.0,<17
 colorama>=0.4.6,<0.5
 pyfiglet>=1.0.0,<2
+# Optional — AI signal gate providers (Setup → 8 → AI gate):
+#   "anthropic" provider:            pip install anthropic
+#   "openai" / "ollama" / "custom":  no extra packages (stdlib HTTP)
