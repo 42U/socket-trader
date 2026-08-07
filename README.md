@@ -205,6 +205,7 @@ Press `S` to open the Setup menu for all configuration options:
 │  6. ATI Port  (36973)                            │
 │  7. Micros    (OFF)                              │
 │  8. Profiles  (none)                             │
+│  9. Live Mon. (disabled)                         │
 │  ESC to close                                    │
 └──────────────────────────────────────────────────┘
 ```
@@ -434,6 +435,30 @@ The web UI can submit orders and flatten accounts, so the localhost bind is deli
 - **Host** — only loopback hostnames are accepted, which defeats DNS rebinding (a hostile domain re-resolved to `127.0.0.1`).
 
 Requests must be `application/json`; the page is served with a strict CSP and `X-Frame-Options: DENY`. A hard-stopped session freezes settings changes, so risk limits can't be weakened while a lockout is in force. **AI gates cannot be configured over HTTP** — an AI gate names an outbound endpoint and an environment variable whose value is sent as a bearer token, so it's terminal-only; existing gates are preserved untouched when you edit a profile from the browser.
+## Optional Live Trade Monitor
+
+NinjaTrader's built-in TCP AT Interface only publishes state transitions (open / fill / cancel / close). It does **not** push live market prices or live unrealized P&L, so by default SocketTrader's session stop / target limits can only fire *after* a trade closes — NinjaTrader's own ATM template handles per-trade risk.
+
+If you want session limits to react **during** an open trade, install the optional `SocketTraderBridge` NinjaScript AddOn. It runs inside NinjaTrader and publishes live `cash`, `realized`, `unrealized`, `equity`, and per-position `last` price / P&L over a TCP socket on every tick.
+
+**Install:**
+
+1. Copy `addon/SocketTraderBridge.cs` into:
+   `Documents\NinjaTrader 8\bin\Custom\AddOns\`
+2. In NinjaTrader: **Control Center → New → NinjaScript Editor**.
+3. Press **F5** to compile. No restart needed — the AddOn hot-loads on successful compile.
+4. The Output tab should print:
+   `SocketTraderBridge listening on 0.0.0.0:36984`
+
+**Enable in SocketTrader:** `S → 7 → 1` to toggle. The menu shows three states:
+
+- `disabled` — plain ATI only, session limits fire post-close.
+- `enabled · active` — AddOn reachable, live P&L stream is flowing.
+- `enabled · NOT REACHABLE` — user wants it on but the AddOn isn't responding. Usually means the `.cs` file wasn't copied, wasn't compiled, or NinjaTrader is down.
+
+When the state is `enabled · NOT REACHABLE`, SocketTrader prints a yellow warning on startup and in the Setup menu so you don't miss it.
+
+Full protocol, port customization, and security notes: see [`addon/README.md`](addon/README.md).
 
 ---
 

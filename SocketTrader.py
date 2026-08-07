@@ -41,7 +41,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -97,6 +97,9 @@ atm_strategy = "NQ_Med"        # ATM strategy template name (fallback)
 follow_publisher_strategy = False  # If True, use the publisher's strategy per-signal when locally installed
 micro_mode = False             # If True, incoming instruments are translated to their CME micro (NQ→MNQ)
 nt_port = 36973                # NinjaTrader AT Interface port (default 36973)
+nt_host_override: str = ""     # Explicit NT host (empty = auto-detect local/WSL)
+live_bridge_enabled = False    # If True, prefer the optional SocketTraderBridge AddOn
+live_bridge_port = 36984       # Port the NinjaScript AddOn listens on (see addon/)
 awaiting_directory_input = False
 awaiting_user_input = False  # Block key handler during any input prompt
 
@@ -2190,6 +2193,10 @@ def _wsl_windows_host_ip() -> str | None:
 
 def _nt_host_candidates() -> list[str]:
     """Return ATI host candidates in preference order."""
+    # Explicit user override always wins — used when NinjaTrader runs on a
+    # different machine on the LAN and auto-detection can't reach it.
+    if nt_host_override:
+        return [nt_host_override]
     if IS_WINDOWS:
         return ["127.0.0.1"]
     if IS_WSL:
@@ -2233,13 +2240,70 @@ def invalidate_nt_host_cache() -> None:
     _nt_host_cache.clear()
 
 
+def probe_live_bridge(host: str, port: int, timeout: float = 2.5) -> bool:
+    """Probe the optional SocketTraderBridge AddOn. See _probe_live_bridge_detail."""
+    ok, _reason = _probe_live_bridge_detail(host, port, timeout)
+    return ok
+
+
+def _probe_live_bridge_detail(host: str, port: int, timeout: float = 2.5) -> tuple[bool, str]:
+    """Probe the AddOn and return (ok, reason).
+
+    Success = TCP connect + at least one newline-delimited JSON line that
+    parses and carries an 'accounts' field. On failure, `reason` is a
+    short human-readable string (ConnectionRefused / Timeout / BadJSON /
+    MissingField / etc.) so the caller can surface it to the user.
+    """
+    s = None
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+    except ConnectionRefusedError:
+        return False, "connection refused (nothing listening)"
+    except socket.timeout:
+        return False, "TCP connect timed out"
+    except OSError as e:
+        return False, f"connect error: {e}"
+    try:
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                return False, "socket closed before any data"
+            buf += chunk
+    except socket.timeout:
+        return False, "socket accepted but no data arrived (timeout)"
+    except OSError as e:
+        return False, f"read error: {e}"
+    finally:
+        try:
+            if s is not None:
+                s.close()
+        except OSError:
+            pass
+    line = buf.split(b"\n", 1)[0].decode("utf-8", errors="ignore")
+    try:
+        obj = json.loads(line)
+    except (ValueError, json.JSONDecodeError):
+        preview = line[:60].replace("\n", " ")
+        return False, f"response is not JSON: {preview!r}"
+    if not isinstance(obj, dict) or "accounts" not in obj:
+        return False, "JSON missing 'accounts' field (wrong port?)"
+    return True, "ok"
+
+
 def _nt_host(port: int = 36973) -> str:
     """Return the correct host for NinjaTrader ATI (handles WSL).
 
-    Probes candidates on first call per port and caches the first that
-    accepts a connection. If no candidate responds, returns the first
-    candidate without caching so a later call can retry.
+    If the user set `nt_host` in config, use it unconditionally — no probe,
+    no cache. Otherwise probe each auto-detected candidate on first call
+    per port and cache the first that accepts a connection. If no candidate
+    responds, return the first candidate without caching so a later call
+    can retry.
     """
+    if nt_host_override:
+        return nt_host_override
     cached = _nt_host_cache.get(port)
     if cached is not None:
         return cached
@@ -4048,6 +4112,219 @@ async def prompt_token():
 
 
 # ---------- Setup submenu ----------
+# ---------- Live-monitor prompt (optional NinjaScript AddOn) ----------
+def _live_bridge_status(timeout: float = 1.0) -> tuple[str, str]:
+    """Return (label, color) summarising the current live-monitor state.
+
+    The default timeout is short because the AddOn broadcasts a snapshot
+    immediately on accept; anything slower than ~1s means it's not there.
+    Callers that want a more patient probe (explicit Test Connection) can
+    pass a longer timeout.
+    """
+    if not live_bridge_enabled:
+        return ("disabled", "WHITE")
+    host = _nt_host(nt_port)
+    reachable = probe_live_bridge(host, live_bridge_port, timeout=timeout)
+    return ("enabled · active", "GREEN") if reachable else ("enabled · NOT REACHABLE", "YELLOW")
+
+
+def _print_addon_install_steps():
+    print(Fore.CYAN + "\n┌─ INSTALL SOCKETTRADER ADDON ───────────────────────┐" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  The AddOn publishes live account P&L from inside  │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  NinjaTrader so stops/targets fire DURING a trade. │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│                                                    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  1. Enable (option 1). Socket Trader copies the    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│     .cs into NinjaTrader\\bin\\Custom\\AddOns\\ for    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│     you (if NT folder is accessible locally).      │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  2. In NinjaTrader:                                │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│     Control Center → New → NinjaScript Editor.     │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  3. Press F5 to compile. (No restart needed —      │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│     AddOn hot-loads on successful compile.)        │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  4. Output tab should print:                       │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│     'SocketTraderBridge listening on 0.0.0.0:XXX'  │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  5. Test from the menu (option 3).                 │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│                                                    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Manual install: copy addon/SocketTraderBridge.cs  │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  into Documents\\NinjaTrader 8\\bin\\Custom\\AddOns\\.  │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Remote NT? Set its LAN IP via option 5.           │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│                                                    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  Full docs: addon/README.md                        │" + Style.RESET_ALL)
+    print(Fore.CYAN + "└────────────────────────────────────────────────────┘" + Style.RESET_ALL)
+
+
+async def prompt_live_bridge():
+    """Setup submenu for the optional live-monitoring NinjaScript AddOn."""
+    global live_bridge_enabled, live_bridge_port, nt_host_override, awaiting_user_input
+    awaiting_user_input = True
+    show_cursor()
+
+    label, color = await asyncio.to_thread(_live_bridge_status)
+    state_color = _STATE_COLORS.get(color, Fore.WHITE)
+    host_display = nt_host_override or f"auto ({_nt_host(nt_port)})"
+
+    print(Fore.CYAN + "\n┌─ LIVE TRADE MONITOR (optional AddOn) ──────────────┐" + Style.RESET_ALL)
+    status_line = f"Status: {label}"
+    print(Fore.CYAN + "│  " + state_color + status_line.ljust(50) + Fore.CYAN + "│" + Style.RESET_ALL)
+    host_line = f"NT host: {host_display}"
+    print(Fore.CYAN + f"│  {host_line[:50].ljust(50)}│" + Style.RESET_ALL)
+    port_line = f"Port:    {live_bridge_port}"
+    print(Fore.CYAN + f"│  {port_line[:50].ljust(50)}│" + Style.RESET_ALL)
+    print(Fore.CYAN + "│                                                    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  With the AddOn: session stops/targets fire DURING │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  an open trade. Without it: only after trade close.│" + Style.RESET_ALL)
+    print(Fore.CYAN + "│                                                    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  1. Toggle enabled / disabled                      │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  2. Show install steps                             │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  3. Test connection now                            │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  4. Change port                                    │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  5. Change NT host (for remote NT on LAN)          │" + Style.RESET_ALL)
+    print(Fore.CYAN + "│  ESC to close                                      │" + Style.RESET_ALL)
+    print(Fore.CYAN + "└────────────────────────────────────────────────────┘" + Style.RESET_ALL)
+
+    if live_bridge_enabled and color != "GREEN":
+        print(Fore.YELLOW + Style.BRIGHT +
+              f"  ⚠  Live monitor is enabled but unreachable at " +
+              f"{_nt_host(nt_port)}:{live_bridge_port}." + Style.RESET_ALL)
+        print(Fore.YELLOW +
+              "     The AddOn isn't compiled or NinjaTrader is down. "
+              "Press 2 for steps." + Style.RESET_ALL)
+
+    sys.stdout.write(Fore.WHITE + "  LIVE ▸ " + Style.RESET_ALL)
+    sys.stdout.flush()
+    key = await asyncio.to_thread(get_key)
+    hide_cursor()
+
+    cfg = load_config()
+    host = _nt_host(nt_port)
+    # Results go through _dash_set_alert because _dash_exit_menu() wipes
+    # everything the submenu printed the moment control returns to the
+    # outer setup_menu. The alert row is the only output that survives.
+    if key == "1":
+        live_bridge_enabled = not live_bridge_enabled
+        cfg["live_bridge_enabled"] = live_bridge_enabled
+        save_config(cfg)
+        if live_bridge_enabled:
+            # Auto-install SocketTraderBridge.cs into NT's AddOns folder
+            # when we know where NT lives (output_directory's parent). This
+            # only works when NT runs on the same box as SocketTrader or
+            # the folder is mounted — remote NT installs still need manual
+            # drop + F5.
+            install_note = ""
+            if output_directory and Path(output_directory).is_dir():
+                nt_base = Path(output_directory).parent
+                inst_ok, inst_msg = await asyncio.to_thread(
+                    install_live_bridge_addon, nt_base)
+                if inst_ok and "copied" in inst_msg.lower():
+                    install_note = " · .cs copied to AddOns (F5 to compile)"
+                elif not inst_ok:
+                    install_note = f" · auto-install skipped: {inst_msg}"
+            ok = await asyncio.to_thread(
+                probe_live_bridge, host, live_bridge_port)
+            if ok:
+                _dash_set_alert(
+                    Fore.GREEN +
+                    f"  ✔  Live monitor enabled · AddOn active on "
+                    f"{host}:{live_bridge_port}.{install_note}" +
+                    Style.RESET_ALL)
+            else:
+                _dash_set_alert(
+                    Fore.YELLOW +
+                    f"  ⚠  Live monitor enabled.{install_note or ''}  "
+                    f"Once compiled in NT (F5), S → 7 → 3 to test." +
+                    Style.RESET_ALL)
+        else:
+            _dash_set_alert(
+                Fore.CYAN + "  ✔  Live monitor disabled." + Style.RESET_ALL)
+    elif key == "2":
+        _print_addon_install_steps()
+        sys.stdout.write(Fore.WHITE +
+                         "\n  Press ENTER to return... " + Style.RESET_ALL)
+        sys.stdout.flush()
+        show_cursor()
+        await asyncio.to_thread(read_line_raw)
+        hide_cursor()
+    elif key == "3":
+        sys.stdout.write(Fore.WHITE +
+                         "  Testing connection..." + Style.RESET_ALL)
+        sys.stdout.flush()
+        ok, reason = await asyncio.to_thread(
+            _probe_live_bridge_detail, host, live_bridge_port, 2.5)
+        if ok:
+            _dash_set_alert(
+                Fore.GREEN +
+                f"  ✔  AddOn reachable · streaming live P&L from "
+                f"{host}:{live_bridge_port}." + Style.RESET_ALL)
+        else:
+            _dash_set_alert(
+                Fore.YELLOW +
+                f"  ✖  {host}:{live_bridge_port}  →  {reason}" +
+                Style.RESET_ALL)
+    elif key == "4":
+        show_cursor()
+        sys.stdout.write(Fore.WHITE +
+                         f"  NEW PORT [{live_bridge_port}] ▸ " + Style.RESET_ALL)
+        sys.stdout.flush()
+        raw = await asyncio.to_thread(read_line_raw)
+        hide_cursor()
+        if raw:
+            try:
+                p = int(raw.strip())
+                if 1 <= p <= 65535:
+                    live_bridge_port = p
+                    cfg["live_bridge_port"] = p
+                    save_config(cfg)
+                    _dash_set_alert(
+                        Fore.GREEN +
+                        f"  ✔  Live monitor port set → {p}." + Style.RESET_ALL)
+                else:
+                    _dash_set_alert(
+                        Fore.RED + "  ✖  Port must be 1–65535." + Style.RESET_ALL)
+            except ValueError:
+                _dash_set_alert(
+                    Fore.RED + "  ✖  Invalid port." + Style.RESET_ALL)
+    elif key == "5":
+        show_cursor()
+        current = nt_host_override or "(auto)"
+        sys.stdout.write(Fore.WHITE +
+                         f"  NT HOST [{current}]  "
+                         f"(IP or hostname, blank = auto) ▸ " + Style.RESET_ALL)
+        sys.stdout.flush()
+        raw = await asyncio.to_thread(read_line_raw)
+        hide_cursor()
+        raw = (raw or "").strip()
+        # Clear the per-port probe cache so the new host gets re-tested.
+        invalidate_nt_host_cache()
+        if not raw:
+            # Blank input = clear override, revert to auto-detect.
+            nt_host_override = ""
+            cfg["nt_host"] = ""
+            save_config(cfg)
+            _dash_set_alert(
+                Fore.CYAN + "  ✔  NT host reverted to auto-detect." +
+                Style.RESET_ALL)
+        else:
+            nt_host_override = raw
+            cfg["nt_host"] = raw
+            save_config(cfg)
+            # Probe the new host on the live bridge port right away so the
+            # alert tells the user whether it actually reaches NT.
+            ok = await asyncio.to_thread(
+                probe_live_bridge, raw, live_bridge_port, 2.5)
+            if ok:
+                _dash_set_alert(
+                    Fore.GREEN +
+                    f"  ✔  NT host set → {raw} · AddOn reachable on "
+                    f"port {live_bridge_port}." + Style.RESET_ALL)
+            else:
+                _dash_set_alert(
+                    Fore.YELLOW +
+                    f"  ⚠  NT host set → {raw} but AddOn not responding "
+                    f"on port {live_bridge_port}.  NT running? "
+                    "Firewall open for the WSL/LAN subnet?" + Style.RESET_ALL)
+
+    awaiting_user_input = False
+
+
 async def setup_menu():
     """Show the setup submenu for config changes."""
     global awaiting_user_input
@@ -4057,6 +4334,10 @@ async def setup_menu():
     cfg = load_config()
     current_server = cfg.get("ws_host", "not set")
     masked_token = "*" * min(len(cfg.get("token", "")), 33) or "not set"
+    # Probe off-loop — a blocking probe here stalls the asyncio event loop
+    # long enough for the WebSocket server to time out the connection.
+    live_label, live_color = await asyncio.to_thread(_live_bridge_status)
+    live_color_code = _STATE_COLORS.get(live_color, "")
     print(Fore.CYAN + "\n┌─ SETUP ──────────────────────────────────────────┐" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  1. Server    ({current_server[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
     print(Fore.CYAN + f"│  2. Token     ({masked_token[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
@@ -4078,8 +4359,25 @@ async def setup_menu():
     n_profiles = len(account_profiles)
     prof_label = f"{n_profiles} account{'s' if n_profiles != 1 else ''} customized" if n_profiles else "none"
     print(Fore.CYAN + f"│  8. Profiles  ({prof_label[:33]})" .ljust(53) + "│" + Style.RESET_ALL)
+    # Live monitor row with inline color on the status label. Slot 9 —
+    # 7 and 8 were already taken by micros and profiles on main.
+    live_row_plain = f"│  9. Live Mon. ({live_label[:33]})"
+    live_pad = " " * max(0, 53 - len(live_row_plain))
+    live_row = (
+        Fore.CYAN + "│  9. Live Mon. (" +
+        live_color_code + live_label[:33] + Fore.CYAN +
+        ")" + live_pad + "│"
+    )
+    print(live_row + Style.RESET_ALL)
     print(Fore.CYAN + "│  ESC to close                                    │" + Style.RESET_ALL)
     print(Fore.CYAN + "└──────────────────────────────────────────────────┘" + Style.RESET_ALL)
+
+    # Inline warning if enabled-but-not-active
+    if live_bridge_enabled and live_color != "GREEN":
+        print(Fore.YELLOW +
+              "  ⚠  Live monitor enabled but AddOn not reachable "
+              "(option 9 for steps)." + Style.RESET_ALL)
+
     sys.stdout.write(Fore.WHITE + "  SETUP ▸ " + Style.RESET_ALL)
     sys.stdout.flush()
     key = await asyncio.to_thread(get_key)
@@ -4107,6 +4405,8 @@ async def setup_menu():
         refresh_header_status()
     elif key == "8":
         await prompt_profiles()
+    elif key == "9":
+        await prompt_live_bridge()
     _dash_exit_menu()
 
 
@@ -4612,19 +4912,98 @@ def query_nt_balance(account: str) -> float | None:
     return None
 
 
+# NT futures month codes for converting "NQ JUN26" → "NQ 06-26", the
+# digit-month-dash format the file-based ATI PLACE/CLOSEPOSITION commands
+# actually accept. NT broadcasts the human-readable JUN26 alias over TCP
+# but rejects it as an order symbol.
+_FUTURES_MONTH_CODES = {
+    "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
+    "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
+    "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12",
+}
+
+
+def _nt_contract_aliases(name: str) -> list[str]:
+    """Return contract-name aliases to try on CLOSEPOSITION.
+
+    NT broadcasts positions under many names (NQ JUN26, @NQ, NQM26, NQ M6)
+    but the ATI file-based command only accepts one specific format —
+    '<root> <MM>-<YY>'. We always try that normalized form first, then
+    fall back to the original in case a given install accepts it.
+    Aliases are deduplicated while preserving order.
+    """
+    if not name:
+        return []
+    aliases: list[str] = []
+    normalized = name
+    parts = name.strip().split()
+    if len(parts) == 2:
+        root, suffix = parts
+        suffix_up = suffix.upper()
+        if "-" not in suffix and len(suffix_up) == 5 and suffix_up[:3] in _FUTURES_MONTH_CODES:
+            mm = _FUTURES_MONTH_CODES[suffix_up[:3]]
+            yy = suffix_up[3:]
+            normalized = f"{root} {mm}-{yy}"
+    # Preferred format first
+    for a in (normalized, name):
+        if a and a not in aliases:
+            aliases.append(a)
+    return aliases
+
+
+def bridge_send_command(cmd: dict, timeout: float = 2.0) -> bool:
+    """Send a JSON command line to the SocketTraderBridge AddOn.
+
+    Opens a short-lived TCP connection, fires one newline-delimited JSON
+    object, and drops. The AddOn accepts commands on the same socket it
+    uses for the state-push stream; one-shot connections keep this code
+    simple and avoid needing to share state with live_bridge_task.
+    Returns True on successful send (does not await an ack — the AddOn
+    logs its own result to NT's Output tab).
+    """
+    if not (live_bridge_enabled and _live_bridge_connected):
+        return False
+    host = _nt_host(nt_port)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, live_bridge_port))
+        payload = (json.dumps(cmd) + "\n").encode("utf-8")
+        s.sendall(payload)
+        s.close()
+        logger.info(f"bridge cmd sent: {cmd}")
+        return True
+    except OSError as exc:
+        logger.warning(f"bridge cmd failed: {cmd} · {exc}")
+        return False
+
+
 def fire_close_position(account: str, contract: str):
-    """Write a CLOSEPOSITION command to the incoming folder."""
+    """Write a CLOSEPOSITION command to the incoming folder.
+
+    NT's file-based ATI wants the '<root> <MM>-<YY>' contract format
+    even though it broadcasts positions as '<root> <MMM><YY>' (e.g.
+    NQ JUN26). We write one command per valid alias — the first NT
+    recognizes flattens the position, subsequent ones no-op because
+    MarketPosition is already Flat. Harmless and covers both format
+    conventions without having to guess which NT version accepts which.
+    """
     if not output_directory:
         return
-    cmd = f"CLOSEPOSITION;{sanitize_ati(account)};{sanitize_ati(contract)};;;;;;;;;;"
-    filename = _next_ati_filename("close")
-    filepath = os.path.join(output_directory, filename)
-    try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(cmd)
-        logger.info(f"CLOSEPOSITION  account={account}  contract={contract}  file={filename}")
-    except Exception as exc:
-        _dash_set_alert(Fore.RED + f"  ✖  Close position write error: {exc}" + Style.RESET_ALL)
+    aliases = _nt_contract_aliases(contract)
+    for alias in aliases:
+        cmd = f"CLOSEPOSITION;{sanitize_ati(account)};{sanitize_ati(alias)};;;;;;;;;;"
+        filename = _next_ati_filename("close")
+        filepath = os.path.join(output_directory, filename)
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(cmd)
+            logger.info(
+                f"CLOSEPOSITION  account={account}  contract={alias}  "
+                f"file={filename}  (aliases_tried={len(aliases)})")
+        except Exception as exc:
+            _dash_set_alert(Fore.RED + f"  ✖  Close position write error: {exc}" + Style.RESET_ALL)
+            return
 
 
 # NT order states that still carry (or may still gain) working exposure
@@ -4698,11 +5077,14 @@ def fire_cancel_account_orders(account: str) -> int:
 def close_account_positions(account: str) -> list[str]:
     """Close every open position on one account.
 
-    Queries NT for actual positions and closes each one, unioned with
-    any contracts tracked in session_contracts as a safety net in case
-    the position query fails or is slow to refresh after a fast fill.
-    Also cancels any working orders first so a pending entry can't
-    leak through during the close.
+    When the SocketTraderBridge AddOn is connected, sends a single
+    FLATTEN command over the bridge — NT calls `account.Flatten(...)`
+    natively, no file-format fragility, no contract-name-alias dance.
+    The file-based CLOSEPOSITION path is retained as a fallback for
+    when the bridge is disabled or unreachable.
+
+    In either path, cancels working orders first so a pending entry
+    can't refill during the close.
     """
     if not account:
         return []
@@ -4714,21 +5096,35 @@ def close_account_positions(account: str) -> list[str]:
 
     closed: set[str] = set()
 
+    # Capture what WAS open so the caller sees the same "Closed: ..."
+    # list regardless of which path executed the flatten.
     try:
         positions = query_nt_positions(account, nt_port)
         for instrument, qty in positions.items():
             if qty != 0 and instrument:
-                fire_close_position(account, instrument)
                 closed.add(instrument)
     except Exception as e:
         logger.error(f"close_account_positions {account}  query error: {e}")
-
-    # Safety net: anything tracked in session_contracts that we haven't
-    # closed yet (e.g. position query was empty due to fill latency).
     for contract in session_contracts:
-        if contract and contract not in closed:
-            fire_close_position(account, contract)
+        if contract:
             closed.add(contract)
+
+    # Preferred path: flatten through the AddOn bridge, which calls NT's
+    # native account.Flatten() — no order-instruction file, so none of the
+    # contract-name-format fragility that the file path has to work around.
+    # Scoped to THIS account so the leader-first ordering in
+    # close_all_open_positions still holds.
+    if bridge_send_command({"cmd": "flatten", "account": account}):
+        logger.info(f"FLATTEN via bridge  account={account}  contracts={sorted(closed)}")
+        return sorted(closed)
+
+    # Fallback: file-based CLOSEPOSITION per instrument, used whenever the
+    # bridge is disabled or unreachable.
+    # `closed` is already de-duplicated (it is a set), so a contract that
+    # appears in both the live-position query and session_contracts gets
+    # exactly one CLOSEPOSITION write.
+    for instrument in sorted(closed):
+        fire_close_position(account, instrument)
 
     return sorted(closed)
 
@@ -5071,6 +5467,95 @@ def _recompute_session_lock():
     if all_stopped:
         paused = True
         set_session_state("hard_stop" if hard_stopped else "soft_stop")
+# ---------- Live P&L bridge consumer (optional SocketTraderBridge AddOn) ----------
+_live_bridge_connected = False
+_live_bridge_last_data_ts: float = 0.0  # wall-clock seconds of last parsed line
+
+async def live_bridge_task():
+    """Maintain a streaming connection to the SocketTraderBridge AddOn.
+
+    When connected, feeds `equity` (cash + unrealized) from the AddOn's
+    JSON stream into session_current_balances[active_account] so the
+    existing balance_monitor trips stops/targets mid-trade. Falls back
+    silently to ATI CashValue polling (via balance_monitor) whenever the
+    AddOn is disabled, unreachable, or stale.
+
+    Reconnects with exponential backoff up to 30s so NT restarts,
+    temporary network hiccups, or AddOn recompiles auto-recover.
+    """
+    global _live_bridge_connected, _live_bridge_last_data_ts
+    backoff = 1.0
+    stale_seconds = 12.0  # no data in this long → drop + reconnect
+
+    while not shutdown.is_set():
+        if not live_bridge_enabled:
+            await asyncio.sleep(2.0)
+            backoff = 1.0
+            continue
+
+        host = _nt_host(nt_port)
+        port = live_bridge_port
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=3.0)
+        except (OSError, asyncio.TimeoutError):
+            _live_bridge_connected = False
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+            continue
+
+        _live_bridge_connected = True
+        backoff = 1.0
+        logger.info(f"live bridge connected → {host}:{port}")
+
+        try:
+            while not shutdown.is_set():
+                try:
+                    line = await asyncio.wait_for(
+                        reader.readline(), timeout=stale_seconds)
+                except asyncio.TimeoutError:
+                    logger.info("live bridge stale — reconnecting")
+                    break
+                if not line:
+                    logger.info("live bridge EOF — reconnecting")
+                    break
+                try:
+                    obj = json.loads(line.decode("utf-8", errors="ignore"))
+                except (ValueError, json.JSONDecodeError):
+                    continue
+                _live_bridge_last_data_ts = time.time()
+                accts = obj.get("accounts") if isinstance(obj, dict) else None
+                if not accts:
+                    continue
+                for a in accts:
+                    name = a.get("name")
+                    if not name:
+                        continue
+                    eq = a.get("equity")
+                    if eq is None:
+                        continue
+                    # Only drive session_current_balances for the active
+                    # account — other accounts still get CashValue from
+                    # balance_monitor, which is enough for their display.
+                    if name == active_account:
+                        try:
+                            session_current_balances[name] = float(eq)
+                        except (TypeError, ValueError):
+                            pass
+        except asyncio.CancelledError:
+            try: writer.close()
+            except Exception: pass
+            _live_bridge_connected = False
+            return
+        except Exception as e:
+            logger.error(f"live_bridge_task error: {e}")
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            _live_bridge_connected = False
 
 
 async def balance_monitor():
@@ -5087,12 +5572,16 @@ async def balance_monitor():
             if not active_account:
                 continue
 
-            # Always poll balances for status bar display (non-blocking).
-            # Session limits are enforced on realized CashValue deltas since
-            # NT's TCP ATI doesn't push live equity; per-trade risk is handled
-            # by NinjaTrader's own ATM stop/target on the entry.
+            # Poll balances for status bar + realized-cash fallback. When
+            # the live bridge AddOn is streaming, it owns the active
+            # account's entry in session_current_balances (equity, not
+            # cash) so mid-trade unrealized P&L reaches the stop/target
+            # check. Other accounts always get ATI's CashValue.
             all_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
             for a in all_accounts:
+                if (live_bridge_enabled and _live_bridge_connected
+                        and a["name"] == active_account):
+                    continue  # bridge is authoritative here
                 session_current_balances[a["name"]] = a["cash"]
             refresh_controls()
 
@@ -5425,6 +5914,7 @@ async def listen(token: str):
                         fib_prev, fib_curr = 60, 60  # Reset backoff on manual reconnect
                         manual_reconnect = True
                         conn_lost_at = time.time()
+                        set_session_state("reconnecting")
                         _dash_set_alert(
                             Fore.YELLOW + "  🔄  Dropping connection for reconnect..." + Style.RESET_ALL,
                             kind=ALERT_CONN)
@@ -5704,6 +6194,50 @@ def install_strategy_templates(nt_base: Path):
             print(Fore.RED + f"  ✖  Could not install {filename}: {exc}" + Style.RESET_ALL)
 
 
+def install_live_bridge_addon(nt_base: Path) -> tuple[bool, str]:
+    """Copy SocketTraderBridge.cs from the repo into NT's AddOns folder.
+
+    Returns (ok, message). Three outcomes:
+      - Source missing → (False, reason).
+      - Dest missing or differs from source → copy (backing up any existing
+        local edits as .cs.bak) and return (True, "installed" message).
+      - Dest already matches source → (True, "already installed" message).
+    Caller surfaces the message to the user.
+    """
+    source = SCRIPT_DIR / "addon" / "SocketTraderBridge.cs"
+    if not source.is_file():
+        return False, "addon/SocketTraderBridge.cs not found in repo."
+    dest_dir = nt_base / "bin" / "Custom" / "AddOns"
+    dest = dest_dir / "SocketTraderBridge.cs"
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, f"cannot create AddOns dir: {exc}"
+
+    try:
+        src_bytes = source.read_bytes()
+    except OSError as exc:
+        return False, f"cannot read source: {exc}"
+
+    if dest.exists():
+        try:
+            if dest.read_bytes() == src_bytes:
+                return True, f"AddOn already installed at {dest}"
+        except OSError:
+            pass
+        # Exists and differs — preserve any local edits before overwriting.
+        backup = dest.with_suffix(".cs.bak")
+        try:
+            shutil.copy2(str(dest), str(backup))
+        except OSError:
+            pass
+    try:
+        dest.write_bytes(src_bytes)
+        return True, f"AddOn copied to {dest} — F5 in NT to compile."
+    except OSError as exc:
+        return False, f"copy failed: {exc}"
+
+
 def _save_server_to_list(cfg: dict, ws_host: str, server_name: str):
     """Ensure the server URL is in the saved servers list."""
     servers = cfg.get("servers", [])
@@ -5768,6 +6302,20 @@ def setup() -> tuple[str, dict]:
         print(Fore.GREEN + f"  ✔  Output: {cfg['output_directory']}" + Style.RESET_ALL)
     if not cfg.get("account") or not cfg.get("output_directory"):
         print(Fore.YELLOW + f"  ⚠  Press S after connecting to finish setup." + Style.RESET_ALL)
+
+    # Startup warning: live monitor enabled but AddOn not reachable.
+    if cfg.get("live_bridge_enabled"):
+        _bridge_port = int(cfg.get("live_bridge_port", 36984))
+        if probe_live_bridge(_nt_host(cfg.get("nt_port", 36973)), _bridge_port):
+            print(Fore.GREEN +
+                  f"  ✔  Live monitor active on port {_bridge_port}." + Style.RESET_ALL)
+        else:
+            print(Fore.YELLOW +
+                  f"  ⚠  Live monitor enabled but AddOn not reachable on "
+                  f"port {_bridge_port}." + Style.RESET_ALL)
+            print(Fore.YELLOW +
+                  "     Press S → 7 for install steps, or disable to silence." +
+                  Style.RESET_ALL)
 
     # Install strategy templates if output directory is configured
     if cfg.get("output_directory") and Path(cfg["output_directory"]).is_dir():
@@ -7475,6 +8023,10 @@ async def main():
     account_profiles.update(load_account_profiles(cfg))
     if account_profiles:
         logger.info(f"PROFILES LOADED  accounts={sorted(account_profiles)}")
+    global live_bridge_enabled, live_bridge_port, nt_host_override
+    live_bridge_enabled = bool(cfg.get("live_bridge_enabled", False))
+    live_bridge_port = int(cfg.get("live_bridge_port", 36984))
+    nt_host_override = str(cfg.get("nt_host", "") or "").strip()
 
     if cfg.get("output_directory"):
         output_directory = cfg["output_directory"]
@@ -7494,6 +8046,7 @@ async def main():
             asyncio.create_task(keyboard_loop()),
             asyncio.create_task(pause_indicator()),
             asyncio.create_task(balance_monitor()),
+            asyncio.create_task(live_bridge_task()),
         ]
 
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
