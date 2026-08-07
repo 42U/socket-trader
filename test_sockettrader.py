@@ -2870,7 +2870,7 @@ class TestHedgeGuard:
     @pytest.fixture(autouse=True)
     def _arm(self, monkeypatch):
         monkeypatch.setattr(st, "validate_strategy", lambda n: True)
-        monkeypatch.setattr(st, "hedge_guard_mode", lambda: "block")
+        monkeypatch.setattr(st, "hedge_guard_mode", lambda: "warn")  # the real default
         st.active_account = "LEAD"
         st.follower_accounts = ["F1"]
 
@@ -2878,13 +2878,51 @@ class TestHedgeGuard:
         plans, skipped = st.plan_signal_legs(sig or self.ENTRY)
         return ({p["account"]: p["signal"].split(";")[3] for p in plans}, skipped)
 
-    def test_inconsistent_invert_is_blocked(self):
+    # --- leader-dominant direction: the leader is the reference account ---
+
+    def test_leader_invert_carries_the_whole_group(self):
         st.account_profiles["LEAD"] = {"default": {"direction": "invert"}}
         acts, skipped = self._actions()
-        assert acts == {}
-        assert all("hedge guard" in r for _, r in skipped)
+        assert acts == {"LEAD": "SELL", "F1": "SELL"} and not skipped
 
-    def test_consistent_invert_is_allowed(self):
+    def test_inheritance_survives_other_per_account_settings(self):
+        # a size override must not accidentally opt F1 out of the leader's
+        # direction — only an explicit `direction` key does that
+        st.account_profiles["LEAD"] = {"default": {"direction": "invert"}}
+        st.account_profiles["F1"] = {"default": {"size": "micros"}}
+        acts, skipped = self._actions()
+        assert acts == {"LEAD": "SELL", "F1": "SELL"} and not skipped
+
+    def test_scoped_leader_invert_is_inherited_too(self):
+        st.account_profiles["LEAD"] = {"rules": [
+            {"symbols": ["NQ"], "direction": "invert"}]}
+        acts, _ = self._actions()
+        assert acts == {"LEAD": "SELL", "F1": "SELL"}
+
+    def test_leader_invert_does_not_apply_to_other_symbols(self):
+        st.account_profiles["LEAD"] = {"rules": [
+            {"symbols": ["GC"], "direction": "invert"}]}
+        acts, _ = self._actions()
+        assert acts == {"LEAD": "BUY", "F1": "BUY"}
+
+    # --- divergence: only an explicit follower direction creates a hedge ---
+
+    def test_follower_invert_against_a_normal_leader_conflicts(self):
+        st.account_profiles["F1"] = {"default": {"direction": "invert"}}
+        plans, _ = st.plan_signal_legs(self.ENTRY)
+        acts = {p["account"]: p["signal"].split(";")[3] for p in plans}
+        assert acts == {"LEAD": "BUY", "F1": "SELL"}
+        assert st._entry_direction_conflict(plans)
+
+    def test_follower_pinned_normal_against_an_inverted_leader_conflicts(self):
+        st.account_profiles["LEAD"] = {"default": {"direction": "invert"}}
+        st.account_profiles["F1"] = {"default": {"direction": "normal"}}
+        plans, _ = st.plan_signal_legs(self.ENTRY)
+        acts = {p["account"]: p["signal"].split(";")[3] for p in plans}
+        assert acts == {"LEAD": "SELL", "F1": "BUY"}
+        assert st._entry_direction_conflict(plans)
+
+    def test_both_invert_is_not_a_conflict(self):
         for a in ("LEAD", "F1"):
             st.account_profiles[a] = {"default": {"direction": "invert"}}
         acts, skipped = self._actions()
@@ -2895,37 +2933,44 @@ class TestHedgeGuard:
         assert acts == {"LEAD": "BUY", "F1": "BUY"}
 
     def test_micro_and_full_are_the_same_underlying(self):
-        # F1 sized to micros still collides with the leader's full-size NQ
-        st.account_profiles["LEAD"] = {"default": {"direction": "invert"}}
-        st.account_profiles["F1"] = {"default": {"size": "micros"}}
-        acts, skipped = self._actions()
-        assert acts == {} and skipped
+        # F1 fades the leader AND trades micros — still one underlying
+        st.account_profiles["F1"] = {"default": {"direction": "invert",
+                                                 "size": "micros"}}
+        plans, _ = st.plan_signal_legs(self.ENTRY)
+        assert list(st._entry_direction_conflict(plans)) == ["NQ"]
 
     def test_different_symbols_do_not_collide(self):
         # F1 only trades gold, so it never takes the NQ entry at all
-        st.account_profiles["LEAD"] = {"default": {"direction": "invert"}}
-        st.account_profiles["F1"] = {"symbols_allowed": ["GC"]}
+        st.account_profiles["F1"] = {"symbols_allowed": ["GC"],
+                                     "default": {"direction": "invert"}}
         acts, skipped = self._actions()
-        assert acts == {"LEAD": "SELL"}
+        assert acts == {"LEAD": "BUY"}
         assert [r for a, r in skipped if a == "F1" and "symbol" in r]
 
-    def test_exits_are_never_blocked(self):
-        st.account_profiles["LEAD"] = {"default": {"direction": "invert"}}
+    def test_exits_are_never_blocked(self, monkeypatch):
+        monkeypatch.setattr(st, "hedge_guard_mode", lambda: "block")
+        st.account_profiles["F1"] = {"default": {"direction": "invert"}}
         plans, _ = st.plan_signal_legs("CLOSEPOSITION;LEAD;NQ 09-26;;;;;;;;;;")
         assert [p["account"] for p in plans] == ["LEAD", "F1"]
         assert all(p["command"] == "CLOSEPOSITION" for p in plans)
 
-    def test_warn_mode_fires_but_flags(self, monkeypatch):
-        monkeypatch.setattr(st, "hedge_guard_mode", lambda: "warn")
-        st.account_profiles["LEAD"] = {"default": {"direction": "invert"}}
+    def test_block_mode_refuses_a_diverging_follower(self, monkeypatch):
+        monkeypatch.setattr(st, "hedge_guard_mode", lambda: "block")
+        st.account_profiles["F1"] = {"default": {"direction": "invert"}}
         acts, skipped = self._actions()
-        assert acts == {"LEAD": "SELL", "F1": "BUY"} and not skipped
+        assert acts == {}
+        assert all("hedge guard" in r for _, r in skipped)
+
+    def test_warn_mode_fires_but_flags(self):
+        st.account_profiles["F1"] = {"default": {"direction": "invert"}}
+        acts, skipped = self._actions()
+        assert acts == {"LEAD": "BUY", "F1": "SELL"} and not skipped
 
     def test_off_mode_disables_the_guard(self, monkeypatch):
         monkeypatch.setattr(st, "hedge_guard_mode", lambda: "off")
-        st.account_profiles["LEAD"] = {"default": {"direction": "invert"}}
+        st.account_profiles["F1"] = {"default": {"direction": "invert"}}
         acts, _ = self._actions()
-        assert acts == {"LEAD": "SELL", "F1": "BUY"}
+        assert acts == {"LEAD": "BUY", "F1": "SELL"}
 
 
 class TestHedgeGuardMode:

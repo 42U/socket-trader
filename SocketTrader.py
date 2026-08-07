@@ -41,7 +41,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -907,6 +907,29 @@ def resolve_rule(account: str, instrument: str = "", pub_strategy: str = "") -> 
     return rule
 
 
+def explicit_rule_keys(account: str, instrument: str = "", pub_strategy: str = ""
+                       ) -> set[str]:
+    """Rule keys this account sets ITSELF for this signal, as opposed to
+    inheriting. Mirrors resolve_rule's precedence: account default, then
+    the first matching scoped rule."""
+    prof = account_profiles.get(account)
+    if not prof:
+        return set()
+    keys = {k for k in prof.get("default", {}) if k in DEFAULT_RULE}
+    root = _instrument_root(instrument)
+    strat = (pub_strategy or "").strip().lower()
+    for scoped in prof.get("rules", []):
+        symbols = scoped.get("symbols") or []
+        strategies = scoped.get("strategies") or []
+        if symbols and not _symbol_matches(symbols, root):
+            continue
+        if strategies and strat not in {str(s).strip().lower() for s in strategies}:
+            continue
+        keys |= {k for k in scoped if k in DEFAULT_RULE}
+        break
+    return keys
+
+
 def profiles_active() -> bool:
     return bool(account_profiles)
 
@@ -1197,8 +1220,22 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = ""
         if rr_pick:
             logger.info(f"ROUND-ROBIN  pick={rr_pick}  remaining={_rr_remaining}")
 
+    # The LEADER'S direction is dominant: it is the reference account, so
+    # when it fades the publisher the whole group fades with it. Accounts
+    # that do not set `direction` themselves inherit the leader's — without
+    # this, turning invert on for the leader alone would put every follower
+    # on the opposite side of it. An account that DOES set its own
+    # direction keeps it, and the hedge guard warns about the divergence.
+    leader_direction = "normal"
+    if active_account:
+        leader_direction = resolve_rule(
+            active_account, instrument, pub_strategy)["direction"]
+
     for account, canonical, is_rr_pick in legs:
         rule = resolve_rule(account, instrument, pub_strategy)
+        if (account != active_account
+                and "direction" not in explicit_rule_keys(account, instrument, pub_strategy)):
+            rule["direction"] = leader_direction
         final, skip_reason, meta = transform_signal_for_account(canonical, account, rule)
         if final is None:
             skipped.append((account, skip_reason or "skipped"))
@@ -5888,7 +5925,7 @@ async def _web_close_all() -> tuple[bool, str]:
 
 async def _web_toggle_micro() -> tuple[bool, str]:
     on = toggle_micro_mode()
-    refresh_header_status()
+    refresh_terminal()
     return True, f"micro mode {'ON' if on else 'off'}"
 
 
@@ -5914,7 +5951,7 @@ async def _web_set_accounts(leader, followers, robins) -> tuple[bool, str]:
     cfg["follower_accounts"] = follower_accounts
     cfg["roundrobin_accounts"] = roundrobin_accounts
     save_config(cfg)
-    refresh_header_status()
+    refresh_terminal()
     logger.info(f"WEB ACCOUNTS SET  leader={lead}  followers={fols}  "
                 f"roundrobin={roundrobin_accounts}")
     return True, (f"leader {lead} · {len(fols)} follower(s) · "
@@ -5941,7 +5978,7 @@ async def _web_set_strategy(name, follow_publisher=None) -> tuple[bool, str]:
         cfg["follow_publisher_strategy"] = follow_publisher_strategy
         msg_bits.append("FOLLOW publisher" if follow_publisher_strategy else "LOCKED")
     save_config(cfg)
-    refresh_header_status()
+    refresh_terminal()
     logger.info(f"WEB STRATEGY  {'; '.join(msg_bits)}")
     return True, " · ".join(msg_bits) or "no change"
 
@@ -6007,7 +6044,7 @@ async def _web_set_profiles(raw) -> tuple[bool, str]:
     account_profiles.clear()
     account_profiles.update(cleaned)
     save_account_profiles()
-    refresh_header_status()
+    refresh_terminal()
     return True, f"profiles saved for {', '.join(sorted(cleaned)) or 'no accounts'}"
 
 
@@ -6015,7 +6052,7 @@ async def _web_reset_pnl() -> tuple[bool, str]:
     # Same path as the terminal's B → R: re-snapshot from the balances the
     # balance monitor already keeps current.
     reset_session_pnl()
-    refresh_header_status()
+    refresh_terminal()
     _dash_set_alert(Fore.GREEN + "  ↺  SESSION P&L RESET from web UI" + Style.RESET_ALL)
     logger.info("WEB RESET P&L")
     return True, "session P&L reset — balances re-snapshotted"
@@ -6383,10 +6420,22 @@ async def _web_set_role(account, role) -> tuple[bool, str]:
     cfg["roundrobin_accounts"] = roundrobin_accounts
     save_config(cfg)
     _live_cache["data"] = None
-    refresh_header_status()
+    refresh_terminal()
     logger.info(f"WEB ROLE  {acct} -> {role}  leader={active_account} "
                 f"followers={follower_accounts} rr={roundrobin_accounts}")
     return True, f"{acct} → {role}"
+
+
+def refresh_terminal():
+    """Redraw both pinned terminal regions after a web-initiated change.
+
+    The two live in different places: the header status bar carries session
+    state, and the bottom controls bar carries the leader, follower count
+    and balance. A web change that touched only the header left the
+    terminal advertising the old account, so both are refreshed together.
+    """
+    refresh_header_status()
+    refresh_controls()
 
 
 def _web_run(coro, timeout: float = 20.0):
