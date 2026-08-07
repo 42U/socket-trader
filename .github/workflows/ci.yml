@@ -111,6 +111,15 @@ jobs:
           if (-not (Get-ChildItem (Join-Path $dir 'strategy') -Filter *.xml)) {
             throw 'strategy templates were not installed'
           }
-          # the whole point is that the app actually starts on a clean machine
-          python -c "import sys; sys.path.insert(0, r'$dir'); import SocketTrader; print('imports OK, v' + SocketTrader.__version__)"
+          # Import with the SAME interpreter the launcher will use. A Windows
+          # box often has several Pythons; checking with a different one than
+          # the installer pip-installed into proves nothing.
+          $cmd = Get-Content (Join-Path $dir 'SocketTrader.cmd') -Raw
+          if ($cmd -notmatch '(?m)^(py(\s+-3)?|python)\s+SocketTrader\.py') {
+            throw "launcher does not invoke SocketTrader.py as expected:`n$cmd"
+          }
+          $interp = $Matches[1] -split '\s+'
+          & $interp[0] @($interp[1..($interp.Length-1)]) -c `
+            "import sys; sys.path.insert(0, r'$dir'); import SocketTrader; print('imports OK, v' + SocketTrader.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw 'app failed to import with the launcher interpreter' }
           Write-Host "installer output verified"
