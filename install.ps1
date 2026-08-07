@@ -146,16 +146,28 @@ if (-not $ntRoot) {
 } elseif (-not $xml) {
     Write-Warn 'No strategy templates found in the download.'
 } else {
-    $atm = Join-Path $ntRoot 'templates\AtmStrategy'
-    New-Item -ItemType Directory -Force -Path $atm | Out-Null
-    $copied = 0; $kept = 0
+    # NinjaTrader keeps ATM and Stop templates in SEPARATE folders and will
+    # not see one filed under the other, so route each file by its actual
+    # root element rather than assuming they are all ATMs.
+    $atm  = Join-Path $ntRoot 'templates\AtmStrategy'
+    $stop = Join-Path $ntRoot 'templates\StopStrategy'
+    New-Item -ItemType Directory -Force -Path $atm  | Out-Null
+    New-Item -ItemType Directory -Force -Path $stop | Out-Null
+    $copied = 0; $kept = 0; $stopCount = 0
     foreach ($f in $xml) {
-        $dest = Join-Path $atm $f.Name
+        $head = Get-Content $f.FullName -TotalCount 5 -Raw
+        # <StopStrategy> also appears NESTED inside an ATM template, so only
+        # treat it as a stop template when it is the element right after the
+        # <NinjaTrader> root.
+        $isStop = $head -match '<NinjaTrader>\s*<StopStrategy'
+        $target = if ($isStop) { $stop } else { $atm }
+        $dest = Join-Path $target $f.Name
         if ((Test-Path $dest) -and -not $Force) { $kept++; continue }
         Copy-Item $f.FullName $dest -Force
         $copied++
+        if ($isStop) { $stopCount++ }
     }
-    Write-Ok "$copied template(s) installed into $atm"
+    Write-Ok "$copied template(s) installed ($($copied - $stopCount) ATM, $stopCount stop)"
     if ($kept -gt 0) {
         Write-Info "$kept already existed and were left alone (re-run with -Force to replace)"
     }
