@@ -41,7 +41,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -2257,6 +2257,184 @@ def query_nt_positions(account: str, port: int = 36973) -> dict[str, int]:
         result[(spaced or names)[0]] = qty
     logger.debug(f"ATI POSITIONS parsed: {result}")
     return result
+
+
+def _alias_root(alias: str) -> str:
+    """Root symbol of an NT instrument alias ("NQ SEP26"/"@NQ"/"NQU26" -> NQ)."""
+    s = alias.strip().lstrip("@")
+    if " " in s:
+        return s.split()[0]
+    m = re.match(r"^([A-Za-z]+?)[FGHJKMNQUVXZ]\d{1,2}$", s)
+    return m.group(1) if m else s
+
+
+def _pick_alias(names: list[str]) -> str:
+    """Prefer the human "ROOT MONYY" alias — NT accepts that form back."""
+    spaced = [n for n in names if " " in n and not n.startswith("@")]
+    return (spaced or names)[0]
+
+
+def nt_snapshot(port: int | None = None, timeout: float = 3.0) -> dict:
+    """One ATI state dump parsed into everything the UI needs.
+
+    NinjaTrader answers ACCOUNTS / POSITIONS / ORDERS with the *same* full
+    state dump, so a single request yields every account's cash, realized
+    P&L and buying power, every open position with its average entry, and
+    each account's working orders. Polling one snapshot beats the old
+    per-account queries: one socket round-trip instead of N.
+    """
+    text = _query_ati("ACCOUNTS", port or nt_port, timeout)
+    snap: dict = {"ok": bool(text), "accounts": {}, "positions": [],
+                  "working": {}, "ts": time.time()}
+    if not text:
+        return snap
+
+    accounts: dict[str, dict] = {}
+    pos_qty: dict[str, dict[str, int]] = {}    # account -> alias -> qty
+    pos_price: dict[str, dict[str, float]] = {}
+    order_ids: dict[str, list[str]] = {}
+    order_status: dict[str, str] = {}
+
+    def acct(name: str) -> dict:
+        return accounts.setdefault(
+            name, {"cash": None, "realized": None, "buying_power": None})
+
+    for field, key, val in _parse_ati_fields(text):
+        if not key:
+            continue  # NT emits a blank-key aggregate row; skip it
+        if field in ("CashValue", "RealizedPnL", "BuyingPower"):
+            try:
+                num = float(val)
+            except ValueError:
+                continue
+            slot = {"CashValue": "cash", "RealizedPnL": "realized",
+                    "BuyingPower": "buying_power"}[field]
+            acct(key)[slot] = num
+        elif field in ("MarketPosition", "AvgEntryPrice") and "|" in key:
+            alias, _, account = key.rpartition("|")
+            if not alias or not account:
+                continue
+            acct(account)
+            try:
+                num = float(val)
+            except ValueError:
+                continue
+            if field == "MarketPosition":
+                if num:
+                    pos_qty.setdefault(account, {})[alias] = int(num)
+            else:
+                pos_price.setdefault(account, {})[alias] = num
+        elif field == "Orders":
+            order_ids[key] = [o for o in val.split("|") if o]
+        elif field == "OrderStatus":
+            order_status[key] = val
+
+    for account, aliases in pos_qty.items():
+        grouped: dict[tuple[str, int], list[str]] = {}
+        for alias, qty in aliases.items():
+            grouped.setdefault((_alias_root(alias), qty), []).append(alias)
+        for (_root, qty), names in grouped.items():
+            chosen = _pick_alias(names)
+            price = None
+            for n in names:
+                if pos_price.get(account, {}).get(n):
+                    price = pos_price[account][n]
+                    break
+            snap["positions"].append({
+                "account": account, "instrument": chosen, "qty": qty,
+                "avg_price": price})
+
+    for account, ids in order_ids.items():
+        if account:
+            snap["working"][account] = sum(
+                1 for oid in ids if order_status.get(oid) in OPEN_ORDER_STATES)
+
+    snap["accounts"] = accounts
+    snap["positions"].sort(key=lambda p: (p["account"], p["instrument"]))
+    return snap
+
+
+# ---------- Futures instrument catalog ----------
+# The web ticket needs something to click BEFORE anything has traded, so the
+# picker is driven by this catalog rather than by session history. Month sets
+# are the actively-quoted cycles per product family: "HMUZ" = Mar/Jun/Sep/Dec
+# (quarterly), "ALL" = every calendar month. Contracts are rendered in the
+# "ROOT MM-YY" form the OIF signals use (e.g. "NQ 09-26").
+MONTH_CODES = {1: "F", 2: "G", 3: "H", 4: "J", 5: "K", 6: "M",
+               7: "N", 8: "Q", 9: "U", 10: "V", 11: "X", 12: "Z"}
+QUARTERLY = (3, 6, 9, 12)
+
+FUTURES_CATALOG = [
+    # root, description, micro root, active months, group
+    ("ES",  "E-mini S&P 500",      "MES", QUARTERLY,            "Equity index"),
+    ("NQ",  "E-mini Nasdaq-100",   "MNQ", QUARTERLY,            "Equity index"),
+    ("YM",  "E-mini Dow",          "MYM", QUARTERLY,            "Equity index"),
+    ("RTY", "E-mini Russell 2000", "M2K", QUARTERLY,            "Equity index"),
+    ("CL",  "WTI Crude Oil",       "MCL", "ALL",                "Energy"),
+    ("NG",  "Natural Gas",         "",    "ALL",                "Energy"),
+    ("RB",  "RBOB Gasoline",       "",    "ALL",                "Energy"),
+    ("GC",  "Gold",                "MGC", (2, 4, 6, 8, 10, 12), "Metals"),
+    ("SI",  "Silver",              "SIL", (3, 5, 7, 9, 12),     "Metals"),
+    ("HG",  "Copper",              "MHG", (3, 5, 7, 9, 12),     "Metals"),
+    ("PL",  "Platinum",            "",    (1, 4, 7, 10),        "Metals"),
+    ("ZB",  "30-Year T-Bond",      "",    QUARTERLY,            "Rates"),
+    ("ZN",  "10-Year T-Note",      "",    QUARTERLY,            "Rates"),
+    ("ZF",  "5-Year T-Note",       "",    QUARTERLY,            "Rates"),
+    ("ZT",  "2-Year T-Note",       "",    QUARTERLY,            "Rates"),
+    ("6E",  "Euro FX",             "M6E", QUARTERLY,            "FX"),
+    ("6B",  "British Pound",       "M6B", QUARTERLY,            "FX"),
+    ("6J",  "Japanese Yen",        "",    QUARTERLY,            "FX"),
+    ("6A",  "Australian Dollar",   "M6A", QUARTERLY,            "FX"),
+    ("6C",  "Canadian Dollar",     "",    QUARTERLY,            "FX"),
+    ("ZC",  "Corn",                "",    (3, 5, 7, 9, 12),     "Ags"),
+    ("ZS",  "Soybeans",            "",    (1, 3, 5, 7, 8, 9, 11), "Ags"),
+    ("ZW",  "Wheat",               "",    (3, 5, 7, 9, 12),     "Ags"),
+    ("BTC", "Bitcoin",             "MBT", "ALL",                "Crypto"),
+    ("ETH", "Ether",               "MET", "ALL",                "Crypto"),
+]
+
+
+def _active_months(spec) -> tuple[int, ...]:
+    return tuple(range(1, 13)) if spec == "ALL" else tuple(spec)
+
+
+def contract_months(root_spec, now: datetime | None = None, count: int = 3
+                    ) -> list[tuple[int, int]]:
+    """The next `count` (year, month) contracts for a month cycle.
+
+    The current month is included only early in the month — most products
+    roll well before expiry, so late in a contract month the front month is
+    already stale. This is a picker convenience, not an exchange calendar:
+    the ticket always accepts a typed contract for anything unusual.
+    """
+    now = now or datetime.now(ET)
+    months = _active_months(root_spec)
+    out: list[tuple[int, int]] = []
+    year, month = now.year, now.month
+    for _ in range(36):
+        if month in months and not (year == now.year and month == now.month
+                                    and now.day > 10):
+            out.append((year, month))
+            if len(out) >= count:
+                break
+        month += 1
+        if month > 12:
+            month, year = 1, year + 1
+    return out
+
+
+def instrument_catalog(now: datetime | None = None) -> list[dict]:
+    """Clickable instruments for the web ticket: root, name, and live
+    contract codes, with the micro twin when the product has one."""
+    out = []
+    for root, name, micro, months, group in FUTURES_CATALOG:
+        codes = [f"{root} {m:02d}-{str(y)[-2:]}"
+                 for y, m in contract_months(months, now)]
+        if not codes:
+            continue
+        out.append({"root": root, "name": name, "micro": micro,
+                    "group": group, "contracts": codes})
+    return out
 
 
 DEFAULT_ACCOUNT = "Sim101"
@@ -5539,6 +5717,9 @@ def web_state() -> dict:
         "last_manual": dict(_last_manual),
         "micro_map": dict(micro_map),
         "rule_defaults": dict(DEFAULT_RULE),
+        "catalog": instrument_catalog(),
+        "favorites": [f for f in (load_config().get("web_favorites") or [])
+                      if isinstance(f, str)][:12],
         "events": list(_web_events),
         "profiles": account_profiles,
         "server": _server_name,
@@ -5712,20 +5893,6 @@ async def _web_reset_pnl() -> tuple[bool, str]:
     return True, "session P&L reset — balances re-snapshotted"
 
 
-def _web_positions() -> list[dict]:
-    """Open positions across every managed account (for the web panel)."""
-    out: list[dict] = []
-    for account in target_accounts():
-        try:
-            for instrument, qty in query_nt_positions(account, nt_port).items():
-                if qty:
-                    out.append({"account": account, "instrument": instrument,
-                                "qty": qty})
-        except Exception as exc:
-            logger.error(f"WEB POSITIONS  {account}  {exc}")
-    return out
-
-
 async def _web_close_position(account, instrument) -> tuple[bool, str]:
     acct = sanitize_ati(str(account or "").strip())
     instr = sanitize_ati(str(instrument or "").strip())
@@ -5758,6 +5925,21 @@ async def _web_set_micro_map(raw) -> tuple[bool, str]:
     return True, f"{len(overrides)} micro override(s) saved"
 
 
+async def _web_set_favorites(raw) -> tuple[bool, str]:
+    """Pin the contracts the ticket shows first (starred in the picker)."""
+    if not isinstance(raw, list):
+        return False, "favorites must be a list"
+    favs: list[str] = []
+    for item in raw:
+        name = sanitize_ati(str(item).strip().upper())
+        if name and name not in favs:
+            favs.append(name)
+    cfg = load_config()
+    cfg["web_favorites"] = favs[:12]
+    save_config(cfg)
+    return True, f"{len(favs[:12])} favourite(s) saved"
+
+
 def _web_nt_accounts() -> list[str]:
     """Account names NinjaTrader reports, for click-to-pick in the web UI."""
     try:
@@ -5765,6 +5947,132 @@ def _web_nt_accounts() -> list[str]:
     except Exception as exc:
         logger.error(f"WEB NT ACCOUNTS  {exc}")
         return []
+
+
+_live_cache: dict = {"ts": 0.0, "data": None}
+_live_lock = threading.Lock()
+LIVE_CACHE_TTL = 1.0   # seconds; several browser tabs share one ATI round-trip
+
+
+def web_live(force: bool = False) -> dict:
+    """Live NinjaTrader view for the web UI: every account NT reports, with
+    role, cash, realized P&L, session P&L, open positions and working orders.
+
+    This is the panel's source of truth — it shows what NinjaTrader actually
+    has right now, including accounts this session does not manage, so the
+    grid matches the terminal's balances screen instead of only echoing
+    configured names.
+    """
+    with _live_lock:
+        fresh = _live_cache["data"] is not None and (
+            time.time() - _live_cache["ts"] < LIVE_CACHE_TTL)
+        if fresh and not force:
+            return _live_cache["data"]
+        try:
+            snap = nt_snapshot(nt_port)
+        except Exception as exc:
+            logger.error(f"WEB LIVE  snapshot failed: {exc}")
+            snap = {"ok": False, "accounts": {}, "positions": [],
+                    "working": {}, "ts": time.time()}
+
+        managed = target_accounts()
+        rows = []
+        names = list(snap["accounts"]) or list(managed)
+        for name in names:
+            info = snap["accounts"].get(name, {})
+            if name == active_account:
+                role = "leader"
+            elif name in follower_accounts:
+                role = "follower"
+            elif name in roundrobin_accounts:
+                role = "round-robin"
+            else:
+                role = ""
+            start = session_start_balances.get(name)
+            cash = info.get("cash")
+            session_pnl = (cash - start) if (start is not None and cash is not None) else None
+            rows.append({
+                "name": name,
+                "role": role,
+                "managed": name in managed,
+                "cash": cash,
+                "realized": info.get("realized"),
+                "session_pnl": session_pnl,
+                "working": snap["working"].get(name, 0),
+                "stop": account_stops.get(name),
+                "profile": profile_summary(name),
+                "limits": get_account_limits(name),
+                "positions": [p for p in snap["positions"] if p["account"] == name],
+            })
+        rows.sort(key=lambda r: (not r["managed"], r["name"]))
+        data = {"ok": snap["ok"], "accounts": rows,
+                "positions": snap["positions"], "ts": snap["ts"]}
+        _live_cache.update(ts=time.time(), data=data)
+        return data
+
+
+async def _web_flatten_account(account) -> tuple[bool, str]:
+    """Flatten one account (its positions and working orders)."""
+    acct = sanitize_ati(str(account or "").strip())
+    if not acct:
+        return False, "account required"
+    closed = await asyncio.to_thread(close_account_positions, acct)
+    _live_cache["data"] = None
+    logger.info(f"WEB FLATTEN  account={acct}  contracts={closed}")
+    _dash_set_alert(Fore.RED + f"  ⛔  FLATTEN {acct} (web)" + Style.RESET_ALL)
+    if closed:
+        return True, f"{acct}: close sent for {', '.join(closed)}"
+    return True, f"{acct}: nothing open to close"
+
+
+async def _web_set_role(account, role) -> tuple[bool, str]:
+    """Assign one account's role without rebuilding the whole set.
+
+    Clicking a role in the grid is the fast path for "add this account to
+    the rotation" / "stop copying to this one", so it edits in place rather
+    than making the user restate every account.
+    """
+    global active_account, follower_accounts, roundrobin_accounts
+    if hard_stopped:
+        return False, "session hard-locked — settings are frozen"
+    acct = sanitize_ati(str(account or "").strip())
+    role = str(role or "").strip().lower()
+    if not acct:
+        return False, "account required"
+    if role not in ("leader", "follower", "round-robin", "off"):
+        return False, "role must be leader, follower, round-robin or off"
+
+    follower_accounts = [a for a in follower_accounts if a != acct]
+    roundrobin_accounts = [a for a in roundrobin_accounts if a != acct]
+    if role == "leader":
+        if active_account and active_account != acct:
+            # the outgoing leader keeps trading as a follower rather than
+            # silently dropping out of the copy set
+            follower_accounts = _dedup_accounts([active_account], follower_accounts)
+        active_account = acct
+    elif role == "follower":
+        if acct == active_account:
+            return False, f"{acct} is the leader — promote another account first"
+        follower_accounts = _dedup_accounts(follower_accounts, [acct])
+    elif role == "round-robin":
+        if acct == active_account:
+            return False, f"{acct} is the leader — promote another account first"
+        roundrobin_accounts = sanitize_roundrobin(
+            roundrobin_accounts + [acct], active_account, follower_accounts)
+    else:
+        if acct == active_account:
+            return False, "cannot unassign the leader — promote another account first"
+    _rr_reset_rotation()
+    cfg = load_config()
+    cfg["account"] = active_account
+    cfg["follower_accounts"] = follower_accounts
+    cfg["roundrobin_accounts"] = roundrobin_accounts
+    save_config(cfg)
+    _live_cache["data"] = None
+    refresh_header_status()
+    logger.info(f"WEB ROLE  {acct} -> {role}  leader={active_account} "
+                f"followers={follower_accounts} rr={roundrobin_accounts}")
+    return True, f"{acct} → {role}"
 
 
 def _web_run(coro, timeout: float = 20.0):
@@ -5848,12 +6156,11 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
                     self._json({"ok": False, "message": "forbidden"}, 403)
                     return
                 self._json(web_state())
-            elif path == "/api/positions":
+            elif path == "/api/live":
                 if not self._token_ok():
                     self._json({"ok": False, "message": "forbidden"}, 403)
                     return
-                self._json({"positions": _web_positions(),
-                            "nt_accounts": _web_nt_accounts()})
+                self._json(web_live())
             else:
                 self._json({"ok": False, "message": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -5905,6 +6212,12 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
             elif path == "/api/close_position":
                 ok, msg = _web_run(_web_close_position(
                     data.get("account"), data.get("instrument")), timeout=30.0)
+            elif path == "/api/flatten_account":
+                ok, msg = _web_run(_web_flatten_account(data.get("account")),
+                                   timeout=30.0)
+            elif path == "/api/role":
+                ok, msg = _web_run(_web_set_role(data.get("account"),
+                                                 data.get("role")))
             elif path == "/api/reset_pnl":
                 ok, msg = _web_run(_web_reset_pnl())
             elif path == "/api/reconnect":
@@ -5914,6 +6227,8 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
                 ok, msg = _web_run(_web_toggle_micro())
             elif path == "/api/micro_map":
                 ok, msg = _web_run(_web_set_micro_map(data.get("map")))
+            elif path == "/api/favorites":
+                ok, msg = _web_run(_web_set_favorites(data.get("favorites")))
             elif path == "/api/accounts":
                 ok, msg = _web_run(_web_set_accounts(
                     data.get("leader"), data.get("followers"),
@@ -5987,143 +6302,160 @@ WEB_UI_HTML = r"""<!DOCTYPE html>
 <title>SocketTrader</title>
 <style>
 :root{
---bg:#0a0d13;--panel:#111621;--panel2:#161c2a;--edge:#222b3d;--edge2:#2e3a52;
---fg:#dbe2ee;--dim:#7d8aa3;--mute:#4d5769;
---green:#33c48d;--green-d:#123a2c;--red:#ef5f6b;--red-d:#3d1418;
---yellow:#e0b15c;--cyan:#4fb6d4;--violet:#8b7fd4;--acc:#4fb6d4;
---shadow:0 6px 24px rgba(0,0,0,.45);
+--bg:#080b11;--panel:#10151f;--panel2:#161d2b;--edge:#212a3b;--edge2:#2d394f;
+--fg:#dde4ef;--dim:#7f8ca5;--mute:#4a5568;
+--green:#2fbf84;--green-d:#0f3527;--red:#ef5865;--red-d:#3a1216;
+--yellow:#dfae57;--cyan:#4bb2d1;--violet:#8a7fd6;
+--shadow:0 8px 28px rgba(0,0,0,.5);
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--fg);padding:0 0 40px;
-font:13.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+body{background:var(--bg);color:var(--fg);
+font:13.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding-bottom:30px}
 ::-webkit-scrollbar{width:9px;height:9px}
 ::-webkit-scrollbar-thumb{background:var(--edge2);border-radius:5px}
-::-webkit-scrollbar-track{background:transparent}
 
-/* ---------- top bar ---------- */
-#top{position:sticky;top:0;z-index:20;background:rgba(10,13,19,.96);
-border-bottom:1px solid var(--edge);padding:9px 14px;
-display:flex;gap:10px;align-items:center;flex-wrap:wrap;backdrop-filter:blur(6px)}
-.brand{font-weight:700;letter-spacing:3px;font-size:14px;color:var(--fg)}
-.brand span{color:var(--acc)}
+/* top bar */
+#top{position:sticky;top:0;z-index:30;background:rgba(8,11,17,.97);
+border-bottom:1px solid var(--edge);padding:9px 13px;display:flex;gap:9px;
+align-items:center;flex-wrap:wrap;backdrop-filter:blur(8px)}
+.brand{font-weight:700;letter-spacing:2.5px;font-size:14px}
+.brand span{color:var(--cyan)}
 .spacer{flex:1}
-.chip{border:1px solid var(--edge2);border-radius:999px;padding:3px 11px;font-size:11.5px;
-color:var(--dim);white-space:nowrap;letter-spacing:.4px}
-.chip.on{color:var(--green);border-color:#1e6b4f;background:var(--green-d)}
-.chip.warn{color:var(--yellow);border-color:#6b5622;background:#302713}
-.chip.bad{color:var(--red);border-color:#7a2830;background:var(--red-d)}
-.chip.info{color:var(--cyan);border-color:#255f72;background:#0e2b34}
+.chip{border:1px solid var(--edge2);border-radius:999px;padding:3px 10px;
+font-size:11.5px;color:var(--dim);white-space:nowrap}
+.chip.on{color:var(--green);border-color:#1d6b50;background:var(--green-d)}
+.chip.warn{color:var(--yellow);border-color:#6a5522;background:#2f2612}
+.chip.bad{color:var(--red);border-color:#78262e;background:var(--red-d)}
+.chip.info{color:var(--cyan);border-color:#245c6f;background:#0d2a33}
 
-/* ---------- layout ---------- */
-.wrap{padding:14px;display:grid;gap:13px;
-grid-template-columns:minmax(340px,1.05fr) minmax(380px,1.5fr)}
-@media(max-width:900px){.wrap{grid-template-columns:1fr}}
-.col{display:grid;gap:13px;align-content:start}
+/* layout */
+.wrap{padding:13px;display:grid;gap:12px;grid-template-columns:370px 1fr}
+@media(max-width:1000px){.wrap{grid-template-columns:1fr}}
+.col{display:grid;gap:12px;align-content:start;min-width:0}
 .card{background:var(--panel);border:1px solid var(--edge);border-radius:11px;
-padding:13px;box-shadow:var(--shadow)}
-.card>h2{font-size:10.5px;color:var(--dim);text-transform:uppercase;letter-spacing:1.6px;
-margin-bottom:11px;display:flex;align-items:center;gap:8px}
-.card>h2 .hint{margin-left:auto;text-transform:none;letter-spacing:0;font-size:11px;color:var(--mute)}
+padding:12px;box-shadow:var(--shadow);min-width:0}
+.card>h2{font-size:10px;color:var(--dim);text-transform:uppercase;
+letter-spacing:1.6px;margin-bottom:10px;display:flex;gap:8px;align-items:center}
+.card>h2 .hint{margin-left:auto;text-transform:none;letter-spacing:0;
+font-size:11px;color:var(--mute)}
 
-/* ---------- buttons ---------- */
+/* buttons */
 button{background:var(--panel2);border:1px solid var(--edge2);color:var(--fg);
-border-radius:8px;padding:9px 13px;font:inherit;cursor:pointer;transition:.12s;white-space:nowrap}
-button:hover{border-color:var(--acc);background:#1b2434}
+border-radius:8px;padding:9px 12px;font:inherit;cursor:pointer;transition:.11s;
+white-space:nowrap}
+button:hover{border-color:var(--cyan);background:#1c2637}
 button:active{transform:translateY(1px)}
+button:disabled{opacity:.35;cursor:not-allowed}
 button.sm{padding:5px 9px;font-size:12px;border-radius:6px}
-button.tiny{padding:3px 7px;font-size:11px;border-radius:5px}
+button.tiny{padding:3px 7px;font-size:10.5px;border-radius:5px}
 button.wide{width:100%}
-button.on{background:var(--acc);border-color:var(--acc);color:#06222c;font-weight:700}
-button.buy.on{background:var(--green);border-color:var(--green);color:#04150e}
-button.sell.on{background:var(--red);border-color:var(--red);color:#1b0407}
-button.danger{color:var(--red);border-color:#5c2129}
+button.on{background:var(--cyan);border-color:var(--cyan);color:#05202a;font-weight:700}
+button.buy.on{background:var(--green);border-color:var(--green);color:#04140d}
+button.sell.on{background:var(--red);border-color:var(--red);color:#180406}
+button.danger{color:var(--red);border-color:#5a2028}
 button.danger:hover{background:var(--red-d);border-color:var(--red)}
 button.ghost{background:transparent;color:var(--dim)}
 button.ghost:hover{color:var(--fg)}
-button:disabled{opacity:.4;cursor:not-allowed}
-.btnrow{display:flex;gap:7px;flex-wrap:wrap}
-.seg{display:flex;gap:0;border:1px solid var(--edge2);border-radius:8px;overflow:hidden}
+button.solid-red{background:var(--red);border-color:var(--red);color:#180406;font-weight:700}
+button.solid-red:hover{filter:brightness(1.1);background:var(--red)}
+.btnrow{display:flex;gap:6px;flex-wrap:wrap}
+
+/* inputs */
+label{font-size:10px;color:var(--dim);display:block;margin:9px 0 4px;
+text-transform:uppercase;letter-spacing:1.1px}
+input,select{background:#0b101a;border:1px solid var(--edge2);color:var(--fg);
+border-radius:8px;padding:8px 10px;font:inherit;width:100%}
+input:focus,select:focus{outline:0;border-color:var(--cyan)}
+input:disabled{opacity:.3}
+.stepper{display:flex;gap:6px;align-items:center}
+.stepper input{text-align:center;font-size:20px;font-weight:700;padding:6px}
+.stepper button{width:42px;font-size:18px;padding:5px 0}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.seg{display:flex;border:1px solid var(--edge2);border-radius:8px;overflow:hidden}
 .seg button{border:0;border-radius:0;flex:1;background:transparent}
 .seg button+button{border-left:1px solid var(--edge2)}
 
-/* ---------- inputs ---------- */
-label{font-size:10px;color:var(--dim);display:block;margin:10px 0 4px;
-text-transform:uppercase;letter-spacing:1.2px}
-input,select{background:#0c111b;border:1px solid var(--edge2);color:var(--fg);
-border-radius:8px;padding:9px 10px;font:inherit;width:100%}
-input:focus,select:focus{outline:0;border-color:var(--acc)}
-input:disabled{opacity:.35}
-.stepper{display:flex;gap:7px;align-items:center}
-.stepper input{text-align:center;font-size:19px;font-weight:700;padding:7px}
-.stepper button{width:44px;font-size:18px;padding:6px 0;text-align:center}
-.row2{display:grid;grid-template-columns:1fr 1fr;gap:9px}
-.row3{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}
+/* instrument picker */
+.pick{border:1px solid var(--edge2);border-radius:7px;padding:5px 9px;cursor:pointer;
+font-size:12px;background:var(--panel2);color:var(--dim);transition:.11s;
+display:inline-flex;gap:5px;align-items:center}
+.pick:hover{border-color:var(--cyan);color:var(--fg)}
+.pick.on{background:var(--cyan);border-color:var(--cyan);color:#05202a;font-weight:700}
+.pick.star{color:var(--yellow);border-color:#6a5522}
+.pick.star.on{background:var(--yellow);border-color:var(--yellow);color:#2a2005}
+.chiplist{display:flex;gap:5px;flex-wrap:wrap;margin-top:5px}
+#instrBox{max-height:184px;overflow-y:auto;border:1px solid var(--edge);
+border-radius:8px;padding:7px;margin-top:6px;background:#0b101a}
+.grp{font-size:9.5px;color:var(--mute);text-transform:uppercase;letter-spacing:1.2px;
+margin:7px 0 3px}
+.grp:first-child{margin-top:0}
+#selected{font-size:17px;font-weight:700;letter-spacing:.5px;margin-top:7px;
+display:flex;align-items:center;gap:8px}
+#selected .none{color:var(--mute);font-size:13px;font-weight:400}
+.starbtn{cursor:pointer;color:var(--mute);font-size:15px;user-select:none}
+.starbtn.on{color:var(--yellow)}
 
-/* ---------- ticket ---------- */
-#ticket.buy{border-color:#1e6b4f}
-#ticket.sell{border-color:#7a2830}
-#submit{width:100%;padding:15px;font-size:15px;font-weight:700;letter-spacing:1.4px;margin-top:12px}
-#submit.buy{background:var(--green);border-color:var(--green);color:#04150e}
-#submit.sell{background:var(--red);border-color:var(--red);color:#1b0407}
-#submit:hover{filter:brightness(1.12)}
-#tSummary{text-align:center;color:var(--dim);font-size:11.5px;margin-top:8px;min-height:16px}
+#ticket.buy{border-color:#1d6b50}
+#ticket.sell{border-color:#78262e}
+#submit{width:100%;padding:15px;font-size:15px;font-weight:700;letter-spacing:1.2px;
+margin-top:11px}
+#submit.buy{background:var(--green);border-color:var(--green);color:#04140d}
+#submit.sell{background:var(--red);border-color:var(--red);color:#180406}
+#submit:hover:not(:disabled){filter:brightness(1.12)}
+#tNote{text-align:center;color:var(--dim);font-size:11px;margin-top:7px;min-height:15px}
 
-/* ---------- tables ---------- */
+/* tables */
+.tblwrap{overflow-x:auto}
 table{width:100%;border-collapse:collapse;font-size:12.5px}
-th{color:var(--dim);text-align:left;font-weight:400;font-size:10px;letter-spacing:1.1px;
-text-transform:uppercase;border-bottom:1px solid var(--edge);padding:5px 7px}
-td{padding:7px;border-bottom:1px solid #151b28;vertical-align:middle}
+th{color:var(--dim);text-align:left;font-weight:400;font-size:9.5px;letter-spacing:1px;
+text-transform:uppercase;border-bottom:1px solid var(--edge);padding:5px 6px;white-space:nowrap}
+td{padding:6px;border-bottom:1px solid #141a26;vertical-align:middle;white-space:nowrap}
 tr:last-child td{border-bottom:0}
-tr.clickable{cursor:pointer}
-tr.clickable:hover td{background:#141b28}
+tr.unmanaged td{opacity:.5}
 .pos{color:var(--green)}.neg{color:var(--red)}.dim{color:var(--dim)}
 .num{text-align:right;font-variant-numeric:tabular-nums}
-.tag{font-size:10px;padding:2px 7px;border-radius:4px;border:1px solid var(--edge2);color:var(--dim)}
-.tag.lead{color:var(--cyan);border-color:#255f72}
-.tag.fol{color:var(--violet);border-color:#453d78}
-.tag.rr{color:var(--yellow);border-color:#6b5622}
+.tag{font-size:9.5px;padding:2px 6px;border-radius:4px;border:1px solid var(--edge2);color:var(--dim)}
+.tag.lead{color:var(--cyan);border-color:#245c6f;background:#0d2a33}
+.tag.fol{color:var(--violet);border-color:#443c76;background:#1a1730}
+.tag.rr{color:var(--yellow);border-color:#6a5522;background:#2a2211}
+.tag.bad{color:var(--red);border-color:#78262e;background:var(--red-d)}
+.roleset{display:flex;gap:3px}
+.roleset button{padding:2px 6px;font-size:10px;border-radius:4px}
 
-/* ---------- feed ---------- */
-#feed{max-height:270px;overflow-y:auto;font-size:12px}
-#feed div{padding:3px 2px;border-bottom:1px solid #141a26;display:flex;gap:9px}
+#feed{max-height:210px;overflow-y:auto;font-size:12px}
+#feed div{padding:2px 0;border-bottom:1px solid #131926;display:flex;gap:8px}
 #feed div:last-child{border-bottom:0}
 #feed .t{color:var(--mute);flex-shrink:0}
-.empty{color:var(--mute);font-size:12px;padding:10px 2px;text-align:center}
+.empty{color:var(--mute);font-size:12px;padding:9px 2px;text-align:center}
 
-/* ---------- modal ---------- */
-#veil{position:fixed;inset:0;background:rgba(4,6,10,.78);display:none;z-index:50;
-padding:22px;overflow-y:auto;backdrop-filter:blur(3px)}
+#veil{position:fixed;inset:0;background:rgba(3,5,9,.8);display:none;z-index:60;
+padding:20px;overflow-y:auto;backdrop-filter:blur(3px)}
 #veil.show{display:block}
-#modal{max-width:640px;margin:0 auto;background:var(--panel);border:1px solid var(--edge2);
-border-radius:13px;padding:17px;box-shadow:var(--shadow)}
-#modal h3{font-size:13px;letter-spacing:1.4px;margin-bottom:3px}
-#modal .sub{color:var(--dim);font-size:11.5px;margin-bottom:13px}
-.fieldset{border-top:1px solid var(--edge);padding-top:11px;margin-top:13px}
+#modal{max-width:600px;margin:0 auto;background:var(--panel);
+border:1px solid var(--edge2);border-radius:12px;padding:16px;box-shadow:var(--shadow)}
+#modal h3{font-size:13px;letter-spacing:1.3px}
+#modal .sub{color:var(--dim);font-size:11.5px;margin:3px 0 12px}
+.fieldset{border-top:1px solid var(--edge);padding-top:10px;margin-top:12px}
 .fieldset:first-of-type{border-top:0;margin-top:0}
-.chiplist{display:flex;gap:6px;flex-wrap:wrap;margin-top:5px}
-.pick{border:1px solid var(--edge2);border-radius:7px;padding:5px 10px;cursor:pointer;
-font-size:12px;background:var(--panel2);color:var(--dim);transition:.12s}
-.pick:hover{border-color:var(--acc);color:var(--fg)}
-.pick.on{background:var(--acc);border-color:var(--acc);color:#06222c;font-weight:700}
-.pick.on.g{background:var(--green);border-color:var(--green);color:#04150e}
-.pick.on.r{background:var(--red);border-color:var(--red);color:#1b0407}
 
-#toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#18202e;
-border:1px solid var(--acc);border-radius:9px;padding:11px 17px;display:none;
-max-width:92vw;z-index:99;box-shadow:var(--shadow);font-size:12.5px}
+#toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);
+background:#171f2d;border:1px solid var(--cyan);border-radius:9px;padding:10px 16px;
+display:none;max-width:92vw;z-index:99;box-shadow:var(--shadow);font-size:12.5px}
 #toast.bad{border-color:var(--red);color:#ffb9be}
-#toast.good{border-color:var(--green);color:#a9edcf}
+#toast.good{border-color:var(--green);color:#a4ecca}
 </style></head><body>
 
 <div id="top">
   <div class="brand">SOCKET<span>TRADER</span></div>
   <span class="chip" id="chState">connecting…</span>
   <span class="chip" id="chReady"></span>
+  <span class="chip" id="chNt"></span>
   <span class="chip" id="chAtm"></span>
   <span class="chip" id="chMicro"></span>
   <div class="spacer"></div>
   <span class="chip dim" id="chCount"></span>
-  <span class="chip dim" id="chVer"></span>
+  <button class="sm" id="btnPause">PAUSE</button>
+  <button class="sm solid-red" id="btnFlatten">FLATTEN ALL</button>
 </div>
 
 <div class="wrap">
@@ -6131,14 +6463,18 @@ max-width:92vw;z-index:99;box-shadow:var(--shadow);font-size:12.5px}
 
     <div class="card" id="ticket">
       <h2>Order ticket <span class="hint" id="tFan"></span></h2>
+
       <div class="row2">
-        <button class="buy" id="sideB" data-side="long">BUY / LONG</button>
-        <button class="sell" id="sideS" data-side="short">SELL / SHORT</button>
+        <button class="buy" id="sideB">BUY / LONG</button>
+        <button class="sell" id="sideS">SELL / SHORT</button>
       </div>
 
       <label>Instrument</label>
-      <div class="chiplist" id="instrChips"></div>
-      <input id="tInstr" placeholder="NQ 09-26" style="margin-top:7px">
+      <div id="favRow" class="chiplist"></div>
+      <input id="instrSearch" placeholder="search NQ, gold, CL…" autocomplete="off">
+      <div id="instrBox"></div>
+      <div id="selected"><span class="none">nothing selected</span></div>
+      <div id="altMonths" class="chiplist"></div>
 
       <label>Contracts</label>
       <div class="stepper">
@@ -6151,10 +6487,7 @@ max-width:92vw;z-index:99;box-shadow:var(--shadow);font-size:12.5px}
       <div class="row2">
         <div>
           <label>Type</label>
-          <div class="seg">
-            <button id="typeM" data-type="market">MARKET</button>
-            <button id="typeL" data-type="limit">LIMIT</button>
-          </div>
+          <div class="seg"><button id="typeM">MARKET</button><button id="typeL">LIMIT</button></div>
         </div>
         <div>
           <label>Limit price</label>
@@ -6166,28 +6499,23 @@ max-width:92vw;z-index:99;box-shadow:var(--shadow);font-size:12.5px}
       <select id="tAtm"></select>
 
       <button id="submit" class="buy">SUBMIT</button>
-      <div id="tSummary"></div>
+      <div id="tNote"></div>
     </div>
 
     <div class="card">
-      <h2>Controls</h2>
+      <h2>Session</h2>
       <div class="btnrow">
-        <button id="btnPause"></button>
         <button class="sm" id="btnReconnect">RECONNECT</button>
         <button class="sm" id="btnMicro">MICROS</button>
         <button class="sm" id="btnResetPnl">RESET P&amp;L</button>
-        <button class="sm danger" id="btnFlatten">FLATTEN ALL</button>
-      </div>
-      <div class="btnrow" style="margin-top:9px">
-        <button class="sm ghost" id="btnAccounts">ACCOUNTS…</button>
         <button class="sm ghost" id="btnStrategy">STRATEGY…</button>
-        <button class="sm ghost" id="btnMicroMap">MICRO MAP…</button>
       </div>
+      <div id="rrline" class="dim" style="margin-top:8px;font-size:11px"></div>
     </div>
 
     <div class="card">
-      <h2>Open positions <span class="hint" id="posHint"></span></h2>
-      <div id="posWrap"></div>
+      <h2>Activity</h2>
+      <div id="feed"></div>
     </div>
 
   </div>
@@ -6195,14 +6523,14 @@ max-width:92vw;z-index:99;box-shadow:var(--shadow);font-size:12.5px}
   <div class="col">
 
     <div class="card">
-      <h2>Accounts <span class="hint">click a row to edit profile &amp; limits</span></h2>
-      <div id="acctWrap"></div>
-      <div id="rrline" class="dim" style="margin-top:8px;font-size:11.5px"></div>
+      <h2>Accounts — live from NinjaTrader
+        <span class="hint" id="acctHint"></span></h2>
+      <div class="tblwrap" id="acctWrap"></div>
     </div>
 
     <div class="card">
-      <h2>Activity</h2>
-      <div id="feed"></div>
+      <h2>Open positions <span class="hint" id="posHint"></span></h2>
+      <div class="tblwrap" id="posWrap"></div>
     </div>
 
   </div>
@@ -6215,441 +6543,434 @@ max-width:92vw;z-index:99;box-shadow:var(--shadow);font-size:12.5px}
 "use strict";
 const TOKEN="__ST_TOKEN__";
 const $=id=>document.getElementById(id);
-let S=null,POS={positions:[],nt_accounts:[]},side="long",otype="market",modalOpen=false;
+let S=null,L=null,side="long",otype="market",instrument="",modalOpen=false,busy=false;
 
-/* ---------- safe DOM helpers (never innerHTML with server data) ---------- */
+/* ---- safe DOM (never innerHTML with server data) ---- */
 function el(tag,cls,text){const e=document.createElement(tag);
   if(cls)e.className=cls; if(text!=null)e.textContent=String(text); return e}
 function clear(n){while(n.firstChild)n.removeChild(n.firstChild)}
 function btn(label,cls,fn){const b=el("button",cls,label);b.onclick=fn;return b}
+function td(cls,text){return el("td",cls,text)}
 
-function toast(msg,kind){const t=$("toast");t.textContent=msg;
-  t.className=kind||"";t.style.display="block";
-  clearTimeout(t._h);t._h=setTimeout(()=>t.style.display="none",5200)}
+function toast(m,kind){const t=$("toast");t.textContent=m;t.className=kind||"";
+  t.style.display="block";clearTimeout(t._h);
+  t._h=setTimeout(()=>t.style.display="none",5000)}
 
 async function api(path,body){
+  if(busy)return{ok:false};
+  busy=true;
   try{
     const r=await fetch(path,{method:"POST",headers:{
       "Content-Type":"application/json","X-ST-Token":TOKEN},body:JSON.stringify(body||{})});
     const j=await r.json();
     toast(j.message,j.ok?"good":"bad");
-    refresh();
+    refresh();refreshLive(true);
     return j;
   }catch(e){toast("request failed: "+e,"bad");return{ok:false}}
+  finally{busy=false}
 }
 async function get(path){
   const r=await fetch(path,{headers:{"X-ST-Token":TOKEN}});
   if(!r.ok)throw new Error(r.status);
   return r.json();
 }
+function fmt(v,d){return v==null?"—":Number(v).toLocaleString(undefined,
+  {minimumFractionDigits:d==null?2:d,maximumFractionDigits:d==null?2:d})}
+function signed(v){return v==null?"—":(v>=0?"+":"")+fmt(v)}
 
-/* ---------- ticket ---------- */
+/* ================= order ticket ================= */
 function setSide(s){side=s;
   $("sideB").classList.toggle("on",s==="long");
   $("sideS").classList.toggle("on",s==="short");
-  const t=$("ticket"),b=$("submit");
-  t.classList.toggle("buy",s==="long");t.classList.toggle("sell",s==="short");
-  b.classList.toggle("buy",s==="long");b.classList.toggle("sell",s==="short");
-  summary()}
+  $("ticket").classList.toggle("buy",s==="long");
+  $("ticket").classList.toggle("sell",s==="short");
+  $("submit").classList.toggle("buy",s==="long");
+  $("submit").classList.toggle("sell",s==="short");
+  note()}
 function setType(t){otype=t;
   $("typeM").classList.toggle("on",t==="market");
   $("typeL").classList.toggle("on",t==="limit");
   $("tPrice").disabled=(t!=="limit");
   if(t!=="limit")$("tPrice").value="";
-  summary()}
+  note()}
 function qty(){return Math.max(1,Math.min(1000,parseInt($("tQty").value||"1",10)||1))}
-function bumpQty(d){$("tQty").value=Math.max(1,Math.min(1000,qty()+d));summary()}
-function summary(){
-  const i=$("tInstr").value.trim()||"—";
+function bumpQty(d){$("tQty").value=qty()+d;renderQty();note()}
+
+function pickInstrument(code){
+  instrument=code;
+  renderPicker();renderAlt();renderSelected();note()}
+
+function renderSelected(){
+  const box=$("selected");clear(box);
+  if(!instrument){box.appendChild(el("span","none","nothing selected"));return}
+  box.appendChild(el("span",null,instrument));
+  const fav=(S&&S.favorites||[]).includes(instrument);
+  const star=el("span","starbtn"+(fav?" on":""),fav?"★":"☆");
+  star.title=fav?"unpin":"pin to favourites";
+  star.onclick=()=>{
+    const cur=(S&&S.favorites||[]).slice();
+    const i=cur.indexOf(instrument);
+    if(i<0)cur.unshift(instrument);else cur.splice(i,1);
+    api("/api/favorites",{favorites:cur})};
+  box.appendChild(star)}
+
+function renderAlt(){
+  const box=$("altMonths");clear(box);
+  if(!instrument||!S)return;
+  const root=instrument.split(" ")[0];
+  for(const p of S.catalog){
+    const roots=[p.root].concat(p.micro?[p.micro]:[]);
+    if(!roots.includes(root))continue;
+    const isMicro=(root===p.micro);
+    p.contracts.forEach(c=>{
+      const code=isMicro?c.replace(p.root,p.micro):c;
+      if(code===instrument)return;
+      box.appendChild(mkPick(code,code.split(" ")[1],false))});
+    if(p.micro){
+      const other=isMicro?p.root:p.micro;
+      const code=instrument.replace(root,other);
+      box.appendChild(mkPick(code,other,false))}
+    break}}
+
+function mkPick(code,label,star){
+  const b=el("div","pick"+(star?" star":"")+(code===instrument?" on":""),label||code);
+  b.onclick=()=>pickInstrument(code);
+  return b}
+
+function renderFavs(){
+  const row=$("favRow");clear(row);
+  const favs=(S&&S.favorites)||[];
+  favs.forEach(c=>row.appendChild(mkPick(c,"★ "+c,true)))}
+
+function renderPicker(){
+  const box=$("instrBox");
+  if(document.activeElement&&document.activeElement.closest("#instrBox"))return;
+  clear(box);
+  if(!S||!S.catalog)return;
+  const q=$("instrSearch").value.trim().toLowerCase();
+  const groups={};
+  S.catalog.forEach(p=>{
+    const hay=(p.root+" "+p.name+" "+p.micro+" "+p.group).toLowerCase();
+    if(q&&!hay.includes(q))return;
+    (groups[p.group]=groups[p.group]||[]).push(p)});
+  const names=Object.keys(groups);
+  if(!names.length){box.appendChild(el("div","empty","no match"));return}
+  names.forEach(g=>{
+    box.appendChild(el("div","grp",g));
+    const row=el("div","chiplist");
+    groups[g].forEach(p=>{
+      const front=p.contracts[0];
+      row.appendChild(mkPick(front,p.root+" "+front.split(" ")[1],false));
+      if(p.micro)row.appendChild(mkPick(front.replace(p.root,p.micro),
+        p.micro+" "+front.split(" ")[1],false))});
+    box.appendChild(row)})}
+
+function renderQty(){
+  const q=$("qtyChips");clear(q);
+  [1,2,3,5,10].forEach(n=>{
+    const b=el("div","pick"+(qty()===n?" on":""),String(n));
+    b.onclick=()=>{$("tQty").value=n;renderQty();note()};
+    q.appendChild(b)})}
+
+function note(){
   const p=otype==="limit"&&$("tPrice").value?(" @ "+$("tPrice").value):"";
-  $("submit").textContent=(side==="long"?"BUY ":"SELL ")+qty()+" "+i+p;
+  $("submit").textContent=instrument
+    ?((side==="long"?"BUY ":"SELL ")+qty()+" "+instrument+p)
+    :"SELECT AN INSTRUMENT";
   const n=S?S.accounts.length:0;
-  $("tSummary").textContent=n?("fans out through "+n+" managed account"+(n===1?"":"s")+
-    " · profiles, filters and rotation apply"):""}
+  let msg="";
+  if(!S)msg="";
+  else if(!S.trade_ready)msg="system not ready — check directory, account, strategy";
+  else if(S.hard_stopped)msg="session hard-locked";
+  else msg="fans out to "+n+" managed account"+(n===1?"":"s")+
+    (S.micro_mode?" · micro mode will convert to the micro contract":"");
+  $("tNote").textContent=msg;
+  $("submit").disabled=!instrument||!S||!S.trade_ready||S.hard_stopped}
+
 function submitOrder(){
-  const instr=$("tInstr").value.trim();
-  if(!instr)return toast("pick an instrument first","bad");
-  api("/api/trade",{side:side,instrument:instr,qty:qty(),order_type:otype,
+  if(!instrument)return toast("pick an instrument first","bad");
+  api("/api/trade",{side:side,instrument:instrument,qty:qty(),order_type:otype,
     limit_price:$("tPrice").value,atm:$("tAtm").value})}
 
-/* ---------- modal ---------- */
+/* ================= accounts ================= */
+const ROLES=[["L","leader"],["F","follower"],["R","round-robin"],["–","off"]];
+
+function renderAccounts(){
+  const w=$("acctWrap");clear(w);
+  if(!L){w.appendChild(el("div","empty","connecting to NinjaTrader…"));return}
+  if(!L.ok){w.appendChild(el("div","empty",
+    "NinjaTrader ATI not reachable — check NT is running and the ATI port"));return}
+  if(!L.accounts.length){w.appendChild(el("div","empty","no accounts reported"));return}
+  $("acctHint").textContent=L.accounts.length+" accounts · updated "+
+    new Date(L.ts*1000).toLocaleTimeString();
+
+  const t=el("table"),h=el("thead"),hr=el("tr");
+  [["Account",""],["Role",""],["Cash","num"],["Realized","num"],
+   ["Session","num"],["Position",""],["Work","num"],["",""]]
+    .forEach(([x,c])=>hr.appendChild(el("th",c,x)));
+  h.appendChild(hr);t.appendChild(h);
+  const tb=el("tbody");
+  L.accounts.forEach(a=>{
+    const tr=el("tr",a.managed?"":"unmanaged");
+    const nameTd=td(null,a.name);
+    nameTd.style.cursor="pointer";
+    nameTd.title="edit limits and profile";
+    nameTd.onclick=()=>accountModal(a);
+    tr.appendChild(nameTd);
+
+    const rt=el("td");const rs=el("div","roleset");
+    ROLES.forEach(([lbl,role])=>{
+      const cur=(a.role||"off")===role;
+      const b=btn(lbl,cur?"on tiny":"tiny ghost",()=>api("/api/role",
+        {account:a.name,role:role}));
+      b.title=role;rs.appendChild(b)});
+    rt.appendChild(rs);tr.appendChild(rt);
+
+    tr.appendChild(td("num",fmt(a.cash)));
+    tr.appendChild(td("num "+(a.realized==null?"dim":a.realized>=0?"pos":"neg"),
+      signed(a.realized)));
+    tr.appendChild(td("num "+(a.session_pnl==null?"dim":a.session_pnl>=0?"pos":"neg"),
+      signed(a.session_pnl)));
+
+    const pt=el("td");
+    if(a.positions.length){
+      a.positions.forEach(p=>{
+        const s=el("div",p.qty>0?"pos":"neg",
+          (p.qty>0?"+":"")+p.qty+" "+p.instrument+
+          (p.avg_price?" @"+fmt(p.avg_price):""));
+        pt.appendChild(s)})}
+    else pt.appendChild(el("span","dim","flat"));
+    tr.appendChild(pt);
+
+    tr.appendChild(td("num"+(a.working?"":" dim"),a.working||"—"));
+
+    const at=el("td");at.style.textAlign="right";
+    if(a.stop)at.appendChild(el("span","tag bad",a.stop.toUpperCase()));
+    at.appendChild(btn("FLAT","tiny danger",()=>{
+      if(confirm("Flatten "+a.name+"?"))api("/api/flatten_account",{account:a.name})}));
+    tr.appendChild(at);
+    tb.appendChild(tr)});
+  t.appendChild(tb);w.appendChild(t)}
+
+function renderPositions(){
+  const w=$("posWrap");clear(w);
+  const list=(L&&L.positions)||[];
+  $("posHint").textContent=list.length?(list.length+" open"):"";
+  if(!list.length){w.appendChild(el("div","empty","flat across all accounts"));return}
+  const t=el("table"),h=el("thead"),hr=el("tr");
+  [["Account",""],["Instrument",""],["Side",""],["Qty","num"],["Avg","num"],["",""]]
+    .forEach(([x,c])=>hr.appendChild(el("th",c,x)));
+  h.appendChild(hr);t.appendChild(h);
+  const tb=el("tbody");
+  list.forEach(p=>{
+    const tr=el("tr");
+    tr.appendChild(td(null,p.account));
+    tr.appendChild(td(null,p.instrument));
+    tr.appendChild(td(p.qty>0?"pos":"neg",p.qty>0?"LONG":"SHORT"));
+    tr.appendChild(td("num",Math.abs(p.qty)));
+    tr.appendChild(td("num",p.avg_price?fmt(p.avg_price):"—"));
+    const act=el("td");act.style.textAlign="right";
+    act.appendChild(btn("CLOSE","tiny danger",()=>{
+      if(confirm("Close "+p.instrument+" on "+p.account+"?"))
+        api("/api/close_position",{account:p.account,instrument:p.instrument})}));
+    tr.appendChild(act);tb.appendChild(tr)});
+  t.appendChild(tb);w.appendChild(t)}
+
+/* ================= modals ================= */
 function openModal(title,sub,build){
   modalOpen=true;const m=$("modal");clear(m);
   m.appendChild(el("h3",null,title));
   if(sub)m.appendChild(el("div","sub",sub));
   build(m);
-  const foot=el("div","btnrow");foot.style.marginTop="15px";
-  foot.appendChild(btn("CLOSE","ghost sm",closeModal));
-  m.appendChild(foot);
+  const f=el("div","btnrow");f.style.marginTop="14px";
+  f.appendChild(btn("CLOSE","ghost sm",closeModal));
+  m.appendChild(f);
   $("veil").classList.add("show")}
-function closeModal(){modalOpen=false;$("veil").classList.remove("show");refresh()}
+function closeModal(){modalOpen=false;$("veil").classList.remove("show")}
 $("veil").onclick=e=>{if(e.target===$("veil"))closeModal()};
 
-/* pick-group: clickable choices, returns a live getter */
-function pickGroup(parent,options,current,extraCls){
+function pickGroup(parent,options,current){
   const wrap=el("div","chiplist");const state={value:current};
   options.forEach(o=>{
-    const b=el("div","pick"+(extraCls?" "+extraCls:""),o.label);
-    if(o.value===current)b.classList.add("on");
+    const b=el("div","pick"+(o.value===current?" on":""),o.label);
     b.onclick=()=>{state.value=o.value;
       [...wrap.children].forEach(c=>c.classList.remove("on"));
-      b.classList.add("on");
-      if(o.onpick)o.onpick()};
-    b.dataset.v=o.value;wrap.appendChild(b)});
+      b.classList.add("on")};
+    wrap.appendChild(b)});
   parent.appendChild(wrap);return state}
 
-function labeled(parent,text){parent.appendChild(el("label",null,text));return parent}
-function numField(parent,text,value,min,max){
+function numField(parent,text,value){
   parent.appendChild(el("label",null,text));
-  const i=el("input");i.type="number";i.value=value;
-  if(min!=null)i.min=min; if(max!=null)i.max=max;
-  parent.appendChild(i);return i}
+  const i=el("input");i.type="number";i.value=value;parent.appendChild(i);return i}
 
-/* ---------- accounts modal ---------- */
-function accountsModal(){
-  openModal("ACCOUNTS","Click to assign each account a role. Leader + followers copy every signal; the round-robin pool rotates one entry at a time.",m=>{
-    const known=[];
-    (POS.nt_accounts||[]).forEach(n=>{if(!known.includes(n))known.push(n)});
-    S.accounts.forEach(a=>{if(!known.includes(a.name))known.push(a.name)});
-    const roles={};
-    known.forEach(n=>{roles[n]=n===S.leader?"leader":
-      (S.followers.includes(n)?"follower":(S.rr.pool.includes(n)?"rr":"off"))});
-    const box=el("div");
-    known.forEach(name=>{
-      const row=el("div","fieldset");
-      row.appendChild(el("div",null,name));
-      pickGroup(row,[
-        {label:"OFF",value:"off"},{label:"LEADER",value:"leader"},
-        {label:"FOLLOWER",value:"follower"},{label:"ROUND-ROBIN",value:"rr"}],
-        roles[name],null).onchange=null;
-      const grp=row.lastChild;
-      [...grp.children].forEach(c=>{
-        c.addEventListener("click",()=>{
-          roles[name]=c.dataset.v;
-          if(c.dataset.v==="leader")
-            known.forEach(o=>{if(o!==name&&roles[o]==="leader")roles[o]="off"});
-        })});
-      box.appendChild(row)});
-    m.appendChild(box);
-    const add=el("div","fieldset");
-    add.appendChild(el("label",null,"Add an account not listed"));
-    const ai=el("input");ai.placeholder="account name";add.appendChild(ai);
-    add.appendChild(btn("ADD","sm",()=>{const v=ai.value.trim();
-      if(v){roles[v]="follower";closeModal();setTimeout(accountsModal,60)}}));
-    m.appendChild(add);
-    const save=el("div","fieldset");
-    save.appendChild(btn("SAVE ACCOUNTS","wide on",()=>{
-      const leader=Object.keys(roles).find(k=>roles[k]==="leader");
-      if(!leader)return toast("pick a leader account","bad");
-      api("/api/accounts",{leader:leader,
-        followers:Object.keys(roles).filter(k=>roles[k]==="follower"),
-        roundrobin:Object.keys(roles).filter(k=>roles[k]==="rr")}).then(closeModal)}));
-    m.appendChild(save)})}
-
-/* ---------- strategy modal ---------- */
-function strategyModal(){
-  openModal("STRATEGY","The ATM template applied to entries. LOCKED always uses yours; FOLLOW keeps the publisher's when it is installed locally.",m=>{
-    const f=el("div","fieldset");
-    f.appendChild(el("label",null,"Session ATM template"));
-    const list=(S.atm_available||[]);
-    let chosen={value:S.atm_strategy};
-    if(list.length){chosen=pickGroup(f,list.map(n=>({label:n,value:n})),S.atm_strategy)}
-    else{const i=el("input");i.value=S.atm_strategy||"";f.appendChild(i);
-      chosen={get value(){return i.value}}}
-    m.appendChild(f);
-    const f2=el("div","fieldset");
-    f2.appendChild(el("label",null,"Publisher strategy"));
-    const mode=pickGroup(f2,[{label:"LOCKED — always mine",value:false},
-      {label:"FOLLOW publisher",value:true}],S.follow_publisher_strategy);
-    m.appendChild(f2);
-    const f3=el("div","fieldset");
-    f3.appendChild(btn("SAVE STRATEGY","wide on",()=>{
-      api("/api/strategy",{name:chosen.value,follow_publisher:mode.value}).then(closeModal)}));
-    m.appendChild(f3)})}
-
-/* ---------- micro map modal ---------- */
-function microMapModal(){
-  openModal("MICRO MAP","Full-size root → micro root. Used by micro mode and per-account micro sizing.",m=>{
-    const f=el("div","fieldset");
-    const rows=[];
-    const tbl=el("table");const tb=el("tbody");
-    Object.keys(S.micro_map||{}).sort().forEach(k=>{
-      const tr=el("tr");
-      tr.appendChild(el("td",null,k));
-      const td=el("td");const i=el("input");i.value=S.micro_map[k];
-      td.appendChild(i);tr.appendChild(td);
-      rows.push({root:k,input:i});tb.appendChild(tr)});
-    tbl.appendChild(tb);f.appendChild(tbl);m.appendChild(f);
-    const f2=el("div","fieldset");
-    f2.appendChild(el("label",null,"Add / override (root and micro root)"));
-    const g=el("div","row2");const a=el("input");a.placeholder="GC";
-    const b=el("input");b.placeholder="MGC";g.appendChild(a);g.appendChild(b);
-    f2.appendChild(g);m.appendChild(f2);
-    const f3=el("div","fieldset");
-    f3.appendChild(btn("SAVE MICRO MAP","wide on",()=>{
-      const map={};rows.forEach(r=>{if(r.input.value.trim())map[r.root]=r.input.value.trim()});
-      if(a.value.trim()&&b.value.trim())map[a.value.trim()]=b.value.trim();
-      api("/api/micro_map",{map:map}).then(closeModal)}));
-    m.appendChild(f3)})}
-
-/* ---------- per-account modal: limits + profile ---------- */
-function accountModal(acct){
-  const prof=(S.profiles&&S.profiles[acct])||{};
+function accountModal(a){
+  const prof=(S.profiles&&S.profiles[a.name])||{};
   const rule=Object.assign({},S.rule_defaults,prof.default||{});
-  const lim=acct_of(acct).limits||{};
-  openModal(acct,"Risk limits and trade profile for this account.",m=>{
-
-    /* limits */
-    const L=el("div","fieldset");
-    L.appendChild(el("label",null,"Session target"));
-    const tVal=el("input");tVal.type="number";tVal.value=lim.target||0;L.appendChild(tVal);
-    const tMode=pickGroup(L,[{label:"OFF",value:"off"},{label:"SOFT",value:"soft"},
+  const lim=a.limits||{};
+  openModal(a.name,"Risk limits and trade profile.",m=>{
+    const L1=el("div","fieldset");
+    const tv=numField(L1,"Session target ($)",lim.target||0);
+    const tm=pickGroup(L1,[{label:"OFF",value:"off"},{label:"SOFT",value:"soft"},
       {label:"HARD",value:"hard"}],lim.target_mode||"off");
-    L.appendChild(el("label",null,"Session stop"));
-    const sVal=el("input");sVal.type="number";sVal.value=lim.stop||0;L.appendChild(sVal);
-    const sMode=pickGroup(L,[{label:"OFF",value:"off"},{label:"SOFT",value:"soft"},
+    const sv=numField(L1,"Session stop ($)",lim.stop||0);
+    const sm=pickGroup(L1,[{label:"OFF",value:"off"},{label:"SOFT",value:"soft"},
       {label:"HARD",value:"hard"}],lim.stop_mode||"off");
-    L.appendChild(btn("SAVE LIMITS","wide sm",()=>{
-      api("/api/limits",{account:acct,target:tVal.value,target_mode:tMode.value,
-        stop:sVal.value,stop_mode:sMode.value})}));
-    m.appendChild(L);
+    L1.appendChild(btn("SAVE LIMITS","wide sm",()=>api("/api/limits",
+      {account:a.name,target:tv.value,target_mode:tm.value,
+       stop:sv.value,stop_mode:sm.value})));
+    m.appendChild(L1);
 
-    /* symbols */
     const P=el("div","fieldset");
     P.appendChild(el("label",null,"Symbols this account trades (none = all)"));
     const allowed=(prof.symbols_allowed||[]).slice();
-    const roots=[];
-    Object.keys(S.micro_map||{}).forEach(r=>{if(!roots.includes(r))roots.push(r)});
-    allowed.forEach(r=>{if(!roots.includes(r))roots.push(r)});
-    const symWrap=el("div","chiplist");
-    roots.sort().forEach(r=>{
-      const b=el("div","pick",r);
-      if(allowed.includes(r))b.classList.add("on");
-      b.onclick=()=>{const i=allowed.indexOf(r);
-        if(i<0)allowed.push(r);else allowed.splice(i,1);
+    const sw=el("div","chiplist");
+    (S.catalog||[]).forEach(p=>{
+      const b=el("div","pick"+(allowed.includes(p.root)?" on":""),p.root);
+      b.onclick=()=>{const i=allowed.indexOf(p.root);
+        if(i<0)allowed.push(p.root);else allowed.splice(i,1);
         b.classList.toggle("on")};
-      symWrap.appendChild(b)});
-    P.appendChild(symWrap);
+      sw.appendChild(b)});
+    P.appendChild(sw);
 
-    /* entries on/off */
     P.appendChild(el("label",null,"Entries"));
-    const enabled=pickGroup(P,[{label:"ON",value:true},
-      {label:"OFF — exits only",value:false}],rule.enabled!==false);
-
-    /* size */
+    const en=pickGroup(P,[{label:"ON",value:true},{label:"OFF — exits only",value:false}],
+      rule.enabled!==false);
     P.appendChild(el("label",null,"Contract size"));
-    const size=pickGroup(P,[{label:"INHERIT",value:"inherit"},
-      {label:"MICROS",value:"micros"},{label:"FULL",value:"full"}],rule.size||"inherit");
-
-    /* qty */
+    const sz=pickGroup(P,[{label:"INHERIT",value:"inherit"},{label:"MICROS",value:"micros"},
+      {label:"FULL",value:"full"}],rule.size||"inherit");
     P.appendChild(el("label",null,"Contracts"));
-    const qmode=pickGroup(P,[{label:"COPY",value:"copy"},{label:"FIXED",value:"fixed"},
+    const qm=pickGroup(P,[{label:"COPY",value:"copy"},{label:"FIXED",value:"fixed"},
       {label:"MULTIPLE",value:"multiple"}],rule.qty_mode||"copy");
-    const qv=el("input");qv.type="number";qv.step="0.1";qv.value=rule.qty_value!=null?rule.qty_value:1;
-    qv.style.marginTop="6px";P.appendChild(qv);
-    const cap=numField(P,"Max contracts per entry (0 = no cap)",rule.max_contracts||0,0,1000);
-
-    /* direction */
+    const qv=numField(P,"Value (count, or multiplier)",rule.qty_value!=null?rule.qty_value:1);
+    const cap=numField(P,"Max contracts per entry (0 = none)",rule.max_contracts||0);
     P.appendChild(el("label",null,"Direction"));
-    const dir=pickGroup(P,[{label:"NORMAL",value:"normal"},
-      {label:"INVERT — fade",value:"invert"}],rule.direction||"normal");
-
-    /* delay + stagger */
-    const g=el("div","row2");
-    const dl=el("div"),jt=el("div");g.appendChild(dl);g.appendChild(jt);
-    const delay=numField(dl,"Entry delay ms",rule.delay_ms||0,0,600000);
-    const jitter=numField(jt,"Random jitter ms",rule.delay_jitter_ms||0,0,600000);
-    P.appendChild(g);
-    const g2=el("div","row2");
-    const st=el("div"),si=el("div");g2.appendChild(st);g2.appendChild(si);
-    const tranches=numField(st,"Stagger tranches",rule.stagger_entries||1,1,10);
-    const interval=numField(si,"Tranche interval ms",rule.stagger_interval_ms||1000,0,600000);
-    P.appendChild(g2);
-
-    /* atm override */
-    P.appendChild(el("label",null,"ATM override (blank = session strategy)"));
-    const atmSel=el("select");
-    atmSel.appendChild(el("option","",""));
-    (S.atm_available||[]).forEach(n=>{const o=el("option",null,n);o.value=n;atmSel.appendChild(o)});
-    atmSel.value=rule.atm||"";P.appendChild(atmSel);
-
-    if(rule.ai){
-      const note=el("div","sub");note.style.marginTop="10px";
-      note.textContent="AI gate: "+rule.ai.provider+" · "+(rule.ai.model||"default")+
-        " — configure from the terminal (S → profiles).";
-      P.appendChild(note)}
+    const dir=pickGroup(P,[{label:"NORMAL",value:"normal"},{label:"INVERT",value:"invert"}],
+      rule.direction||"normal");
+    const dl=numField(P,"Entry delay ms",rule.delay_ms||0);
+    const stg=numField(P,"Stagger tranches (1 = off)",rule.stagger_entries||1);
+    P.appendChild(el("label",null,"ATM override (blank = session)"));
+    const at=el("select");at.appendChild(el("option","",""));
+    (S.atm_available||[]).forEach(n=>{const o=el("option",null,n);o.value=n;at.appendChild(o)});
+    at.value=rule.atm||"";P.appendChild(at);
+    if(rule.ai)P.appendChild(el("div","sub","AI gate: "+rule.ai.provider+
+      " — configure from the terminal"));
 
     P.appendChild(btn("SAVE PROFILE","wide on",()=>{
       const profiles=JSON.parse(JSON.stringify(S.profiles||{}));
-      const entry=profiles[acct]||{};
-      const d=entry.default||{};
-      d.enabled=enabled.value;d.size=size.value;d.qty_mode=qmode.value;
+      const e=profiles[a.name]||{};const d=e.default||{};
+      d.enabled=en.value;d.size=sz.value;d.qty_mode=qm.value;
       d.qty_value=parseFloat(qv.value||"1");d.max_contracts=parseInt(cap.value||"0",10);
-      d.direction=dir.value;d.delay_ms=parseInt(delay.value||"0",10);
-      d.delay_jitter_ms=parseInt(jitter.value||"0",10);
-      d.stagger_entries=parseInt(tranches.value||"1",10);
-      d.stagger_interval_ms=parseInt(interval.value||"1000",10);
-      if(atmSel.value)d.atm=atmSel.value;else delete d.atm;
-      entry.default=d;
-      if(allowed.length)entry.symbols_allowed=allowed;else delete entry.symbols_allowed;
-      profiles[acct]=entry;
+      d.direction=dir.value;d.delay_ms=parseInt(dl.value||"0",10);
+      d.stagger_entries=parseInt(stg.value||"1",10);
+      if(at.value)d.atm=at.value;else delete d.atm;
+      e.default=d;
+      if(allowed.length)e.symbols_allowed=allowed;else delete e.symbols_allowed;
+      profiles[a.name]=e;
       api("/api/profiles",{profiles:profiles}).then(closeModal)}));
-
-    const reset=el("div","btnrow");reset.style.marginTop="8px";
-    reset.appendChild(btn("RESET TO DEFAULTS","sm danger",()=>{
+    P.appendChild(btn("RESET PROFILE","wide sm danger",()=>{
       const profiles=JSON.parse(JSON.stringify(S.profiles||{}));
-      delete profiles[acct];
+      delete profiles[a.name];
       api("/api/profiles",{profiles:profiles}).then(closeModal)}));
-    P.appendChild(reset);
     m.appendChild(P)})}
 
-function acct_of(name){return (S.accounts||[]).find(a=>a.name===name)||{}}
+function strategyModal(){
+  openModal("STRATEGY","ATM template applied to entries.",m=>{
+    const f=el("div","fieldset");
+    f.appendChild(el("label",null,"Session ATM template"));
+    let chosen;
+    const list=S.atm_available||[];
+    if(list.length)chosen=pickGroup(f,list.map(n=>({label:n,value:n})),S.atm_strategy);
+    else{const i=el("input");i.value=S.atm_strategy||"";f.appendChild(i);
+      chosen={get value(){return i.value}}}
+    f.appendChild(el("label",null,"Publisher strategy"));
+    const mode=pickGroup(f,[{label:"LOCKED — always mine",value:false},
+      {label:"FOLLOW publisher",value:true}],S.follow_publisher_strategy);
+    f.appendChild(btn("SAVE","wide on",()=>api("/api/strategy",
+      {name:chosen.value,follow_publisher:mode.value}).then(closeModal)));
+    m.appendChild(f)})}
 
-/* ---------- render ---------- */
-function fmt(v){return v==null?"—":Number(v).toLocaleString(undefined,
-  {minimumFractionDigits:2,maximumFractionDigits:2})}
-
+/* ================= render ================= */
 function renderChips(){
   const st=$("chState");st.textContent=S.status_text||S.state;
   st.className="chip "+(S.hard_stopped?"bad":S.paused?"warn":"on");
   const rd=$("chReady");rd.textContent=S.trade_ready?"READY":"NOT READY";
   rd.className="chip "+(S.trade_ready?"on":"bad");
+  const nt=$("chNt");
+  nt.textContent=(L&&L.ok)?"NT LINKED":"NT OFFLINE";
+  nt.className="chip "+((L&&L.ok)?"info":"bad");
   const mc=$("chMicro");mc.textContent=S.micro_mode?"MICROS ON":"micros off";
   mc.className="chip "+(S.micro_mode?"info":"");
-  $("chAtm").textContent="ATM "+(S.atm_strategy||"—")+(S.follow_publisher_strategy?" · follow":"");
-  $("chCount").textContent=S.signal_count+" signals";
-  $("chVer").textContent="v"+S.version;
-  const p=$("btnPause");p.textContent=S.paused?"▶ RESUME":"⏸ PAUSE";
-  p.className=S.paused?"on":""}
-
-function renderAccounts(){
-  const w=$("acctWrap");clear(w);
-  if(!S.accounts.length){w.appendChild(el("div","empty","No accounts configured — click ACCOUNTS…"));return}
-  const t=el("table"),h=el("thead"),hr=el("tr");
-  ["Account","Role","P&L","Profile","Status"].forEach((x,i)=>{
-    const th=el("th",i===2?"num":null,x);hr.appendChild(th)});
-  h.appendChild(hr);t.appendChild(h);
-  const tb=el("tbody");
-  S.accounts.forEach(a=>{
-    const tr=el("tr","clickable");tr.onclick=()=>accountModal(a.name);
-    tr.appendChild(el("td",null,a.name));
-    const rt=el("td");
-    rt.appendChild(el("span","tag "+(a.role==="leader"?"lead":a.role==="follower"?"fol":"rr"),
-      a.role==="round-robin"?"RR":a.role.toUpperCase()));
-    tr.appendChild(rt);
-    const pnl=el("td","num "+(a.pnl==null?"dim":a.pnl>=0?"pos":"neg"),
-      a.pnl==null?"—":(a.pnl>=0?"+":"")+fmt(a.pnl));
-    tr.appendChild(pnl);
-    tr.appendChild(el("td","dim",a.profile));
-    const stt=el("td");
-    stt.appendChild(a.stop?el("span","tag bad",a.stop.toUpperCase()+" STOP")
-      :el("span","tag","active"));
-    tr.appendChild(stt);
-    tb.appendChild(tr)});
-  t.appendChild(tb);w.appendChild(t);
+  $("chAtm").textContent="ATM "+(S.atm_strategy||"—")+
+    (S.follow_publisher_strategy?" · follow":"");
+  $("chCount").textContent=S.signal_count+" signals · v"+S.version;
+  const p=$("btnPause");
+  p.textContent=S.paused?"▶ RESUME":"⏸ PAUSE";
+  p.className="sm "+(S.paused?"on":"");
   const rr=$("rrline");
-  if(S.rr.pool.length){
-    rr.textContent="rotation "+S.rr.pool.join(" → ")+
-      "   ·   owed this round: "+(S.rr.remaining.length?S.rr.remaining.join(", "):"(reshuffles next)")+
-      (S.rr.last?"   ·   last: "+S.rr.last:"")}
-  else rr.textContent=""}
-
-function renderPositions(){
-  const w=$("posWrap");clear(w);
-  const list=POS.positions||[];
-  $("posHint").textContent=list.length?(list.length+" open"):"";
-  if(!list.length){w.appendChild(el("div","empty","flat — no open positions"));return}
-  const t=el("table"),tb=el("tbody");
-  list.forEach(p=>{
-    const tr=el("tr");
-    tr.appendChild(el("td",null,p.account));
-    tr.appendChild(el("td",null,p.instrument));
-    tr.appendChild(el("td","num "+(p.qty>0?"pos":"neg"),
-      (p.qty>0?"LONG ":"SHORT ")+Math.abs(p.qty)));
-    const td=el("td");td.style.textAlign="right";
-    td.appendChild(btn("CLOSE","tiny danger",()=>{
-      if(confirm("Close "+p.instrument+" on "+p.account+"?"))
-        api("/api/close_position",{account:p.account,instrument:p.instrument})}));
-    tr.appendChild(td);tb.appendChild(tr)});
-  t.appendChild(tb);w.appendChild(t)}
+  rr.textContent=S.rr.pool.length
+    ?("rotation "+S.rr.pool.join(" → ")+" · owed: "+
+      (S.rr.remaining.length?S.rr.remaining.join(", "):"(reshuffles next)")):""}
 
 function renderFeed(){
   const f=$("feed");clear(f);
   const ev=(S.events||[]).slice().reverse();
   if(!ev.length){f.appendChild(el("div","empty","waiting for signals…"));return}
-  ev.forEach(e=>{
-    const d=el("div");
+  ev.forEach(e=>{const d=el("div");
     d.appendChild(el("span","t",new Date(e.ts*1000).toLocaleTimeString()));
-    d.appendChild(el("span",null,e.text));
-    f.appendChild(d)})}
+    d.appendChild(el("span",null,e.text));f.appendChild(d)})}
 
-function renderTicketOptions(){
-  const chips=$("instrChips");clear(chips);
-  const seen=[];
-  (POS.positions||[]).forEach(p=>{if(!seen.includes(p.instrument))seen.push(p.instrument)});
-  (S.session_contracts||[]).forEach(c=>{if(!seen.includes(c))seen.push(c)});
-  if(S.last_manual&&S.last_manual.instrument&&!seen.includes(S.last_manual.instrument))
-    seen.push(S.last_manual.instrument);
-  seen.forEach(c=>{
-    const b=el("div","pick",c);
-    if($("tInstr").value.trim()===c)b.classList.add("on");
-    b.onclick=()=>{$("tInstr").value=c;renderTicketOptions();summary()};
-    chips.appendChild(b)});
-  if(!seen.length)chips.appendChild(el("span","dim","type one below — traded instruments appear here"));
-
-  const q=$("qtyChips");clear(q);
-  [1,2,3,5,10].forEach(n=>{
-    const b=el("div","pick",String(n));
-    if(qty()===n)b.classList.add("on");
-    b.onclick=()=>{$("tQty").value=n;renderTicketOptions();summary()};
-    q.appendChild(b)});
-
+function renderAtm(){
   const sel=$("tAtm");
-  if(document.activeElement!==sel){
-    const cur=sel.value||S.atm_strategy;clear(sel);
-    const opts=(S.atm_available||[]).slice();
-    if(S.atm_strategy&&!opts.includes(S.atm_strategy))opts.unshift(S.atm_strategy);
-    opts.forEach(n=>{const o=el("option",null,n);o.value=n;sel.appendChild(o)});
-    if(cur&&opts.includes(cur))sel.value=cur;else if(S.atm_strategy)sel.value=S.atm_strategy}
-  $("tFan").textContent=S.trade_ready?"":"system not ready";
-  $("submit").disabled=!S.trade_ready||S.hard_stopped}
+  if(document.activeElement===sel)return;
+  const cur=sel.value||S.atm_strategy;clear(sel);
+  const opts=(S.atm_available||[]).slice();
+  if(S.atm_strategy&&!opts.includes(S.atm_strategy))opts.unshift(S.atm_strategy);
+  opts.forEach(n=>{const o=el("option",null,n);o.value=n;sel.appendChild(o)});
+  if(cur&&opts.includes(cur))sel.value=cur;else if(S.atm_strategy)sel.value=S.atm_strategy}
 
 function render(){if(!S)return;
-  renderChips();renderAccounts();renderFeed();
-  if(!modalOpen){renderTicketOptions();renderPositions()}
-  summary()}
+  renderChips();renderFeed();renderAtm();
+  if(!modalOpen){renderFavs();renderPicker();renderSelected();renderAlt();renderQty()}
+  note()}
 
 async function refresh(){
-  try{S=await get("/api/state");render()}
+  try{S=await get("/api/state");
+    if(!instrument&&S.last_manual&&S.last_manual.instrument)
+      instrument=S.last_manual.instrument;
+    render()}
   catch(e){const st=$("chState");st.textContent="app offline";st.className="chip bad"}}
-async function refreshPositions(){
-  try{POS=await get("/api/positions");if(!modalOpen)renderPositions()}catch(e){}}
 
-/* ---------- wiring ---------- */
+async function refreshLive(force){
+  try{L=await get("/api/live");
+    if(!modalOpen){renderAccounts();renderPositions()}
+    if(S)renderChips()}
+  catch(e){}}
+
+/* ---- wiring ---- */
 $("sideB").onclick=()=>setSide("long");
 $("sideS").onclick=()=>setSide("short");
 $("typeM").onclick=()=>setType("market");
 $("typeL").onclick=()=>setType("limit");
 $("qtyMinus").onclick=()=>bumpQty(-1);
 $("qtyPlus").onclick=()=>bumpQty(1);
-$("tQty").oninput=summary;$("tInstr").oninput=summary;$("tPrice").oninput=summary;
+$("tQty").oninput=()=>{renderQty();note()};
+$("tPrice").oninput=note;
+$("instrSearch").oninput=renderPicker;
 $("submit").onclick=submitOrder;
 $("btnPause").onclick=()=>api("/api/pause",{paused:!S.paused});
+$("btnFlatten").onclick=()=>{if(confirm("Flatten ALL positions on every managed account?"))
+  api("/api/close_all",{})};
 $("btnReconnect").onclick=()=>api("/api/reconnect",{});
 $("btnMicro").onclick=()=>api("/api/micro",{});
 $("btnResetPnl").onclick=()=>{if(confirm("Reset session P&L and re-snapshot balances?"))
   api("/api/reset_pnl",{})};
-$("btnFlatten").onclick=()=>{if(confirm("Flatten ALL positions on every managed account?"))
-  api("/api/close_all",{})};
-$("btnAccounts").onclick=()=>{if(S)accountsModal()};
 $("btnStrategy").onclick=()=>{if(S)strategyModal()};
-$("btnMicroMap").onclick=()=>{if(S)microMapModal()};
 document.addEventListener("keydown",e=>{if(e.key==="Escape"&&modalOpen)closeModal()});
 
-setSide("long");setType("market");
-refresh();refreshPositions();
+setSide("long");setType("market");renderQty();
+refresh();refreshLive();
 setInterval(refresh,1500);
-setInterval(refreshPositions,5000);
+setInterval(refreshLive,2000);
 </script></body></html>
 """
 

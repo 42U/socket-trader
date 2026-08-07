@@ -95,14 +95,45 @@ for parent, keys in nested.items():
     gap = sorted(k for k in keys if k not in (state.get(parent) or {}))
     check(f"web_state['{parent}'] carries {sorted(keys)}", not gap, ", ".join(gap))
 
-account_keys = set((state["accounts"] or [{}])[0])
-needed = {"name", "role", "pnl", "profile", "stop", "limits"}
-check("account rows carry the fields the table renders",
-      needed <= account_keys, ", ".join(sorted(needed - account_keys)))
+# The account grid and positions table render from /api/live, so check that
+# payload rather than web_state(). A stub snapshot keeps this offline-safe.
+st.nt_snapshot = lambda port=None, timeout=3.0: {
+    "ok": True,
+    "accounts": {"Sim101": {"cash": 1000.0, "realized": 5.0, "buying_power": 0.0}},
+    "positions": [{"account": "Sim101", "instrument": "NQ 09-26",
+                   "qty": -1, "avg_price": 23895.25}],
+    "working": {"Sim101": 2}, "ts": 0.0,
+}
+live = st.web_live(force=True)
 
-pos_src = inspect.getsource(st._web_positions)
-check("positions payload shape is intact",
-      all(k in pos_src for k in ("account", "instrument", "qty")))
+# `a` is the account row inside the grid renderer; ignore DOM members in case
+# a local element ever shares the name.
+DOM_MEMBERS = {"appendChild", "style", "className", "textContent", "onclick",
+               "value", "classList", "title", "type", "placeholder", "disabled"}
+live_read = set(re.findall(r"\ba\.([A-Za-z_][A-Za-z0-9_]*)", JS)) - DOM_MEMBERS
+account_keys = set((live["accounts"] or [{}])[0])
+needed = {"name", "role", "managed", "cash", "realized", "session_pnl",
+          "working", "stop", "profile", "limits", "positions"}
+check("live account rows carry every field the grid renders",
+      needed <= account_keys, ", ".join(sorted(needed - account_keys)))
+check("grid reads no field the live payload lacks",
+      live_read <= account_keys | {"name"},
+      ", ".join(sorted(live_read - account_keys)))
+
+pos_keys = set((live["positions"] or [{}])[0])
+pos_needed = {"account", "instrument", "qty", "avg_price"}
+check("live positions carry every field the table renders",
+      pos_needed <= pos_keys, ", ".join(sorted(pos_needed - pos_keys)))
+
+# The ticket's instrument picker must never be empty — that was the whole
+# failure mode of the previous build (it only listed already-traded symbols).
+cat = st.instrument_catalog()
+check("instrument catalog is populated", len(cat) >= 10, f"{len(cat)} products")
+check("every catalog product has a live contract",
+      all(p["contracts"] for p in cat))
+check("contracts use the OIF 'ROOT MM-YY' form",
+      all(re.fullmatch(r"[A-Z0-9]+ \d{2}-\d{2}", p["contracts"][0]) for p in cat),
+      cat[0]["contracts"][0] if cat else "")
 
 # ---- 5. request gating must stay wired ------------------------------------
 # These are the controls that stop another page in the user's browser from
