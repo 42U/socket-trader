@@ -41,7 +41,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -2315,29 +2315,60 @@ def _nt_host(port: int = 36973) -> str:
     return candidates[0] if candidates else "127.0.0.1"
 
 
+# NinjaTrader ends every state dump with this marker. It does NOT close the
+# socket afterwards, so the marker is the only reliable end-of-response
+# signal — waiting for silence is not one.
+_ATI_END = (b"ATI\x00True\x00", b"ATI\x00False\x00")
+
+
+def ati_response_complete(text: str) -> bool:
+    """True when an ATI response carries NinjaTrader's end-of-dump marker."""
+    return text.endswith(("ATI\x00True\x00", "ATI\x00False\x00"))
+
+
 def _query_ati(command: str, port: int = 36973, timeout: float = 2.0) -> str:
-    """Send a command to NinjaTrader ATI and return the raw response text."""
+    """Send a command to NinjaTrader ATI and return the raw response text.
+
+    Reads until NT's end-of-dump marker rather than until the stream goes
+    quiet. The old "stop after 250ms of silence" rule silently truncated
+    the ~10KB dump whenever NT paused mid-send — measured gaps of 300ms
+    are normal — and a truncated dump does not fail loudly: it parses fine
+    and simply comes back missing whatever had not arrived yet. That made
+    accounts and positions blink in and out of existence.
+
+    A response without the marker is returned anyway (callers may still
+    want a partial), but is logged so truncation is never silent.
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    deadline = time.monotonic() + timeout
+    buf = b""
     try:
         s.settimeout(timeout)
         s.connect((_nt_host(port), port))
         s.sendall(f"{command}\n".encode())
-        parts = []
         while True:
-            try:
-                chunk = s.recv(4096)
-                if not chunk:
-                    break
-                parts.append(chunk)
-                # After first data arrives, shorten timeout — no more data = done
-                s.settimeout(0.25)
-            except socket.timeout:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 break
-        return b"".join(parts).decode("utf-8", errors="ignore")
+            s.settimeout(min(remaining, 0.5))
+            try:
+                chunk = s.recv(65536)
+            except socket.timeout:
+                continue          # a pause is not the end — only the marker is
+            if not chunk:
+                break             # NT closed the connection
+            buf += chunk
+            if buf.endswith(_ATI_END):
+                break
     except Exception:
         return ""
     finally:
         s.close()
+    text = buf.decode("utf-8", errors="ignore")
+    if text and not ati_response_complete(text):
+        logger.warning(f"ATI TRUNCATED  command={command}  got={len(text)} bytes "
+                       f"without end marker after {timeout}s")
+    return text
 
 
 def _parse_ati_fields(text: str) -> list[tuple[str, str, str]]:
@@ -2459,9 +2490,14 @@ def nt_snapshot(port: int | None = None, timeout: float = 3.0) -> dict:
     each account's working orders. Polling one snapshot beats the old
     per-account queries: one socket round-trip instead of N.
     """
+    # One retry on a truncated dump: a partial response parses cleanly and
+    # would otherwise look like accounts and positions having disappeared.
     text = _query_ati("ACCOUNTS", port or nt_port, timeout)
-    snap: dict = {"ok": bool(text), "accounts": {}, "positions": [],
-                  "working": {}, "ts": time.time()}
+    if text and not ati_response_complete(text):
+        text = _query_ati("ACCOUNTS", port or nt_port, timeout)
+    complete = bool(text) and ati_response_complete(text)
+    snap: dict = {"ok": complete, "accounts": {}, "positions": [],
+                  "working": {}, "ts": time.time(), "partial": bool(text) and not complete}
     if not text:
         return snap
 
@@ -6687,6 +6723,14 @@ def web_live(force: bool = False) -> dict:
             logger.error(f"WEB LIVE  snapshot failed: {exc}")
             snap = {"ok": False, "accounts": {}, "positions": [],
                     "working": {}, "ts": time.time()}
+        # A truncated or failed dump must not be rendered as "these accounts
+        # and positions are gone" — that is what made rows blink. Serve the
+        # last good view instead and let the timestamp show it is stale.
+        if not snap.get("ok") and _live_cache.get("last_good"):
+            stale = dict(_live_cache["last_good"])
+            stale["stale"] = True
+            _live_cache.update(ts=time.time(), data=stale)
+            return stale
 
         managed = target_accounts()
         rows = []
@@ -6719,10 +6763,10 @@ def web_live(force: bool = False) -> dict:
             })
         rows.sort(key=lambda r: (not r["managed"], r["name"]))
         _annotate_sync(rows)
-        data = {"ok": snap["ok"], "accounts": rows,
+        data = {"ok": snap["ok"], "accounts": rows, "stale": False,
                 "positions": snap["positions"], "ts": snap["ts"],
                 "totals": _live_totals(rows)}
-        _live_cache.update(ts=time.time(), data=data)
+        _live_cache.update(ts=time.time(), data=data, last_good=data)
         return data
 
 
