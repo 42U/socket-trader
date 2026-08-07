@@ -41,7 +41,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -6005,10 +6005,164 @@ def web_live(force: bool = False) -> dict:
                 "positions": [p for p in snap["positions"] if p["account"] == name],
             })
         rows.sort(key=lambda r: (not r["managed"], r["name"]))
+        _annotate_sync(rows)
         data = {"ok": snap["ok"], "accounts": rows,
-                "positions": snap["positions"], "ts": snap["ts"]}
+                "positions": snap["positions"], "ts": snap["ts"],
+                "totals": _live_totals(rows)}
         _live_cache.update(ts=time.time(), data=data)
         return data
+
+
+def _position_shape(positions: list[dict]) -> set[tuple[str, int]]:
+    """(market, direction) pairs an account holds.
+
+    Copy-traded accounts legitimately differ in SIZE — that is what
+    per-account multipliers are for — so sync compares which markets are
+    held and on which side, not how many contracts. Micro and full-size
+    are the same market here, since an account may be sized to micros.
+    """
+    shape = set()
+    for p in positions:
+        root = _instrument_root(to_full_instrument(p["instrument"]))
+        if root and p["qty"]:
+            shape.add((root, 1 if p["qty"] > 0 else -1))
+    return shape
+
+
+def _annotate_sync(rows: list[dict]):
+    """Mark each copy-trade account in/out of sync with the leader.
+
+    Out-of-sync is the failure mode copy trading actually suffers: a
+    follower's entry was rejected, or its exit did not land, so it now
+    holds something the leader does not (or misses something the leader
+    has). Every copier surfaces failures somehow, but none of them show
+    the one number a copy trader wants at a glance — how many accounts
+    currently match. Round-robin accounts are exempt: holding different
+    positions is the entire point of a rotation.
+    """
+    leader_row = next((r for r in rows if r["role"] == "leader"), None)
+    leader_shape = _position_shape(leader_row["positions"]) if leader_row else set()
+    for r in rows:
+        r["sync_detail"] = ""   # always present so the UI contract is total
+        if r["role"] == "leader":
+            r["sync"] = "leader"
+        elif r["role"] == "follower":
+            shape = _position_shape(r["positions"])
+            if shape == leader_shape:
+                r["sync"] = "in-sync"
+            else:
+                r["sync"] = "out-of-sync"
+                missing = leader_shape - shape
+                extra = shape - leader_shape
+                bits = []
+                if missing:
+                    bits.append("missing " + ", ".join(
+                        f"{'long' if d > 0 else 'short'} {s}" for s, d in sorted(missing)))
+                if extra:
+                    bits.append("holds " + ", ".join(
+                        f"{'long' if d > 0 else 'short'} {s}" for s, d in sorted(extra)))
+                r["sync_detail"] = "; ".join(bits)
+        elif r["role"] == "round-robin":
+            r["sync"] = "rotation"
+        else:
+            r["sync"] = ""
+
+
+def _live_totals(rows: list[dict]) -> dict:
+    """Roll-up tiles: exposure and copy health across managed accounts."""
+    managed = [r for r in rows if r["managed"]]
+    followers = [r for r in managed if r["role"] == "follower"]
+    return {
+        "accounts": len(managed),
+        "realized": sum(r["realized"] or 0 for r in managed),
+        "session_pnl": sum(r["session_pnl"] or 0 for r in managed
+                           if r["session_pnl"] is not None),
+        "open_positions": sum(len(r["positions"]) for r in managed),
+        "contracts": sum(abs(p["qty"]) for r in managed for p in r["positions"]),
+        "working": sum(r["working"] or 0 for r in managed),
+        "in_sync": sum(1 for r in followers if r["sync"] == "in-sync"),
+        "followers": len(followers),
+        "out_of_sync": [r["name"] for r in followers if r["sync"] == "out-of-sync"],
+        "locked": [r["name"] for r in managed if r["stop"]],
+    }
+
+
+async def _web_set_sizing(account, mode, value) -> tuple[bool, str]:
+    """Set one account's contract sizing straight from the grid.
+
+    A per-account multiplier on the leader's contract count is the
+    dominant idiom in futures copy trading, so it belongs in the grid
+    rather than three clicks deep in a profile editor.
+    """
+    if hard_stopped:
+        return False, "session hard-locked — settings are frozen"
+    acct = sanitize_ati(str(account or "").strip())
+    mode = str(mode or "").strip().lower()
+    if not acct:
+        return False, "account required"
+    if mode not in ("copy", "fixed", "multiple"):
+        return False, "mode must be copy, fixed or multiple"
+    prof = account_profiles.setdefault(acct, {})
+    rule = prof.setdefault("default", {})
+    rule["qty_mode"] = mode
+    note = ""
+    if mode == "copy":
+        rule.pop("qty_value", None)
+    else:
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return False, f"invalid size value '{value}'"
+        lo, hi = RULE_CLAMPS["qty_value"]
+        rule["qty_value"] = max(lo, min(val, hi))
+        if mode == "multiple" and rule["qty_value"] < 0.5:
+            # _rule_qty rounds half up, so anything under 0.5 sizes a
+            # single-contract signal to zero and the leg is skipped.
+            note = "  ⚠  below ×0.5 a 1-contract signal sizes to 0 and is skipped"
+    save_account_profiles()
+    _live_cache["data"] = None
+    label = "copy" if mode == "copy" else (
+        f"×{rule['qty_value']:g}" if mode == "multiple" else f"fixed {int(rule['qty_value'])}")
+    logger.info(f"WEB SIZING  {acct} -> {label}")
+    return True, f"{acct} → {label}{note}"
+
+
+async def _web_reverse_position(account, instrument) -> tuple[bool, str]:
+    """Reverse one account's position — NinjaTrader's `Rev` action.
+
+    Writes a REVERSEPOSITION for that account only; NT closes the current
+    position and opens the same size on the other side. Deliberately
+    account-scoped rather than fanned out, so it cannot silently flip a
+    whole copy set from a single click.
+    """
+    acct = sanitize_ati(str(account or "").strip())
+    instr = sanitize_ati(str(instrument or "").strip())
+    if not acct or not instr:
+        return False, "account and instrument required"
+    if acct not in target_accounts():
+        return False, f"{acct} is not a managed account"
+    if hard_stopped:
+        return False, "session hard-locked"
+    if acct in account_stops:
+        return False, f"{acct} is stopped for the session"
+    live = web_live()
+    pos = next((p for p in live["positions"]
+                if p["account"] == acct and p["instrument"] == instr), None)
+    if not pos:
+        return False, f"no open {instr} position on {acct}"
+    action = "SELL" if pos["qty"] > 0 else "BUY"
+    signal = (f"REVERSEPOSITION;{acct};{instr};{action};{abs(pos['qty'])};"
+              f"MARKET;;;DAY;;;{sanitize_ati(atm_strategy)};")
+    err = validate_signal(signal.split(";"))
+    if err:
+        return False, f"could not build reversal: {err}"
+    written = await asyncio.to_thread(write_signal_to_file, signal)
+    _live_cache["data"] = None
+    if not written:
+        return False, "order file write failed — check the output directory"
+    logger.info(f"WEB REVERSE  {acct}  {instr}  {action} {abs(pos['qty'])}")
+    _dash_set_alert(Fore.YELLOW + f"  ⇄  REVERSE {instr} on {acct}" + Style.RESET_ALL)
+    return True, f"{acct}: reversing {instr} ({action} {abs(pos['qty'])})"
 
 
 async def _web_flatten_account(account) -> tuple[bool, str]:
@@ -6218,6 +6372,12 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
             elif path == "/api/role":
                 ok, msg = _web_run(_web_set_role(data.get("account"),
                                                  data.get("role")))
+            elif path == "/api/sizing":
+                ok, msg = _web_run(_web_set_sizing(
+                    data.get("account"), data.get("mode"), data.get("value")))
+            elif path == "/api/reverse_position":
+                ok, msg = _web_run(_web_reverse_position(
+                    data.get("account"), data.get("instrument")), timeout=30.0)
             elif path == "/api/reset_pnl":
                 ok, msg = _web_run(_web_reset_pnl())
             elif path == "/api/reconnect":
@@ -6422,6 +6582,23 @@ tr.unmanaged td{opacity:.5}
 .roleset{display:flex;gap:3px}
 .roleset button{padding:2px 6px;font-size:10px;border-radius:4px}
 
+/* aggregate tiles */
+#tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(104px,1fr));gap:7px}
+.tile{background:var(--panel2);border:1px solid var(--edge);border-radius:8px;padding:8px 9px}
+.tile .k{font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:1px}
+.tile .v{font-size:17px;font-weight:700;margin-top:2px;font-variant-numeric:tabular-nums}
+.tile.good .v{color:var(--green)}
+.tile.bad{border-color:#78262e;background:var(--red-d)}
+.tile.bad .v{color:var(--red)}
+.banner{margin-top:9px;border:1px solid #78262e;background:var(--red-d);color:#ffc0c5;
+border-radius:8px;padding:8px 10px;font-size:12px}
+.banner b{color:var(--red)}
+.led{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
+.led.g{background:var(--green)}.led.y{background:var(--yellow)}
+.led.r{background:var(--red)}.led.d{background:var(--mute)}
+.sizecell{cursor:pointer;border-bottom:1px dotted var(--edge2)}
+.sizecell:hover{color:var(--cyan)}
+
 #feed{max-height:210px;overflow-y:auto;font-size:12px}
 #feed div{padding:2px 0;border-bottom:1px solid #131926;display:flex;gap:8px}
 #feed div:last-child{border-bottom:0}
@@ -6521,6 +6698,12 @@ display:none;max-width:92vw;z-index:99;box-shadow:var(--shadow);font-size:12.5px
   </div>
 
   <div class="col">
+
+    <div class="card">
+      <h2>Copy health <span class="hint" id="liveHint"></span></h2>
+      <div id="tiles"></div>
+      <div id="syncWarn"></div>
+    </div>
 
     <div class="card">
       <h2>Accounts — live from NinjaTrader
@@ -6695,18 +6878,80 @@ function submitOrder(){
 /* ================= accounts ================= */
 const ROLES=[["L","leader"],["F","follower"],["R","round-robin"],["–","off"]];
 
+/* Sizing label mirrors the profile rule so the grid reads like the editor. */
+function sizeLabel(name){
+  const p=(S&&S.profiles&&S.profiles[name])||{};
+  const r=Object.assign({},(S&&S.rule_defaults)||{},p.default||{});
+  if(r.qty_mode==="fixed")return String(parseInt(r.qty_value||1,10));
+  if(r.qty_mode==="multiple")return "×"+(+r.qty_value||1);
+  return "copy"}
+
+/* A per-account multiplier on the leader's contract count is the standard
+   futures copy-trading control, so it is editable inline. */
+function sizeCell(a){
+  const cell=el("td","num");
+  const span=el("span","sizecell",sizeLabel(a.name));
+  span.title="click to change this account's contract sizing";
+  span.onclick=()=>{
+    clear(cell);
+    const box=el("div","chiplist");
+    const opt=(label,mode,value)=>{
+      const b=el("div","pick",label);
+      b.onclick=()=>api("/api/sizing",{account:a.name,mode:mode,value:value});
+      box.appendChild(b)};
+    opt("copy","copy",0);
+    [0.5,1,2,3].forEach(m=>opt("×"+m,"multiple",m));
+    [1,2,3,5].forEach(n=>opt(String(n),"fixed",n));
+    const x=el("div","pick","✕");x.onclick=()=>renderAccounts();
+    box.appendChild(x);
+    cell.appendChild(box)};
+  cell.appendChild(span);
+  return cell}
+
+const SYNC_LED={"in-sync":"g","out-of-sync":"y","leader":"g","rotation":"d","":"d"};
+
+function renderTiles(){
+  const box=$("tiles");clear(box);
+  const w=$("syncWarn");clear(w);
+  if(!L||!L.totals)return;
+  const T=L.totals;
+  const tile=(k,v,cls)=>{const d=el("div","tile"+(cls?" "+cls:""));
+    d.appendChild(el("div","k",k));d.appendChild(el("div","v",v));box.appendChild(d)};
+
+  // The number every copy trader wants and no copier on the market shows.
+  const syncOk=T.followers===0||T.in_sync===T.followers;
+  tile("In sync",T.followers?(T.in_sync+" / "+T.followers):"n/a",
+    syncOk?"good":"bad");
+  tile("Accounts",T.accounts);
+  tile("Realized",signed(T.realized),T.realized>=0?"good":"bad");
+  tile("Session P&L",signed(T.session_pnl),T.session_pnl>=0?"good":"bad");
+  tile("Contracts",T.contracts||"flat");
+  tile("Working",T.working||"—");
+
+  if(T.out_of_sync&&T.out_of_sync.length){
+    const b=el("div","banner");
+    b.appendChild(el("b","","OUT OF SYNC: "));
+    b.appendChild(el("span",null,T.out_of_sync.join(", ")+
+      " — position does not match the leader. A copy leg was rejected or an exit did not land."));
+    w.appendChild(b)}
+  if(T.locked&&T.locked.length){
+    const b=el("div","banner");
+    b.appendChild(el("b","","LOCKED: "));
+    b.appendChild(el("span",null,T.locked.join(", ")+" — session stop or target hit."));
+    w.appendChild(b)}}
+
 function renderAccounts(){
   const w=$("acctWrap");clear(w);
   if(!L){w.appendChild(el("div","empty","connecting to NinjaTrader…"));return}
   if(!L.ok){w.appendChild(el("div","empty",
     "NinjaTrader ATI not reachable — check NT is running and the ATI port"));return}
   if(!L.accounts.length){w.appendChild(el("div","empty","no accounts reported"));return}
-  $("acctHint").textContent=L.accounts.length+" accounts · updated "+
-    new Date(L.ts*1000).toLocaleTimeString();
+  $("acctHint").textContent=L.accounts.length+" accounts";
+  $("liveHint").textContent="updated "+new Date(L.ts*1000).toLocaleTimeString();
 
   const t=el("table"),h=el("thead"),hr=el("tr");
-  [["Account",""],["Role",""],["Cash","num"],["Realized","num"],
-   ["Session","num"],["Position",""],["Work","num"],["",""]]
+  [["Account",""],["Role",""],["Size","num"],["Sync",""],["Cash","num"],
+   ["Realized","num"],["Session","num"],["Position",""],["Work","num"],["",""]]
     .forEach(([x,c])=>hr.appendChild(el("th",c,x)));
   h.appendChild(hr);t.appendChild(h);
   const tb=el("tbody");
@@ -6726,6 +6971,16 @@ function renderAccounts(){
       b.title=role;rs.appendChild(b)});
     rt.appendChild(rs);tr.appendChild(rt);
 
+    tr.appendChild(a.managed?sizeCell(a):td("dim","—"));
+
+    const sy=el("td");
+    if(a.sync){
+      sy.appendChild(el("span","led "+(SYNC_LED[a.sync]||"d")));
+      sy.appendChild(el("span",a.sync==="out-of-sync"?"":"dim",
+        a.sync==="out-of-sync"?"OUT OF SYNC":a.sync));
+      if(a.sync_detail)sy.title=a.sync_detail}
+    tr.appendChild(sy);
+
     tr.appendChild(td("num",fmt(a.cash)));
     tr.appendChild(td("num "+(a.realized==null?"dim":a.realized>=0?"pos":"neg"),
       signed(a.realized)));
@@ -6735,10 +6990,9 @@ function renderAccounts(){
     const pt=el("td");
     if(a.positions.length){
       a.positions.forEach(p=>{
-        const s=el("div",p.qty>0?"pos":"neg",
+        pt.appendChild(el("div",p.qty>0?"pos":"neg",
           (p.qty>0?"+":"")+p.qty+" "+p.instrument+
-          (p.avg_price?" @"+fmt(p.avg_price):""));
-        pt.appendChild(s)})}
+          (p.avg_price?" @"+fmt(p.avg_price):"")))})}
     else pt.appendChild(el("span","dim","flat"));
     tr.appendChild(pt);
 
@@ -6746,7 +7000,7 @@ function renderAccounts(){
 
     const at=el("td");at.style.textAlign="right";
     if(a.stop)at.appendChild(el("span","tag bad",a.stop.toUpperCase()));
-    at.appendChild(btn("FLAT","tiny danger",()=>{
+    at.appendChild(btn("Flat","tiny danger",()=>{
       if(confirm("Flatten "+a.name+"?"))api("/api/flatten_account",{account:a.name})}));
     tr.appendChild(at);
     tb.appendChild(tr)});
@@ -6770,9 +7024,16 @@ function renderPositions(){
     tr.appendChild(td("num",Math.abs(p.qty)));
     tr.appendChild(td("num",p.avg_price?fmt(p.avg_price):"—"));
     const act=el("td");act.style.textAlign="right";
-    act.appendChild(btn("CLOSE","tiny danger",()=>{
+    const grp=el("div","btnrow");grp.style.justifyContent="flex-end";
+    grp.appendChild(btn("Rev","tiny",()=>{
+      if(confirm("Reverse "+p.instrument+" on "+p.account+
+        "?\n\nCloses "+(p.qty>0?"long":"short")+" "+Math.abs(p.qty)+
+        " and opens the same size the other way."))
+        api("/api/reverse_position",{account:p.account,instrument:p.instrument})}));
+    grp.appendChild(btn("Close","tiny danger",()=>{
       if(confirm("Close "+p.instrument+" on "+p.account+"?"))
         api("/api/close_position",{account:p.account,instrument:p.instrument})}));
+    act.appendChild(grp);
     tr.appendChild(act);tb.appendChild(tr)});
   t.appendChild(tb);w.appendChild(t)}
 
@@ -6942,7 +7203,7 @@ async function refresh(){
 
 async function refreshLive(force){
   try{L=await get("/api/live");
-    if(!modalOpen){renderAccounts();renderPositions()}
+    if(!modalOpen){renderTiles();renderAccounts();renderPositions()}
     if(S)renderChips()}
   catch(e){}}
 

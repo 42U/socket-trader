@@ -113,7 +113,8 @@ DOM_MEMBERS = {"appendChild", "style", "className", "textContent", "onclick",
 live_read = set(re.findall(r"\ba\.([A-Za-z_][A-Za-z0-9_]*)", JS)) - DOM_MEMBERS
 account_keys = set((live["accounts"] or [{}])[0])
 needed = {"name", "role", "managed", "cash", "realized", "session_pnl",
-          "working", "stop", "profile", "limits", "positions"}
+          "working", "stop", "profile", "limits", "positions",
+          "sync", "sync_detail"}
 check("live account rows carry every field the grid renders",
       needed <= account_keys, ", ".join(sorted(needed - account_keys)))
 check("grid reads no field the live payload lacks",
