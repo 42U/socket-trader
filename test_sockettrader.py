@@ -3090,11 +3090,20 @@ class TestFlattenVerification:
         ok, _ = asyncio.run(st._web_close_all())
         assert ok is True
 
-    def test_nothing_open_skips_verification(self, monkeypatch):
+    def test_nothing_closed_still_verifies(self, monkeypatch):
+        """An empty close list can mean 'already flat' OR 'the position
+        query failed and we wrote nothing' — so it must still verify."""
         self._arm(monkeypatch, [])
         monkeypatch.setattr(st, "close_all_open_positions", lambda: [])
         ok, msg = asyncio.run(st._web_close_all())
-        assert ok is True and "nothing closed" in msg
+        assert ok is True and "verified flat" in msg
+
+    def test_nothing_closed_but_still_holding_is_a_failure(self, monkeypatch):
+        self._arm(monkeypatch, [{"account": "F1", "instrument": "MNQ 09-26",
+                                 "qty": 2, "avg_price": 1.0}])
+        monkeypatch.setattr(st, "close_all_open_positions", lambda: [])
+        ok, msg = asyncio.run(st._web_close_all())
+        assert ok is False and "INCOMPLETE" in msg
 
 
 class TestFlattenOrdering:

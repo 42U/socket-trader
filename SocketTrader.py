@@ -41,7 +41,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.10.1"
+__version__ = "0.10.2"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -1291,12 +1291,16 @@ def _entry_direction_conflict(plans: list[dict]) -> dict[str, dict[str, list[str
     """
     by_root: dict[str, dict[str, list[str]]] = {}
     for p in plans:
-        if p["command"] != "PLACE":
+        # REVERSEPOSITION is included: it OPENS a position, and its action
+        # is flipped for inverted accounts, so it can hedge the group the
+        # same way a PLACE can. apply_hedge_guard only ever drops PLACE
+        # legs, so a reversal conflict warns without stranding a position.
+        if p["command"] not in ("PLACE", "REVERSEPOSITION"):
             continue
         action = (p["action"] or "").strip().upper()
         if action not in ("BUY", "SELL"):
             continue
-        root = _instrument_root(to_full_instrument(p["instrument"]))
+        root = _underlying_root(p["instrument"])
         if root:
             by_root.setdefault(root, {}).setdefault(action, []).append(p["account"])
     return {root: sides for root, sides in by_root.items() if len(sides) > 1}
@@ -2482,6 +2486,19 @@ def query_nt_accounts(port: int = 36973, timeout: float = 3.0) -> list[dict]:
     return [{"name": n, "cash": v} for n, v in cash_by_account.items()]
 
 
+def _query_ati_complete(command: str, port: int, timeout: float = 2.0) -> str:
+    """_query_ati with one retry when the end-of-dump marker is missing.
+
+    A short dump parses cleanly and simply lacks whatever had not arrived,
+    so a position or a working order can silently not exist. The risk paths
+    that cancel orders and close positions must not act on that.
+    """
+    text = _query_ati(command, port, timeout)
+    if text and not ati_response_complete(text):
+        text = _query_ati(command, port, timeout)
+    return text
+
+
 def query_nt_positions(account: str, port: int = 36973) -> dict[str, int]:
     """Query NinjaTrader ATI for open positions on an account.
 
@@ -2493,7 +2510,7 @@ def query_nt_positions(account: str, port: int = 36973) -> dict[str, int]:
     first alias that contains a space (the human-readable "ROOT MONTHYY"
     form) since NT accepts that format back in PLACE / CLOSEPOSITION.
     """
-    text = _query_ati("POSITIONS", port)
+    text = _query_ati_complete("POSITIONS", port)
     if not text:
         return {}
     logger.debug(f"ATI POSITIONS raw ({len(text)} bytes): {repr(text[:500])}")
@@ -2547,6 +2564,20 @@ def _alias_root(alias: str) -> str:
         return s.split()[0]
     m = re.match(r"^([A-Za-z]+?)[FGHJKMNQUVXZ]\d{1,2}$", s)
     return m.group(1) if m else s
+
+
+def _underlying_root(alias: str) -> str:
+    """Underlying market for an NT instrument alias, micro folded into full.
+
+    Handles every alias shape NinjaTrader broadcasts — "MNQ 09-26",
+    "MNQ SEP26", "MNQU26", "@MNQ" — because to_full_instrument alone only
+    understands the spaced form. That gap made the hedge and sync checks
+    blind to a micro position whenever NT reported it as a continuous
+    code, which is exactly when a cross-account hedge would go unseen.
+    """
+    root = _alias_root(alias).upper()
+    reverse = {v: k for k, v in micro_map.items() if v != k}
+    return reverse.get(root, root)
 
 
 def _pick_alias(names: list[str]) -> str:
@@ -5167,7 +5198,7 @@ def query_nt_open_orders(account: str, port: int = 36973) -> list[str]:
     The ATI state dump lists Orders|<account> (pipe-joined order IDs) and
     OrderStatus|<id> per order; only IDs in an open state are returned.
     """
-    text = _query_ati("POSITIONS", port)
+    text = _query_ati_complete("POSITIONS", port)
     if not text:
         return []
     ids: list[str] = []
@@ -5583,7 +5614,30 @@ async def _trip_account(account: str, mode: str, kind: str, pnl: float, limit: f
     account_stops[account] = mode
     state, colour, icon, title, limit_word, hint = _TRIP_STATE[(kind, mode)]
 
-    closed = close_account_positions(account)
+    # to_thread: this does up to three blocking NT round-trips, and running
+    # them on the event loop stalls signal intake and every other account's
+    # risk poll at exactly the moment a limit has tripped.
+    closed = await asyncio.to_thread(close_account_positions, account)
+
+    # CONFIRM the flatten. balance_monitor skips accounts already in
+    # account_stops, so this account is never looked at again — if the close
+    # missed a leg (truncated dump, rejected order), that position would run
+    # unmanaged for the rest of the session against the other accounts.
+    still = await verify_flat([account])
+    if still:
+        detail = ", ".join(
+            p["instrument"] if p["instrument"] == "UNVERIFIED"
+            else f"{p['qty']:+d} {p['instrument']}" for p in still)
+        logger.warning(f"TRIP FLATTEN INCOMPLETE  account={account}  {detail}")
+        await asyncio.to_thread(close_account_positions, account)   # one retry
+        still = await verify_flat([account])
+    if still:
+        _dash_set_alert(
+            Fore.RED + Style.BRIGHT +
+            f"  ⛔  {account} STOPPED BUT NOT FLAT — close it in NinjaTrader now"
+            + Style.RESET_ALL, sticky=True)
+        logger.error(f"TRIP FLATTEN FAILED  account={account}  still open")
+
     close_str = ", ".join(closed) if closed else "none"
 
     multi = len(target_accounts()) > 1
@@ -6627,17 +6681,28 @@ async def verify_flat(accounts: list[str]) -> list[dict]:
     be appealed". So the close is confirmed, not assumed.
     """
     remaining: list[dict] = []
+    confirmed = False
     for attempt in range(FLATTEN_VERIFY_TRIES):
         await asyncio.sleep(FLATTEN_VERIFY_DELAY)
         try:
             snap = await asyncio.to_thread(nt_snapshot, nt_port)
         except Exception as exc:
             logger.error(f"FLATTEN VERIFY  snapshot failed: {exc}")
-            return []
+            continue          # unknown is NOT flat — burn a retry instead
+        if not snap.get("ok"):
+            # A truncated dump parses cleanly and simply comes back short,
+            # so "positions vanished" is indistinguishable from "flat".
+            logger.warning("FLATTEN VERIFY  incomplete dump — cannot confirm")
+            continue
         remaining = [p for p in snap["positions"] if p["account"] in accounts]
+        confirmed = True
         if not remaining:
             return []
         logger.info(f"FLATTEN VERIFY  attempt {attempt + 1}: still open {remaining}")
+    if not confirmed:
+        logger.warning("FLATTEN VERIFY  never got a complete dump")
+        return [{"account": ", ".join(accounts), "instrument": "UNVERIFIED",
+                 "qty": 0, "avg_price": None}]
     return remaining
 
 
@@ -6645,15 +6710,19 @@ async def _web_close_all() -> tuple[bool, str]:
     accounts = target_accounts()
     closed = await asyncio.to_thread(close_all_open_positions)
     logger.info(f"WEB CLOSE ALL  contracts={closed}")
-    if not closed:
-        return True, "no open positions tracked — nothing closed"
-    _dash_set_alert(Fore.RED + f"  ⛔  WEB CLOSE ALL → {', '.join(closed)}"
-                    + Style.RESET_ALL)
+    if closed:
+        _dash_set_alert(Fore.RED + f"  ⛔  WEB CLOSE ALL → {', '.join(closed)}"
+                        + Style.RESET_ALL)
+    # ALWAYS verify, even when nothing was closed. An empty list can mean
+    # "already flat" or "the position query failed and we wrote no closes at
+    # all" — close_account_positions swallows that error — and those must
+    # not both report success.
     still = await verify_flat(accounts)
     _live_cache["data"] = None
     if still:
-        detail = ", ".join(f"{p['account']} {p['qty']:+d} {p['instrument']}"
-                           for p in still)
+        detail = ", ".join(
+            p["instrument"] if p["instrument"] == "UNVERIFIED"
+            else f"{p['account']} {p['qty']:+d} {p['instrument']}" for p in still)
         logger.warning(f"FLATTEN INCOMPLETE  {detail}")
         _dash_set_alert(
             Fore.RED + f"  ⛔  FLATTEN INCOMPLETE — still open: {detail}"
@@ -6662,6 +6731,8 @@ async def _web_close_all() -> tuple[bool, str]:
                        "Close these in NinjaTrader now: a group left part "
                        "flat and part in the market is how a cross-account "
                        "hedge gets created.")
+    if not closed:
+        return True, "verified flat — nothing was open"
     return True, f"flat — closes confirmed for {', '.join(closed)}"
 
 
@@ -6955,7 +7026,7 @@ def _position_shape(positions: list[dict]) -> set[tuple[str, int]]:
     """
     shape = set()
     for p in positions:
-        root = _instrument_root(to_full_instrument(p["instrument"]))
+        root = _underlying_root(p["instrument"])
         if root and p["qty"]:
             shape.add((root, 1 if p["qty"] > 0 else -1))
     return shape
