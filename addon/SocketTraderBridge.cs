@@ -76,8 +76,15 @@ namespace NinjaTrader.NinjaScript.AddOns
         // sends it as the first line of every connection. No valid token,
         // no snapshot and no commands.
         private const string TokenFileName = "SocketTraderBridge.token";
-        private const int AuthTimeoutMs = 3000;
-        private string sharedToken;
+        // Every legitimate client writes its auth line immediately on
+        // connect, so this only needs to cover network latency.
+        private const int AuthTimeoutMs = 1000;
+        // Re-read the token at most this often when one does not match, so
+        // a rotated secret recovers without restarting NinjaTrader.
+        private const int TokenRefreshMs = 5000;
+        private volatile string sharedToken;
+        private DateTime lastTokenRead = DateTime.MinValue;
+        private readonly object tokenLock = new object();
 
         private string TokenPath()
         {
@@ -90,18 +97,38 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void LoadToken()
         {
-            sharedToken = null;
+            string loaded = null;
             try
             {
                 var path = TokenPath();
                 if (path != null && File.Exists(path))
-                    sharedToken = File.ReadAllText(path).Trim();
+                    loaded = File.ReadAllText(path).Trim();
             }
             catch (Exception ex)
             {
                 NinjaTrader.Code.Output.Process(
                     $"SocketTraderBridge: could not read token: {ex.Message}",
                     PrintTo.OutputTab1);
+            }
+            sharedToken = string.IsNullOrEmpty(loaded) ? null : loaded;
+            lastTokenRead = DateTime.UtcNow;
+        }
+
+        /// <summary>
+        /// Re-read the token file when the offered secret does not match the
+        /// one held in memory. Without this the token is fixed for the whole
+        /// NinjaTrader session, so writing the file — which is exactly what
+        /// SocketTrader does on every start — would not take effect until NT
+        /// restarted, and the client would loop on rejected connections.
+        /// Rate-limited so a bad peer cannot drive constant disk reads.
+        /// </summary>
+        private void RefreshTokenIfStale()
+        {
+            lock (tokenLock)
+            {
+                if ((DateTime.UtcNow - lastTokenRead).TotalMilliseconds < TokenRefreshMs)
+                    return;
+                LoadToken();
             }
         }
 
@@ -226,6 +253,39 @@ namespace NinjaTrader.NinjaScript.AddOns
                 try { client = listener.AcceptTcpClient(); }
                 catch { return; }
 
+                // Hand the client off immediately. Authentication, the
+                // initial snapshot build and its write all take real time
+                // (up to AuthTimeoutMs + WriteTimeoutMs each), and doing
+                // them inline made this single thread the bottleneck: one
+                // peer that connects and stays silent would stall every
+                // other connection, including the trading client's, until
+                // it timed out. A worker per client keeps accept free.
+                var c = client;
+                try
+                {
+                    ThreadPool.QueueUserWorkItem(_ => HandleNewClient(c));
+                }
+                catch (Exception ex)
+                {
+                    NinjaTrader.Code.Output.Process(
+                        $"SocketTraderBridge: could not start client worker: {ex.Message}",
+                        PrintTo.OutputTab1);
+                    try { c.Close(); } catch { }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Authenticate one client, send it the first snapshot, register it
+        /// for broadcasts and then serve its commands. Runs on a pool
+        /// thread — never on the accept thread. Wrapped so an unexpected
+        /// throw kills only this connection, not the listener.
+        /// </summary>
+        private void HandleNewClient(TcpClient client)
+        {
+            try
+            {
+
                 // Configure the socket: disable Nagle so the first-snapshot
                 // reaches the client immediately, and cap write time so a
                 // half-open peer can't wedge the accept thread on the next
@@ -244,10 +304,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                         "Enable the live monitor in SocketTrader (Setup > 9) to create it.",
                         PrintTo.OutputTab1);
                     try { client.Close(); } catch { }
-                    continue;
+                    return;
                 }
                 var hello = ReadLineWithTimeout(client, AuthTimeoutMs);
                 var offered = ExtractJsonString(hello ?? "", "auth");
+                if (!TokensMatch(offered, sharedToken))
+                {
+                    RefreshTokenIfStale();   // secret may have been rotated
+                }
                 if (!TokensMatch(offered, sharedToken))
                 {
                     string peer = "?";
@@ -256,7 +320,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                         $"SocketTraderBridge: rejected unauthenticated client {peer}",
                         PrintTo.OutputTab1);
                     try { client.Close(); } catch { }
-                    continue;
+                    return;
                 }
 
                 // Build + send the initial snapshot DIRECTLY to the new
@@ -286,7 +350,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                             $"SocketTraderBridge: initial write to new client failed: {ex.Message}",
                             PrintTo.OutputTab1);
                         try { client.Close(); } catch { }
-                        continue;  // don't register a client we couldn't even snapshot
+                        return;  // don't register a client we couldn't even snapshot
                     }
                 }
 
@@ -303,6 +367,13 @@ namespace NinjaTrader.NinjaScript.AddOns
                     Name = "STB-ClientRead"
                 };
                 readerThread.Start();
+            }
+            catch (Exception ex)
+            {
+                NinjaTrader.Code.Output.Process(
+                    $"SocketTraderBridge: client handler error: {ex.Message}",
+                    PrintTo.OutputTab1);
+                try { client.Close(); } catch { }
             }
         }
 

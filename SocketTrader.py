@@ -41,7 +41,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -366,10 +366,14 @@ VALID_TIF = {"DAY", "GTC"}
 
 
 def sanitize_ati(value: str) -> str:
+    # NOTE: also strips C0/C1 control characters, not just the ATI field
+    # separators. Account names arrive from the web API and are printed into
+    # the pinned terminal header, where a bare ESC would let a stored name
+    # repaint the live session status of a running trading app.
     """Strip characters that could break ATI line-based parsing or inject fields."""
-    return (value
-            .replace('\n', '').replace('\r', '').replace('\x00', '')
-            .replace(';', ''))
+    return "".join(
+        ch for ch in value.replace(';', '')
+        if ch.isprintable() or ch == ' ')
 
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -2273,7 +2277,24 @@ def write_bridge_token(token: str | None = None) -> Path | None:
     try:
         existing = path.read_text(encoding="utf-8").strip() if path.exists() else None
         if existing != token:
-            path.write_text(token, encoding="utf-8")
+            # Atomic + private, mirroring save_config: a truncating in-place
+            # write can be read as empty by the AddOn mid-update, which
+            # fails it closed until NinjaTrader restarts.
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".sttoken")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(token)
+                try:
+                    os.chmod(tmp, 0o600)
+                except OSError:
+                    pass          # DrvFs/NTFS ignores POSIX modes
+                os.replace(tmp, path)
+            except OSError:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
             logger.info(f"live bridge token written → {path} "
                         "(restart or recompile the AddOn to pick it up)")
         return path
@@ -5053,19 +5074,55 @@ def bridge_send_command(cmd: dict, timeout: float = 2.0) -> bool:
     if not (live_bridge_enabled and _live_bridge_connected):
         return False
     host = _nt_host(nt_port)
+    s = None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         s.connect((host, live_bridge_port))
         s.sendall(bridge_auth_line())
-        payload = (json.dumps(cmd) + "\n").encode("utf-8")
-        s.sendall(payload)
-        s.close()
-        logger.info(f"bridge cmd sent: {cmd}")
+        s.sendall((json.dumps(cmd) + "\n").encode("utf-8"))
+        # Half-close so the AddOn sees end-of-request but can still reply.
+        # A full close() here would RST the socket and could discard the
+        # command before the AddOn's reader ever sees it.
+        try:
+            s.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        # WAIT FOR THE ACK. sendall() only proves the kernel accepted the
+        # bytes — not that the AddOn authenticated us, parsed the command,
+        # or executed it. Callers treat True as "this is done" and skip
+        # their fallback, so True must mean the AddOn said so.
+        buf = b""
+        while b"\n" not in buf and len(buf) < 4096:
+            chunk = s.recv(1024)
+            if not chunk:
+                break
+            buf += chunk
+        line = buf.split(b"\n", 1)[0].decode("utf-8", errors="ignore").strip()
+        if not line:
+            logger.warning(f"bridge cmd UNCONFIRMED (no ack): {cmd}")
+            return False
+        try:
+            ack = json.loads(line)
+        except (ValueError, json.JSONDecodeError):
+            logger.warning(f"bridge cmd UNCONFIRMED (bad ack {line[:80]!r}): {cmd}")
+            return False
+        # AddOn replies {"ack":true|false,"msg":"..."} — see SendAck().
+        if not ack.get("ack"):
+            logger.warning(f"bridge cmd REFUSED by AddOn: {cmd} · "
+                           f"{ack.get('msg') or ack}")
+            return False
+        logger.info(f"bridge cmd acked: {cmd}")
         return True
     except OSError as exc:
         logger.warning(f"bridge cmd failed: {cmd} · {exc}")
         return False
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
 
 
 def fire_close_position(account: str, contract: str):
@@ -5204,12 +5261,19 @@ def close_account_positions(account: str) -> list[str]:
     # contract-name-format fragility that the file path has to work around.
     # Scoped to THIS account so the leader-first ordering in
     # close_all_open_positions still holds.
+    # Only an ACKNOWLEDGED bridge flatten may skip the file path. Anything
+    # else — no ack, refused, unauthenticated, AddOn wedged — must fall
+    # through, because returning here while nothing closed would report a
+    # successful flatten on a position that is still open.
     if bridge_send_command({"cmd": "flatten", "account": account}):
         logger.info(f"FLATTEN via bridge  account={account}  contracts={sorted(closed)}")
         return sorted(closed)
+    if live_bridge_enabled:
+        logger.warning(f"FLATTEN  bridge unconfirmed for {account} — "
+                       "falling back to CLOSEPOSITION files")
 
     # Fallback: file-based CLOSEPOSITION per instrument, used whenever the
-    # bridge is disabled or unreachable.
+    # bridge is disabled, unreachable, or did not acknowledge.
     # `closed` is already de-duplicated (it is a set), so a contract that
     # appears in both the live-position query and session_contracts gets
     # exactly one CLOSEPOSITION write.
@@ -5286,8 +5350,8 @@ def build_manual_signal(side, instrument, qty, order_type: str = "market",
             price = float(str(limit_price).strip())
         except (TypeError, ValueError):
             return None, "limit orders need a price"
-        if price <= 0:
-            return None, "limit price must be positive"
+        if not math.isfinite(price) or price <= 0:
+            return None, "limit price must be a positive number"
         limit_field = f"{price:.10g}"
     else:
         return None, f"unknown order type '{order_type}' — use market/limit"
@@ -5607,9 +5671,12 @@ async def live_bridge_task():
             backoff = min(backoff * 2, 30.0)
             continue
 
-        _live_bridge_connected = True
-        backoff = 1.0
-        logger.info(f"live bridge connected → {host}:{port}")
+        # NOT connected yet: the auth write only proves the kernel took
+        # the bytes. A rejected token looks exactly like a clean EOF, so
+        # the flag flips only once a line actually comes back — otherwise
+        # bridge_send_command would think it had a live bridge.
+        got_data = False
+        logger.info(f"live bridge socket open → {host}:{port} (awaiting auth)")
 
         try:
             while not shutdown.is_set():
@@ -5620,8 +5687,24 @@ async def live_bridge_task():
                     logger.info("live bridge stale — reconnecting")
                     break
                 if not line:
-                    logger.info("live bridge EOF — reconnecting")
+                    if not got_data:
+                        # Closed before sending anything: the AddOn refused
+                        # our token (rotated secret, stale AddOn, or no
+                        # token file). Back off — retrying instantly here
+                        # spins a reconnect storm against the AddOn's
+                        # single-threaded accept loop.
+                        logger.warning(
+                            "live bridge closed before any data — token rejected? "
+                            "Re-check the AddOn has SocketTraderBridge.token and "
+                            "was recompiled.")
+                    else:
+                        logger.info("live bridge EOF — reconnecting")
                     break
+                if not got_data:
+                    got_data = True
+                    _live_bridge_connected = True
+                    backoff = 1.0
+                    logger.info("live bridge authenticated and streaming")
                 try:
                     obj = json.loads(line.decode("utf-8", errors="ignore"))
                 except (ValueError, json.JSONDecodeError):
@@ -6498,7 +6581,11 @@ def web_state() -> dict:
         "favorites": [f for f in (load_config().get("web_favorites") or [])
                       if isinstance(f, str)][:12],
         "events": list(_web_events),
-        "profiles": account_profiles,
+        # Snapshot (the loop thread clears/repopulates this dict, and
+        # json.dumps on the HTTP thread would raise mid-iteration), and
+        # strip the AI gate: the write path refuses to accept it, so the
+        # read path should not hand out its endpoint and key env var.
+        "profiles": _strip_ai_config(json.loads(json.dumps(account_profiles))),
         "server": _server_name,
         "output_directory": output_directory or "",
         "ts": time.time(),
@@ -6579,6 +6666,8 @@ async def _web_close_all() -> tuple[bool, str]:
 
 
 async def _web_toggle_micro() -> tuple[bool, str]:
+    if hard_stopped:
+        return False, "session hard-locked — settings are frozen"
     on = toggle_micro_mode()
     refresh_terminal()
     return True, f"micro mode {'ON' if on else 'off'}"
@@ -6652,7 +6741,16 @@ async def _web_set_limits(account, target, target_mode, stop, stop_mode) -> tupl
     if t_mode not in modes or s_mode not in modes:
         return False, "mode must be off, soft or hard"
     try:
-        set_account_limits(acct, float(target or 0), t_mode, float(stop or 0), s_mode)
+        t_val, s_val = float(target or 0), float(stop or 0)
+    except (TypeError, ValueError) as exc:
+        return False, f"invalid limits: {exc}"
+    # nan/inf would store a limit that never compares true — pnl <= nan is
+    # always False — leaving a stop displayed but permanently dead, and it
+    # also serialises as bare NaN which is not valid JSON.
+    if not (math.isfinite(t_val) and math.isfinite(s_val)):
+        return False, "limits must be finite numbers"
+    try:
+        set_account_limits(acct, t_val, t_mode, s_val, s_mode)
     except (TypeError, ValueError) as exc:
         return False, f"invalid limits: {exc}"
     logger.info(f"WEB LIMITS  {acct}  target={target}/{target_mode}  stop={stop}/{stop_mode}")
@@ -6704,6 +6802,12 @@ async def _web_set_profiles(raw) -> tuple[bool, str]:
 
 
 async def _web_reset_pnl() -> tuple[bool, str]:
+    # reset_session_pnl() clears account_stops and hard_stopped, so without
+    # this the web button quietly undoes a tripped risk limit — the one
+    # control the app says can only be cleared by exiting.
+    if hard_stopped:
+        return False, ("session hard-locked — a stop or target was hit. "
+                       "Exit and restart to clear it deliberately.")
     # Same path as the terminal's B → R: re-snapshot from the balances the
     # balance monitor already keeps current.
     reset_session_pnl()
@@ -7005,7 +7109,7 @@ async def _web_reverse_position(account, instrument) -> tuple[bool, str]:
         return False, "session hard-locked"
     if acct in account_stops:
         return False, f"{acct} is stopped for the session"
-    live = web_live()
+    live = await asyncio.to_thread(web_live)
     pos = next((p for p in live["positions"]
                 if p["account"] == acct and p["instrument"] == instr), None)
     if not pos:
@@ -7030,6 +7134,8 @@ async def _web_flatten_account(account) -> tuple[bool, str]:
     acct = sanitize_ati(str(account or "").strip())
     if not acct:
         return False, "account required"
+    if acct not in target_accounts():
+        return False, f"{acct} is not a managed account"
     closed = await asyncio.to_thread(close_account_positions, acct)
     _live_cache["data"] = None
     logger.info(f"WEB FLATTEN  account={acct}  contracts={closed}")
@@ -7149,8 +7255,15 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _json(self, obj, code: int = 200):
-        self._reply(code, json.dumps(obj).encode("utf-8"),
-                    "application/json; charset=utf-8")
+        # allow_nan=False: bare NaN/Infinity is invalid JSON and would make
+        # every poll throw in the browser, pinning the panel offline.
+        try:
+            body = json.dumps(obj, allow_nan=False).encode("utf-8")
+        except ValueError:
+            body = json.dumps({"ok": False,
+                               "message": "state contains non-finite numbers"}).encode()
+            code = 500
+        self._reply(code, body, "application/json; charset=utf-8")
 
     def _host_ok(self) -> bool:
         """Reject DNS-rebinding: the Host must name loopback, not a domain."""

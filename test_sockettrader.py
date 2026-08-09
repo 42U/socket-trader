@@ -3233,6 +3233,119 @@ class TestWebMutatingEndpoints:
         assert ok is False
 
 
+class TestReviewRegressions:
+    """Each of these is a defect found in the 2026-08-09 deep review."""
+
+    def test_reset_pnl_cannot_clear_a_hard_lockout(self, tmp_config):
+        # reset_session_pnl() clears hard_stopped and account_stops, so the
+        # web button was an undocumented escape hatch from a tripped limit.
+        st.hard_stopped = True
+        st.account_stops["A"] = "hard"
+        ok, msg = asyncio.run(st._web_reset_pnl())
+        assert ok is False and "hard-locked" in msg
+        assert st.hard_stopped is True and st.account_stops["A"] == "hard"
+
+    def test_flatten_refuses_unmanaged_account(self, tmp_config):
+        st.active_account = "A"
+        ok, msg = asyncio.run(st._web_flatten_account("SomeoneElse"))
+        assert ok is False and "not a managed account" in msg
+
+    def test_limits_reject_non_finite(self, tmp_config):
+        # pnl <= nan is always False, so a nan stop is displayed but dead
+        st.active_account = "A"
+        for bad in ("nan", "inf", "-inf"):
+            ok, msg = asyncio.run(st._web_set_limits("A", 0, "off", bad, "hard"))
+            assert ok is False and "finite" in msg, bad
+
+    def test_limit_price_rejects_non_finite(self, monkeypatch):
+        monkeypatch.setattr(st, "validate_strategy", lambda n: True)
+        st.active_account = "A"
+        for bad in ("nan", "inf", "1e400"):
+            sig, err = st.build_manual_signal("long", "NQ 09-26", 1, "limit", bad, "X")
+            assert sig is None and "positive number" in err, bad
+
+    def test_micro_toggle_frozen_while_hard_stopped(self, tmp_config):
+        st.hard_stopped = True
+        before = st.micro_mode
+        ok, _ = asyncio.run(st._web_toggle_micro())
+        assert ok is False and st.micro_mode is before
+
+    def test_sanitize_strips_terminal_escapes(self):
+        # a stored account name is printed into the pinned TUI header
+        assert "\x1b" not in st.sanitize_ati("\x1b[2J\x1b[HSim101")
+        assert st.sanitize_ati("\x1b[2JSim101").endswith("Sim101")
+        assert st.sanitize_ati("NQ 09-26") == "NQ 09-26"      # spaces survive
+
+    def test_state_does_not_expose_ai_gate(self, tmp_config, monkeypatch):
+        monkeypatch.setattr(st, "list_atm_strategies", lambda: [])
+        monkeypatch.setattr(st, "get_account_limits", lambda a: {})
+        st.active_account = "A"
+        st.account_profiles["A"] = {"default": {"ai": {
+            "provider": "custom", "endpoint": "http://x/y",
+            "api_key_env": "ANTHROPIC_API_KEY"}}}
+        payload = json.dumps(st.web_state())
+        assert "ANTHROPIC_API_KEY" not in payload
+        assert "http://x/y" not in payload
+
+    def test_json_reply_never_emits_bare_nan(self, tmp_config):
+        # bare NaN is invalid JSON and would break every browser poll
+        with pytest.raises(ValueError):
+            json.dumps({"x": float("nan")}, allow_nan=False)
+
+    def test_unacked_bridge_command_is_not_success(self, tmp_config, monkeypatch):
+        """A flatten that was merely SENT must not report success — the
+        caller skips its file-based fallback when this returns True."""
+        st.save_config({"live_bridge_token": "S"})
+
+        class Silent:                      # connects, accepts bytes, says nothing
+            def settimeout(self, *_): pass
+            def connect(self, *_): pass
+            def sendall(self, b): pass
+            def shutdown(self, *_): pass
+            def recv(self, *_): return b""
+            def close(self): pass
+
+        monkeypatch.setattr(st.socket, "socket", lambda *a, **k: Silent())
+        monkeypatch.setattr(st, "live_bridge_enabled", True)
+        monkeypatch.setattr(st, "_live_bridge_connected", True)
+        monkeypatch.setattr(st, "_nt_host", lambda p: "127.0.0.1")
+        assert st.bridge_send_command({"cmd": "flatten", "account": "A"}) is False
+
+    def test_refused_bridge_command_is_not_success(self, tmp_config, monkeypatch):
+        st.save_config({"live_bridge_token": "S"})
+
+        class Refuses:
+            def settimeout(self, *_): pass
+            def connect(self, *_): pass
+            def sendall(self, b): pass
+            def shutdown(self, *_): pass
+            def recv(self, *_): return b'{"ack":false,"msg":"no such account"}\n'
+            def close(self): pass
+
+        monkeypatch.setattr(st.socket, "socket", lambda *a, **k: Refuses())
+        monkeypatch.setattr(st, "live_bridge_enabled", True)
+        monkeypatch.setattr(st, "_live_bridge_connected", True)
+        monkeypatch.setattr(st, "_nt_host", lambda p: "127.0.0.1")
+        assert st.bridge_send_command({"cmd": "flatten", "account": "A"}) is False
+
+    def test_unconfirmed_bridge_falls_back_to_close_files(self, tmp_output_dir,
+                                                          monkeypatch):
+        """The whole point: an unacknowledged bridge flatten must still
+        close positions via the file path, not silently do nothing."""
+        st.active_account = "A"
+        monkeypatch.setattr(st, "live_bridge_enabled", True)
+        monkeypatch.setattr(st, "bridge_send_command", lambda *a, **k: False)
+        monkeypatch.setattr(st, "fire_cancel_account_orders", lambda a: None)
+        monkeypatch.setattr(st, "query_nt_positions",
+                            lambda a, p=36973: {"NQ 09-26": -2})
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            closed = st.close_account_positions("A")
+        assert closed == ["NQ 09-26"]
+        files = list(tmp_output_dir.glob("close_*.txt"))
+        assert files, "no CLOSEPOSITION file written on the fallback path"
+        assert "CLOSEPOSITION" in files[0].read_text()
+
+
 class TestBridgeAuth:
     """The AddOn socket streams balances and accepts FLATTEN, and cannot be
     loopback-only (SocketTrader reaches it across WSL's NAT), so the token
@@ -3281,6 +3394,8 @@ class TestBridgeAuth:
             def settimeout(self, *_): pass
             def connect(self, *_): pass
             def sendall(self, b): sent.append(b)
+            def shutdown(self, *_): pass
+            def recv(self, *_): return b'{"ack":true,"msg":"ok"}\n'
             def close(self): pass
 
         monkeypatch.setattr(st.socket, "socket", lambda *a, **k: FakeSock())
