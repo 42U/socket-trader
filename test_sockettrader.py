@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -39,6 +40,25 @@ def tmp_output_dir(tmp_path):
     out = tmp_path / "incoming"
     out.mkdir()
     return out
+
+
+@pytest.fixture(autouse=True)
+def isolate_config(tmp_path_factory):
+    """Never let the suite touch the real ~/.voidorigin_config.json.
+
+    That file holds the live account set, risk limits, profiles and auth
+    tokens of a running trading app. Any test that calls save_config,
+    save_account_profiles, set_account_limits or bridge_token — directly
+    or through a helper like hedge_guard_mode(), which reads config on
+    every call — would otherwise read and WRITE the user's real settings.
+    That has actually happened: a sizing test wrote a stray profile into
+    the live config, and setting hedge_guard=block on the real machine
+    silently broke an unrelated dispatch test.
+    """
+    original = st.CONFIG_FILE
+    st.CONFIG_FILE = tmp_path_factory.mktemp("cfg") / ".voidorigin_config.json"
+    yield
+    st.CONFIG_FILE = original
 
 
 @pytest.fixture(autouse=True)
@@ -3090,6 +3110,127 @@ class TestFlattenOrdering:
         st.close_all_open_positions()
         assert order[0] == "LEAD"
         assert set(order) == {"LEAD", "F1", "F2", "RR1"}
+
+
+class TestAtiCompleteness:
+    """A truncated ATI dump parses fine and simply lacks data, so
+    completeness has to be detected explicitly — see v0.9.2."""
+
+    FULL = "CashValue|Sim101\x0010\x002\x00ATI\x00True\x00"
+
+    def test_complete_dump_recognised(self):
+        assert st.ati_response_complete(self.FULL) is True
+
+    def test_false_variant_also_complete(self):
+        assert st.ati_response_complete("x\x00ATI\x00False\x00") is True
+
+    def test_truncated_dump_rejected(self):
+        assert st.ati_response_complete(self.FULL[:-6]) is False
+
+    def test_empty_is_not_complete(self):
+        assert st.ati_response_complete("") is False
+
+    def test_marker_must_be_at_the_end(self):
+        # marker present mid-stream but more data followed = still truncated
+        assert st.ati_response_complete(self.FULL + "CashValue|B\x001") is False
+
+    def test_truncated_snapshot_reports_partial(self, monkeypatch):
+        monkeypatch.setattr(st, "_query_ati", lambda *a, **k: "CashValue|Sim101\x0010\x00")
+        snap = st.nt_snapshot(36973)
+        assert snap["ok"] is False and snap["partial"] is True
+
+    def test_complete_snapshot_is_ok(self, monkeypatch):
+        monkeypatch.setattr(st, "_query_ati", lambda *a, **k: self.FULL)
+        snap = st.nt_snapshot(36973)
+        assert snap["ok"] is True and snap["partial"] is False
+        assert snap["accounts"]["Sim101"]["cash"] == 10.0
+
+
+class TestContractMonths:
+    def _et(self, iso):
+        return datetime.fromisoformat(iso).replace(tzinfo=st.ET)
+
+    def test_quarterly_cycle_only_returns_quarterly_months(self):
+        out = st.contract_months(st.QUARTERLY, self._et("2026-08-07"), count=4)
+        assert all(m in (3, 6, 9, 12) for _y, m in out)
+
+    def test_front_month_rolls_late_in_the_month(self):
+        early = st.contract_months(st.QUARTERLY, self._et("2026-09-05"))[0]
+        late = st.contract_months(st.QUARTERLY, self._et("2026-09-15"))[0]
+        assert early == (2026, 9) and late == (2026, 12)
+
+    def test_year_rolls_over(self):
+        out = st.contract_months(st.QUARTERLY, self._et("2026-12-20"), count=2)
+        assert out[0] == (2027, 3)
+
+    def test_monthly_products_return_consecutive_months(self):
+        out = st.contract_months("ALL", self._et("2026-08-07"), count=3)
+        assert out == [(2026, 8), (2026, 9), (2026, 10)]
+
+    def test_catalog_is_populated_and_well_formed(self):
+        cat = st.instrument_catalog(self._et("2026-08-07"))
+        assert len(cat) >= 20
+        for p in cat:
+            assert p["contracts"], f"{p['root']} has no contract"
+            assert re.fullmatch(r"[A-Z0-9]+ \d{2}-\d{2}", p["contracts"][0])
+
+    def test_micro_roots_are_real_symbols(self):
+        for p in st.instrument_catalog():
+            if p["micro"]:
+                assert p["micro"] != p["root"]
+
+
+class TestWebMutatingEndpoints:
+    """The role / sizing / reverse endpoints place or reshape real trades."""
+
+    def test_role_promotes_and_demotes(self, tmp_config):
+        st.active_account = "A"
+        st.follower_accounts = ["B"]
+        asyncio.run(st._web_set_role("B", "round-robin"))
+        assert st.follower_accounts == [] and st.roundrobin_accounts == ["B"]
+
+    def test_promoting_a_follower_keeps_the_old_leader_trading(self, tmp_config):
+        st.active_account = "A"
+        st.follower_accounts = ["B"]
+        asyncio.run(st._web_set_role("B", "leader"))
+        assert st.active_account == "B"
+        assert "A" in st.follower_accounts   # old leader must not silently drop out
+
+    def test_leader_cannot_be_unassigned(self, tmp_config):
+        st.active_account = "A"
+        ok, msg = asyncio.run(st._web_set_role("A", "off"))
+        assert ok is False and "leader" in msg
+
+    def test_unknown_role_rejected(self, tmp_config):
+        st.active_account = "A"
+        assert asyncio.run(st._web_set_role("A", "boss"))[0] is False
+
+    def test_sizing_rejects_bad_mode_and_value(self, tmp_config):
+        st.active_account = "A"
+        assert asyncio.run(st._web_set_sizing("A", "sideways", 1))[0] is False
+        assert asyncio.run(st._web_set_sizing("A", "fixed", "abc"))[0] is False
+
+    def test_sizing_warns_below_half_multiplier(self, tmp_config):
+        st.active_account = "A"
+        ok, msg = asyncio.run(st._web_set_sizing("A", "multiple", 0.25))
+        assert ok is True and "sizes to 0" in msg
+
+    def test_reverse_refuses_unmanaged_account(self, tmp_config):
+        st.active_account = "A"
+        ok, msg = asyncio.run(st._web_reverse_position("Stranger", "NQ 09-26"))
+        assert ok is False and "not a managed account" in msg
+
+    def test_reverse_refuses_when_flat(self, tmp_config, monkeypatch):
+        st.active_account = "A"
+        monkeypatch.setattr(st, "web_live", lambda *a, **k: {"positions": []})
+        ok, msg = asyncio.run(st._web_reverse_position("A", "NQ 09-26"))
+        assert ok is False and "no open" in msg
+
+    def test_reverse_refuses_while_hard_stopped(self, tmp_config):
+        st.active_account = "A"
+        st.hard_stopped = True
+        ok, msg = asyncio.run(st._web_reverse_position("A", "NQ 09-26"))
+        assert ok is False
 
 
 class TestBridgeAuth:
