@@ -17,6 +17,7 @@ import os
 import re
 import platform
 import threading
+import concurrent.futures
 import http.server
 import secrets
 import urllib.error
@@ -41,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.10.2"
+__version__ = "0.10.3"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -7279,10 +7280,31 @@ def refresh_terminal():
 
 
 def _web_run(coro, timeout: float = 20.0):
-    """Run a coroutine on the app loop from a web server thread."""
-    if _web_loop is None or _web_loop.is_closed():
-        raise RuntimeError("app loop not running")
-    return asyncio.run_coroutine_threadsafe(coro, _web_loop).result(timeout)
+    """Run a coroutine on the app loop from a web server thread.
+
+    The timeout is a backstop for a wedged handler, NOT a shutdown wait:
+    once the app is shutting down the loop stops running submitted work, so
+    a request in flight at that moment would otherwise sit here for the full
+    timeout — which is what made quitting take ~20 seconds. Refuse
+    immediately instead.
+    """
+    if _web_loop is None or _web_loop.is_closed() or shutdown.is_set():
+        coro.close()          # never leave the coroutine un-awaited
+        raise RuntimeError("app is shutting down")
+    fut = asyncio.run_coroutine_threadsafe(coro, _web_loop)
+    deadline = time.monotonic() + timeout
+    while True:
+        if shutdown.is_set():
+            fut.cancel()
+            raise RuntimeError("app is shutting down")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fut.cancel()
+            raise TimeoutError("request timed out")
+        try:
+            return fut.result(min(remaining, 0.25))
+        except concurrent.futures.TimeoutError:
+            continue          # re-check the shutdown flag and keep waiting
 
 
 # The web UI controls real money, so the loopback bind is NOT treated as the
@@ -7822,6 +7844,17 @@ async function api(path,body){
 }
 async function get(path){
   const r=await fetch(path,{headers:{"X-ST-Token":TOKEN}});
+  if(r.status===403){
+    // The token is minted per app process, so a tab left open across a
+    // restart holds a dead one and every poll 403s forever. Reload once to
+    // pick up the new token instead of sitting there looking broken.
+    if(!sessionStorage.getItem("st-reloaded")){
+      sessionStorage.setItem("st-reloaded","1");
+      location.reload();
+    }
+    throw new Error("stale session — reload the page");
+  }
+  sessionStorage.removeItem("st-reloaded");
   if(!r.ok)throw new Error(r.status);
   return r.json();
 }
@@ -8381,6 +8414,12 @@ async def main():
         # Stop keyboard thread so it releases stdin for input()
         _kb_stop = True
         shutdown.set()
+
+        # Take the web server down FIRST. Any request that arrives after the
+        # loop stops would block its thread waiting for work the loop will
+        # never run, and the browser polls twice a second — so this is the
+        # difference between quitting instantly and quitting in ~20s.
+        stop_web_ui()
 
         # Cancel remaining tasks — including in-flight deferred profile
         # legs (delayed/staggered entries) — and wait for threads to drain
