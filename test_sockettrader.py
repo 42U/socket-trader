@@ -3242,6 +3242,125 @@ class TestWebMutatingEndpoints:
         assert ok is False
 
 
+class TestRoundRobinSlotReturn:
+    """A drawn pool slot must not be consumed when nothing was placed —
+    round-robin sends an entry to exactly ONE member, so a burnt slot means
+    the pool misses that trade entirely."""
+
+    ENTRY = "PLACE;LEAD;NQ 09-26;BUY;2;MARKET;;;DAY;;;NQ_Med;77"
+
+    @pytest.fixture(autouse=True)
+    def _arm(self, monkeypatch):
+        monkeypatch.setattr(st, "validate_strategy", lambda n: True)
+        monkeypatch.setattr(st, "hedge_guard_mode", lambda: "warn")
+        st.active_account = "LEAD"
+        st.roundrobin_accounts = ["RR1", "RR2"]
+        st._rr_remaining = ["RR1", "RR2"]
+
+    def test_entries_off_account_is_passed_over_not_handed_the_turn(self):
+        # Structurally dead accounts are skipped at DRAW time, like symbol
+        # filters — otherwise the pool misses the trade every rotation.
+        st.account_profiles["RR1"] = {"default": {"enabled": False}}
+        plans, _ = st.plan_signal_legs(self.ENTRY)
+        assert [p["account"] for p in plans if p["rr_pick"]] == ["RR2"]
+        assert "RR1" in st._rr_remaining          # keeps its slot
+
+    def test_symbol_filtered_and_disabled_pool_places_nothing(self):
+        for a in ("RR1", "RR2"):
+            st.account_profiles[a] = {"default": {"enabled": False}}
+        plans, _ = st.plan_signal_legs(self.ENTRY)
+        assert not [p for p in plans if p["rr_pick"]]
+        assert sorted(st._rr_remaining) == ["RR1", "RR2"]   # nothing consumed
+
+    def test_slot_returned_when_sized_to_zero(self):
+        st.account_profiles["RR1"] = {"default": {"qty_mode": "multiple",
+                                                  "qty_value": 0.1}}
+        st.plan_signal_legs(self.ENTRY)
+        assert "RR1" in st._rr_remaining
+
+    def test_slot_returned_when_the_hedge_guard_blocks(self, monkeypatch):
+        monkeypatch.setattr(st, "hedge_guard_mode", lambda: "block")
+        st.follower_accounts = ["F1"]
+        st.account_profiles["F1"] = {"default": {"direction": "invert"}}
+        plans, _ = st.plan_signal_legs(self.ENTRY)
+        assert plans == []
+        assert "RR1" in st._rr_remaining
+
+    def test_slot_still_consumed_on_a_normal_fill(self):
+        plans, _ = st.plan_signal_legs(self.ENTRY)
+        assert [p["account"] for p in plans if p["rr_pick"]] == ["RR1"]
+        assert st._rr_remaining == ["RR2"]                  # correctly used
+
+    def test_pool_does_not_miss_the_trade_after_a_skip(self):
+        """The real payoff: the next signal reaches a pool account."""
+        st.account_profiles["RR1"] = {"default": {"enabled": False}}
+        st.plan_signal_legs(self.ENTRY)                      # RR1 drawn, skipped
+        plans, _ = st.plan_signal_legs(self.ENTRY)
+        assert [p["account"] for p in plans if p["rr_pick"]], "pool missed the trade"
+
+
+class TestExitSizeMismatch:
+    """An account entered in micros must still be closed if the exit was
+    computed as full-size (strategy-scoped rules don't match exits, and the
+    micro toggle can flip mid-position)."""
+
+    def test_close_is_sent_for_both_contract_sizes(self, monkeypatch):
+        monkeypatch.setattr(st, "validate_strategy", lambda n: True)
+        st.active_account = "LEAD"
+        plans, _ = st.plan_signal_legs("CLOSEPOSITION;LEAD;NQ 09-26;;;;;;;;;;")
+        instruments = {f.split(";")[2] for f in plans[0]["files"]}
+        assert instruments == {"NQ 09-26", "MNQ 09-26"}
+
+    def test_micro_close_also_covers_full_size(self, monkeypatch):
+        monkeypatch.setattr(st, "validate_strategy", lambda n: True)
+        st.active_account = "LEAD"
+        plans, _ = st.plan_signal_legs("CLOSEPOSITION;LEAD;MNQ 09-26;;;;;;;;;;")
+        instruments = {f.split(";")[2] for f in plans[0]["files"]}
+        assert instruments == {"MNQ 09-26", "NQ 09-26"}
+
+    def test_entries_are_not_duplicated(self, monkeypatch):
+        monkeypatch.setattr(st, "validate_strategy", lambda n: True)
+        st.active_account = "LEAD"
+        plans, _ = st.plan_signal_legs(
+            "PLACE;LEAD;NQ 09-26;BUY;1;MARKET;;;DAY;;;NQ_Med;77")
+        assert len(plans[0]["files"]) == 1      # only exits fan out
+
+    def test_symbol_without_a_micro_twin_is_not_duplicated(self, monkeypatch):
+        monkeypatch.setattr(st, "validate_strategy", lambda n: True)
+        st.active_account = "LEAD"
+        plans, _ = st.plan_signal_legs("CLOSEPOSITION;LEAD;ZB 09-26;;;;;;;;;;")
+        assert len(plans[0]["files"]) == 1      # ZB has no micro
+
+
+class TestSessionContractsScoping:
+    def test_close_does_not_fire_for_other_accounts_markets(self, tmp_output_dir,
+                                                             monkeypatch):
+        """session_contracts is global; a per-account close must not fire for
+        markets that account never traded."""
+        st.active_account = "A"
+        st.session_contracts.update({"NQ 09-26", "ES 09-26", "GC 12-26"})
+        monkeypatch.setattr(st, "fire_cancel_account_orders", lambda a: None)
+        monkeypatch.setattr(st, "bridge_send_command", lambda *a, **k: False)
+        monkeypatch.setattr(st, "query_nt_positions",
+                            lambda a, p=36973: {"NQ 09-26": -1})
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            closed = st.close_account_positions("A")
+        assert closed == ["NQ 09-26"]
+        assert "ES 09-26" not in closed and "GC 12-26" not in closed
+
+    def test_session_contracts_still_cover_a_micro_of_the_same_market(
+            self, tmp_output_dir, monkeypatch):
+        st.active_account = "A"
+        st.session_contracts.update({"MNQ 09-26"})
+        monkeypatch.setattr(st, "fire_cancel_account_orders", lambda a: None)
+        monkeypatch.setattr(st, "bridge_send_command", lambda *a, **k: False)
+        monkeypatch.setattr(st, "query_nt_positions",
+                            lambda a, p=36973: {"NQ 09-26": -1})
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            closed = st.close_account_positions("A")
+        assert "MNQ 09-26" in closed      # same underlying — safety net kept
+
+
 class TestReviewRegressions:
     """Each of these is a defect found in the 2026-08-09 deep review."""
 

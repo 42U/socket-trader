@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.10.3"
+__version__ = "0.11.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -1210,11 +1210,11 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = ""
     rr_pick: str | None = None
     if roundrobin_accounts:
         if cmd == "PLACE":
-            rr_pick = _rr_next(instrument)
+            rr_pick = _rr_next(instrument, pub_strategy)
             if rr_pick:
                 legs.append((rr_pick, signal_text, True))
         elif cmd == "REVERSEPOSITION":
-            rr_pick = _rr_next(instrument)
+            rr_pick = _rr_next(instrument, pub_strategy)
             synth_close = (f"CLOSEPOSITION;{parts[1] if len(parts) >= 2 else ''};"
                            f"{instrument};;;;;;;;;;")
             for a in _rr_pool():
@@ -1248,6 +1248,8 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = ""
         if final is None:
             skipped.append((account, skip_reason or "skipped"))
             logger.info(f"LEG SKIPPED  account={account}  reason={skip_reason}  signal={canonical}")
+            if is_rr_pick:
+                _rr_return(account)   # nothing was placed — don't burn the turn
             continue
         final_parts = final.split(";")
         final_cmd = final_parts[0].strip().upper() if final_parts else ""
@@ -1257,6 +1259,22 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = ""
         files = [final]
         if final_cmd in ("CLOSESTRATEGY", "CANCEL", "CHANGE"):
             files = _expand_exit_ids(final, account)
+        elif final_cmd == "CLOSEPOSITION" and len(final_parts) >= 3 and final_parts[2]:
+            # Send the close for BOTH contract sizes. The exit's instrument
+            # is recomputed from current state, but the position was opened
+            # under whatever the rule said THEN — a strategy-scoped `size`
+            # rule does not match an exit (exits carry no strategy name),
+            # and the global micro toggle can flip mid-position. Either way
+            # the close would address a contract the account is not holding.
+            # NT no-ops the variant that is not held, exactly as the
+            # existing alias fan-out relies on.
+            twin = _apply_size(final_parts[2],
+                               "full" if final_parts[2] != to_full_instrument(final_parts[2])
+                               else "micros")
+            if twin and twin != final_parts[2]:
+                alt = list(final_parts)
+                alt[2] = twin
+                files.append(";".join(alt))
         if meta["note"]:
             logger.info(f"LEG NOTE  account={account}  {meta['note']}  signal={canonical}")
         plans.append({
@@ -1351,6 +1369,8 @@ def apply_hedge_guard(plans: list[dict], skipped: list[tuple[str, str]]
     for p in plans:
         if p["command"] == "PLACE":
             skipped.append((p["account"], "hedge guard: opposite entries across accounts"))
+            if p.get("rr_pick"):
+                _rr_return(p["account"])
     return [p for p in plans if p["command"] != "PLACE"]
 
 
@@ -1824,7 +1844,22 @@ def _rr_pool() -> list[str]:
     return [a for a in roundrobin_accounts if a not in account_stops]
 
 
-def _rr_next(instrument: str = "") -> str | None:
+def _rr_eligible(account: str, instrument: str, pub_strategy: str = "") -> bool:
+    """Could this pool account actually take an entry on this instrument?
+
+    Checks the STRUCTURAL reasons a leg would be dropped — the symbol
+    filter and `entries: off` — so a permanently dead account is passed
+    over at draw time instead of being handed the turn and skipped, which
+    would make the pool miss the trade on every rotation. Per-signal
+    reasons (an AI veto, sizing to zero on a small order) can't be known
+    here; those return the slot afterwards via _rr_return().
+    """
+    if not account_trades_symbol(account, instrument):
+        return False
+    return bool(resolve_rule(account, instrument, pub_strategy)["enabled"])
+
+
+def _rr_next(instrument: str = "", pub_strategy: str = "") -> str | None:
     """Draw the next round-robin account for an entry on `instrument`.
 
     Random without repeats inside a round: a shuffled round of the pool is
@@ -1841,7 +1876,7 @@ def _rr_next(instrument: str = "") -> str | None:
     """
     global _rr_last
     pool = _rr_pool()
-    eligible = {a for a in pool if account_trades_symbol(a, instrument)}
+    eligible = {a for a in pool if _rr_eligible(a, instrument, pub_strategy)}
     if not eligible:
         return None
     for _ in range(2):  # pass 2 runs after the top-up below, which
@@ -1866,6 +1901,25 @@ def _rr_next(instrument: str = "") -> str | None:
             fresh[0], fresh[swap] = fresh[swap], fresh[0]
         _rr_remaining.extend(fresh)
     return None
+
+
+def _rr_return(account: str):
+    """Put a drawn round-robin slot back at the head of the round.
+
+    _rr_next() pops the account and stamps _rr_last BEFORE the leg is
+    transformed, so anything that drops it afterwards — entries disabled,
+    sized to zero, an AI veto, the hedge guard — consumed the turn with no
+    order placed. Round-robin sends an entry to exactly ONE pool member, so
+    a burnt slot means the pool misses that trade entirely, not merely that
+    the rotation is unfair.
+    """
+    global _rr_last
+    if not account:
+        return
+    if account not in _rr_remaining:
+        _rr_remaining.insert(0, account)
+    _rr_last = None          # it never traded, so it must not be avoided next
+    logger.info(f"ROUND-ROBIN  slot returned to {account} (leg not placed)")
 
 
 def _rr_reset_rotation():
@@ -4689,8 +4743,14 @@ async def close_positions_menu():
         elif key == "\r" or key == "\n":
             # Selected — ask for confirmation
             chosen = entries[selected]
+            n_acct = len(target_accounts())
             if chosen[0] == "_ALL_":
-                confirm_msg = f"Close ALL {len(open_pos)} position{'s' if len(open_pos) != 1 else ''}?"
+                confirm_msg = (f"Flatten EVERY managed account "
+                               f"({n_acct}) — {len(open_pos)} leader "
+                               f"position{'s' if len(open_pos) != 1 else ''}?"
+                               if n_acct > 1 else
+                               f"Close ALL {len(open_pos)} position"
+                               f"{'s' if len(open_pos) != 1 else ''}?")
             else:
                 direction = "LONG" if chosen[1] > 0 else "SHORT"
                 confirm_msg = f"Close {chosen[0]} ({direction} {abs(chosen[1])})?"
@@ -4699,11 +4759,26 @@ async def close_positions_menu():
             confirm = await asyncio.to_thread(get_key)
             if confirm.lower() == "y":
                 if chosen[0] == "_ALL_":
-                    for instrument, qty in open_pos.items():
-                        fire_close_position(active_account, instrument)
-                        sys.stdout.write("\r\033[K")
+                    # Every managed account, leader first — not just the
+                    # leader. Closing only the leader leaves followers and
+                    # the rotation holding the other side of the book.
+                    all_closed = await asyncio.to_thread(close_all_open_positions)
+                    sys.stdout.write("\r\033[K")
+                    for instrument in all_closed:
                         print(Fore.RED + f"  ⛔  CLOSEPOSITION → {instrument}" + Style.RESET_ALL)
-                    logger.info(f"CLOSE ALL  account={active_account}  contracts={list(open_pos.keys())}")
+                    logger.info(f"CLOSE ALL  accounts={target_accounts()}  "
+                                f"contracts={all_closed}")
+                    still = await verify_flat(target_accounts())
+                    if still:
+                        detail = ", ".join(
+                            p["instrument"] if p["instrument"] == "UNVERIFIED"
+                            else f"{p['account']} {p['qty']:+d} {p['instrument']}"
+                            for p in still)
+                        print(Fore.RED + Style.BRIGHT +
+                              f"  ⛔  NOT FLAT — still open: {detail}" + Style.RESET_ALL)
+                        logger.error(f"CLOSE ALL INCOMPLETE  {detail}")
+                    else:
+                        print(Fore.GREEN + "  ✔  verified flat" + Style.RESET_ALL)
                 else:
                     fire_close_position(active_account, chosen[0])
                     sys.stdout.write("\r\033[K")
@@ -5284,8 +5359,17 @@ def close_account_positions(account: str) -> list[str]:
                 closed.add(instrument)
     except Exception as e:
         logger.error(f"close_account_positions {account}  query error: {e}")
+    # session_contracts is global — every account's instruments, including
+    # other accounts' micro conversions. Using it wholesale made a
+    # single-account close fire for contracts that account never traded and
+    # report them as closed. Keep it only as a safety net for markets this
+    # account is actually in, matched on the underlying so a micro/full
+    # mismatch still counts.
+    live_roots = {_underlying_root(c) for c in closed}
     for contract in session_contracts:
-        if contract:
+        if not contract:
+            continue
+        if not live_roots or _underlying_root(contract) in live_roots:
             closed.add(contract)
 
     # Preferred path: flatten through the AddOn bridge, which calls NT's
@@ -5707,8 +5791,20 @@ async def live_bridge_task():
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port), timeout=3.0)
-        except (OSError, asyncio.TimeoutError):
+        except (OSError, asyncio.TimeoutError) as exc:
             _live_bridge_connected = False
+            # Say something. This path used to be completely silent, so a
+            # blocked port (Windows Firewall drops WSL traffic to 36984 by
+            # default) produced a session log with no bridge lines at all —
+            # indistinguishable from the feature being switched off. Log the
+            # first failure and then only on each backoff step, so a long
+            # outage does not flood the log.
+            if backoff <= 1.0 or backoff >= 30.0:
+                logger.warning(
+                    f"live bridge unreachable at {host}:{port} — "
+                    f"{type(exc).__name__}: {exc or 'timed out'}. "
+                    "If NinjaTrader is running with the AddOn compiled, this is "
+                    "usually the Windows Firewall blocking the port.")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
             continue
