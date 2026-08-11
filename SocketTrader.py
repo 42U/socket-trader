@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -96,6 +96,7 @@ account_stops: dict[str, str] = {}  # account -> "hard" | "soft" once its sessio
                                     # Absent = tradeable. NOT persisted (session-local lockout).
 atm_strategy = "NQ_Med"        # ATM strategy template name (fallback)
 follow_publisher_strategy = False  # If True, use the publisher's strategy per-signal when locally installed
+atm_aliases: dict[str, str] = {}   # publisher strategy id -> local ATM template (or base name)
 micro_mode = False             # If True, incoming instruments are translated to their CME micro (NQ→MNQ)
 nt_port = 36973                # NinjaTrader AT Interface port (default 36973)
 nt_host_override: str = ""     # Explicit NT host (empty = auto-detect local/WSL)
@@ -689,6 +690,7 @@ RULE_CLAMPS = {
 
 account_profiles: dict[str, dict] = {}   # account -> {"default": rule, "rules": [rule...]}
 _atm_override_warned: set[str] = set()   # missing ATM templates already warned about
+_pub_atm_fallback_warned: set[str] = set()  # publisher ATM names already alerted about
 _stagger_placed: dict[tuple[str, str], int] = {}  # (account, ati id) -> tranches placed
 _MAX_STAGGER_KEYS = 512
 _leg_tasks: set[asyncio.Task] = set()    # in-flight deferred legs (delay/AI/stagger)
@@ -1779,6 +1781,48 @@ def validate_strategy(name: str) -> bool:
     if not base:
         return False
     return (base / "templates" / "AtmStrategy" / f"{name}.xml").exists()
+
+
+def _norm_atm_name(name: str) -> str:
+    """Case/separator-insensitive key: 'macro_zone_b' → 'macrozoneb'."""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def resolve_publisher_atm(pub_strategy: str, instrument: str = "") -> str | None:
+    """Best installed ATM template for a publisher strategy name, or None.
+
+    Publishers put their internal strategy id in field 11 (e.g.
+    'macro_zone_b') while the bundled templates carry instrument-prefixed
+    PascalCase filenames (GC-MacroZoneB.xml), so an exact filename check
+    alone misses every one and the signal silently falls back to the
+    session default — sizing stops/targets for the wrong market. Matching
+    stays deterministic: exact name, then config `atm_aliases`, then a
+    normalized comparison ignoring case and separators, preferring the
+    signal instrument's '<root>-<name>' template over a bare match. No
+    fuzzy matching — a wrong ATM on a live order is worse than the
+    fallback.
+    """
+    pub = pub_strategy.strip()
+    if not pub:
+        return None
+    if validate_strategy(pub):
+        return pub
+    root_key = ""
+    if instrument:
+        root_key = _norm_atm_name(_instrument_root(to_full_instrument(instrument)))
+    by_norm: dict[str, str] = {}
+    for tmpl in list_atm_strategies():
+        by_norm.setdefault(_norm_atm_name(tmpl), tmpl)
+    for name in (atm_aliases.get(pub) or atm_aliases.get(pub.lower()), pub):
+        if not name:
+            continue
+        if name != pub and validate_strategy(name):
+            return name
+        key = _norm_atm_name(name)
+        for candidate in ((root_key + key if root_key else ""), key):
+            if candidate and candidate in by_norm:
+                return by_norm[candidate]
+    return None
 
 
 def is_trade_ready() -> bool:
@@ -4962,6 +5006,9 @@ def extract_signal_string(msg: str, account: str, atm: str, follow_publisher: bo
     try:
         data = json.loads(msg)
         if isinstance(data, dict) and "signal" in data:
+            # Verbatim wire capture — settles disputes about what the server
+            # actually sends (field 11 vs extra envelope keys) from the log.
+            logger.info(f"RAW ENVELOPE  {json.dumps(data)[:500]}")
             raw = data["signal"]
             ts = data.get("ts")
             parts = [sanitize_ati(p) for p in raw.split(";")]
@@ -4978,13 +5025,23 @@ def extract_signal_string(msg: str, account: str, atm: str, follow_publisher: bo
             # Resolve ATM strategy (field 11)
             if len(parts) >= 12:
                 pub_strategy = parts[11].strip()
-                if follow_publisher and pub_strategy and validate_strategy(pub_strategy):
-                    # Keep publisher's choice — it's installed locally
-                    parts[11] = pub_strategy
+                resolved = None
+                if follow_publisher:
+                    resolved = resolve_publisher_atm(
+                        pub_strategy, parts[2] if len(parts) >= 3 else "")
+                if resolved:
+                    if resolved != pub_strategy:
+                        logger.info(f"STRATEGY MATCH  publisher='{pub_strategy}' → '{resolved}'")
+                    parts[11] = resolved
                 else:
                     if follow_publisher and pub_strategy and pub_strategy != atm:
                         logger.info(
                             f"STRATEGY FALLBACK  publisher='{pub_strategy}' not installed → using '{atm}'")
+                        if pub_strategy not in _pub_atm_fallback_warned:
+                            _pub_atm_fallback_warned.add(pub_strategy)
+                            _dash_set_alert(
+                                Fore.YELLOW + f"  ⚠  No local ATM for publisher '{pub_strategy}'"
+                                f" — using {atm}" + Style.RESET_ALL)
                     parts[11] = atm
             # Translate the instrument (field 2) to its micro contract.
             # Runs on every command that carries an instrument (PLACE,
@@ -5005,6 +5062,14 @@ _ati_seq_lock = threading.Lock()
 def _next_ati_filename(prefix: str) -> str:
     """Return a unique incoming-folder filename.
 
+    `prefix` must start with "oif": NT classifies incoming files by NAME
+    and consumes-then-discards anything not matching oif*.txt with
+    "ERROR: Unknown OIF file type" — no order executes. close_*/cancel_*
+    names were eaten exactly this way (NT trace 2026-08-10 23:31) while
+    two followers stayed in the market. Normalized here rather than
+    asserted because crashing a flatten path is worse than fixing the
+    name.
+
     A bare millisecond timestamp isn't unique — two writes in the same
     millisecond (which happens when copy-trading fans one signal out to
     several accounts, or the hard-stop loop closes multiple contracts
@@ -5013,6 +5078,8 @@ def _next_ati_filename(prefix: str) -> str:
     if filename generation is called from concurrent paths.
     """
     global _ati_write_seq
+    if not prefix.startswith("oif"):
+        prefix = "oif" + prefix
     with _ati_seq_lock:
         _ati_write_seq += 1
         seq = _ati_write_seq
@@ -5247,7 +5314,7 @@ def fire_close_position(account: str, contract: str):
     aliases = _nt_contract_aliases(contract)
     for alias in aliases:
         cmd = f"CLOSEPOSITION;{sanitize_ati(account)};{sanitize_ati(alias)};;;;;;;;;;"
-        filename = _next_ati_filename("close")
+        filename = _next_ati_filename("oifclose")
         filepath = os.path.join(output_directory, filename)
         try:
             with open(filepath, "w", encoding="utf-8") as f:
@@ -5292,7 +5359,7 @@ def fire_cancel_order(order_id: str):
     if not output_directory or not order_id:
         return
     cmd = f"CANCEL;;;;;;;;;;{sanitize_ati(order_id)};;"
-    filename = _next_ati_filename("cancel")
+    filename = _next_ati_filename("oifcancel")
     filepath = os.path.join(output_directory, filename)
     try:
         with open(filepath, "w", encoding="utf-8") as f:
@@ -6803,17 +6870,14 @@ async def verify_flat(accounts: list[str]) -> list[dict]:
     return remaining
 
 
-async def _web_close_all() -> tuple[bool, str]:
-    accounts = target_accounts()
-    closed = await asyncio.to_thread(close_all_open_positions)
-    logger.info(f"WEB CLOSE ALL  contracts={closed}")
-    if closed:
-        _dash_set_alert(Fore.RED + f"  ⛔  WEB CLOSE ALL → {', '.join(closed)}"
-                        + Style.RESET_ALL)
-    # ALWAYS verify, even when nothing was closed. An empty list can mean
-    # "already flat" or "the position query failed and we wrote no closes at
-    # all" — close_account_positions swallows that error — and those must
-    # not both report success.
+async def _confirm_flat(accounts: list[str], closed: list[str]) -> tuple[bool, str]:
+    """Shared verdict for every web flatten: verify against NT, then report.
+
+    ALWAYS verifies, even when nothing was closed. An empty list can mean
+    "already flat" or "the position query failed and we wrote no closes at
+    all" — close_account_positions swallows that error — and those must
+    not both report success.
+    """
     still = await verify_flat(accounts)
     _live_cache["data"] = None
     if still:
@@ -6831,6 +6895,16 @@ async def _web_close_all() -> tuple[bool, str]:
     if not closed:
         return True, "verified flat — nothing was open"
     return True, f"flat — closes confirmed for {', '.join(closed)}"
+
+
+async def _web_close_all() -> tuple[bool, str]:
+    accounts = target_accounts()
+    closed = await asyncio.to_thread(close_all_open_positions)
+    logger.info(f"WEB CLOSE ALL  contracts={closed}")
+    if closed:
+        _dash_set_alert(Fore.RED + f"  ⛔  WEB CLOSE ALL → {', '.join(closed)}"
+                        + Style.RESET_ALL)
+    return await _confirm_flat(accounts, closed)
 
 
 async def _web_toggle_micro() -> tuple[bool, str]:
@@ -7308,9 +7382,12 @@ async def _web_flatten_account(account) -> tuple[bool, str]:
     _live_cache["data"] = None
     logger.info(f"WEB FLATTEN  account={acct}  contracts={closed}")
     _dash_set_alert(Fore.RED + f"  ⛔  FLATTEN {acct} (web)" + Style.RESET_ALL)
-    if closed:
-        return True, f"{acct}: close sent for {', '.join(closed)}"
-    return True, f"{acct}: nothing open to close"
+    # Same contract as FLATTEN ALL: never answer the button from the
+    # request alone. This path used to reply "close sent" — true even
+    # when NT discarded every close file and the account stayed in the
+    # market (2026-08-10, two followers left holding NQ).
+    ok, msg = await _confirm_flat([acct], closed)
+    return ok, f"{acct}: {msg}"
 
 
 async def _web_set_role(account, role) -> tuple[bool, str]:
@@ -8458,7 +8535,7 @@ setInterval(refreshLive,2000);
 # ---------- Main ----------
 async def main():
     global output_directory, active_account, atm_strategy, follow_publisher_strategy, nt_port
-    global follower_accounts, roundrobin_accounts, micro_mode, micro_map
+    global follower_accounts, roundrobin_accounts, micro_mode, micro_map, atm_aliases
 
     token, cfg = setup()
     active_account = cfg.get("account", "")
@@ -8467,6 +8544,10 @@ async def main():
         cfg.get("roundrobin_accounts", []), active_account, follower_accounts)
     atm_strategy = cfg.get("atm_strategy", "NQ_Med")
     follow_publisher_strategy = bool(cfg.get("follow_publisher_strategy", False))
+    raw_aliases = cfg.get("atm_aliases")
+    atm_aliases = ({str(k).strip(): str(v).strip() for k, v in raw_aliases.items()
+                    if str(k).strip() and str(v).strip()}
+                   if isinstance(raw_aliases, dict) else {})
     micro_mode = bool(cfg.get("micro_mode", False))
     micro_map = load_micro_map(cfg)
     nt_port = cfg.get("nt_port", 36973)

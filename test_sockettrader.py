@@ -294,6 +294,77 @@ class TestExtractSignalString:
         assert result is None or ";" not in result.split(";")[2]
 
 
+# ── resolve_publisher_atm ─────────────────────────────────────────────
+
+
+INSTALLED_TEMPLATES = ["Bhorgini", "BreadNButter", "GC-Bhorgini", "GC-MSSComp",
+                       "GC-MacroZoneB", "NQ-MSSComp", "NQ-MacroZoneB", "NQ_Goopi"]
+
+
+class TestResolvePublisherAtm:
+    @pytest.fixture(autouse=True)
+    def _templates(self, monkeypatch):
+        monkeypatch.setattr(st, "list_atm_strategies", lambda: list(INSTALLED_TEMPLATES))
+        monkeypatch.setattr(st, "validate_strategy", lambda name: name in INSTALLED_TEMPLATES)
+        monkeypatch.setattr(st, "atm_aliases", {})
+        monkeypatch.setattr(st, "micro_map", {"GC": "MGC", "NQ": "MNQ"})
+        st._pub_atm_fallback_warned.clear()
+
+    def test_exact_name_kept(self):
+        assert st.resolve_publisher_atm("NQ_Goopi", "NQ 06-26") == "NQ_Goopi"
+
+    def test_snake_case_id_maps_to_root_prefixed_template(self):
+        assert st.resolve_publisher_atm("macro_zone_b", "GC 12-26") == "GC-MacroZoneB"
+
+    def test_root_disambiguates_between_markets(self):
+        assert st.resolve_publisher_atm("macro_zone_b", "NQ 06-26") == "NQ-MacroZoneB"
+
+    def test_micro_instrument_resolves_full_size_root(self):
+        assert st.resolve_publisher_atm("macro_zone_b", "MGC 12-26") == "GC-MacroZoneB"
+
+    def test_bare_template_matches_without_prefix(self):
+        assert st.resolve_publisher_atm("bread_n_butter", "GC 12-26") == "BreadNButter"
+
+    def test_root_specific_template_preferred_over_bare(self):
+        assert st.resolve_publisher_atm("bhorgini", "GC 12-26") == "GC-Bhorgini"
+
+    def test_alias_maps_abbreviated_template(self, monkeypatch):
+        monkeypatch.setattr(st, "atm_aliases", {"mss_de_composite": "MSSComp"})
+        assert st.resolve_publisher_atm("mss_de_composite", "NQ 06-26") == "NQ-MSSComp"
+
+    def test_alias_can_target_exact_template(self, monkeypatch):
+        monkeypatch.setattr(st, "atm_aliases", {"mystery_strat": "NQ_Goopi"})
+        assert st.resolve_publisher_atm("mystery_strat", "GC 12-26") == "NQ_Goopi"
+
+    def test_unknown_id_returns_none(self):
+        assert st.resolve_publisher_atm("hmm_squeeze_v3", "NQ 06-26") is None
+
+    def test_empty_returns_none(self):
+        assert st.resolve_publisher_atm("", "GC 12-26") is None
+
+    def test_follow_mode_end_to_end_uses_gold_template(self):
+        msg = json.dumps({"signal": "PLACE;pub;GC 12-26;BUY;1;MARKET;;;DAY;;;"
+                          "macro_zone_b;ent:gc_macro_zone_b", "ts": 1})
+        result, _, _, reason = st.extract_signal_string(
+            msg, "Sim101", "NQ_Goopi", follow_publisher=True)
+        assert reason is None
+        assert result.split(";")[11] == "GC-MacroZoneB"
+
+    def test_follow_mode_unknown_publisher_falls_back(self):
+        msg = json.dumps({"signal": "PLACE;pub;GC 12-26;BUY;1;MARKET;;;DAY;;;"
+                          "mystery_strat;123", "ts": 1})
+        result, _, _, _ = st.extract_signal_string(
+            msg, "Sim101", "NQ_Goopi", follow_publisher=True)
+        assert result.split(";")[11] == "NQ_Goopi"
+
+    def test_locked_mode_ignores_publisher(self):
+        msg = json.dumps({"signal": "PLACE;pub;GC 12-26;BUY;1;MARKET;;;DAY;;;"
+                          "macro_zone_b;123", "ts": 1})
+        result, _, _, _ = st.extract_signal_string(
+            msg, "Sim101", "NQ_Goopi", follow_publisher=False)
+        assert result.split(";")[11] == "NQ_Goopi"
+
+
 # ── Config persistence ────────────────────────────────────────────────
 
 
@@ -458,10 +529,28 @@ class TestFireClosePosition:
         st.output_directory = str(tmp_output_dir)
         try:
             st.fire_close_position("Sim101", "NQ 06-26")
-            files = list(tmp_output_dir.glob("close_*.txt"))
+            files = list(tmp_output_dir.glob("oifclose_*.txt"))
             assert len(files) == 1
             content = files[0].read_text()
             assert content.startswith("CLOSEPOSITION;Sim101;NQ 06-26")
+        finally:
+            st.output_directory = original
+
+    def test_every_ati_file_is_named_oif(self, tmp_output_dir):
+        """NT8 executes only incoming files named oif*.txt; anything else
+        is consumed and discarded with "Unknown OIF file type" and NO
+        order fires. close_*/cancel_* names turned every file-path
+        flatten into a silent no-op (NT trace 2026-08-10 23:31 — two
+        followers left holding NQ after the web Flat button)."""
+        original = st.output_directory
+        st.output_directory = str(tmp_output_dir)
+        try:
+            st.fire_close_position("Sim101", "NQ 06-26")
+            st.fire_cancel_order("abc123")
+            st.write_signal_to_file("PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;NQ_Med;1")
+            names = [f.name for f in tmp_output_dir.iterdir()]
+            assert len(names) == 3
+            assert all(n.startswith("oif") and n.endswith(".txt") for n in names)
         finally:
             st.output_directory = original
 
@@ -779,7 +868,7 @@ class TestCloseAllOpenPositions:
                               return_value={"NQ 06-26": 2, "ES 06-26": -1}):
                 closed = st.close_all_open_positions()
             assert set(closed) == {"NQ 06-26", "ES 06-26"}
-            close_files = list(tmp_output_dir.glob("close_*.txt"))
+            close_files = list(tmp_output_dir.glob("oifclose_*.txt"))
             assert len(close_files) == 2
             # No global CANCELALLORDERS files — cancels are per-order now
             assert list(tmp_output_dir.glob("cancelall_*.txt")) == []
@@ -801,7 +890,7 @@ class TestCloseAllOpenPositions:
                               return_value={"NQ 06-26": 0, "ES 06-26": 1}):
                 closed = st.close_all_open_positions()
             assert closed == ["ES 06-26"]
-            close_files = list(tmp_output_dir.glob("close_*.txt"))
+            close_files = list(tmp_output_dir.glob("oifclose_*.txt"))
             assert len(close_files) == 1
         finally:
             st.active_account = original_acct
@@ -818,7 +907,7 @@ class TestCloseAllOpenPositions:
             with patch.object(st, "query_nt_positions", return_value={}):
                 closed = st.close_all_open_positions()
             assert "MNQ 06-26" in closed
-            close_files = list(tmp_output_dir.glob("close_*.txt"))
+            close_files = list(tmp_output_dir.glob("oifclose_*.txt"))
             assert len(close_files) == 1
             assert "MNQ 06-26" in close_files[0].read_text()
         finally:
@@ -852,7 +941,7 @@ class TestCloseAllOpenPositions:
                               return_value={"NQ 06-26": 1, "ES 06-26": 2}):
                 closed = st.close_all_open_positions()
             assert set(closed) == {"NQ 06-26", "ES 06-26"}
-            close_files = list(tmp_output_dir.glob("close_*.txt"))
+            close_files = list(tmp_output_dir.glob("oifclose_*.txt"))
             assert len(close_files) == 2
         finally:
             st.active_account = original_acct
@@ -894,7 +983,7 @@ class TestScopedCancel:
             with patch.object(st, "_query_ati", return_value=self.DUMP):
                 n = st.fire_cancel_account_orders("Sim101")
             assert n == 2
-            files = sorted(tmp_output_dir.glob("cancel_*.txt"))
+            files = sorted(tmp_output_dir.glob("oifcancel_*.txt"))
             contents = sorted(p.read_text() for p in files)
             assert contents == ["CANCEL;;;;;;;;;;aaa;;", "CANCEL;;;;;;;;;;ccc;;"]
             assert list(tmp_output_dir.glob("cancelall_*.txt")) == []
@@ -917,7 +1006,7 @@ class TestScopedCancel:
              patch.object(st, "query_nt_positions", return_value={"NQ 06-26": 1}):
             closed = st.close_account_positions("Sim101")
         assert closed == ["NQ 06-26"]
-        cancels = [f.read_text() for f in tmp_output_dir.glob("cancel_*.txt")]
+        cancels = [f.read_text() for f in tmp_output_dir.glob("oifcancel_*.txt")]
         assert cancels == ["CANCEL;;;;;;;;;;oid1;;"]
         assert list(tmp_output_dir.glob("cancelall_*.txt")) == []
 
@@ -1300,7 +1389,7 @@ class TestCloseAllMultiAccount:
 
         assert closed == ["NQ 06-26"]
         # One CLOSEPOSITION per account (2); no global CANCELALLORDERS
-        close_files = list(tmp_output_dir.glob("close_*.txt"))
+        close_files = list(tmp_output_dir.glob("oifclose_*.txt"))
         assert len(close_files) == 2
         assert list(tmp_output_dir.glob("cancelall_*.txt")) == []
         closed_accounts = {f.read_text().split(";")[1] for f in close_files}
@@ -1312,7 +1401,7 @@ class TestCloseAllMultiAccount:
         with patch.object(st, "output_directory", str(tmp_output_dir)), \
              patch.object(st, "query_nt_positions", return_value={"NQ 06-26": 1}):
             st.close_all_open_positions()
-        close_files = list(tmp_output_dir.glob("close_*.txt"))
+        close_files = list(tmp_output_dir.glob("oifclose_*.txt"))
         assert len(close_files) == 1
         assert close_files[0].read_text().split(";")[1] == "Sim101"
 
@@ -1435,7 +1524,7 @@ class TestPerAccountRisk:
         assert st.account_stops == {"Sim102": "hard"}
         assert st.tradeable_accounts() == ["Sim101"]  # leader still trades
         # only Sim102 flattened
-        close_files = list(tmp_output_dir.glob("close_*.txt"))
+        close_files = list(tmp_output_dir.glob("oifclose_*.txt"))
         assert {f.read_text().split(";")[1] for f in close_files} == {"Sim102"}
 
     def test_recompute_hard_locks_when_all_hard(self):
@@ -3105,6 +3194,32 @@ class TestFlattenVerification:
         ok, msg = asyncio.run(st._web_close_all())
         assert ok is False and "INCOMPLETE" in msg
 
+    def test_single_account_flat_confirms(self, monkeypatch):
+        self._arm(monkeypatch, [])
+        monkeypatch.setattr(st, "close_account_positions", lambda a: ["MNQ 09-26"])
+        ok, msg = asyncio.run(st._web_flatten_account("F1"))
+        assert ok is True and "confirmed" in msg
+
+    def test_single_account_flat_reports_survivor(self, monkeypatch):
+        # The per-account web Flat button's original sin: it answered
+        # "close sent" from the request alone. On 2026-08-10 NT had
+        # discarded every close file and both followers stayed in the
+        # market while the UI reported success.
+        self._arm(monkeypatch, [{"account": "F1", "instrument": "MNQ 09-26",
+                                 "qty": 2, "avg_price": 1.0}])
+        monkeypatch.setattr(st, "close_account_positions", lambda a: ["MNQ 09-26"])
+        ok, msg = asyncio.run(st._web_flatten_account("F1"))
+        assert ok is False and "INCOMPLETE" in msg and "F1" in msg
+
+    def test_single_account_ignores_other_accounts_positions(self, monkeypatch):
+        # LEAD still holding must not fail F1's verdict — only the
+        # flattened account is verified.
+        self._arm(monkeypatch, [{"account": "LEAD", "instrument": "MNQ 09-26",
+                                 "qty": 1, "avg_price": 1.0}])
+        monkeypatch.setattr(st, "close_account_positions", lambda a: ["MNQ 09-26"])
+        ok, msg = asyncio.run(st._web_flatten_account("F1"))
+        assert ok is True and "confirmed" in msg
+
 
 class TestFlattenOrdering:
     def test_leader_is_flattened_first(self, monkeypatch):
@@ -3469,7 +3584,7 @@ class TestReviewRegressions:
         with patch.object(st, "output_directory", str(tmp_output_dir)):
             closed = st.close_account_positions("A")
         assert closed == ["NQ 09-26"]
-        files = list(tmp_output_dir.glob("close_*.txt"))
+        files = list(tmp_output_dir.glob("oifclose_*.txt"))
         assert files, "no CLOSEPOSITION file written on the fallback path"
         assert "CLOSEPOSITION" in files[0].read_text()
 
