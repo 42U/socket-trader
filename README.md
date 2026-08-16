@@ -1,33 +1,28 @@
-<p align="center">
-  <img src="images/socket-traderLOGO.png" alt="SocketTrader" width="600">
-</p>
+<div align="center">
 
-<p align="center">
-  <strong>Real-time WebSocket signal gateway for NinjaTrader 8</strong>
-</p>
+# SocketTrader
 
-<p align="center">
-  <a href="https://github.com/42U/socket-trader/actions/workflows/ci.yml"><img src="https://github.com/42U/socket-trader/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white" alt="Python 3.10+"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
-  <a href="#"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue" alt="Platform"></a>
-  <a href="#ninjatrader-setup"><img src="https://img.shields.io/badge/NinjaTrader-8-orange" alt="NinjaTrader 8"></a>
-  <a href="https://voidorigin.com"><img src="https://img.shields.io/badge/VoidOrigin-signal%20server-blueviolet" alt="VoidOrigin"></a>
-</p>
+![SocketTrader](images/socket-traderLOGO.png)
 
-<p align="center">
-  <a href="#installation">Installation</a> &nbsp;·&nbsp;
-  <a href="#ninjatrader-setup">NinjaTrader Setup</a> &nbsp;·&nbsp;
-  <a href="#usage">Usage</a> &nbsp;·&nbsp;
-  <a href="#keyboard-controls">Controls</a> &nbsp;·&nbsp;
-  <a href="#risk-management">Risk</a> &nbsp;·&nbsp;
-  <a href="#signal-latency">Latency</a> &nbsp;·&nbsp;
-  <a href="#configuration">Config</a>
-</p>
+[![VoidOrigin](https://img.shields.io/badge/VOIDORIGIN-voidorigin.com-0a0a0a?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiIHN0cm9rZT0iI2ZmNmIzNSIgc3Ryb2tlLXdpZHRoPSIyIi8+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iNCIgZmlsbD0iI2ZmNmIzNSIvPjwvc3ZnPg==&logoColor=ff6b35&labelColor=0a0a0a)](https://voidorigin.com)
+
+[![Version](https://img.shields.io/badge/v0.14.0-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
+[![GitHub Stars](https://img.shields.io/github/stars/42U/socket-trader?style=for-the-badge&logo=github&color=gold)](https://github.com/42U/socket-trader)
+[![License: MIT](https://img.shields.io/github/license/42U/socket-trader?style=for-the-badge&logo=opensourceinitiative&color=blue)](https://opensource.org/licenses/MIT)
+[![CI](https://img.shields.io/github/actions/workflow/status/42U/socket-trader/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/downloads/)
+[![NinjaTrader](https://img.shields.io/badge/NinjaTrader-8-ff6b00?style=for-the-badge)](https://ninjatrader.com)
+[![Tests](https://img.shields.io/badge/Tests-566_passing-brightgreen?style=for-the-badge&logo=pytest&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
+
+**One WebSocket signal in — verified NinjaTrader orders out, across every account you run.**
+
+[Install](#installation) | [NinjaTrader Setup](#ninjatrader-setup) | [Copy Trading](#copy-trading) | [Prop Firm Mode](#prop-firm-mode) | [Risk](#risk-management) | [Web UI](#manual-trading--web-ui) | [Config](#configuration)
+
+</div>
 
 ---
 
-## Overview
+## What it does
 
 SocketTrader connects to a remote signal server over WebSocket, receives trading signals in real time, and writes them directly into NinjaTrader 8's `incoming/` folder for automated order execution.
 
@@ -63,7 +58,11 @@ The sim account is automatically swapped with your real NinjaTrader account name
 | **Cross-platform** | Windows and Linux support |
 | **Copy trading** | Fan one signal out to a leader account **plus multiple follower accounts** — one order file per account |
 | **Round-robin** | Link accounts into a rotation pool: each **entry** goes to exactly **one** pool account, drawn randomly with no repeats until every pool account has traded a round — alongside copy trading |
+| **Prop firm mode** | Mark an account `prop` and the router enforces the rules a funded account lives under: **one position at a time with confirmed close-before-open**, no opposite sides across accounts (product-group aware), and a **verified flat-by-close** with per-firm deadline presets — research on ten firms in [`PROP_RULES.md`](PROP_RULES.md) |
+| **Global strategy filter** | One map — *"GoldStrat only trades GC, NasdaqStrat only NQ"* — applied to every account before any leg exists; exits are never filtered |
 | **Per-account profiles** | Each account can filter which **symbols it trades**, trade micros or full-size, its own contract count, inverted direction, delayed or staggered entries, its own ATM template, and an optional **AI gate** — scoped per symbol / publisher strategy |
+| **Balance outage armor** | A NinjaTrader broker-feed outage that zeroes every account reading is quarantined: last known balances are **held and marked stale** instead of tripping phantom stops or poisoning session baselines |
+| **Live trade monitor** | Optional NinjaTrader AddOn streams live equity (cash + unrealized) so stops and targets trip **mid-trade**, with native `account.Flatten()` for closes |
 | **Manual trading** | Press `O` (or use the web UI) to submit your own long/short market/limit order with an ATM template — it fans out through copy trading, round-robin, and profiles exactly like a publisher signal |
 | **Web UI** | A localhost control panel starts with the app: live dashboard, manual orders, pause/flatten/reconnect, micro toggle, accounts, strategy, limits, and profiles from the browser |
 | **Micro mode** | One toggle converts every signal to its CME micro contract — NQ→MNQ, ES→MES, RTY→M2K, GC→MGC, … |
@@ -89,13 +88,29 @@ The sim account is automatically swapped with your real NinjaTrader account name
 
 ## Installation
 
+### One double-click (Windows)
+
+The whole setup — Python, dependencies, the app, NinjaTrader's ATM templates, and shortcuts — is one file:
+
+1. [**Download the repo ZIP**](https://github.com/42U/socket-trader/archive/refs/heads/main.zip) and extract it anywhere.
+2. Double-click **`install.bat`**.
+
+That's it. The installer (no admin rights needed) checks for Python 3.10+ and installs it via winget if missing, downloads the latest SocketTrader into `%LOCALAPPDATA%\SocketTrader`, installs dependencies **and proves the app imports** before calling it done, files the ATM/stop templates into NinjaTrader's own template folders (OneDrive-redirected Documents included), creates Desktop and Start Menu shortcuts, and checks whether NinjaTrader's AT Interface is switched on — telling you exactly where to enable it if not. First launch asks for your server, token, and account; nothing else.
+
+> Windows SmartScreen may show *"Windows protected your PC"* the first time — click **More info → Run anyway**. The `.bat` exists precisely so you never have to touch PowerShell execution policy yourself.
+
+**Re-run the installer any time to update.** Your config (`~/.voidorigin_config.json`) and any templates you've edited are left untouched. CI runs this installer end to end on a clean Windows machine on every push.
+
+### Manual (any OS)
+
 ```bash
 git clone https://github.com/42U/socket-trader.git
 cd socket-trader
 pip install -r requirements.txt
+python SocketTrader.py
 ```
 
-**Requirements:** Python 3.10+ &nbsp;·&nbsp; NinjaTrader 8 (Windows) or any target directory (Linux)
+**Requirements:** Python 3.10+ &nbsp;·&nbsp; NinjaTrader 8 (Windows) or any target directory (Linux/WSL2)
 
 ### Running the tests
 
@@ -679,10 +694,12 @@ Settings persist in `~/.voidorigin_config.json`:
 | `output_directory` | Path to NinjaTrader 8 `incoming/` folder |
 | `nt_port` | NinjaTrader AT Interface port |
 | `account_limits` | Per-account risk management settings |
-| `account_profiles` | Per-account trade profiles — allowed-symbols filter (`symbols_allowed`), size, contracts, direction, delay, stagger, ATM override, AI gate (see [Per-Account Profiles](#per-account-profiles)) |
-| `hedge_guard` | What to do when an entry fan-out would open **opposite sides** of one underlying across accounts — `warn` (default), `block`, or `off`. See [Cross-account hedging](#cross-account-hedging) |
+| `account_profiles` | Per-account trade profiles — allowed-symbols filter (`symbols_allowed`), size, contracts, direction, delay, stagger, ATM override, AI gate, and the prop-firm flag (`prop`, `prop_firm`, `prop_flat_et`, `prop_cutoff_et` — see [Prop Firm Mode](#prop-firm-mode)) |
+| `strategy_symbols` | Global strategy → symbol filter, e.g. `{ "GoldStrat": ["GC"] }` — a listed publisher strategy only **enters** trades on its listed markets, on every account (see [Global Strategy → Symbol Filter](#global-strategy--symbol-filter)) |
+| `hedge_guard` | What to do when an entry fan-out would open **opposite sides** of one underlying across accounts — `warn` (default), `block`, or `off`; **auto-escalates to `block` when a prop account is involved**. See [Cross-account hedging](#cross-account-hedging) |
 | `webui_enabled` | Start the localhost web UI with the app (default `true`) |
 | `webui_port` | Web UI port (default `8720`, localhost only) |
+| `live_bridge_enabled` / `live_bridge_port` | The optional live trade monitor AddOn — streamed equity for mid-trade stop/target enforcement (see [Optional Live Trade Monitor](#optional-live-trade-monitor)) |
 | `roundrobin_accounts` | Accounts in the rotation pool — each entry signal goes to one of them in random no-repeat rounds (see [Round-Robin Mode](#round-robin-mode)) |
 
 > This file contains your authentication token and is excluded from version control via `.gitignore`. On non-Windows systems, file permissions are set to `0600` (owner-only).

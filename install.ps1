@@ -12,7 +12,7 @@
     Steps, each of which is skipped if already satisfied:
       1. Python 3.10+            (via winget, or a direct download link)
       2. SocketTrader itself     (into %LOCALAPPDATA%\SocketTrader)
-      3. Python dependencies     (pip, into that folder)
+      3. Python dependencies     (pip), then a proof the app imports
       4. ATM strategy templates  (copied into NinjaTrader's templates folder)
       5. Desktop + Start Menu shortcut
       6. A check that NinjaTrader's Automated Trading Interface is switched on
@@ -135,6 +135,13 @@ $reqs = Join-Path $InstallDir 'requirements.txt'
 if ($LASTEXITCODE -ne 0) { throw 'pip install failed.' }
 Write-Ok 'Dependencies installed'
 
+# Prove the app actually starts with THIS interpreter before calling it
+# installed — a broken dependency or a stub Python surfaces here, at
+# install time, instead of at the user's first launch. Same check CI runs.
+$appVer = & $py.Exe @($py.Prefix) -c "import sys; sys.path.insert(0, r'$InstallDir'); import SocketTrader; print(SocketTrader.__version__)" 2>&1
+if ($LASTEXITCODE -ne 0) { throw "SocketTrader failed its import check: $appVer" }
+Write-Ok "SocketTrader v$appVer imports cleanly"
+
 # ---- 4. ATM strategy templates ------------------------------------------
 Write-Step 4 'Installing ATM strategy templates into NinjaTrader'
 $ntRoot = Get-NinjaTraderRoot
@@ -219,4 +226,6 @@ if ($atiOpen) {
 Write-Host ""
 Write-Host "  Done. Launch SocketTrader from the desktop shortcut." -ForegroundColor Green
 Write-Host "  First run asks for your server, token and account - nothing else." -ForegroundColor DarkGray
+Write-Host "  Re-run this installer any time to update: your config and any" -ForegroundColor DarkGray
+Write-Host "  templates you have edited are left untouched." -ForegroundColor DarkGray
 Write-Host ""
