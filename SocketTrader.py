@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.12.0"
+__version__ = "0.12.1"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -179,6 +179,92 @@ session_contracts: set[str] = set()              # instruments traded this sessi
 soft_stopped = False                              # True if soft stop triggered
 hard_stopped = False                              # True if hard stop triggered
 BALANCE_POLL_INTERVAL = 3                         # seconds between balance checks
+
+# A NinjaTrader broker-connection outage zeroes every AccountItem while the
+# ATI port and the bridge AddOn keep answering, so a $52k account suddenly
+# reads $0.00 and session P&L swings to -$52k of phantom loss — enough to
+# trip a session stop, and enough to poison the 4:20 PM baseline re-snapshot
+# into +$52k of phantom profit after reconnect. A real balance cannot step to
+# exactly $0.00 between two polls, so zero readings are quarantined: the last
+# known balance is held (and shown as stale) until real data returns.
+BALANCE_ZERO_EPS = 0.005    # cents precision: |reading| below this is "zero"
+_balance_suspect_since: dict[str, float] = {}   # account -> monotonic ts of first quarantined read
+
+
+def _suspect_zero_balance(account: str, value: float) -> bool:
+    """True when a ~$0.00 reading contradicts a materially nonzero last-known
+    balance — the signature of NT answering while its broker feed is down."""
+    if abs(value) > BALANCE_ZERO_EPS:
+        return False
+    last = session_current_balances.get(account)
+    if last is None:
+        last = session_start_balances.get(account)
+    return last is not None and abs(last) > BALANCE_ZERO_EPS
+
+
+def _ingest_balance(account: str, value, source: str) -> bool:
+    """Gate every polled/streamed balance before it enters
+    session_current_balances; True when the reading was accepted.
+
+    A rejected reading freezes the account at its last known balance so the
+    P&L display, the stop/target enforcement and the 4:20 PM baseline
+    re-snapshot all keep operating on real numbers through an outage.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(v):
+        return False
+    if _suspect_zero_balance(account, v):
+        if account not in _balance_suspect_since:
+            _balance_suspect_since[account] = time.monotonic()
+            last = session_current_balances.get(
+                account, session_start_balances.get(account))
+            logger.warning(
+                f"BALANCE SUSPECT  {source} reported ${v:,.2f} for {account} "
+                f"(last known ${last:,.2f}) — NinjaTrader connection likely "
+                "down; holding last known balance")
+            _dash_set_alert(
+                Fore.YELLOW + f"  ⚠  NinjaTrader reports $0.00 for {account}"
+                " — connection lost? Holding last known balance." +
+                Style.RESET_ALL, sticky=True)
+        return False
+    started = _balance_suspect_since.pop(account, None)
+    if started is not None:
+        logger.info(f"BALANCE RESTORED  {source} {account} ${v:,.2f} "
+                    f"after {time.monotonic() - started:.0f}s")
+        _dash_set_alert(
+            Fore.GREEN + f"  ✔  NinjaTrader balance feed restored for "
+            f"{account} (${v:,.2f})." + Style.RESET_ALL)
+    session_current_balances[account] = v
+    return True
+
+
+def _seed_start_balance(account: str, cash: float):
+    """First real reading becomes the session baseline — never a ~$0.00 one.
+
+    Seeding $0 while NT is disconnected would reconnect as pure phantom
+    "profit"; a truly empty account loses nothing by having no baseline."""
+    if account not in session_start_balances and abs(cash) > BALANCE_ZERO_EPS:
+        session_start_balances[account] = cash
+
+
+def _held_balance(account: str, polled) -> float | None:
+    """A fresh ATI reading for display, with outage artifacts substituted by
+    the last known good balance (None only when nothing is known at all)."""
+    try:
+        v = float(polled)
+    except (TypeError, ValueError):
+        v = None
+    if v is not None and math.isfinite(v) and not _suspect_zero_balance(account, v):
+        return v
+    held = session_current_balances.get(account)
+    if held is None:
+        held = session_start_balances.get(account)
+    if held is None and v is not None and math.isfinite(v):
+        held = v
+    return held
 
 # Auto-reset: futures session ends ~4:15 PM ET, reset P&L at 4:20 PM ET
 try:
@@ -3090,14 +3176,18 @@ def _build_controls_line():
         lead = active_account + (f"+{len(follower_accounts)}" if follower_accounts else "")
         start = session_start_balances.get(active_account)
         current = session_current_balances.get(active_account)
+        # A quarantined feed (NT outage) freezes `current`; say so instead
+        # of letting a frozen number read as live.
+        stale = "  ⚠ stale" if active_account in _balance_suspect_since else ""
+        stale_colored = (Fore.YELLOW + stale + Fore.CYAN + Style.DIM) if stale else ""
         if start is not None and current is not None:
             pnl = current - start
             pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
-            acct_info = f"{lead}: ${current:,.2f} (${pnl:+,.2f})"
-            acct_info_colored = f"{lead}: ${current:,.2f} (" + pnl_color + f"${pnl:+,.2f}" + Fore.CYAN + Style.DIM + ")"
+            acct_info = f"{lead}: ${current:,.2f} (${pnl:+,.2f}){stale}"
+            acct_info_colored = f"{lead}: ${current:,.2f} (" + pnl_color + f"${pnl:+,.2f}" + Fore.CYAN + Style.DIM + ")" + stale_colored
         elif current is not None:
-            acct_info = f"{lead}: ${current:,.2f}"
-            acct_info_colored = acct_info
+            acct_info = f"{lead}: ${current:,.2f}{stale}"
+            acct_info_colored = acct_info if not stale else f"{lead}: ${current:,.2f}" + stale_colored
         elif start is not None:
             acct_info = f"{lead}: ${start:,.2f}"
             acct_info_colored = acct_info
@@ -4666,7 +4756,9 @@ async def show_balances():
     print(Fore.CYAN + f"  ╭─ BALANCES {'─' * (box_inner - 9)}╮" + Style.RESET_ALL)
     for a in accounts:
         name = a["name"]
-        cash = a["cash"]
+        cash = _held_balance(name, a["cash"])  # outage zeros → last known
+        if cash is None:
+            continue
         if name == active_account:
             marker = " ◀"
         elif name in follower_accounts:
@@ -5941,11 +6033,10 @@ async def live_bridge_task():
                     # Only drive session_current_balances for the active
                     # account — other accounts still get CashValue from
                     # balance_monitor, which is enough for their display.
+                    # _ingest_balance quarantines the equity:0 heartbeats NT
+                    # keeps streaming while its broker connection is down.
                     if name == active_account:
-                        try:
-                            session_current_balances[name] = float(eq)
-                        except (TypeError, ValueError):
-                            pass
+                        _ingest_balance(name, eq, "bridge")
         except asyncio.CancelledError:
             try: writer.close()
             except Exception: pass
@@ -5986,7 +6077,13 @@ async def balance_monitor():
                 if (live_bridge_enabled and _live_bridge_connected
                         and a["name"] == active_account):
                     continue  # bridge is authoritative here
-                session_current_balances[a["name"]] = a["cash"]
+                if not _ingest_balance(a["name"], a["cash"], "ATI poll"):
+                    continue
+                # Late baseline: an account with no start yet (NT was down
+                # when the session began) gets one from its first real
+                # reading — otherwise it would run all session with no P&L
+                # and no stop/target enforcement.
+                _seed_start_balance(a["name"], a["cash"])
             refresh_controls()
 
             # Auto-reset P&L at 4:20 PM ET (futures session boundary)
@@ -6094,7 +6191,8 @@ async def prompt_limits():
 
     limits = get_account_limits(acct)
     start_bal = session_start_balances.get(acct)
-    current_bal = await asyncio.to_thread(query_nt_balance, acct)
+    current_bal = _held_balance(
+        acct, await asyncio.to_thread(query_nt_balance, acct))
 
     _lim_inner = 52
     _lim_title = f"─ SESSION LIMITS ({'ALL ACCOUNTS' if apply_all else acct}) "
@@ -6265,9 +6363,8 @@ async def listen(token: str):
                 # — the monitor then trips the session limit if crossed.
                 nt_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
                 for a in nt_accounts:
-                    if a["name"] not in session_start_balances:
-                        session_start_balances[a["name"]] = a["cash"]
-                    session_current_balances[a["name"]] = a["cash"]
+                    if _ingest_balance(a["name"], a["cash"], "session snapshot"):
+                        _seed_start_balance(a["name"], a["cash"])
 
                 # Only announce a restore on first boot — mid-run reconnects
                 # re-apply state that never left memory, and the row is
@@ -6772,6 +6869,7 @@ def web_state() -> dict:
         accounts.append({
             "name": name, "role": role, "start": start, "current": current,
             "pnl": pnl, "stop": account_stops.get(name),
+            "stale": name in _balance_suspect_since,
             "profile": profile_summary(name),
             "limits": get_account_limits(name),
         })
@@ -7141,9 +7239,15 @@ def web_live(force: bool = False) -> dict:
             snap = {"ok": False, "accounts": {}, "positions": [],
                     "working": {}, "ts": time.time()}
         # A truncated or failed dump must not be rendered as "these accounts
-        # and positions are gone" — that is what made rows blink. Serve the
-        # last good view instead and let the timestamp show it is stale.
-        if not snap.get("ok") and _live_cache.get("last_good"):
+        # and positions are gone" — that is what made rows blink. Same for a
+        # dump that answers with AccountItems zeroed out: that is NT with its
+        # broker connection down, not accounts at $0. Serve the last good
+        # view instead and let the timestamp show it is stale.
+        zeroed = bool(snap.get("ok")) and any(
+            isinstance(info.get("cash"), (int, float))
+            and _suspect_zero_balance(name, info["cash"])
+            for name, info in snap["accounts"].items())
+        if (not snap.get("ok") or zeroed) and _live_cache.get("last_good"):
             stale = dict(_live_cache["last_good"])
             stale["stale"] = True
             _live_cache.update(ts=time.time(), data=stale)
@@ -7163,7 +7267,7 @@ def web_live(force: bool = False) -> dict:
             else:
                 role = ""
             start = session_start_balances.get(name)
-            cash = info.get("cash")
+            cash = _held_balance(name, info.get("cash"))  # outage zeros → last known
             session_pnl = (cash - start) if (start is not None and cash is not None) else None
             rows.append({
                 "name": name,

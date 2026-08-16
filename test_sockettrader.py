@@ -66,6 +66,7 @@ def reset_session_state():
     """Reset global session state between tests."""
     st.session_start_balances.clear()
     st.session_current_balances.clear()
+    st._balance_suspect_since.clear()
     st.session_contracts.clear()
     st.soft_stopped = False
     st.hard_stopped = False
@@ -3669,3 +3670,125 @@ class TestAiConfigValidation:
         out = st._strip_ai_config(raw)
         assert out["A"]["default"] == {"size": "micros"}
         assert out["A"]["rules"][0] == {"symbols": ["NQ"]}
+
+
+# ── Balance quarantine (NT outage reports $0.00) ──────────────────────
+
+
+class TestBalanceQuarantine:
+    """NT zeroes every AccountItem while its broker connection is down, so a
+    $52k account suddenly polls as $0.00 and session P&L displayed -$52k.
+    These verify zero readings are quarantined instead of stored."""
+
+    def test_zero_after_nonzero_is_suspect(self):
+        st.session_current_balances["Apex1"] = 52776.40
+        assert st._suspect_zero_balance("Apex1", 0.0) is True
+
+    def test_zero_with_no_history_is_not_suspect(self):
+        assert st._suspect_zero_balance("Fresh", 0.0) is False
+
+    def test_zero_when_already_zero_is_not_suspect(self):
+        st.session_current_balances["Empty"] = 0.0
+        assert st._suspect_zero_balance("Empty", 0.0) is False
+
+    def test_nonzero_reading_is_never_suspect(self):
+        st.session_current_balances["Apex1"] = 52776.40
+        assert st._suspect_zero_balance("Apex1", 12.34) is False
+
+    def test_start_balance_backs_the_check_when_current_missing(self):
+        st.session_start_balances["Apex1"] = 52776.40
+        assert st._suspect_zero_balance("Apex1", 0.0) is True
+
+    def test_ingest_quarantines_outage_zero_and_holds_last_value(self):
+        st.session_current_balances["Apex1"] = 52776.40
+        assert st._ingest_balance("Apex1", 0.0, "test") is False
+        assert st.session_current_balances["Apex1"] == 52776.40
+        assert "Apex1" in st._balance_suspect_since
+
+    def test_ingest_recovers_when_real_value_returns(self):
+        st.session_current_balances["Apex1"] = 52776.40
+        st._ingest_balance("Apex1", 0.0, "test")
+        assert st._ingest_balance("Apex1", 52801.15, "test") is True
+        assert st.session_current_balances["Apex1"] == 52801.15
+        assert "Apex1" not in st._balance_suspect_since
+
+    def test_ingest_accepts_normal_updates(self):
+        st.session_current_balances["Apex1"] = 52776.40
+        assert st._ingest_balance("Apex1", 52700.00, "test") is True
+        assert st.session_current_balances["Apex1"] == 52700.00
+
+    def test_ingest_accepts_genuine_zero_account(self):
+        # An account that has always read $0 keeps reading $0.
+        assert st._ingest_balance("Empty", 0.0, "test") is True
+        assert st.session_current_balances["Empty"] == 0.0
+
+    def test_ingest_rejects_garbage_without_storing(self):
+        st.session_current_balances["Apex1"] = 52776.40
+        assert st._ingest_balance("Apex1", None, "test") is False
+        assert st._ingest_balance("Apex1", "abc", "test") is False
+        assert st._ingest_balance("Apex1", float("nan"), "test") is False
+        assert st._ingest_balance("Apex1", float("inf"), "test") is False
+        assert st.session_current_balances["Apex1"] == 52776.40
+
+    def test_pnl_never_swings_negative_by_full_account_on_outage(self):
+        # The reported symptom: a disconnect made the dashboard show
+        # 0 - 52,776.40 = -$52,776.40. The quarantine holds P&L instead.
+        st.session_start_balances["Apex1"] = 52776.40
+        st.session_current_balances["Apex1"] = 52950.00   # +$173.60 today
+        st._ingest_balance("Apex1", 0.0, "bridge")        # outage heartbeat
+        pnl = (st.session_current_balances["Apex1"]
+               - st.session_start_balances["Apex1"])
+        assert pnl == pytest.approx(173.60)
+
+    def test_suspect_alert_fires_once_per_outage(self):
+        st.session_current_balances["Apex1"] = 52776.40
+        st._ingest_balance("Apex1", 0.0, "test")
+        first_alert = st._alert_text
+        st._alert_text = ""                       # something else cleared it
+        st._ingest_balance("Apex1", 0.0, "test")  # next zero heartbeat
+        assert "NinjaTrader" in first_alert
+        assert st._alert_text == ""               # no re-alert while suspect
+
+    def test_reset_during_outage_keeps_real_baseline(self):
+        # A 4:20 PM auto-reset while NT is down must not snapshot $0 as the
+        # new baseline — that read as +$52k phantom profit after reconnect.
+        st.session_start_balances["Apex1"] = 52776.40
+        st.session_current_balances["Apex1"] = 52950.00
+        st._ingest_balance("Apex1", 0.0, "test")          # outage begins
+        st.reset_session_pnl()
+        assert st.session_start_balances["Apex1"] == 52950.00
+
+    def test_seed_start_balance_refuses_zero_and_never_overwrites(self):
+        st._seed_start_balance("Apex1", 0.0)
+        assert "Apex1" not in st.session_start_balances
+        st._seed_start_balance("Apex1", 52776.40)
+        assert st.session_start_balances["Apex1"] == 52776.40
+        st._seed_start_balance("Apex1", 99999.0)
+        assert st.session_start_balances["Apex1"] == 52776.40
+
+    def test_held_balance_passthrough_and_substitution(self):
+        st.session_current_balances["Apex1"] = 52776.40
+        assert st._held_balance("Apex1", 52800.0) == 52800.0
+        assert st._held_balance("Apex1", 0.0) == 52776.40   # outage zero
+        assert st._held_balance("Unknown", 0.0) == 0.0      # no history: trust it
+        assert st._held_balance("Unknown", None) is None
+
+    def test_held_balance_falls_back_to_start(self):
+        st.session_start_balances["Apex1"] = 52776.40
+        assert st._held_balance("Apex1", 0.0) == 52776.40
+
+    def test_stale_marker_in_controls_line(self):
+        st.active_account = "Apex1"
+        st.session_start_balances["Apex1"] = 52776.40
+        st.session_current_balances["Apex1"] = 52950.00
+        st._ingest_balance("Apex1", 0.0, "test")
+        line = st._build_controls_line()
+        assert "⚠ stale" in line
+        assert "$52,950.00" in line               # holds last known balance
+
+    def test_no_stale_marker_when_feed_healthy(self):
+        st.active_account = "Apex1"
+        st.session_start_balances["Apex1"] = 52776.40
+        st.session_current_balances["Apex1"] = 52950.00
+        line = st._build_controls_line()
+        assert "stale" not in line
