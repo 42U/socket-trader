@@ -255,8 +255,10 @@ SocketTrader checks this **before** any order is written, comparing at the under
 | Mode | Behaviour |
 |---|---|
 | `warn` *(default)* | Orders fire; a sticky alert names the conflicting accounts and sides |
-| `block` | The **entry** legs are refused entirely and logged as skipped — **use this on prop-funded accounts** |
+| `block` | The **entry** legs are refused entirely and logged as skipped |
 | `off` | No check |
+
+When any account in the conflict is marked as a [prop account](#prop-firm-mode), the guard **escalates to `block` automatically** — whatever `hedge_guard` is set to, including `off`. For those accounts an opposite position across accounts is an account-closure event, not a strategy.
 
 Two things are never affected: **exits and reversals always flow** regardless of mode (stranding a live position is its own hazard), and a fan-out where *every* account inverts is not a conflict — the whole group simply fades the publisher together.
 
@@ -399,6 +401,58 @@ Profiles persist in `~/.voidorigin_config.json` under `account_profiles` and are
 ```
 
 Accounts without a profile behave exactly as before — identical copy of the leader's signal.
+
+### Global Strategy → Symbol Filter
+
+When a publisher strategy trades several markets but you only want some of them, a **global filter** restricts it in one place instead of per-account rule pairs: a listed strategy only *enters* trades on its listed symbols, **on every account** (micro twins included — `GC` covers `MGC`). Strategies not listed are unrestricted.
+
+Set it from the terminal (`S` → `8` → `G`), the web UI (STRATEGY modal → *Strategy symbol filters*), or config:
+
+```json
+"strategy_symbols": {
+  "GoldStrat":   ["GC"],
+  "NasdaqStrat": ["NQ"]
+}
+```
+
+A blocked entry is dropped before any leg — including the round-robin draw — exists, so no rotation turn is burned. Exit priority holds everywhere: closes are never filtered, and a reversal for a filtered-out market is downgraded to a `CLOSEPOSITION` for every account so the old position still exits. Per-account scoped rules still apply on top for accounts that need to deviate from the global map.
+
+---
+
+## Prop Firm Mode
+
+Futures prop firms (Apex, Topstep, MyFundedFutures, Take Profit Trader, Tradeify, Bulenox, Elite, FundedNext, Alpha, Lucid, …) ban configurations an ordinary broker account is free to run — and they judge the **resulting positions, not intent**, with account closure and profit forfeiture on the line. Mark an account as a prop account (`S` → `8` → account → `P`, the web UI's profile modal, or config) and SocketTrader enforces the rules an order router *can* enforce:
+
+1. **One position at a time — confirmed close-before-open.** When a signal is about to open a position on a prop account, every position that account holds in a *different* market is closed first, the close is **verified against NinjaTrader** (never assumed), and only then does the entry fire. If the close cannot be confirmed, the entry is **withheld** with a sticky alert — a missed trade is recoverable, a rule violation is not. Two strategies signalling two markets (your GC position, then an NQ entry) can never stack. Positions in the *same* contract are left alone — NinjaTrader nets those, so a partial exit stays a partial exit — while a micro/full twin (holding MNQ when NQ fires) is closed either direction: opposite is the classic intra-account hedge, and same-direction stacking across contract sizes is the cap-evasion pattern MFFU names a breach.
+2. **No opposite sides across accounts.** The [hedge guard](#cross-account-hedging) escalates to `block` whenever a prop account is part of an opposite-entry fan-out, and before a prop entry fires, any *other* managed prop account still holding the opposite side of that **product group** is flattened first (Tradeify scopes the ban to whole groups — long ES against short NQ counts; Apex names ES-vs-NQ opposing illegal outright).
+3. **Flat by the close.** Prop accounts are auto-flattened at their flat-by-close time — and the flatten is verified, retried, and alarmed if it fails — with new entries refused from the cutoff until the 18:00 ET reopen (Friday's cutoff holds through the weekend). Deadlines differ per firm, so naming the firm picks safe times:
+
+| `prop_firm` | Firm's own deadline | Auto-flat | Entry cutoff |
+|---|---|---|---|
+| `apex` | auto-liquidates 4:59 PM ET | 4:57 PM | 4:55 PM |
+| `topstep` | flat by 4:10 PM ET, staff flatten from 4:08 | 4:05 PM | 4:02 PM |
+| `mffu` | held past 4:10 PM ET **breaches the account** | 4:07 PM | 4:05 PM |
+| `tpt` | auto-closes 4:55 PM ET | 4:52 PM | 4:50 PM |
+| `tradeify` | auto-closes 4:59 PM ET (not a breach) | 4:57 PM | 4:55 PM |
+| `bulenox` | flat by 3:59 PM CT | 4:57 PM | 4:55 PM |
+| `elite` | 1 min before each instrument's close | 4:57 PM | 4:55 PM |
+| `fundednext` | flat by end of trading day | 4:57 PM | 4:55 PM |
+| `alpha` | closed before **4:20 PM ET** | 4:17 PM | 4:15 PM |
+| `lucid` | auto-liquidates 4:45 PM ET | 4:42 PM | 4:40 PM |
+| *(none / unknown)* | — | 4:57 PM | 4:55 PM |
+
+Override per account with `prop_flat_et` / `prop_cutoff_et` (`"HH:MM"` ET). Config shape:
+
+```json
+"account_profiles": {
+  "APEX-123456": { "prop": true, "prop_firm": "apex" },
+  "TST-789":     { "prop": true, "prop_firm": "topstep", "prop_flat_et": "16:00" }
+}
+```
+
+Prop entries run as background legs (the confirmation can take a few seconds); the dashboard shows `⏳ PROP one-trade rule — closing …` and then `✔ PROP entry placed`. Simple entries across many prop accounts share **one** close-confirm-enter wave, so the group lands together. Exits, as everywhere else in SocketTrader, are never blocked or delayed — a `REVERSEPOSITION` fires immediately and the one-position sweep trails it.
+
+**What marking an account prop does *not* cover** — rules no order router can enforce, which remain on you and your publisher: news-window blackouts (MFFU ±2 min, TPT ±1 min, Alpha ±2 min on funded accounts — consider the [AI gate](#ai-signal-gate) with event instructions, or `P` pause), minimum hold times (Elite: 10 s hard rule; FundedNext/Lucid flag scalps), no-DCA rules (Elite bans adding to losers), consistency percentages (payout gates, not order rules), and most importantly **each firm's automation policy** — Apex 4.0 prohibits automation outright, Take Profit Trader requires every trade be manually executed, Alpha bans bots, Elite/Bulenox require approved tools/written approval. A copier fanning out a human's manual trades is the sanctioned pattern at most firms; a fully automated publisher is not compliant everywhere. **Verify your setup against your firm's current rules — see [`PROP_RULES.md`](PROP_RULES.md)** for the per-firm research (official sources, quoted and linked) behind every number above.
 
 ---
 

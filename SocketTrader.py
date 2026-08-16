@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.12.1"
+__version__ = "0.14.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -187,8 +187,17 @@ BALANCE_POLL_INTERVAL = 3                         # seconds between balance chec
 # into +$52k of phantom profit after reconnect. A real balance cannot step to
 # exactly $0.00 between two polls, so zero readings are quarantined: the last
 # known balance is held (and shown as stale) until real data returns.
+# Known limits, by design: (1) a session-long genuine zeroing (the firm
+# liquidates the account intraday) is indistinguishable from an outage, so
+# enforcement freezes on the held balance with sticky STALE alerts as the
+# operator's signal — the 4:20 PM reset then drops the quarantined baseline
+# entirely so the next real reading re-seeds it clean. (2) An account whose
+# cash legitimately reads $0.00 gets no baseline and therefore no stop/
+# target enforcement until it reads nonzero; balance_monitor raises a
+# sticky warning when that account has limits configured.
 BALANCE_ZERO_EPS = 0.005    # cents precision: |reading| below this is "zero"
 _balance_suspect_since: dict[str, float] = {}   # account -> monotonic ts of first quarantined read
+_no_baseline_warned: set[str] = set()           # limits-without-baseline already warned
 
 
 def _suspect_zero_balance(account: str, value: float) -> bool:
@@ -241,11 +250,17 @@ def _ingest_balance(account: str, value, source: str) -> bool:
     return True
 
 
-def _seed_start_balance(account: str, cash: float):
+def _seed_start_balance(account: str, cash):
     """First real reading becomes the session baseline — never a ~$0.00 one.
 
     Seeding $0 while NT is disconnected would reconnect as pure phantom
     "profit"; a truly empty account loses nothing by having no baseline."""
+    try:
+        cash = float(cash)
+    except (TypeError, ValueError):
+        return
+    if not math.isfinite(cash):
+        return
     if account not in session_start_balances and abs(cash) > BALANCE_ZERO_EPS:
         session_start_balances[account] = cash
 
@@ -378,7 +393,17 @@ def restore_session_state() -> bool:
     if current_session and saved.get("id") == current_session:
         global signal_count, _rr_remaining, _rr_last
         for name, bal in saved.get("start_balances", {}).items():
-            session_start_balances[name] = bal
+            # Same guard as every other baseline write: a persisted ~$0.00
+            # (saved through an outage, possibly by an older build) must
+            # not come back as the baseline — recovery would read as pure
+            # phantom profit and trip targets. The account re-seeds from
+            # its first real reading instead.
+            try:
+                bal = float(bal)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(bal) and abs(bal) > BALANCE_ZERO_EPS:
+                session_start_balances[name] = bal
         session_contracts.update(saved.get("contracts", []))
         signal_count = saved.get("signal_count", 0)
         # Resume the round-robin rotation only if the pool is unchanged —
@@ -422,9 +447,36 @@ def _clear_positive_stops():
 def reset_session_pnl():
     """Re-snapshot all account balances and clear session state."""
     global soft_stopped, hard_stopped, signal_count, _last_auto_reset_date
-    # Re-snapshot current balances as new starting point
-    for name, bal in session_current_balances.items():
-        session_start_balances[name] = bal
+    # Re-snapshot current balances as new starting point. A ~$0.00 current
+    # must never become a baseline: it is either an outage artifact that
+    # slipped in with no history to quarantine against (app booted while NT
+    # was down) or an account that cannot trade anyway — and snapshotting
+    # it makes the feed's recovery read as pure phantom profit, tripping
+    # targets and pushing real losses out of the stop's reach. Dropping the
+    # start instead leaves the account baseline-less until the next real
+    # reading seeds one (balance_monitor's late-baseline path).
+    #
+    # An account still under zero-quarantine gets full amnesia instead of a
+    # re-baseline: its held `current` is a stale pre-outage value, and
+    # snapshotting it would hide whatever the zeros really meant (a firm
+    # zeroing the account included) behind a frozen baseline for the whole
+    # next session. Dropping both sides lets the first real post-outage
+    # reading re-seed cleanly.
+    for name in list(session_current_balances):
+        if name in _balance_suspect_since:
+            session_current_balances.pop(name)
+            session_start_balances.pop(name, None)
+            _balance_suspect_since.pop(name, None)
+            logger.warning(
+                f"RESET  {name} balance still quarantined — baseline dropped; "
+                "it will re-seed from the next real reading")
+            continue
+        bal = session_current_balances[name]
+        if abs(bal) > BALANCE_ZERO_EPS:
+            session_start_balances[name] = bal
+        else:
+            session_start_balances.pop(name, None)
+    _no_baseline_warned.clear()
     session_contracts.clear()
     account_stops.clear()
     soft_stopped = False
@@ -714,6 +766,83 @@ def toggle_micro_mode() -> bool:
     return micro_mode
 
 
+# ---------- Global strategy → symbol filter ----------
+# One map — "GoldStrat only ever trades GC, NasdaqStrat only NQ" — applied
+# to the WHOLE fan-out before any per-account leg exists, so it does not
+# have to be repeated in every account's profile (the per-account
+# scoped-rule pairs still work and compose on top). A listed strategy may
+# only OPEN positions on its listed markets; strategies not listed are
+# unrestricted. Exit priority holds: closes are never filtered, and a
+# reversal for a filtered-out market is downgraded to a close for every
+# account so the old position still exits.
+
+strategy_symbols: dict[str, list[str]] = {}   # publisher strategy (lowercase) -> roots
+
+
+def load_strategy_symbols(cfg: dict) -> dict[str, list[str]]:
+    """Sanitize the config "strategy_symbols" map.
+
+    Keys are publisher strategy names (field 11 of the raw signal, matched
+    case-insensitively); values are symbol roots — a list or a "GC, NQ"
+    style string. Micro/full twins fold together at match time, so "GC"
+    covers MGC. Entries that sanitize to nothing are dropped, which is
+    also how the web editor removes one.
+    """
+    out: dict[str, list[str]] = {}
+    raw = cfg.get("strategy_symbols")
+    if not isinstance(raw, dict):
+        return out
+    for strat, syms in raw.items():
+        name = sanitize_ati(str(strat).strip()).lower()
+        if not name:
+            continue
+        if isinstance(syms, str):
+            syms = syms.replace(",", " ").split()
+        if not isinstance(syms, list):
+            continue
+        roots: list[str] = []
+        for sym in syms:
+            root = sanitize_ati(str(sym).strip().upper())
+            if root and root not in roots:
+                roots.append(root)
+        if roots:
+            out[name] = roots
+    return out
+
+
+def save_strategy_symbols():
+    """Persist the active strategy → symbol map to config."""
+    cfg = load_config()
+    if strategy_symbols:
+        cfg["strategy_symbols"] = {k: list(v) for k, v in strategy_symbols.items()}
+    else:
+        cfg.pop("strategy_symbols", None)
+    save_config(cfg)
+    logger.info(f"STRATEGY FILTERS SAVED  {strategy_symbols or 'none'}")
+
+
+def strategy_symbol_block(pub_strategy: str, instrument: str) -> str | None:
+    """Why the global filter refuses this ENTRY, or None to allow it.
+
+    Never blocks: strategies not in the map, signals with no publisher
+    strategy name, and signals with no instrument. Exits are not routed
+    through this at all — the caller only consults it for commands that
+    open a position.
+    """
+    strat = (pub_strategy or "").strip().lower()
+    if not strat:
+        return None
+    allowed = strategy_symbols.get(strat)
+    if not allowed:
+        return None
+    root = _instrument_root(instrument)
+    if not root:
+        return None
+    if _symbol_matches(allowed, root):
+        return None
+    return f"strategy '{pub_strategy}' only trades {', '.join(allowed)}"
+
+
 def to_full_instrument(instrument: str) -> str:
     """Translate a micro instrument back to full size: "MNQ 06-26" → "NQ 06-26".
 
@@ -749,6 +878,14 @@ def to_full_instrument(instrument: str) -> str:
 # CHANGE on an inverted account, which is dropped because the publisher's
 # price levels are for the opposite side (the account's own ATM template
 # manages its stops).
+#
+# A profile can also carry `prop: true` (plus optional `prop_flat_et` /
+# `prop_cutoff_et` ET times), marking the account as a prop-firm funded or
+# evaluation account. Prop accounts run under the close-before-open engine:
+# one position at a time (a new entry first closes — and CONFIRMS closed —
+# whatever the account holds in other markets), no opposite sides across
+# accounts, no new entries near the close, and an automatic flatten before
+# the firm's own 4:59 PM ET liquidation. See the prop section below.
 
 DEFAULT_RULE = {
     "enabled": True,            # False blocks NEW entries only — exits still flow
@@ -901,6 +1038,35 @@ def load_account_profiles(cfg: dict) -> dict[str, dict]:
                     cleaned.append(name)
             if cleaned:
                 entry["symbols_allowed"] = cleaned
+        if prof.get("prop"):
+            entry["prop"] = True
+            firm = str(prof.get("prop_firm", "")).strip().lower()
+            if firm:
+                entry["prop_firm"] = firm
+                if firm not in PROP_FIRM_PRESETS:
+                    logger.warning(
+                        f"PROP  unknown firm '{firm}' for {acct} — using default "
+                        "flat/cutoff times; set prop_flat_et explicitly")
+            for key in ("prop_flat_et", "prop_cutoff_et"):
+                raw_t = prof.get(key)
+                if raw_t in (None, ""):
+                    continue
+                hm = _parse_prop_hhmm(raw_t)
+                if hm is None:
+                    logger.warning(
+                        f"PROP  {acct} {key}='{raw_t}' rejected — expected 24h "
+                        "ET 'HH:MM' between 12:00 and 17:59; using the firm preset")
+                    continue
+                entry[key] = f"{hm[0]:02d}:{hm[1]:02d}"
+            preset = PROP_FIRM_PRESETS.get(
+                firm, (PROP_FLAT_ET_DEFAULT, PROP_CUTOFF_ET_DEFAULT))
+            eff_flat = _parse_hhmm(entry.get("prop_flat_et")) or preset[0]
+            eff_cut = _parse_hhmm(entry.get("prop_cutoff_et")) or preset[1]
+            if eff_cut >= eff_flat:
+                logger.warning(
+                    f"PROP  {acct} entry cutoff {eff_cut[0]:02d}:{eff_cut[1]:02d} is not "
+                    f"before its flat time {eff_flat[0]:02d}:{eff_flat[1]:02d} — entries "
+                    "could fire after the daily flatten already ran")
         if entry:
             out[acct.strip()] = entry
     return out
@@ -919,6 +1085,11 @@ def save_account_profiles():
             entry["rules"] = rules
         if prof.get("symbols_allowed"):
             entry["symbols_allowed"] = prof["symbols_allowed"]
+        if prof.get("prop"):
+            entry["prop"] = True
+            for key in ("prop_firm", "prop_flat_et", "prop_cutoff_et"):
+                if prof.get(key):
+                    entry[key] = prof[key]
         if entry:
             pruned[acct] = entry
     account_profiles = pruned
@@ -973,6 +1144,155 @@ def account_trades_symbol(account: str, instrument: str) -> bool:
     if not root:
         return True
     return _symbol_matches(allowed, root)
+
+
+# ---------- Prop-firm account mode ----------
+# A profile with "prop": true marks a funded / evaluation account at a
+# futures prop firm. Those firms ban configurations an ordinary broker
+# account is free to run, and the violations that matter here are judged on
+# the resulting positions — not intent — with account closure and profit
+# forfeiture on the line. What the app enforces for prop accounts:
+#
+#   1. ONE POSITION AT A TIME (close-before-open). Before a new entry
+#      fires, every position the account holds in a DIFFERENT market is
+#      closed and the close is CONFIRMED against NinjaTrader. Two
+#      strategies signalling two markets (a GC position, then an NQ entry)
+#      would otherwise stack concurrent positions — within the letter of
+#      most firms' rules when same-direction, but the user's chosen
+#      safe-common-denominator policy, and the only shape that can never
+#      drift into a correlated-hedge violation (Tradeify, for one, bans
+#      opposing positions across an entire product GROUP — long ES /
+#      short NQ counts).
+#   2. NO OPPOSITE SIDES ACROSS ACCOUNTS. The hedge guard escalates to
+#      `block` whenever a prop account is part of an opposite-entry
+#      fan-out, and before a prop entry fires, any OTHER managed prop
+#      account still holding the opposite side of that product group is
+#      flattened first. Apex bans opposing positions "across multiple
+#      accounts" on pain of closure; Topstep calls a hedge unappealable
+#      "even if the overlap is brief or unintentional".
+#   3. FLAT BY CLOSE. Firms auto-liquidate near the CME close and some
+#      treat a held position as an outright breach (MyFundedFutures:
+#      holding past 4:10 PM ET breaches the account). Prop accounts are
+#      flattened at their flat-by-close time and new entries are refused
+#      from the cutoff until the 18:00 ET Globex reopen (Friday's cutoff
+#      holds through the weekend).
+#
+# Firm deadlines differ, so `prop_firm` picks safe defaults and
+# `prop_flat_et` / `prop_cutoff_et` ("HH:MM" ET) override them. Times sit
+# a couple of minutes AHEAD of each firm's own deadline so market closes
+# fill before the firm's risk engine acts. See PROP_RULES.md for sources.
+
+PROP_FLAT_ET_DEFAULT = (16, 57)     # ET flatten time when no firm preset applies
+PROP_CUTOFF_ET_DEFAULT = (16, 55)   # ET entry cutoff when no firm preset applies
+PROP_REOPEN_HOUR_ET = 18            # Globex reopen — prop entries allowed again
+PROP_VERIFY_TRIES = 4               # close-before-open confirm polls (× FLATTEN_VERIFY_DELAY)
+
+# firm -> (flat_et, cutoff_et). Aliases share one entry. Each flat time sits
+# ahead of the firm's own deadline (breach or auto-liquidation) so our closes
+# fill first; sources for every deadline are in PROP_RULES.md.
+PROP_FIRM_PRESETS: dict[str, tuple[tuple[int, int], tuple[int, int]]] = {
+    "apex":             ((16, 57), (16, 55)),  # Apex auto-liquidates 4:59 PM ET
+    "topstep":          ((16, 5), (16, 2)),    # Topstep: flat 4:10, staff flatten 4:08 PM ET
+    "mffu":             ((16, 7), (16, 5)),    # MFFU: held past 4:10 PM ET = breach
+    "myfundedfutures":  ((16, 7), (16, 5)),
+    "tpt":              ((16, 52), (16, 50)),  # TPT auto-closes 4:55 PM ET
+    "takeprofittrader": ((16, 52), (16, 50)),
+    "tradeify":         ((16, 57), (16, 55)),  # Tradeify auto-closes 4:59 PM ET
+    "bulenox":          ((16, 57), (16, 55)),  # flat by 3:59 PM CT (= 4:59 PM ET)
+    "elite":            ((16, 57), (16, 55)),  # ETF: 1 min before instrument close
+    "etf":              ((16, 57), (16, 55)),
+    "fundednext":       ((16, 57), (16, 55)),  # flat by end of trading day (5 PM ET)
+    "alpha":            ((16, 17), (16, 15)),  # Alpha: closed before 4:20 PM ET
+    "lucid":            ((16, 42), (16, 40)),  # Lucid auto-liquidates 4:45 PM ET
+}
+
+
+def is_prop_account(account: str) -> bool:
+    """True when the account's profile carries "prop": true."""
+    return bool(account_profiles.get(account, {}).get("prop"))
+
+
+def _parse_hhmm(raw) -> tuple[int, int] | None:
+    """Parse an 'HH:MM' Eastern-time string; None when unusable."""
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", str(raw or "").strip())
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    return (h, mi) if h < 24 and mi < 60 else None
+
+
+def _parse_prop_hhmm(raw) -> tuple[int, int] | None:
+    """Parse a prop flat/cutoff time: 24h ET 'HH:MM' between 12:00 and 17:59.
+
+    Every firm's deadline sits between 16:00 and 17:00 ET, and an
+    unbounded parse would read a 12h-style "4:55" as 4:55 AM — flattening
+    overnight positions at dawn and leaving the real close uncovered.
+    EVERY ingest point (config loader, terminal editor, the runtime
+    getters below) must use this, never bare _parse_hhmm.
+    """
+    hm = _parse_hhmm(raw)
+    return hm if hm is not None and 12 <= hm[0] < 18 else None
+
+
+def _prop_preset(account: str) -> tuple[tuple[int, int], tuple[int, int]]:
+    firm = str(account_profiles.get(account, {}).get("prop_firm", "")).strip().lower()
+    return PROP_FIRM_PRESETS.get(firm, (PROP_FLAT_ET_DEFAULT, PROP_CUTOFF_ET_DEFAULT))
+
+
+def prop_flat_time(account: str) -> tuple[int, int]:
+    """ET (hour, minute) this prop account is force-flattened at."""
+    return (_parse_prop_hhmm(account_profiles.get(account, {}).get("prop_flat_et"))
+            or _prop_preset(account)[0])
+
+
+def prop_cutoff_time(account: str) -> tuple[int, int]:
+    """ET (hour, minute) after which this prop account opens no new entry.
+
+    Clamped to at least 2 minutes BEFORE the account's flat time: a custom
+    flat time with a preset cutoff can otherwise invert the ordering, and
+    an entry landing between the once-per-day flatten and a later cutoff
+    would ride past the firm's deadline with nothing left to flatten it.
+    """
+    cut = (_parse_prop_hhmm(account_profiles.get(account, {}).get("prop_cutoff_et"))
+           or _prop_preset(account)[1])
+    fh, fm = prop_flat_time(account)
+    latest = divmod(fh * 60 + fm - 2, 60)
+    return min(cut, latest)
+
+
+def _prop_entry_blocked_now(account: str, now_et: datetime | None = None) -> bool:
+    """True inside the account's no-new-entries window around the close.
+
+    Runs from the account's entry cutoff until the 18:00 ET Globex reopen.
+    Friday's cutoff holds through the weekend until Sunday 18:00 ET. Exits
+    are never blocked by this — it is consulted only for entry legs.
+    """
+    now = now_et or datetime.now(ET)
+    wd = now.weekday()
+    if wd == 5:                                   # Saturday
+        return True
+    if wd == 6:                                   # Sunday, pre-reopen
+        return now.hour < PROP_REOPEN_HOUR_ET
+    past_cutoff = (now.hour, now.minute) >= prop_cutoff_time(account)
+    if wd == 4:                                   # Friday: closed into the weekend
+        return past_cutoff
+    return past_cutoff and now.hour < PROP_REOPEN_HOUR_ET
+
+
+def _product_group(alias: str) -> str:
+    """Correlation group for an instrument alias, per the futures catalog.
+
+    Tradeify bans opposing positions across a whole product group (long ES
+    against short NQ is a violation — both "Equity index"), so cross-account
+    conflict checks match on this rather than on the bare underlying. An
+    instrument the catalog doesn't know falls back to its own underlying
+    root, which degrades to the same-market-only check.
+    """
+    root = _underlying_root(alias)
+    for full, _desc, _micro, _months, group in FUTURES_CATALOG:
+        if root == full:
+            return group
+    return root
 
 
 def resolve_rule(account: str, instrument: str = "", pub_strategy: str = "") -> dict:
@@ -1045,6 +1365,10 @@ def profile_summary(account: str) -> str:
         return "default"
     base = {**DEFAULT_RULE, **prof.get("default", {})}
     bits: list[str] = []
+    if prof.get("prop"):
+        fh, fm = prop_flat_time(account)
+        firm = prof.get("prop_firm", "")
+        bits.append(f"PROP{f' {firm}' if firm else ''} flat {fh:02d}:{fm:02d}")
     if prof.get("symbols_allowed"):
         bits.append(f"only {','.join(prof['symbols_allowed'])}")
     if not base["enabled"]:
@@ -1176,6 +1500,12 @@ def transform_signal_for_account(signal_text: str, account: str, rule: dict
                 return _close_instead("inverted non-market reversal")
             if qty is not None and qty < 1:
                 return _close_instead("sized to 0 contracts")
+            if is_prop_account(account) and _prop_entry_blocked_now(account):
+                # A reversal OPENS the other side, and past the cutoff the
+                # once-per-day flatten has fired or is about to — nothing
+                # would re-flatten the fresh position before the firm's
+                # deadline. The old position still exits.
+                return _close_instead("prop flat-by-close window")
 
         if rule["direction"] == "invert" and len(parts) > 3:
             parts[3] = _flip_action(parts[3])
@@ -1267,7 +1597,8 @@ def publisher_strategy_of(msg: str) -> str:
         return ""
 
 
-def plan_signal_legs(signal_text: str, pub_strategy: str = ""
+def plan_signal_legs(signal_text: str, pub_strategy: str = "",
+                     manual: bool = False
                      ) -> tuple[list[dict], list[tuple[str, str]]]:
     """Resolve one canonical signal into per-account leg plans.
 
@@ -1282,6 +1613,24 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = ""
     parts = signal_text.split(";")
     cmd = parts[0].strip().upper() if parts else ""
     instrument = parts[2] if len(parts) >= 3 else ""
+
+    # Global strategy → symbol filter: gates the whole fan-out before any
+    # leg — including the round-robin draw — exists. Entries for a
+    # non-listed market are refused outright; a reversal is downgraded to
+    # a close for every account so the old position still exits (NT
+    # no-ops the close on accounts holding nothing). Pure exits never
+    # reach this check.
+    if cmd in ("PLACE", "REVERSEPOSITION"):
+        why = strategy_symbol_block(pub_strategy, instrument)
+        if why:
+            if cmd == "PLACE":
+                logger.info(f"GLOBAL FILTER  entry dropped — {why}  signal={signal_text}")
+                return [], [("all accounts", why)]
+            logger.info(f"GLOBAL FILTER  reversal downgraded to close — {why}")
+            signal_text = (f"CLOSEPOSITION;{parts[1] if len(parts) >= 2 else ''};"
+                           f"{instrument};;;;;;;;;;")
+            parts = signal_text.split(";")
+            cmd = "CLOSEPOSITION"
 
     # Which account gets which canonical signal. Copy-trade accounts always
     # get the signal as-is. Round-robin accounts rotate: entries go to ONE
@@ -1341,9 +1690,15 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = ""
             continue
         final_parts = final.split(";")
         final_cmd = final_parts[0].strip().upper() if final_parts else ""
-        deferred = final_cmd == "PLACE" and (
+        base_deferred = final_cmd == "PLACE" and (
             rule["delay_ms"] > 0 or rule["delay_jitter_ms"] > 0
             or rule["stagger_entries"] > 1 or bool(rule["ai"]))
+        # A prop account's entry ALWAYS runs as a background leg: it must
+        # first close-and-CONFIRM whatever the account holds elsewhere
+        # (see the prop section), and that confirmation cannot sit on the
+        # signal intake path.
+        prop = is_prop_account(account)
+        deferred = base_deferred or (prop and final_cmd == "PLACE")
         files = [final]
         if final_cmd in ("CLOSESTRATEGY", "CANCEL", "CHANGE"):
             files = _expand_exit_ids(final, account)
@@ -1377,6 +1732,12 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = ""
             "qty": meta["qty"],
             "note": meta["note"],
             "rr_pick": is_rr_pick,
+            "manual": manual,
+            "prop": prop,
+            # Simple prop entries (no delay/AI/stagger of their own) are
+            # batched into ONE close-confirm-enter wave so N accounts cost
+            # one snapshot and one confirmation instead of N.
+            "prop_group": prop and final_cmd == "PLACE" and not base_deferred,
         })
     plans = apply_hedge_guard(plans, skipped)
     return plans, skipped
@@ -1419,9 +1780,10 @@ def hedge_guard_mode() -> str:
     Defaults to `warn`, not `block`, because inverting one account against
     the others is a supported strategy (fading the leader) on ordinary
     broker accounts, and silently refusing to send orders someone has
-    configured is the wrong default. Prop-funded traders should set
-    "hedge_guard": "block" in config — for them an opposite position
-    across accounts is an account-closure event, not a strategy.
+    configured is the wrong default. When a PROP account is part of the
+    conflict, apply_hedge_guard escalates to `block` regardless of this
+    setting — for those accounts an opposite position across accounts is
+    an account-closure event, not a strategy.
     """
     mode = str(load_config().get("hedge_guard", "warn")).strip().lower()
     return mode if mode in ("block", "warn", "off") else "warn"
@@ -1443,6 +1805,17 @@ def apply_hedge_guard(plans: list[dict], skipped: list[tuple[str, str]]
                                   for side, accts in sorted(sides.items()))
         for root, sides in sorted(conflicts.items()))
     mode = hedge_guard_mode()
+    # A prop account on either side of the conflict overrides warn/off:
+    # the firms judge the resulting positions, and both sides of the
+    # hedge count against whoever holds the prop account.
+    prop_involved = sorted({
+        a for sides in conflicts.values() for accts in sides.values()
+        for a in accts if is_prop_account(a)})
+    if prop_involved and mode != "block":
+        logger.warning(
+            f"HEDGE GUARD  '{mode}' escalated to block — prop account(s) "
+            f"in conflict: {', '.join(prop_involved)}")
+        mode = "block"
     logger.warning(f"HEDGE GUARD ({mode})  entry legs would open opposite sides — {detail}")
     if mode == "off":
         return plans
@@ -1452,13 +1825,37 @@ def apply_hedge_guard(plans: list[dict], skipped: list[tuple[str, str]]
             + Style.RESET_ALL, sticky=True)
         return plans
     _dash_set_alert(
-        Fore.RED + f"  ⛔  HEDGE BLOCKED — {detail}. Check per-account "
-        "'direction: invert'." + Style.RESET_ALL, sticky=True)
+        Fore.RED + f"  ⛔  HEDGE BLOCKED — {detail}. "
+        + (f"Prop account(s) {', '.join(prop_involved)} may not hedge."
+           if prop_involved else "Check per-account 'direction: invert'.")
+        + Style.RESET_ALL, sticky=True)
     for p in plans:
         if p["command"] == "PLACE":
             skipped.append((p["account"], "hedge guard: opposite entries across accounts"))
             if p.get("rr_pick"):
                 _rr_return(p["account"])
+        elif p["command"] == "REVERSEPOSITION":
+            # Exit priority forbids dropping a reversal — the old position
+            # must still exit — so only its OPENING half is stripped: the
+            # leg is rewritten as a CLOSEPOSITION. Without this, blocked
+            # reversal legs fired in full while the alert claimed the
+            # hedge was prevented.
+            base = _with_account(
+                f"CLOSEPOSITION;;{p['instrument']};;;;;;;;;;", p["account"])
+            files = [base]
+            twin = _apply_size(
+                p["instrument"],
+                "full" if p["instrument"] != to_full_instrument(p["instrument"])
+                else "micros")
+            if twin and twin != p["instrument"]:
+                alt = base.split(";")
+                alt[2] = twin
+                files.append(";".join(alt))
+            note = "downgraded to CLOSEPOSITION (hedge blocked)"
+            p.update(signal=base, files=files, command="CLOSEPOSITION",
+                     action="", qty=0, deferred=False, prop_group=False,
+                     note=f"{p['note']}; {note}" if p["note"] else note)
+            logger.info(f"HEDGE GUARD  reversal downgraded to close  account={p['account']}")
     return [p for p in plans if p["command"] != "PLACE"]
 
 
@@ -1470,24 +1867,35 @@ def _note_contract(signal_text: str):
         session_contracts.add(parts[2])
 
 
-def _leg_blocked(account: str) -> str | None:
-    """Why a pending leg must abort right now, or None to proceed."""
+def _leg_blocked(account: str, manual: bool = False) -> str | None:
+    """Why a pending leg must abort right now, or None to proceed.
+
+    `manual` marks a leg the trader typed themselves: pause only mutes the
+    publisher, never the trader (see the manual-trading section), so a
+    manual leg ignores `paused` — every other gate still applies. Without
+    this, routing prop entries through the deferred rail would silently
+    swallow a deliberate manual order during pause while the ticket
+    reported success.
+    """
     if shutdown.is_set():
         return "shutdown"
     if hard_stopped:
         return "session hard stop"
-    if paused:
+    if paused and not manual:
         return "signals paused"
     if account in account_stops:
         return "account stop/target hit"
+    if is_prop_account(account) and _prop_entry_blocked_now(account):
+        return "prop entry cutoff (flat-by-close window)"
     return None
 
 
-async def _interruptible_sleep(seconds: float, account: str) -> bool:
+async def _interruptible_sleep(seconds: float, account: str,
+                               manual: bool = False) -> bool:
     """Sleep in small steps, bailing early (False) if the leg gets blocked."""
     end = time.monotonic() + max(0.0, seconds)
     while True:
-        if _leg_blocked(account):
+        if _leg_blocked(account, manual):
             return False
         remaining = end - time.monotonic()
         if remaining <= 0:
@@ -1495,12 +1903,418 @@ async def _interruptible_sleep(seconds: float, account: str) -> bool:
         await asyncio.sleep(min(0.25, remaining))
 
 
+# ---------- Prop close-before-open engine ----------
+# Every prop entry runs: snapshot NT → close what conflicts → CONFIRM the
+# closes against NT → only then write the entry. All of it happens under
+# ONE lock so two signals seconds apart cannot interleave (signal A's
+# confirmed-flat check racing signal B's entry write is how a "one position
+# at a time" account ends up holding two).
+
+_prop_entry_lock: asyncio.Lock | None = None
+_prop_lock_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_prop_lock() -> asyncio.Lock:
+    """The one lock all prop entry work serializes under.
+
+    Created lazily per running loop: asyncio.Lock binds to the loop that
+    first awaits it, and the test suite runs each test in its own
+    asyncio.run() loop.
+    """
+    global _prop_entry_lock, _prop_lock_loop
+    loop = asyncio.get_running_loop()
+    if _prop_entry_lock is None or _prop_lock_loop is not loop:
+        _prop_entry_lock = asyncio.Lock()
+        _prop_lock_loop = loop
+    return _prop_entry_lock
+
+
+def _prop_preempt_closures(plans: list[dict], snap: dict,
+                           cross_account: bool = True,
+                           exclude: set[str] = frozenset()
+                           ) -> tuple[dict[str, list[str]], dict[str, bool]]:
+    """What must CLOSE before these prop entry legs may fire.
+
+    Returns (to_close, keeps): to_close maps account -> position aliases to
+    flatten; keeps flags accounts that RETAIN a position, so the flatten
+    for them must stay scoped to the listed contracts (a whole-account
+    flatten would also cancel the kept position's ATM bracket).
+
+    Per held position of an account that is ENTERING:
+      - same exact root as its entry (holds NQ, enters NQ): KEEP. NT nets
+        same-contract orders — the publisher's partial SELL against a long
+        is an exit, and pre-closing the long would turn that exit into a
+        fresh short.
+      - same underlying, different root (micro/full twin — holds MNQ,
+        enters NQ): CLOSE regardless of direction. Opposite is the classic
+        intra-account hedge; same-direction stacking across contract sizes
+        is the exact cap-evasion pattern MyFundedFutures names a breach.
+      - anything else: CLOSE — one position at a time.
+    Per held position of a managed prop account that is NOT entering
+    (cross_account=True): CLOSE only when it sits on the OPPOSITE side of
+    the entry's product group — opposing correlated positions across
+    accounts is the ban every firm agrees on (Tradeify scopes it to whole
+    product groups, so this matches groups, not bare symbols).
+    """
+    entering = {p["account"]: p for p in plans}
+    pos_rows: dict[str, list[tuple[str, int]]] = {}
+    for row in snap.get("positions", []):
+        pos_rows.setdefault(row["account"], []).append((row["instrument"], row["qty"]))
+    group_sides = {(_product_group(p["instrument"]), (p["action"] or "").strip().upper())
+                   for p in plans
+                   if (p["action"] or "").strip().upper() in ("BUY", "SELL")}
+
+    def opposite(qty: int, action: str) -> bool:
+        return (qty > 0 and action == "SELL") or (qty < 0 and action == "BUY")
+
+    to_close: dict[str, list[str]] = {}
+    keeps: dict[str, bool] = {}
+    for acct in target_accounts():
+        if not is_prop_account(acct):
+            continue
+        plan = entering.get(acct)
+        if plan is None and (not cross_account or acct in exclude):
+            # `exclude` names accounts with their OWN in-flight leg of the
+            # same action — closing their position out from under a
+            # reversal that is mid-fill would flatten what should flip.
+            continue
+        for alias, qty in pos_rows.get(acct, []):
+            if plan is not None:
+                # _alias_root on BOTH sides: the plan instrument is usually
+                # the publisher's "ROOT MM-YY", but the web Rev path passes
+                # whatever alias NT broadcast ("NQU26", "@NQ"), and a
+                # mismatch here would flatten the very position the user
+                # just reversed into.
+                if _alias_root(alias).upper() == _alias_root(plan["instrument"]).upper():
+                    keeps[acct] = True
+                else:
+                    to_close.setdefault(acct, []).append(alias)
+            else:
+                if any(_product_group(alias) == group and opposite(qty, action)
+                       for group, action in group_sides):
+                    to_close.setdefault(acct, []).append(alias)
+                else:
+                    keeps[acct] = True
+    return to_close, keeps
+
+
+def _prop_flatten_wave(to_close: dict[str, list[str]], keeps: dict[str, bool]):
+    """Fire the closes for a prop preemption (blocking — call via to_thread).
+
+    Leader-first, sequential — same load-bearing order as
+    close_all_open_positions. An account keeping nothing is flattened
+    whole (close_account_positions also cancels its working orders, so a
+    resting entry can't refill after we close); an account that keeps a
+    position gets targeted CLOSEPOSITIONs so the kept position's ATM
+    bracket survives.
+    """
+    for acct in target_accounts():
+        contracts = to_close.get(acct)
+        if not contracts:
+            continue
+        if keeps.get(acct):
+            for c in contracts:
+                fire_close_position(acct, c)
+            logger.info(f"PROP PREEMPT  account={acct}  targeted close={contracts}")
+        else:
+            closed = close_account_positions(acct)
+            logger.info(f"PROP PREEMPT  account={acct}  flattened={closed}")
+
+
+async def _prop_snapshot() -> dict | None:
+    """One complete NT state dump, or None when NT can't prove its state."""
+    for _ in range(2):
+        try:
+            snap = await asyncio.to_thread(nt_snapshot, nt_port)
+        except Exception as exc:
+            logger.error(f"PROP GUARD  snapshot failed: {exc}")
+            continue
+        if snap.get("ok"):
+            return snap
+        logger.warning("PROP GUARD  incomplete NT dump — retrying")
+    return None
+
+
+async def _prop_verify_cleared(to_close: dict[str, list[str]]) -> bool:
+    """Confirm every preempted position is actually gone. Proof, not hope —
+    same doctrine as verify_flat: an unverifiable state is NOT clear.
+
+    Deliberately separate from verify_flat: this confirms specific
+    (account, root) targets so a KEPT same-market position doesn't read as
+    "still open", where verify_flat proves whole accounts flat. A change
+    to either loop's dump-failure or retry semantics must be mirrored in
+    the other."""
+    targets = {(acct, _alias_root(c).upper())
+               for acct, contracts in to_close.items() for c in contracts}
+    for attempt in range(PROP_VERIFY_TRIES):
+        await asyncio.sleep(FLATTEN_VERIFY_DELAY)
+        try:
+            snap = await asyncio.to_thread(nt_snapshot, nt_port)
+        except Exception as exc:
+            logger.error(f"PROP VERIFY  snapshot failed: {exc}")
+            continue
+        if not snap.get("ok"):
+            logger.warning("PROP VERIFY  incomplete dump — cannot confirm")
+            continue
+        open_roots = {(p["account"], _alias_root(p["instrument"]).upper())
+                      for p in snap["positions"]}
+        still = targets & open_roots
+        if not still:
+            return True
+        logger.info(f"PROP VERIFY  attempt {attempt + 1}: still open {sorted(still)}")
+    return False
+
+
+def _prop_withhold(plans: list[dict], why: str):
+    """Refuse prop entries loudly: log, sticky alert, round-robin refund."""
+    accounts = ", ".join(p["account"] for p in plans)
+    logger.error(f"PROP GUARD  entry withheld  accounts={accounts}  reason={why}")
+    _dash_set_alert(
+        Fore.RED + Style.BRIGHT +
+        f"  ⛔  PROP GUARD — entry withheld for {accounts}: {why}. "
+        "Check NinjaTrader before trading on." + Style.RESET_ALL, sticky=True)
+    for p in plans:
+        if p.get("rr_pick"):
+            _rr_return(p["account"])
+
+
+async def _prop_clear_for_entry(plans: list[dict]) -> tuple[bool, bool]:
+    """Close-before-open for prop entry legs.
+
+    Returns (clear_to_enter, closed_anything). Callers hold
+    _get_prop_lock(), so nothing else can interleave between this
+    confirmation and the entry writes that follow it — and they use
+    closed_anything to alarm loudly if the entry then never fires, because
+    a position destroyed for an entry that was withheld must not vanish
+    into an info-level log line.
+    """
+    snap = await _prop_snapshot()
+    if snap is None:
+        _prop_withhold(plans, "NinjaTrader would not prove its position state")
+        return False, False
+    to_close, keeps = _prop_preempt_closures(plans, snap)
+    if not to_close:
+        return True, False
+    detail = "; ".join(f"{a}: {', '.join(c)}" for a, c in sorted(to_close.items()))
+    logger.info(f"PROP PREEMPT  closing before entry — {detail}")
+    _dash_set_alert(
+        Fore.CYAN + f"  ⏳  PROP one-trade rule — closing {detail} before entry"
+        + Style.RESET_ALL)
+    await asyncio.to_thread(_prop_flatten_wave, to_close, keeps)
+    if await _prop_verify_cleared(to_close):
+        return True, True
+    logger.warning(f"PROP PREEMPT  close unconfirmed — retrying  {detail}")
+    await asyncio.to_thread(_prop_flatten_wave, to_close, keeps)
+    if await _prop_verify_cleared(to_close):
+        return True, True
+    _prop_withhold(plans, f"could not confirm close of {detail}")
+    return False, True
+
+
+def _prop_alert_closed_without_entry(accounts: str, why: str):
+    """Positions were preempted but no entry followed — say so, loudly."""
+    logger.error(f"PROP GUARD  closed without entry  accounts={accounts}  reason={why}")
+    _dash_set_alert(
+        Fore.RED + Style.BRIGHT +
+        f"  ⛔  PROP — positions were closed for an entry that was then "
+        f"withheld ({why}) on {accounts}. The account(s) are FLAT with no "
+        "entry placed." + Style.RESET_ALL, sticky=True)
+
+
+async def _run_prop_group(plans: list[dict], sig_id: str | None = None):
+    """One signal's simple prop entry legs as a single close-confirm-enter
+    wave: one snapshot, one flatten pass, one confirmation, then
+    leader-first writes — so five prop accounts land together instead of
+    serializing five confirmations."""
+    try:
+        async with _get_prop_lock():
+            live = []
+            for p in plans:
+                reason = _leg_blocked(p["account"], p.get("manual", False))
+                if reason:
+                    logger.info(f"LEG ABORTED  account={p['account']}  reason={reason}")
+                    if p.get("rr_pick"):
+                        _rr_return(p["account"])
+                else:
+                    live.append(p)
+            if not live:
+                return
+            ok, closed_any = await _prop_clear_for_entry(live)
+            if not ok:
+                return
+            order = {a: i for i, a in enumerate(target_accounts())}
+            placed: list[str] = []
+            last_reason = ""
+            for plan in sorted(live, key=lambda p: order.get(p["account"], len(order))):
+                reason = _leg_blocked(plan["account"], plan.get("manual", False))
+                if reason:
+                    last_reason = reason
+                    logger.info(f"LEG ABORTED  account={plan['account']}  reason={reason}")
+                    if plan.get("rr_pick"):
+                        _rr_return(plan["account"])
+                    continue
+                if await _write_entry_tranches(plan, [plan["qty"]], sig_id, quiet=True):
+                    placed.append(plan["account"])
+            not_placed = [p["account"] for p in live
+                          if p["account"] not in placed]
+            if closed_any and not_placed:
+                # The confirmation window can cross the entry cutoff, or a
+                # write can fail — either way positions died for an entry
+                # that never happened, which must not be silent. This wins
+                # the alert slot even when OTHER accounts placed: a green
+                # banner over a destroyed position is the worst outcome.
+                _prop_alert_closed_without_entry(
+                    ", ".join(not_placed), last_reason or "entry write failed")
+                if placed:
+                    logger.info(f"PROP GROUP  placed={placed} while withheld={not_placed}")
+            elif placed:
+                _dash_set_alert(
+                    Fore.GREEN + f"  ✔  PROP entry placed → {', '.join(placed)}"
+                    + Style.RESET_ALL)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error(f"prop group error  accounts={[p['account'] for p in plans]}  error={exc}")
+
+
+async def _prop_reversal_cleanup(plans: list[dict], cross_account: bool = True,
+                                 exclude: set[str] = frozenset()):
+    """After REVERSEPOSITION legs fire on prop accounts, close every OTHER
+    market they still hold, plus any other managed prop account left on
+    the opposite side of the product group (the cross-account hedge the
+    PLACE path sweeps — a reversal must not be the one opening path that
+    leaves it standing). The reversals themselves are never delayed —
+    exit priority — so this trails them instead of gating them.
+
+    `exclude` carries the accounts whose own reversal leg of this same
+    signal is in flight: their position is about to flip on its own, and
+    sweeping it mid-fill would flatten what should reverse. Accounts whose
+    leg was downgraded to a close, or who got no leg at all, are NOT
+    excluded — they are exactly the ones a standing opposite position can
+    survive on. One task covers the whole fan-out: one snapshot, one
+    flatten wave, one confirmation."""
+    try:
+        async with _get_prop_lock():
+            snap = await _prop_snapshot()
+            if snap is None:
+                accounts = ", ".join(p["account"] for p in plans)
+                logger.warning(f"PROP REVERSAL CLEANUP  no NT state for {accounts}")
+                return
+            to_close, keeps = _prop_preempt_closures(plans, snap,
+                                                     cross_account=cross_account,
+                                                     exclude=exclude)
+            if not to_close:
+                return
+            detail = "; ".join(f"{a}: {', '.join(c)}" for a, c in sorted(to_close.items()))
+            logger.info(f"PROP REVERSAL CLEANUP  {detail}")
+            await asyncio.to_thread(_prop_flatten_wave, to_close, keeps)
+            if not await _prop_verify_cleared(to_close):
+                _dash_set_alert(
+                    Fore.RED + Style.BRIGHT +
+                    f"  ⛔  PROP — could not confirm close of {detail} after a "
+                    "reversal. Close it in NinjaTrader now." + Style.RESET_ALL,
+                    sticky=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error(f"prop reversal cleanup error  "
+                     f"accounts={[p['account'] for p in plans]}  error={exc}")
+
+
+_prop_autoflat_done: dict[str, str] = {}   # account -> ET date already flattened
+_prop_flat_task: asyncio.Task | None = None  # in-flight flat-by-close sweep
+PROP_FLAT_WINDOW_MIN = 30                  # fire within this window past flat time
+
+
+async def _check_prop_flat_by_close(now_et: datetime):
+    """Flatten prop accounts at their flat-by-close time.
+
+    balance_monitor calls this every poll. Firms auto-liquidate at their
+    own deadline and some (MFFU) treat a position held past it as an
+    account breach — closing on our side first keeps the record clean.
+    Runs once per account per trading day, inside a bounded window so a
+    late app start doesn't flatten the NEXT session's positions.
+    """
+    if now_et.weekday() >= 5:
+        return
+    today = now_et.strftime("%Y-%m-%d")
+    minutes_now = now_et.hour * 60 + now_et.minute
+    for acct in target_accounts():
+        if not is_prop_account(acct) or _prop_autoflat_done.get(acct) == today:
+            continue
+        fh, fm = prop_flat_time(acct)
+        start = fh * 60 + fm
+        if not (start <= minutes_now < start + PROP_FLAT_WINDOW_MIN):
+            continue
+        _prop_autoflat_done[acct] = today
+        # No exemption for accounts in account_stops: their stop/target
+        # flatten SHOULD have left them flat, but _trip_account's close can
+        # fail unconfirmed and never be looked at again — the close window
+        # is the last chance to catch that before the firm's deadline. A
+        # genuinely flat stopped account costs one quiet verification.
+        # A flat account gets a quiet log line, not a "flattened" alert —
+        # close_account_positions returns session-contract safety-net names
+        # even when nothing was open, so its return value can't be the
+        # evidence. A quick position query decides; when it reads empty,
+        # verify_flat still has to PROVE it (an empty read can also mean
+        # the query failed, and NT being unreachable at the close is
+        # exactly when a stuck position must raise an alarm, not silence).
+        # Per-account try: this runs as an unawaited background task, and
+        # one account's error must neither kill the other accounts' sweeps
+        # nor vanish unraised.
+        try:
+            try:
+                pre = await asyncio.to_thread(query_nt_positions, acct, nt_port)
+            except Exception:
+                pre = {}
+            if not pre and await verify_flat([acct]) == []:
+                logger.info(f"PROP FLAT-BY-CLOSE  account={acct}  already flat")
+                continue
+            closed = await asyncio.to_thread(close_account_positions, acct)
+            still = await verify_flat([acct])
+            if still:
+                await asyncio.to_thread(close_account_positions, acct)   # one retry
+                still = await verify_flat([acct])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(f"PROP FLAT-BY-CLOSE  account={acct}  error={exc}")
+            still = [{"account": acct, "instrument": "UNVERIFIED",
+                      "qty": 0, "avg_price": None}]
+            pre, closed = {}, []
+        if still:
+            detail = ", ".join(
+                p["instrument"] if p["instrument"] == "UNVERIFIED"
+                else f"{p['qty']:+d} {p['instrument']}" for p in still)
+            logger.error(f"PROP FLAT-BY-CLOSE FAILED  account={acct}  still open: {detail}")
+            _dash_set_alert(
+                Fore.RED + Style.BRIGHT +
+                f"  ⛔  {acct} NOT FLAT AT THE CLOSE ({detail}) — close it in "
+                "NinjaTrader NOW before the firm's deadline." + Style.RESET_ALL,
+                sticky=True)
+        else:
+            had = sorted(pre) or closed
+            logger.info(f"PROP FLAT-BY-CLOSE  account={acct}  closed={had}")
+            _dash_set_alert(
+                Fore.CYAN + f"  🕔  PROP flat-by-close — {acct} flattened "
+                f"({', '.join(had) or 'confirmed'})" + Style.RESET_ALL)
+
+
 async def execute_plans(plans: list[dict], sig_id: str | None = None) -> list[str]:
-    """Write instant legs now; launch deferred legs (delay/AI/stagger) as
-    background tasks. Returns the accounts whose files were written NOW —
-    deferred accounts report via alerts/log when they land."""
+    """Write instant legs now; launch deferred legs (delay/AI/stagger) and
+    prop close-before-open waves as background tasks. Returns the accounts
+    whose files were written NOW — deferred accounts report via alerts/log
+    when they land."""
     written: list[str] = []
+    prop_reversals: list[dict] = []
+    group = [p for p in plans if p.get("prop_group")]
+    if group:
+        task = asyncio.create_task(_run_prop_group(group, sig_id))
+        _leg_tasks.add(task)
+        task.add_done_callback(_leg_tasks.discard)
     for plan in plans:
+        if plan.get("prop_group"):
+            continue     # riding the close-confirm-enter wave above
         if plan["deferred"]:
             task = asyncio.create_task(_run_deferred_leg(plan, sig_id))
             _leg_tasks.add(task)
@@ -1525,6 +2339,19 @@ async def execute_plans(plans: list[dict], sig_id: str | None = None) -> list[st
             written.append(account)
             if plan["command"] == "PLACE":
                 _record_stagger(plan["signal"], account, 1)
+            elif plan["command"] == "REVERSEPOSITION" and plan.get("prop"):
+                prop_reversals.append(plan)
+    if prop_reversals:
+        # The reversals were never delayed (exit priority); now one task
+        # sweeps every other market the reversing prop accounts hold AND
+        # any other prop account left opposite the new side — excluding
+        # only accounts whose own reversal leg is mid-flight.
+        reversing = {p["account"] for p in plans
+                     if p["command"] == "REVERSEPOSITION"}
+        task = asyncio.create_task(_prop_reversal_cleanup(
+            prop_reversals, cross_account=True, exclude=reversing))
+        _leg_tasks.add(task)
+        task.add_done_callback(_leg_tasks.discard)
     return written
 
 
@@ -1534,13 +2361,14 @@ async def _run_deferred_leg(plan: dict, sig_id: str | None = None):
     account, rule = plan["account"], plan["rule"]
     label = f"[{account}] " if len(target_accounts()) > 1 else ""
     try:
+        manual = plan.get("manual", False)
         delay_s = (rule["delay_ms"]
                    + (random.uniform(0, rule["delay_jitter_ms"]) if rule["delay_jitter_ms"] else 0)
                    ) / 1000.0
-        if delay_s > 0 and not await _interruptible_sleep(delay_s, account):
-            logger.info(f"LEG ABORTED  account={account}  during=delay  reason={_leg_blocked(account)}")
+        if delay_s > 0 and not await _interruptible_sleep(delay_s, account, manual):
+            logger.info(f"LEG ABORTED  account={account}  during=delay  reason={_leg_blocked(account, manual)}")
             return
-        reason = _leg_blocked(account)
+        reason = _leg_blocked(account, manual)
         if reason:
             logger.info(f"LEG ABORTED  account={account}  reason={reason}")
             return
@@ -1569,49 +2397,87 @@ async def _run_deferred_leg(plan: dict, sig_id: str | None = None):
                     qty = ai_qty
 
         tranches = split_qty(qty, rule["stagger_entries"]) if qty >= 1 else [qty]
-        interval_s = rule["stagger_interval_ms"] / 1000.0
-        placed = 0
-        for i, tranche_qty in enumerate(tranches):
-            if i > 0 and interval_s > 0 and not await _interruptible_sleep(interval_s, account):
-                logger.info(f"LEG ABORTED  account={account}  during=stagger {i + 1}/{len(tranches)}")
-                break
-            reason = _leg_blocked(account)
-            if reason:
-                logger.info(f"LEG ABORTED  account={account}  at tranche {i + 1}/{len(tranches)}  reason={reason}")
-                break
-            sig = _tranche_signal(plan["signal"], tranche_qty, i)
-            leader_first = (i == 0 and account == active_account)
-            pre_pos = 0
-            if leader_first:
-                try:
-                    pre = await asyncio.to_thread(query_nt_positions, account, nt_port)
-                    pre_pos = pre.get(plan["instrument"], 0)
-                except Exception:
-                    pre_pos = 0
-            path = write_signal_to_file(sig)
-            if not path:
-                logger.error(f"LEG WRITE FAIL  account={account}  tranche={i + 1}  signal={sig}")
-                _dash_set_alert(
-                    Fore.RED + f"  ✖  {label}entry write failed" + Style.RESET_ALL)
-                break
-            placed += 1
-            _note_contract(sig)
-            if leader_first:
-                add_pending_confirm(sig, sig_id, plan["instrument"], plan["action"], pre_pos)
-        if placed:
-            _record_stagger(plan["signal"], account, placed)
-            detail = f" {placed}/{len(tranches)} tranches" if len(tranches) > 1 else ""
-            timing = f" after {rule['delay_ms']}ms" if rule["delay_ms"] else ""
-            _dash_set_alert(
-                Fore.GREEN + f"  ✔  {label}entry placed{detail}{timing}" + Style.RESET_ALL)
-            logger.info(
-                f"LEG DONE  account={account}  tranches={placed}/{len(tranches)}  "
-                f"qty={qty}  signal={plan['signal']}")
+        if plan.get("prop"):
+            # Close-before-open, then write — all under the prop lock so no
+            # other prop entry can slip between the confirmation and the
+            # writes (the whole tranche run stays inside for the same
+            # reason: a later signal must not flatten a half-placed entry
+            # and then race its own entry against our remaining tranches).
+            async with _get_prop_lock():
+                ok, closed_any = await _prop_clear_for_entry([plan])
+                if not ok:
+                    if plan.get("rr_pick"):
+                        _rr_return(account)
+                    return
+                reason = _leg_blocked(account, manual)
+                if reason:
+                    logger.info(f"LEG ABORTED  account={account}  reason={reason}")
+                    if plan.get("rr_pick"):
+                        _rr_return(account)
+                    if closed_any:
+                        _prop_alert_closed_without_entry(account, reason)
+                    return
+                placed = await _write_entry_tranches(plan, tranches, sig_id)
+                if not placed and closed_any:
+                    _prop_alert_closed_without_entry(account, "entry write failed")
+        else:
+            await _write_entry_tranches(plan, tranches, sig_id)
     except asyncio.CancelledError:
         logger.info(f"LEG CANCELLED  account={account}")
         raise
     except Exception as exc:
         logger.error(f"deferred leg error  account={account}  error={exc}")
+
+
+async def _write_entry_tranches(plan: dict, tranches: list[int],
+                                sig_id: str | None, quiet: bool = False) -> int:
+    """Write one entry's tranche files — the shared tail of every deferred
+    leg, re-checking stops/pause before every write. Returns the number of
+    tranches written. `quiet` suppresses the per-account success alert
+    (the prop group prints one summary line instead of N)."""
+    account, rule = plan["account"], plan["rule"]
+    manual = plan.get("manual", False)
+    label = f"[{account}] " if len(target_accounts()) > 1 else ""
+    interval_s = rule["stagger_interval_ms"] / 1000.0
+    placed = 0
+    for i, tranche_qty in enumerate(tranches):
+        if i > 0 and interval_s > 0 and not await _interruptible_sleep(interval_s, account, manual):
+            logger.info(f"LEG ABORTED  account={account}  during=stagger {i + 1}/{len(tranches)}")
+            break
+        reason = _leg_blocked(account, manual)
+        if reason:
+            logger.info(f"LEG ABORTED  account={account}  at tranche {i + 1}/{len(tranches)}  reason={reason}")
+            break
+        sig = _tranche_signal(plan["signal"], tranche_qty, i)
+        leader_first = (i == 0 and account == active_account)
+        pre_pos = 0
+        if leader_first:
+            try:
+                pre = await asyncio.to_thread(query_nt_positions, account, nt_port)
+                pre_pos = pre.get(plan["instrument"], 0)
+            except Exception:
+                pre_pos = 0
+        path = write_signal_to_file(sig)
+        if not path:
+            logger.error(f"LEG WRITE FAIL  account={account}  tranche={i + 1}  signal={sig}")
+            _dash_set_alert(
+                Fore.RED + f"  ✖  {label}entry write failed" + Style.RESET_ALL)
+            break
+        placed += 1
+        _note_contract(sig)
+        if leader_first:
+            add_pending_confirm(sig, sig_id, plan["instrument"], plan["action"], pre_pos)
+    if placed:
+        _record_stagger(plan["signal"], account, placed)
+        if not quiet:
+            detail = f" {placed}/{len(tranches)} tranches" if len(tranches) > 1 else ""
+            timing = f" after {rule['delay_ms']}ms" if rule["delay_ms"] else ""
+            _dash_set_alert(
+                Fore.GREEN + f"  ✔  {label}entry placed{detail}{timing}" + Style.RESET_ALL)
+        logger.info(
+            f"LEG DONE  account={account}  tranches={placed}/{len(tranches)}  "
+            f"qty={sum(tranches)}  signal={plan['signal']}")
+    return placed
 
 
 # ---------- AI signal gate ----------
@@ -2729,7 +3595,7 @@ def query_nt_positions(account: str, port: int = 36973) -> dict[str, int]:
             return s.split()[0]
         # Continuous-contract code like "NQM26" — strip trailing
         # <month_code><1-2 digit year>. Month codes: FGHJKMNQUVXZ.
-        m = re.match(r"^([A-Za-z]+?)[FGHJKMNQUVXZ]\d{1,2}$", s)
+        m = re.match(r"^([A-Za-z0-9]+?)[FGHJKMNQUVXZ]\d{1,2}$", s)
         return m.group(1) if m else s
     by_root_qty: dict[tuple[str, int], list[str]] = {}
     for alias, qty in aliases.items():
@@ -2747,7 +3613,7 @@ def _alias_root(alias: str) -> str:
     s = alias.strip().lstrip("@")
     if " " in s:
         return s.split()[0]
-    m = re.match(r"^([A-Za-z]+?)[FGHJKMNQUVXZ]\d{1,2}$", s)
+    m = re.match(r"^([A-Za-z0-9]+?)[FGHJKMNQUVXZ]\d{1,2}$", s)
     return m.group(1) if m else s
 
 
@@ -4227,10 +5093,19 @@ async def _edit_account_profile(account: str):
         n_rules = len(prof_now.get("rules", []))
         allowed = prof_now.get("symbols_allowed", [])
         sym_label = ", ".join(allowed) if allowed else "all symbols"
+        if prof_now.get("prop"):
+            fh, fm = prop_flat_time(account)
+            ch, cm = prop_cutoff_time(account)
+            firm = prof_now.get("prop_firm", "")
+            prop_label = (f"ON{f' ({firm})' if firm else ''} — flat {fh:02d}:{fm:02d}"
+                          f" · no entries {ch:02d}:{cm:02d} ET")
+        else:
+            prop_label = "off"
         _prof_box(f"PROFILE — {account}", [
             f"Now: {profile_summary(account)}"[:_PROF_INNER],
             "",
             f"S. Symbols        — trades {sym_label}"[:_PROF_INNER],
+            f"P. Prop account   — {prop_label}"[:_PROF_INNER],
             "D. Default rule   — applies to every signal",
             f"R. Scoped rules   — {n_rules} configured (per symbol/strategy)",
             "X. Reset          — remove this account's profile",
@@ -4238,7 +5113,50 @@ async def _edit_account_profile(account: str):
         raw = (await _ask_line("OPTION")).lower()
         if raw in ("", "q"):
             return
-        if raw == "s":
+        if raw == "p":
+            prof = account_profiles.setdefault(account, {})
+            if prof.get("prop"):
+                for key in ("prop", "prop_firm", "prop_flat_et", "prop_cutoff_et"):
+                    prof.pop(key, None)
+                if not prof:
+                    account_profiles.pop(account, None)
+                print(Fore.GREEN + f"  ✔  {account} is no longer a prop account."
+                      + Style.RESET_ALL)
+            else:
+                prof["prop"] = True
+                firms = ", ".join(sorted({
+                    k for k in PROP_FIRM_PRESETS
+                    if k not in ("myfundedfutures", "takeprofittrader", "etf")}))
+                raw_f = (await _ask_line(
+                    f"FIRM ({firms}; ENTER = generic)")).strip().lower()
+                if raw_f:
+                    prof["prop_firm"] = raw_f
+                    if raw_f not in PROP_FIRM_PRESETS:
+                        print(Fore.YELLOW + f"  ⚠  Unknown firm '{raw_f}' — using "
+                              "generic 16:57/16:55 ET times. Set them below if "
+                              "your firm closes earlier." + Style.RESET_ALL)
+                (dh, dm), (dch, dcm) = _prop_preset(account)
+                for key, label, dflt in (
+                        ("prop_flat_et", "FLAT-BY-CLOSE", f"{dh:02d}:{dm:02d}"),
+                        ("prop_cutoff_et", "ENTRY CUTOFF", f"{dch:02d}:{dcm:02d}")):
+                    raw_t = await _ask_line(f"{label} ET as HH:MM (ENTER = {dflt})")
+                    hm = _parse_prop_hhmm(raw_t)
+                    if hm:
+                        prof[key] = f"{hm[0]:02d}:{hm[1]:02d}"
+                    elif raw_t.strip():
+                        print(Fore.YELLOW + f"  ⚠  '{raw_t.strip()}' rejected — "
+                              "need 24h ET HH:MM between 12:00 and 17:59 "
+                              f"(e.g. 16:55, not 4:55). Using {dflt}."
+                              + Style.RESET_ALL)
+                fh, fm = prop_flat_time(account)
+                print(Fore.GREEN + f"  ✔  {account} marked PROP — one position at "
+                      "a time (closes are confirmed before a new entry fires),"
+                      + Style.RESET_ALL)
+                print(Fore.GREEN + "     opposite entries across accounts are "
+                      f"blocked, and it is flattened at {fh:02d}:{fm:02d} ET."
+                      + Style.RESET_ALL)
+            save_account_profiles()
+        elif raw == "s":
             raw_s = await _ask_line(
                 "ALLOWED SYMBOLS e.g. 'GC' or 'NQ ES' (ENTER = all symbols)")
             prof = account_profiles.setdefault(account, {})
@@ -4274,6 +5192,46 @@ async def _edit_account_profile(account: str):
                 print(Fore.GREEN + f"  ✔  {account} back to defaults." + Style.RESET_ALL)
 
 
+async def _edit_strategy_symbols():
+    """Global strategy → symbol filter editor (applies to every account)."""
+    while True:
+        lines = []
+        if strategy_symbols:
+            for name, roots in sorted(strategy_symbols.items()):
+                lines.append(f"{name[:24].ljust(24)} → {', '.join(roots)}"[:_PROF_INNER])
+        else:
+            lines.append("No filters — every strategy trades every symbol.")
+        _prof_box("GLOBAL STRATEGY → SYMBOL FILTERS", lines, [
+            "A listed strategy only ENTERS trades on its symbols —",
+            "on EVERY account. Micro twins included (GC covers MGC).",
+            "Exits are never filtered; a blocked reversal closes.",
+            "STRATEGY name to add/edit · ENTER = back",
+        ])
+        raw = (await _ask_line("STRATEGY")).strip()
+        if not raw:
+            return
+        name = sanitize_ati(raw).lower()
+        if not name:
+            continue
+        current = ", ".join(strategy_symbols.get(name, []))
+        raw_s = await _ask_line(
+            f"SYMBOLS for '{raw}' e.g. 'GC' or 'NQ ES' (ENTER = remove"
+            + (f", now {current}" if current else "") + ")")
+        roots: list[str] = []
+        for tok in raw_s.replace(",", " ").split():
+            root = sanitize_ati(tok.strip().upper())
+            if root and root not in roots:
+                roots.append(root)
+        if roots:
+            strategy_symbols[name] = roots
+            print(Fore.GREEN + f"  ✔  '{raw}' now only enters {', '.join(roots)} "
+                  "(micro twins included) on every account." + Style.RESET_ALL)
+        elif strategy_symbols.pop(name, None) is not None:
+            print(Fore.GREEN + f"  ✔  '{raw}' filter removed — trades every symbol."
+                  + Style.RESET_ALL)
+        save_strategy_symbols()
+
+
 async def prompt_profiles():
     """Per-account trade profiles: size, contracts, direction, delay,
     stagger, ATM override, and AI gating — per account, scoped by symbol
@@ -4302,14 +5260,19 @@ async def prompt_profiles():
                     role = ""
                 lines.append(f"{i}. {name[:13].ljust(13)} {role.ljust(10)} "
                              f"{profile_summary(name)[:29]}")
+            n_filters = len(strategy_symbols)
             _prof_box("ACCOUNT PROFILES", lines, [
                 "Per-account: symbol filter, micros/full, contracts,",
                 "invert, delay, stagger, ATM override, AI gate.",
+                f"G = global strategy→symbol filters ({n_filters} set)",
                 "ACCOUNT number or name to edit · ENTER = close",
             ])
             raw = await _ask_line("ACCOUNT")
             if not raw:
                 break
+            if raw.strip().lower() == "g":
+                await _edit_strategy_symbols()
+                continue
             if raw.isdigit() and 1 <= int(raw) <= len(names):
                 acct = names[int(raw) - 1]
             else:
@@ -5666,7 +6629,7 @@ async def submit_manual_trade(side, instrument, qty, order_type: str = "market",
                                       limit_price, atm)
     if err:
         return False, err
-    plans, skipped = plan_signal_legs(signal)
+    plans, skipped = plan_signal_legs(signal, manual=True)
     if not plans:
         why = ", ".join(f"{a}: {r}" for a, r in skipped[:3]) or "no eligible accounts"
         return False, f"no legs to fire — {why}"
@@ -6076,7 +7039,14 @@ async def balance_monitor():
             for a in all_accounts:
                 if (live_bridge_enabled and _live_bridge_connected
                         and a["name"] == active_account):
-                    continue  # bridge is authoritative here
+                    # Bridge owns `current` for the leader — but a session
+                    # baseline can still be missing (NT was down at boot,
+                    # then the bridge connected), and without one the
+                    # enforcement loop below skips the account taking every
+                    # trade. Seed it from the ATI cash reading; the seeder
+                    # itself refuses outage zeros and never overwrites.
+                    _seed_start_balance(a["name"], a["cash"])
+                    continue  # bridge is authoritative for `current` here
                 if not _ingest_balance(a["name"], a["cash"], "ATI poll"):
                     continue
                 # Late baseline: an account with no start yet (NT was down
@@ -6099,6 +7069,17 @@ async def balance_monitor():
                     Fore.CYAN + Style.BRIGHT + "  🔄  Session P&L auto-reset (4:20 PM ET)" + Style.RESET_ALL)
                 logger.info("AUTO RESET  session P&L reset at 4:20 PM ET")
 
+            # Prop accounts must be flat before their firm's close deadline.
+            # Spawned, not awaited: the close/verify/retry cycle can take
+            # tens of seconds per stuck account, and stalling this loop
+            # would suspend stop/target enforcement for every other account
+            # at exactly the close. The once-per-day markers inside make
+            # re-entry safe; the task guard stops overlapping sweeps.
+            global _prop_flat_task
+            if _prop_flat_task is None or _prop_flat_task.done():
+                _prop_flat_task = asyncio.create_task(
+                    _check_prop_flat_by_close(now_et))
+
             # Periodically persist session state for crash recovery
             _balance_poll_count += 1
             if _balance_poll_count >= SESSION_SAVE_INTERVAL:
@@ -6120,6 +7101,27 @@ async def balance_monitor():
                 if acct in account_stops:
                     continue  # already locked (hard) or paused-out (soft)
                 if acct not in session_start_balances:
+                    # An account whose cash legitimately reads ~$0.00 never
+                    # seeds a baseline (the zero-refusing seeder cannot
+                    # tell it from an outage artifact), so its stop/target
+                    # would silently never be enforced. Losing enforcement
+                    # must at least be visible: warn once per session when
+                    # limits are configured and the feed is alive.
+                    if (acct in session_current_balances
+                            and acct not in _balance_suspect_since
+                            and acct not in _no_baseline_warned):
+                        limits = get_account_limits(acct)
+                        if limits["target"] or limits["stop"]:
+                            _no_baseline_warned.add(acct)
+                            logger.warning(
+                                f"NO BASELINE  {acct} has limits configured but no "
+                                "session baseline (balance reads ~$0.00) — "
+                                "stop/target NOT enforced until a nonzero reading")
+                            _dash_set_alert(
+                                Fore.YELLOW + f"  ⚠  {acct}: no session baseline "
+                                "($0.00 balance) — its stop/target is NOT "
+                                "enforced until NT reports a nonzero balance."
+                                + Style.RESET_ALL, sticky=True)
                     continue
                 current = session_current_balances.get(acct)
                 if current is None:
@@ -6870,6 +7872,7 @@ def web_state() -> dict:
             "name": name, "role": role, "start": start, "current": current,
             "pnl": pnl, "stop": account_stops.get(name),
             "stale": name in _balance_suspect_since,
+            "prop": is_prop_account(name),
             "profile": profile_summary(name),
             "limits": get_account_limits(name),
         })
@@ -6892,6 +7895,7 @@ def web_state() -> dict:
         "session_contracts": sorted(session_contracts),
         "last_manual": dict(_last_manual),
         "micro_map": dict(micro_map),
+        "strategy_symbols": {k: list(v) for k, v in strategy_symbols.items()},
         "rule_defaults": dict(DEFAULT_RULE),
         "catalog": instrument_catalog(),
         "favorites": [f for f in (load_config().get("web_favorites") or [])
@@ -7189,6 +8193,24 @@ async def _web_set_micro_map(raw) -> tuple[bool, str]:
     return True, f"{len(overrides)} micro override(s) saved"
 
 
+async def _web_set_strategy_symbols(raw) -> tuple[bool, str]:
+    """Persist the global strategy → symbol filter from the web UI.
+
+    The UI sends the complete map on every save (like profiles), so an
+    entry sanitized down to nothing is a removal.
+    """
+    if hard_stopped:
+        return False, "session hard-locked — settings are frozen"
+    if not isinstance(raw, dict):
+        return False, "strategy_symbols must be a JSON object"
+    cleaned = load_strategy_symbols({"strategy_symbols": raw})
+    strategy_symbols.clear()
+    strategy_symbols.update(cleaned)
+    save_strategy_symbols()
+    return True, (f"{len(cleaned)} strategy filter(s) saved"
+                  if cleaned else "strategy filters cleared")
+
+
 async def _web_set_favorites(raw) -> tuple[bool, str]:
     """Pin the contracts the ticket shows first (starred in the picker)."""
     if not isinstance(raw, list):
@@ -7214,6 +8236,8 @@ def _web_nt_accounts() -> list[str]:
 
 
 _live_cache: dict = {"ts": 0.0, "data": None}
+LIVE_ZERO_FREEZE_S = 180        # how long zeroed AccountItems freeze the live view
+_live_zeroed_since: float | None = None   # wall-clock start of the current zeroed run
 _live_lock = threading.Lock()
 LIVE_CACHE_TTL = 1.0   # seconds; several browser tabs share one ATI round-trip
 
@@ -7242,11 +8266,26 @@ def web_live(force: bool = False) -> dict:
         # and positions are gone" — that is what made rows blink. Same for a
         # dump that answers with AccountItems zeroed out: that is NT with its
         # broker connection down, not accounts at $0. Serve the last good
-        # view instead and let the timestamp show it is stale.
+        # view instead and let the timestamp show it is stale — but only for
+        # a bounded window: past it the zeros are no longer a blip being
+        # ridden out but the actual state (one broker connection dropped for
+        # the day, an account the firm zeroed), and freezing every OTHER
+        # account's positions forever is worse than rendering the truth
+        # with held balances.
+        global _live_zeroed_since
         zeroed = bool(snap.get("ok")) and any(
             isinstance(info.get("cash"), (int, float))
             and _suspect_zero_balance(name, info["cash"])
             for name, info in snap["accounts"].items())
+        if zeroed:
+            if _live_zeroed_since is None:
+                _live_zeroed_since = time.time()
+            zeroed = time.time() - _live_zeroed_since < LIVE_ZERO_FREEZE_S
+        elif snap.get("ok"):
+            # Only a complete, non-zeroed dump proves recovery. Truncated
+            # dumps interleaving with zeroed ones must not restart the
+            # freeze clock — that made the "bounded" freeze unbounded.
+            _live_zeroed_since = None
         if (not snap.get("ok") or zeroed) and _live_cache.get("last_good"):
             stale = dict(_live_cache["last_good"])
             stale["stale"] = True
@@ -7455,7 +8494,17 @@ async def _web_reverse_position(account, instrument) -> tuple[bool, str]:
         return False, "session hard-locked"
     if acct in account_stops:
         return False, f"{acct} is stopped for the session"
+    if is_prop_account(acct) and _prop_entry_blocked_now(acct):
+        return False, (f"{acct} is a prop account inside its flat-by-close "
+                       "window — a reversal would open a position nothing "
+                       "re-flattens today. Close it instead.")
     live = await asyncio.to_thread(web_live)
+    if live.get("stale"):
+        # The frozen last-good view can be minutes old; sizing a live
+        # REVERSEPOSITION from it can reverse a quantity that no longer
+        # exists and open an unintended net position.
+        return False, ("live view is stale — NinjaTrader has not confirmed "
+                       "current positions; refusing to size a reversal from it")
     pos = next((p for p in live["positions"]
                 if p["account"] == acct and p["instrument"] == instr), None)
     if not pos:
@@ -7472,6 +8521,18 @@ async def _web_reverse_position(account, instrument) -> tuple[bool, str]:
         return False, "order file write failed — check the output directory"
     logger.info(f"WEB REVERSE  {acct}  {instr}  {action} {abs(pos['qty'])}")
     _dash_set_alert(Fore.YELLOW + f"  ⇄  REVERSE {instr} on {acct}" + Style.RESET_ALL)
+    if is_prop_account(acct):
+        # One position at a time: sweep any OTHER market this prop account
+        # still holds, trailing the reversal (exits are never delayed).
+        # cross_account — this reversal was account-scoped, so another
+        # prop account left on the now-opposite side of the product group
+        # would be exactly the cross-account hedge the firms close accounts
+        # for, and no other leg of this action exists to handle it.
+        task = asyncio.create_task(_prop_reversal_cleanup(
+            [{"account": acct, "instrument": instr, "action": action}],
+            cross_account=True))
+        _leg_tasks.add(task)
+        task.add_done_callback(_leg_tasks.discard)
     return True, f"{acct}: reversing {instr} ({action} {abs(pos['qty'])})"
 
 
@@ -7751,6 +8812,9 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
             elif path == "/api/strategy":
                 ok, msg = _web_run(_web_set_strategy(
                     data.get("name"), data.get("follow_publisher")))
+            elif path == "/api/strategy_symbols":
+                ok, msg = _web_run(_web_set_strategy_symbols(
+                    data.get("strategy_symbols")))
             elif path == "/api/limits":
                 ok, msg = _web_run(_web_set_limits(
                     data.get("account"), data.get("target"),
@@ -8511,6 +9575,15 @@ function accountModal(a){
     if(rule.ai)P.appendChild(el("div","sub","AI gate: "+rule.ai.provider+
       " — configure from the terminal"));
 
+    P.appendChild(el("label",null,"Prop firm account (one trade at a time · flat by close)"));
+    const pr=pickGroup(P,[{label:"OFF",value:false},{label:"PROP",value:true}],!!prof.prop);
+    P.appendChild(el("label",null,"Prop firm (apex, topstep, mffu, tpt, tradeify, …) — sets safe close times"));
+    const pfirm=el("input");pfirm.value=prof.prop_firm||"";P.appendChild(pfirm);
+    P.appendChild(el("label",null,"Flat-by-close ET HH:MM (blank = firm preset)"));
+    const pflat=el("input");pflat.value=prof.prop_flat_et||"";P.appendChild(pflat);
+    P.appendChild(el("label",null,"Entry cutoff ET HH:MM (blank = firm preset)"));
+    const pcut=el("input");pcut.value=prof.prop_cutoff_et||"";P.appendChild(pcut);
+
     P.appendChild(btn("SAVE PROFILE","wide on",()=>{
       const profiles=JSON.parse(JSON.stringify(S.profiles||{}));
       const e=profiles[a.name]||{};const d=e.default||{};
@@ -8521,6 +9594,11 @@ function accountModal(a){
       if(at.value)d.atm=at.value;else delete d.atm;
       e.default=d;
       if(allowed.length)e.symbols_allowed=allowed;else delete e.symbols_allowed;
+      if(pr.value){e.prop=true;
+        if(pfirm.value.trim())e.prop_firm=pfirm.value.trim();else delete e.prop_firm;
+        if(pflat.value.trim())e.prop_flat_et=pflat.value.trim();else delete e.prop_flat_et;
+        if(pcut.value.trim())e.prop_cutoff_et=pcut.value.trim();else delete e.prop_cutoff_et}
+      else{delete e.prop;delete e.prop_firm;delete e.prop_flat_et;delete e.prop_cutoff_et}
       profiles[a.name]=e;
       api("/api/profiles",{profiles:profiles}).then(closeModal)}));
     P.appendChild(btn("RESET PROFILE","wide sm danger",()=>{
@@ -8543,7 +9621,34 @@ function strategyModal(){
       {label:"FOLLOW publisher",value:true}],S.follow_publisher_strategy);
     f.appendChild(btn("SAVE","wide on",()=>api("/api/strategy",
       {name:chosen.value,follow_publisher:mode.value}).then(closeModal)));
-    m.appendChild(f)})}
+    m.appendChild(f);
+
+    const G=el("div","fieldset");
+    G.appendChild(el("label",null,
+      "Strategy symbol filters — a listed strategy only ENTERS trades on its symbols, on every account. Exits are never filtered."));
+    const map=JSON.parse(JSON.stringify(S.strategy_symbols||{}));
+    const rows=el("div");G.appendChild(rows);
+    function redraw(){
+      rows.textContent="";
+      const keys=Object.keys(map).sort();
+      if(!keys.length){rows.appendChild(el("div","sub","No filters — every strategy trades every symbol."));return}
+      keys.forEach(k=>{
+        const row=el("div","sub");
+        row.appendChild(el("span",null,k+" → "+map[k].join(", ")+"  "));
+        row.appendChild(btn("REMOVE","sm",()=>{delete map[k];redraw()}));
+        rows.appendChild(row)})}
+    redraw();
+    G.appendChild(el("label",null,"Strategy name (as the publisher sends it)"));
+    const gn=el("input");G.appendChild(gn);
+    G.appendChild(el("label",null,"Symbols (e.g. GC, or NQ ES — micro twins included)"));
+    const gs=el("input");G.appendChild(gs);
+    G.appendChild(btn("ADD / UPDATE","wide sm",()=>{
+      const k=gn.value.trim();
+      const v=gs.value.trim().split(/[\s,]+/).filter(Boolean).map(s=>s.toUpperCase());
+      if(k&&v.length){map[k]=v;gn.value="";gs.value="";redraw()}}));
+    G.appendChild(btn("SAVE FILTERS","wide on",()=>api("/api/strategy_symbols",
+      {strategy_symbols:map}).then(closeModal)));
+    m.appendChild(G)})}
 
 /* ================= render ================= */
 function renderChips(){
@@ -8655,6 +9760,10 @@ async def main():
     micro_mode = bool(cfg.get("micro_mode", False))
     micro_map = load_micro_map(cfg)
     nt_port = cfg.get("nt_port", 36973)
+    strategy_symbols.clear()
+    strategy_symbols.update(load_strategy_symbols(cfg))
+    if strategy_symbols:
+        logger.info(f"STRATEGY FILTERS LOADED  {strategy_symbols}")
     account_profiles.clear()
     account_profiles.update(load_account_profiles(cfg))
     if account_profiles:

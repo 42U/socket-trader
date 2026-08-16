@@ -96,6 +96,8 @@ def reset_session_state():
     st._alert_kind = ""
     st._alert_sticky = False
     st._alert_ts = 0.0
+    st._prop_autoflat_done.clear()
+    st.strategy_symbols.clear()
     yield
     st.active_account = None
     st.follower_accounts = []
@@ -3749,14 +3751,21 @@ class TestBalanceQuarantine:
         assert "NinjaTrader" in first_alert
         assert st._alert_text == ""               # no re-alert while suspect
 
-    def test_reset_during_outage_keeps_real_baseline(self):
+    def test_reset_during_outage_never_snapshots_zero_or_stale(self):
         # A 4:20 PM auto-reset while NT is down must not snapshot $0 as the
-        # new baseline — that read as +$52k phantom profit after reconnect.
+        # new baseline (phantom profit on reconnect) — and must not re-
+        # baseline the HELD value either, which would hide a genuine
+        # zeroing behind a frozen number. The quarantined account gets
+        # full amnesia and re-seeds from its next real reading.
         st.session_start_balances["Apex1"] = 52776.40
         st.session_current_balances["Apex1"] = 52950.00
         st._ingest_balance("Apex1", 0.0, "test")          # outage begins
         st.reset_session_pnl()
-        assert st.session_start_balances["Apex1"] == 52950.00
+        assert "Apex1" not in st.session_start_balances
+        assert "Apex1" not in st.session_current_balances
+        st._ingest_balance("Apex1", 52950.00, "test")     # feed recovers
+        st._seed_start_balance("Apex1", 52950.00)
+        assert st.session_start_balances["Apex1"] == 52950.00   # clean re-seed
 
     def test_seed_start_balance_refuses_zero_and_never_overwrites(self):
         st._seed_start_balance("Apex1", 0.0)
@@ -3792,3 +3801,866 @@ class TestBalanceQuarantine:
         st.session_current_balances["Apex1"] = 52950.00
         line = st._build_controls_line()
         assert "stale" not in line
+
+
+# ── Prop-firm account mode ────────────────────────────────────────────
+
+
+def _wed(h, m):
+    """A plain Wednesday in ET (2026-08-12)."""
+    return datetime(2026, 8, 12, h, m, tzinfo=st.ET)
+
+
+class TestPropProfileParsing:
+    def test_prop_flag_parsed_and_persisted_shape(self):
+        cfg = {"account_profiles": {"Apex1": {
+            "prop": True, "prop_firm": "Apex",
+            "prop_flat_et": "16:30", "prop_cutoff_et": "16:20"}}}
+        out = st.load_account_profiles(cfg)
+        assert out["Apex1"]["prop"] is True
+        assert out["Apex1"]["prop_firm"] == "apex"       # normalized lowercase
+        assert out["Apex1"]["prop_flat_et"] == "16:30"
+        assert out["Apex1"]["prop_cutoff_et"] == "16:20"
+
+    def test_invalid_times_dropped_falls_back_to_preset(self):
+        cfg = {"account_profiles": {"A": {
+            "prop": True, "prop_flat_et": "26:99", "prop_cutoff_et": "garbage"}}}
+        out = st.load_account_profiles(cfg)
+        assert "prop_flat_et" not in out["A"]
+        assert "prop_cutoff_et" not in out["A"]
+
+    def test_not_prop_ignores_time_keys(self):
+        cfg = {"account_profiles": {"A": {"prop_flat_et": "16:30",
+                                          "default": {"enabled": False}}}}
+        out = st.load_account_profiles(cfg)
+        assert "prop" not in out["A"]
+        assert "prop_flat_et" not in out["A"]
+
+    def test_is_prop_account(self):
+        st.account_profiles["Apex1"] = {"prop": True}
+        assert st.is_prop_account("Apex1") is True
+        assert st.is_prop_account("Cash1") is False
+
+    def test_web_strip_ai_keeps_prop_keys(self):
+        raw = {"Apex1": {"prop": True, "prop_firm": "apex",
+                         "default": {"ai": {"provider": "openai"}}}}
+        cleaned = st._strip_ai_config(raw)
+        assert cleaned["Apex1"]["prop"] is True
+        assert cleaned["Apex1"]["prop_firm"] == "apex"
+        assert "ai" not in cleaned["Apex1"]["default"]
+
+    def test_profile_summary_shows_prop_and_flat_time(self):
+        st.account_profiles["Apex1"] = {"prop": True, "prop_firm": "apex"}
+        s = st.profile_summary("Apex1")
+        assert "PROP" in s and "16:57" in s
+
+    def test_firm_presets_pick_safe_times(self):
+        st.account_profiles["M"] = {"prop": True, "prop_firm": "mffu"}
+        st.account_profiles["T"] = {"prop": True, "prop_firm": "topstep"}
+        st.account_profiles["U"] = {"prop": True, "prop_firm": "unknownfirm"}
+        assert st.prop_flat_time("M") == (16, 7)      # MFFU breach at 4:10 PM ET
+        assert st.prop_flat_time("T") == (16, 5)      # Topstep staff flatten 4:08 PM ET
+        assert st.prop_flat_time("U") == st.PROP_FLAT_ET_DEFAULT
+
+    def test_explicit_time_beats_firm_preset(self):
+        st.account_profiles["M"] = {"prop": True, "prop_firm": "mffu",
+                                    "prop_flat_et": "15:45"}
+        assert st.prop_flat_time("M") == (15, 45)
+
+    def test_save_round_trip_keeps_prop(self):
+        st.account_profiles["Apex1"] = {"prop": True, "prop_firm": "apex",
+                                        "prop_flat_et": "16:30"}
+        st.save_account_profiles()
+        loaded = st.load_account_profiles(st.load_config())
+        assert loaded["Apex1"]["prop"] is True
+        assert loaded["Apex1"]["prop_firm"] == "apex"
+        assert loaded["Apex1"]["prop_flat_et"] == "16:30"
+
+
+class TestPropEntryCutoff:
+    def _mark(self, account="Apex1", **extra):
+        st.account_profiles[account] = {"prop": True, **extra}
+
+    def test_open_hours_not_blocked(self):
+        self._mark()
+        assert st._prop_entry_blocked_now("Apex1", _wed(10, 30)) is False
+
+    def test_blocked_from_cutoff_until_reopen(self):
+        self._mark()
+        assert st._prop_entry_blocked_now("Apex1", _wed(16, 55)) is True
+        assert st._prop_entry_blocked_now("Apex1", _wed(17, 30)) is True
+        assert st._prop_entry_blocked_now("Apex1", _wed(18, 0)) is False
+
+    def test_friday_cutoff_holds_through_weekend(self):
+        self._mark()
+        fri = datetime(2026, 8, 14, 17, 30, tzinfo=st.ET)
+        sat = datetime(2026, 8, 15, 11, 0, tzinfo=st.ET)
+        sun_pre = datetime(2026, 8, 16, 17, 59, tzinfo=st.ET)
+        sun_post = datetime(2026, 8, 16, 18, 0, tzinfo=st.ET)
+        assert st._prop_entry_blocked_now("Apex1", fri) is True
+        assert st._prop_entry_blocked_now("Apex1", sat) is True
+        assert st._prop_entry_blocked_now("Apex1", sun_pre) is True
+        assert st._prop_entry_blocked_now("Apex1", sun_post) is False
+
+    def test_custom_cutoff_respected(self):
+        self._mark(prop_cutoff_et="15:00")
+        assert st._prop_entry_blocked_now("Apex1", _wed(15, 0)) is True
+        assert st._prop_entry_blocked_now("Apex1", _wed(14, 59)) is False
+
+    def test_leg_blocked_reports_prop_window(self, monkeypatch):
+        self._mark()
+        monkeypatch.setattr(st, "_prop_entry_blocked_now", lambda a: True)
+        assert "prop entry cutoff" in st._leg_blocked("Apex1")
+
+    def test_leg_blocked_ignores_non_prop(self, monkeypatch):
+        monkeypatch.setattr(st, "_prop_entry_blocked_now", lambda a: True)
+        assert st._leg_blocked("Cash1") is None
+
+
+def _snap(*positions):
+    """Build an nt_snapshot-shaped dict from (account, instrument, qty)."""
+    return {"ok": True, "accounts": {}, "working": {}, "ts": 0.0,
+            "positions": [{"account": a, "instrument": i, "qty": q,
+                           "avg_price": None} for a, i, q in positions]}
+
+
+class TestPropPreemptClosures:
+    def _plan(self, account="Apex1", instrument="NQ 09-26", action="BUY"):
+        return {"account": account, "instrument": instrument, "action": action}
+
+    def test_other_market_closed_before_entry(self):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        to_close, keeps = st._prop_preempt_closures(
+            [self._plan()], _snap(("Apex1", "GC DEC26", 2)))
+        assert to_close == {"Apex1": ["GC DEC26"]}
+        assert not keeps.get("Apex1")
+
+    def test_same_contract_kept_for_netting(self):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        to_close, keeps = st._prop_preempt_closures(
+            [self._plan(action="SELL")], _snap(("Apex1", "NQ SEP26", 2)))
+        assert to_close == {}
+        assert keeps["Apex1"] is True
+
+    def test_micro_twin_closed_either_direction(self):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        for qty in (2, -2):
+            to_close, _ = st._prop_preempt_closures(
+                [self._plan()], _snap(("Apex1", "MNQ SEP26", qty)))
+            assert to_close == {"Apex1": ["MNQ SEP26"]}
+
+    def test_mixed_keep_and_close_flags_selective_flatten(self):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        to_close, keeps = st._prop_preempt_closures(
+            [self._plan()],
+            _snap(("Apex1", "NQ SEP26", 1), ("Apex1", "GC DEC26", 1)))
+        assert to_close == {"Apex1": ["GC DEC26"]}
+        assert keeps["Apex1"] is True
+
+    def test_cross_account_opposite_same_group_closed(self):
+        st.active_account = "Apex1"
+        st.follower_accounts = ["Apex2", "Cash1"]
+        st.account_profiles["Apex1"] = {"prop": True}
+        st.account_profiles["Apex2"] = {"prop": True}
+        # Apex2 short ES — same product group (Equity index) opposite the
+        # group's NQ BUY. Cash1 is not prop and is never touched.
+        to_close, _ = st._prop_preempt_closures(
+            [self._plan()],
+            _snap(("Apex2", "ES SEP26", -1), ("Cash1", "ES SEP26", -5)))
+        assert to_close == {"Apex2": ["ES SEP26"]}
+
+    def test_cross_account_same_direction_kept(self):
+        st.active_account = "Apex1"
+        st.follower_accounts = ["Apex2"]
+        st.account_profiles["Apex1"] = {"prop": True}
+        st.account_profiles["Apex2"] = {"prop": True}
+        to_close, keeps = st._prop_preempt_closures(
+            [self._plan()], _snap(("Apex2", "ES SEP26", 3)))
+        assert to_close == {}
+        assert keeps["Apex2"] is True
+
+    def test_cross_account_other_group_kept(self):
+        st.active_account = "Apex1"
+        st.follower_accounts = ["Apex2"]
+        st.account_profiles["Apex1"] = {"prop": True}
+        st.account_profiles["Apex2"] = {"prop": True}
+        to_close, _ = st._prop_preempt_closures(
+            [self._plan()], _snap(("Apex2", "GC DEC26", -2)))
+        assert to_close == {}
+
+    def test_cross_account_excluded_when_disabled(self):
+        st.active_account = "Apex1"
+        st.follower_accounts = ["Apex2"]
+        st.account_profiles["Apex1"] = {"prop": True}
+        st.account_profiles["Apex2"] = {"prop": True}
+        to_close, _ = st._prop_preempt_closures(
+            [self._plan()], _snap(("Apex2", "MNQ SEP26", -1)),
+            cross_account=False)
+        assert to_close == {}
+
+    def test_flatten_wave_selective_vs_whole_account(self, monkeypatch):
+        st.active_account = "Apex1"
+        st.follower_accounts = ["Apex2"]
+        fired, flattened = [], []
+        monkeypatch.setattr(st, "fire_close_position",
+                            lambda a, c: fired.append((a, c)))
+        monkeypatch.setattr(st, "close_account_positions",
+                            lambda a: flattened.append(a) or ["X"])
+        st._prop_flatten_wave(
+            {"Apex1": ["GC DEC26"], "Apex2": ["ES SEP26"]},
+            {"Apex1": True})
+        assert fired == [("Apex1", "GC DEC26")]   # keeps → targeted close
+        assert flattened == ["Apex2"]             # nothing kept → full flatten
+
+
+class TestPropPlanFlags:
+    SIG = "PLACE;Apex1;NQ 09-26;BUY;2;MARKET;;;DAY;;;NQ_Med;42"
+
+    def test_prop_place_is_deferred_group(self):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        plans, skipped = st.plan_signal_legs(self.SIG)
+        assert skipped == []
+        (p,) = plans
+        assert p["prop"] is True
+        assert p["deferred"] is True
+        assert p["prop_group"] is True
+
+    def test_prop_with_delay_is_individual_deferred(self):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True,
+                                        "default": {"delay_ms": 500}}
+        (p,), _ = st.plan_signal_legs(self.SIG)
+        assert p["deferred"] is True
+        assert p["prop_group"] is False
+
+    def test_non_prop_place_unchanged(self):
+        st.active_account = "Cash1"
+        sig = self.SIG.replace("Apex1", "Cash1")
+        (p,), _ = st.plan_signal_legs(sig)
+        assert p["prop"] is False
+        assert p["deferred"] is False
+        assert p["prop_group"] is False
+
+    def test_prop_reversal_not_deferred(self):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        sig = self.SIG.replace("PLACE", "REVERSEPOSITION")
+        (p,), _ = st.plan_signal_legs(sig)
+        assert p["prop"] is True
+        assert p["deferred"] is False
+        assert p["prop_group"] is False
+
+
+class TestPropHedgeEscalation:
+    SIG = "PLACE;Apex1;NQ 09-26;BUY;1;MARKET;;;DAY;;;NQ_Med;7"
+
+    def _inverted_pair(self, prop_on_leader):
+        st.active_account = "Apex1"
+        st.follower_accounts = ["B2"]
+        if prop_on_leader:
+            st.account_profiles["Apex1"] = {"prop": True}
+        prof = st.account_profiles.setdefault("B2", {})
+        prof["default"] = {"direction": "invert"}
+
+    def test_warn_mode_escalates_to_block_for_prop(self):
+        self._inverted_pair(prop_on_leader=True)   # hedge_guard defaults to warn
+        plans, skipped = st.plan_signal_legs(self.SIG)
+        assert plans == []
+        assert {a for a, _ in skipped} == {"Apex1", "B2"}
+        assert "PROP" in st._alert_text.upper() or "HEDGE BLOCKED" in st._alert_text
+
+    def test_warn_mode_stays_warn_without_prop(self):
+        self._inverted_pair(prop_on_leader=False)
+        plans, _ = st.plan_signal_legs(self.SIG)
+        assert len(plans) == 2                     # warned, not blocked
+
+    def test_off_mode_still_blocks_for_prop(self):
+        cfg = st.load_config()
+        cfg["hedge_guard"] = "off"
+        st.save_config(cfg)
+        self._inverted_pair(prop_on_leader=True)
+        plans, _ = st.plan_signal_legs(self.SIG)
+        assert plans == []
+
+
+class TestPropGroupExecution:
+    SIG = "PLACE;Apex1;NQ 09-26;BUY;2;MARKET;;;DAY;;;NQ_Med;42"
+
+    @pytest.fixture(autouse=True)
+    def _fast_and_quiet(self, monkeypatch):
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_DELAY", 0.001)
+        monkeypatch.setattr(st, "query_nt_positions",
+                            lambda account, port=36973: {})
+        monkeypatch.setattr(st, "query_nt_open_orders",
+                            lambda account, port=36973: [])
+        # Pin the clock OUT of the flat-by-close window: these tests run
+        # at any wall time, and prop entries are genuinely blocked on
+        # weekends and near the close.
+        monkeypatch.setattr(st, "_prop_entry_blocked_now",
+                            lambda account, now_et=None: False)
+
+    def _wire_nt(self, monkeypatch, positions):
+        """Fake NT: a mutable position table the flatten mutates."""
+        state = {"pos": list(positions), "closed": [], "snapshots": 0}
+
+        def fake_snapshot(port=None, timeout=3.0):
+            state["snapshots"] += 1
+            return _snap(*state["pos"])
+
+        def fake_close(account):
+            gone = [p for p in state["pos"] if p[0] == account]
+            state["pos"] = [p for p in state["pos"] if p[0] != account]
+            state["closed"].append(account)
+            return [i for _, i, _ in gone]
+
+        monkeypatch.setattr(st, "nt_snapshot", fake_snapshot)
+        monkeypatch.setattr(st, "close_account_positions", fake_close)
+        return state
+
+    def test_conflict_closed_confirmed_then_entry_written(
+            self, monkeypatch, tmp_output_dir):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        state = self._wire_nt(monkeypatch, [("Apex1", "GC DEC26", 2)])
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(self.SIG)
+            written = _run_plans(plans)
+        assert written == []                      # group runs deferred
+        assert state["closed"] == ["Apex1"]       # GC flattened first
+        files = [f.read_text() for f in tmp_output_dir.glob("oif_*.txt")]
+        assert len(files) == 1 and files[0].startswith("PLACE;Apex1;NQ 09-26;BUY")
+
+    def test_entry_withheld_when_close_never_confirms(
+            self, monkeypatch, tmp_output_dir):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        state = self._wire_nt(monkeypatch, [("Apex1", "GC DEC26", 2)])
+        # Flatten "fires" but the position never leaves the snapshot.
+        monkeypatch.setattr(st, "close_account_positions",
+                            lambda a: state["closed"].append(a) or ["GC DEC26"])
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(self.SIG)
+            _run_plans(plans)
+        assert list(tmp_output_dir.glob("oif_*.txt")) == []   # NO entry
+        assert state["closed"] == ["Apex1", "Apex1"]          # one retry
+        assert "PROP GUARD" in st._alert_text
+
+    def test_entry_withheld_when_nt_state_unavailable(
+            self, monkeypatch, tmp_output_dir):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        monkeypatch.setattr(st, "nt_snapshot",
+                            lambda port=None, timeout=3.0: {"ok": False, "positions": []})
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(self.SIG)
+            _run_plans(plans)
+        assert list(tmp_output_dir.glob("oif_*.txt")) == []
+        assert "PROP GUARD" in st._alert_text
+
+    def test_flat_account_enters_without_closing_anything(
+            self, monkeypatch, tmp_output_dir):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        state = self._wire_nt(monkeypatch, [])
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(self.SIG)
+            _run_plans(plans)
+        assert state["closed"] == []
+        assert len(list(tmp_output_dir.glob("oif_*.txt"))) == 1
+
+    def test_group_covers_all_prop_accounts_and_cross_account_sweep(
+            self, monkeypatch, tmp_output_dir):
+        st.active_account = "Apex1"
+        st.follower_accounts = ["Apex2", "Cash1"]
+        st.account_profiles["Apex1"] = {"prop": True}
+        st.account_profiles["Apex2"] = {"prop": True,
+                                        "symbols_allowed": ["GC"]}
+        # Apex2 sits out the NQ entry (GC-only) but holds short MNQ —
+        # opposite side of the group's BUY in the same product group.
+        # Cash1 also holds short MNQ but is NOT prop: untouched.
+        state = self._wire_nt(monkeypatch, [("Apex2", "MNQ SEP26", -3),
+                                            ("Cash1", "MNQ SEP26", -3)])
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, skipped = st.plan_signal_legs(self.SIG)
+            written = _run_plans(plans)
+        assert ("Apex2", "symbol filtered (NQ)") in skipped
+        assert written == ["Cash1"]               # instant leg, not prop
+        assert state["closed"] == ["Apex2"]       # swept before the entry
+        bodies = [f.read_text() for f in tmp_output_dir.glob("oif_*.txt")]
+        entries = [b for b in bodies if b.startswith("PLACE")]
+        assert {b.split(";")[1] for b in entries} == {"Apex1", "Cash1"}
+        # Cash1's short MNQ stayed: still in the fake NT position table.
+        assert ("Cash1", "MNQ SEP26", -3) in state["pos"]
+
+    def test_leader_group_leg_registers_fill_confirm(
+            self, monkeypatch, tmp_output_dir):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        self._wire_nt(monkeypatch, [])
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(self.SIG)
+            _run_plans(plans, sig_id="42")
+        assert len(st._pending_confirms) == 1
+        assert st._pending_confirms[0]["instrument"] == "NQ 09-26"
+
+    def test_deferred_prop_leg_with_delay_also_preempts(
+            self, monkeypatch, tmp_output_dir):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True,
+                                        "default": {"delay_ms": 1}}
+        state = self._wire_nt(monkeypatch, [("Apex1", "GC DEC26", 2)])
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(self.SIG)
+            _run_plans(plans)
+        assert state["closed"] == ["Apex1"]
+        assert len(list(tmp_output_dir.glob("oif_*.txt"))) == 1
+
+    def test_reversal_fires_instantly_then_sweeps_other_markets(
+            self, monkeypatch, tmp_output_dir):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        state = self._wire_nt(monkeypatch, [("Apex1", "NQ SEP26", 2),
+                                            ("Apex1", "GC DEC26", 1)])
+        fired = []
+        monkeypatch.setattr(st, "fire_close_position", lambda a, c: (
+            fired.append((a, c)),
+            state.update(pos=[p for p in state["pos"] if p[1] != c])))
+        sig = self.SIG.replace("PLACE", "REVERSEPOSITION").replace("BUY", "SELL")
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(sig)
+            written = _run_plans(plans)
+        assert written == ["Apex1"]               # reversal wrote immediately
+        assert fired == [("Apex1", "GC DEC26")]   # GC swept, NQ untouched
+        assert ("Apex1", "NQ SEP26", 2) in state["pos"]
+
+
+class TestPropFlatByClose:
+    @pytest.fixture(autouse=True)
+    def _fast(self, monkeypatch):
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_DELAY", 0.001)
+
+    def _wire(self, monkeypatch, still_open=False, holding=True):
+        calls = []
+        monkeypatch.setattr(st, "query_nt_positions",
+                            lambda account, port=36973: {"NQ SEP26": 2} if holding else {})
+        monkeypatch.setattr(st, "close_account_positions",
+                            lambda a: calls.append(a) or ["NQ SEP26"])
+
+        async def fake_verify(accounts):
+            if still_open:
+                return [{"account": accounts[0], "instrument": "NQ SEP26",
+                         "qty": 2, "avg_price": None}]
+            return []
+        monkeypatch.setattr(st, "verify_flat", fake_verify)
+        return calls
+
+    def test_flattens_prop_account_inside_window_once(self, monkeypatch):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        calls = self._wire(monkeypatch)
+        asyncio.run(st._check_prop_flat_by_close(_wed(16, 58)))
+        asyncio.run(st._check_prop_flat_by_close(_wed(16, 59)))
+        assert calls == ["Apex1"]                 # once per day
+        assert "flat-by-close" in st._alert_text
+
+    def test_already_flat_account_stays_quiet(self, monkeypatch):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        calls = self._wire(monkeypatch, holding=False)
+        asyncio.run(st._check_prop_flat_by_close(_wed(16, 58)))
+        assert calls == []                        # nothing closed
+        assert st._alert_text == ""               # and no "flattened" claim
+
+    def test_respects_firm_specific_time(self, monkeypatch):
+        st.active_account = "M1"
+        st.account_profiles["M1"] = {"prop": True, "prop_firm": "mffu"}
+        calls = self._wire(monkeypatch)
+        asyncio.run(st._check_prop_flat_by_close(_wed(16, 5)))
+        assert calls == []                        # before 16:07
+        asyncio.run(st._check_prop_flat_by_close(_wed(16, 8)))
+        assert calls == ["M1"]
+
+    def test_outside_window_or_weekend_no_fire(self, monkeypatch):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        calls = self._wire(monkeypatch)
+        asyncio.run(st._check_prop_flat_by_close(_wed(12, 0)))
+        asyncio.run(st._check_prop_flat_by_close(_wed(17, 40)))   # past window end
+        sat = datetime(2026, 8, 15, 16, 58, tzinfo=st.ET)
+        asyncio.run(st._check_prop_flat_by_close(sat))
+        assert calls == []
+
+    def test_non_prop_account_never_touched(self, monkeypatch):
+        st.active_account = "Cash1"
+        calls = self._wire(monkeypatch)
+        asyncio.run(st._check_prop_flat_by_close(_wed(16, 58)))
+        assert calls == []
+
+    def test_stopped_but_flat_account_stays_quiet(self, monkeypatch):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        st.account_stops["Apex1"] = "hard"
+        calls = self._wire(monkeypatch, holding=False)
+        asyncio.run(st._check_prop_flat_by_close(_wed(16, 58)))
+        assert calls == []                        # verified flat, no close
+
+    def test_stopped_but_not_flat_account_is_caught(self, monkeypatch):
+        # _trip_account's flatten can fail unconfirmed and never be looked
+        # at again — the close window must still catch the position.
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        st.account_stops["Apex1"] = "hard"
+        calls = self._wire(monkeypatch, holding=True)
+        asyncio.run(st._check_prop_flat_by_close(_wed(16, 58)))
+        assert calls == ["Apex1"]
+
+    def test_unconfirmed_flatten_retries_and_alerts(self, monkeypatch):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        calls = self._wire(monkeypatch, still_open=True)
+        asyncio.run(st._check_prop_flat_by_close(_wed(16, 58)))
+        assert calls == ["Apex1", "Apex1"]        # one retry
+        assert "NOT FLAT" in st._alert_text
+
+
+# ── Prop-mode review fixes ────────────────────────────────────────────
+
+
+class TestPropReviewFixes:
+    def test_reset_never_seeds_zero_baseline(self):
+        # Boot-time outage: 0.0 was accepted with no history, then a reset
+        # (16:20 auto / B->R / web) must not snapshot it as the baseline —
+        # feed recovery would read as phantom profit.
+        st.session_current_balances["Apex1"] = 0.0
+        st.session_start_balances["Apex1"] = 0.0
+        st.session_current_balances["Cash1"] = 52776.40
+        st.reset_session_pnl()
+        assert "Apex1" not in st.session_start_balances
+        assert st.session_start_balances["Cash1"] == 52776.40
+
+    def test_seed_start_balance_rejects_garbage(self):
+        st._seed_start_balance("A", None)
+        st._seed_start_balance("A", "abc")
+        st._seed_start_balance("A", float("nan"))
+        assert "A" not in st.session_start_balances
+
+    def test_keep_test_handles_continuous_alias_instrument(self):
+        # Web Rev passes whatever alias NT broadcast ("NQU26"), and the
+        # just-reversed position must be KEPT, not flattened.
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        plan = {"account": "Apex1", "instrument": "NQU26", "action": "SELL"}
+        to_close, keeps = st._prop_preempt_closures(
+            [plan], _snap(("Apex1", "NQ SEP26", 2), ("Apex1", "GC DEC26", 1)))
+        assert to_close == {"Apex1": ["GC DEC26"]}
+        assert keeps["Apex1"] is True
+
+    def test_manual_prop_entry_fires_while_paused(self, monkeypatch, tmp_output_dir):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        st.paused = True
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_DELAY", 0.001)
+        monkeypatch.setattr(st, "query_nt_positions", lambda a, port=36973: {})
+        monkeypatch.setattr(st, "nt_snapshot", lambda port=None, timeout=3.0: _snap())
+        monkeypatch.setattr(st, "_prop_entry_blocked_now",
+                            lambda account, now_et=None: False)
+        sig = "PLACE;Apex1;NQ 09-26;BUY;1;MARKET;;;DAY;;;NQ_Med;7"
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(sig, manual=True)
+            _run_plans(plans)
+        assert len(list(tmp_output_dir.glob("oif_*.txt"))) == 1
+
+    def test_publisher_prop_entry_blocked_while_paused(self, monkeypatch, tmp_output_dir):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        st.paused = True
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_DELAY", 0.001)
+        monkeypatch.setattr(st, "nt_snapshot", lambda port=None, timeout=3.0: _snap())
+        monkeypatch.setattr(st, "_prop_entry_blocked_now",
+                            lambda account, now_et=None: False)
+        sig = "PLACE;Apex1;NQ 09-26;BUY;1;MARKET;;;DAY;;;NQ_Med;7"
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(sig)          # not manual
+            _run_plans(plans)
+        assert list(tmp_output_dir.glob("oif_*.txt")) == []
+
+    def test_prop_reversal_downgraded_to_close_inside_window(self, monkeypatch):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        monkeypatch.setattr(st, "_prop_entry_blocked_now", lambda a: True)
+        sig = "REVERSEPOSITION;Apex1;NQ 09-26;SELL;2;MARKET;;;DAY;;;NQ_Med;9"
+        (p,), _ = st.plan_signal_legs(sig)
+        assert p["command"] == "CLOSEPOSITION"
+        assert "prop flat-by-close window" in p["note"]
+
+    def test_closed_without_entry_raises_sticky_alarm(self, monkeypatch, tmp_output_dir):
+        # Positions are preempted, then every write fails (no output dir):
+        # the group must alarm loudly, not log-and-vanish.
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_DELAY", 0.001)
+        monkeypatch.setattr(st, "query_nt_positions", lambda a, port=36973: {})
+        monkeypatch.setattr(st, "query_nt_open_orders", lambda a, port=36973: [])
+        monkeypatch.setattr(st, "_prop_entry_blocked_now",
+                            lambda account, now_et=None: False)
+        state = {"pos": [("Apex1", "GC DEC26", 2)]}
+        monkeypatch.setattr(st, "nt_snapshot",
+                            lambda port=None, timeout=3.0: _snap(*state["pos"]))
+        monkeypatch.setattr(st, "close_account_positions",
+                            lambda a: state.update(pos=[]) or ["GC DEC26"])
+        sig = "PLACE;Apex1;NQ 09-26;BUY;1;MARKET;;;DAY;;;NQ_Med;7"
+        plans, _ = st.plan_signal_legs(sig)
+        with patch.object(st, "output_directory", None):   # write fails
+            _run_plans(plans)
+        assert "withheld" in st._alert_text
+        assert st._alert_sticky is True
+
+    def test_prop_times_outside_afternoon_rejected(self):
+        cfg = {"account_profiles": {"A": {
+            "prop": True, "prop_flat_et": "4:55", "prop_cutoff_et": "18:30"}}}
+        out = st.load_account_profiles(cfg)
+        assert "prop_flat_et" not in out["A"]      # 4:55 AM footgun rejected
+        assert "prop_cutoff_et" not in out["A"]
+
+    def test_web_reverse_refuses_prop_window_and_stale_view(self, monkeypatch):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        monkeypatch.setattr(st, "_prop_entry_blocked_now", lambda a: True)
+        ok, msg = asyncio.run(st._web_reverse_position("Apex1", "NQ SEP26"))
+        assert ok is False and "flat-by-close" in msg
+
+        monkeypatch.setattr(st, "_prop_entry_blocked_now", lambda a: False)
+        monkeypatch.setattr(st, "web_live", lambda force=False: {
+            "stale": True, "positions": [
+                {"account": "Apex1", "instrument": "NQ SEP26", "qty": 2}]})
+        ok, msg = asyncio.run(st._web_reverse_position("Apex1", "NQ SEP26"))
+        assert ok is False and "stale" in msg
+
+
+# ── Global strategy → symbol filter ───────────────────────────────────
+
+
+class TestGlobalStrategySymbolFilter:
+    ENTRY = "PLACE;Sim101;ES 09-26;BUY;2;MARKET;;;DAY;;;NQ_Med;42"
+
+    def test_loader_sanitizes_and_normalizes(self):
+        out = st.load_strategy_symbols({"strategy_symbols": {
+            "GoldStrat": ["gc"], "NasdaqStrat": "nq, es",
+            "  ": ["GC"], "Junk": [], "Bad": 42}})
+        assert out == {"goldstrat": ["GC"], "nasdaqstrat": ["NQ", "ES"]}
+
+    def test_block_logic_with_twins_and_unknowns(self):
+        st.strategy_symbols["goldstrat"] = ["GC"]
+        assert st.strategy_symbol_block("GoldStrat", "GC 12-26") is None
+        assert st.strategy_symbol_block("GOLDSTRAT", "MGC 12-26") is None   # twin
+        assert "only trades GC" in st.strategy_symbol_block("GoldStrat", "NQ 09-26")
+        assert st.strategy_symbol_block("OtherStrat", "NQ 09-26") is None  # unlisted
+        assert st.strategy_symbol_block("", "NQ 09-26") is None            # no name
+        assert st.strategy_symbol_block("GoldStrat", "") is None           # no instrument
+
+    def test_entry_blocked_for_all_accounts_before_rr_draw(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.roundrobin_accounts = ["Sim103", "Sim104"]
+        st._rr_remaining = ["Sim103", "Sim104"]
+        st.strategy_symbols["goldstrat"] = ["GC"]
+        plans, skipped = st.plan_signal_legs(self.ENTRY, "GoldStrat")
+        assert plans == []
+        assert skipped == [("all accounts", "strategy 'GoldStrat' only trades GC")]
+        assert st._rr_remaining == ["Sim103", "Sim104"]   # no turn burned
+
+    def test_entry_allowed_on_listed_symbol(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.strategy_symbols["goldstrat"] = ["ES"]
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, skipped = st.plan_signal_legs(self.ENTRY, "GoldStrat")
+        assert skipped == []
+        assert len(plans) == 1 and plans[0]["command"] == "PLACE"
+
+    def test_reversal_downgraded_to_close_for_every_account(self):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        st.roundrobin_accounts = ["Sim103"]
+        st._rr_remaining = ["Sim103"]
+        st.strategy_symbols["goldstrat"] = ["GC"]
+        sig = self.ENTRY.replace("PLACE", "REVERSEPOSITION")
+        plans, _ = st.plan_signal_legs(sig, "GoldStrat")
+        assert {p["account"] for p in plans} == {"Sim101", "Sim102", "Sim103"}
+        assert all(p["command"] == "CLOSEPOSITION" for p in plans)
+
+    def test_pure_exits_never_filtered(self):
+        st.active_account = "Sim101"
+        st.strategy_symbols["goldstrat"] = ["GC"]
+        close = "CLOSEPOSITION;Sim101;ES 09-26;;;;;;;;;;"
+        plans, skipped = st.plan_signal_legs(close, "GoldStrat")
+        assert len(plans) == 1 and plans[0]["command"] == "CLOSEPOSITION"
+        assert skipped == []
+
+    def test_manual_orders_carry_no_strategy_and_pass(self, tmp_output_dir):
+        st.active_account = "Sim101"
+        st.strategy_symbols["goldstrat"] = ["GC"]
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(self.ENTRY, "", manual=True)
+        assert len(plans) == 1
+
+    def test_web_setter_round_trips_and_guards(self):
+        ok, msg = asyncio.run(st._web_set_strategy_symbols(
+            {"GoldStrat": ["GC"], "NasdaqStrat": "NQ"}))
+        assert ok is True and "2" in msg
+        assert st.strategy_symbols == {"goldstrat": ["GC"], "nasdaqstrat": ["NQ"]}
+        assert st.load_strategy_symbols(st.load_config()) == st.strategy_symbols
+
+        ok, msg = asyncio.run(st._web_set_strategy_symbols({}))
+        assert ok is True and st.strategy_symbols == {}
+        assert "strategy_symbols" not in st.load_config()
+
+        ok, _ = asyncio.run(st._web_set_strategy_symbols("nope"))
+        assert ok is False
+        st.hard_stopped = True
+        ok, msg = asyncio.run(st._web_set_strategy_symbols({"A": ["GC"]}))
+        assert ok is False and "hard-locked" in msg
+
+    def test_web_state_exposes_map(self):
+        st.strategy_symbols["goldstrat"] = ["GC"]
+        assert st.web_state()["strategy_symbols"] == {"goldstrat": ["GC"]}
+
+
+# ── Second review round: pre-release fixes ────────────────────────────
+
+
+class TestSecondReviewFixes:
+    def test_hedge_block_downgrades_reversals_to_closes(self, monkeypatch):
+        # 'HEDGE BLOCKED' must not fire opposing reversal legs.
+        monkeypatch.setattr(st, "_prop_entry_blocked_now",
+                            lambda account, now_et=None: False)
+        st.active_account = "Apex1"
+        st.follower_accounts = ["B2"]
+        st.account_profiles["Apex1"] = {"prop": True}
+        st.account_profiles["B2"] = {"default": {"direction": "invert"}}
+        sig = "REVERSEPOSITION;Apex1;NQ 09-26;SELL;2;MARKET;;;DAY;;;NQ_Med;9"
+        plans, _ = st.plan_signal_legs(sig)
+        assert {p["account"] for p in plans} == {"Apex1", "B2"}
+        assert all(p["command"] == "CLOSEPOSITION" for p in plans)
+        assert all("hedge blocked" in p["note"] for p in plans)
+
+    def test_alias_root_handles_digit_prefixed_fx_roots(self):
+        assert st._alias_root("6EU26") == "6E"
+        assert st._alias_root("6E SEP26") == "6E"
+        assert st._underlying_root("M6EU26") == "6E"     # micro folds
+        assert st._product_group("6EU26") == "FX"
+
+    def test_preempt_keeps_fx_position_reported_as_continuous_code(self):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        plan = {"account": "Apex1", "instrument": "6E 09-26", "action": "SELL"}
+        to_close, keeps = st._prop_preempt_closures(
+            [plan], _snap(("Apex1", "6EU26", 3)))
+        assert to_close == {}                     # kept, not flattened
+        assert keeps["Apex1"] is True
+
+    def test_parse_prop_hhmm_bounds(self):
+        assert st._parse_prop_hhmm("16:55") == (16, 55)
+        assert st._parse_prop_hhmm("4:55") is None      # 12h AM footgun
+        assert st._parse_prop_hhmm("18:30") is None
+        assert st._parse_prop_hhmm("junk") is None
+
+    def test_cutoff_clamped_below_custom_flat_time(self):
+        # mffu preset cutoff is 16:05; an earlier custom flat time must
+        # drag the cutoff below it, or an entry can fire after the
+        # once-per-day flatten already ran.
+        st.account_profiles["M"] = {"prop": True, "prop_firm": "mffu",
+                                    "prop_flat_et": "16:00"}
+        assert st.prop_flat_time("M") == (16, 0)
+        assert st.prop_cutoff_time("M") == (15, 58)
+
+    def test_restore_refuses_zero_baselines(self, monkeypatch):
+        saved = {"session": {"id": "2026-08-14",
+                             "start_balances": {"A": 0.0, "B": 52776.40},
+                             "contracts": [], "signal_count": 3}}
+        monkeypatch.setattr(st, "load_config", lambda: dict(saved))
+        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: "2026-08-14")
+        assert st.restore_session_state() is True
+        assert "A" not in st.session_start_balances
+        assert st.session_start_balances["B"] == 52776.40
+
+    def test_reset_gives_quarantined_account_full_amnesia(self):
+        st.session_start_balances["Apex1"] = 52776.40
+        st.session_current_balances["Apex1"] = 52950.00
+        st._ingest_balance("Apex1", 0.0, "test")          # quarantined
+        st.reset_session_pnl()
+        assert "Apex1" not in st.session_start_balances
+        assert "Apex1" not in st.session_current_balances
+        assert "Apex1" not in st._balance_suspect_since   # clean re-seed path
+
+    def test_group_partial_write_failure_raises_sticky_alarm(
+            self, monkeypatch, tmp_output_dir):
+        st.active_account = "Apex1"
+        st.follower_accounts = ["Apex2"]
+        st.account_profiles["Apex1"] = {"prop": True}
+        st.account_profiles["Apex2"] = {"prop": True}
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_DELAY", 0.001)
+        monkeypatch.setattr(st, "query_nt_positions", lambda a, port=36973: {})
+        monkeypatch.setattr(st, "query_nt_open_orders", lambda a, port=36973: [])
+        monkeypatch.setattr(st, "_prop_entry_blocked_now",
+                            lambda account, now_et=None: False)
+        state = {"pos": [("Apex1", "GC DEC26", 2), ("Apex2", "GC DEC26", 2)]}
+        monkeypatch.setattr(st, "nt_snapshot",
+                            lambda port=None, timeout=3.0: _snap(*state["pos"]))
+        monkeypatch.setattr(st, "close_account_positions", lambda a: (
+            state.update(pos=[p for p in state["pos"] if p[0] != a]) or ["GC DEC26"]))
+        real_write = st.write_signal_to_file
+        monkeypatch.setattr(st, "write_signal_to_file",
+                            lambda sig: None if ";Apex2;" in sig else real_write(sig))
+        sig = "PLACE;Apex1;NQ 09-26;BUY;1;MARKET;;;DAY;;;NQ_Med;7"
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(sig)
+            _run_plans(plans)
+        bodies = [f.read_text() for f in tmp_output_dir.glob("oif_*.txt")
+                  if f.read_text().startswith("PLACE")]
+        assert {b.split(";")[1] for b in bodies} == {"Apex1"}   # Apex1 placed
+        assert "Apex2" in st._alert_text and "withheld" in st._alert_text
+        assert st._alert_sticky is True           # failure beats the green banner
+
+    def test_publisher_reversal_sweeps_other_prop_account_cross_group(
+            self, monkeypatch, tmp_output_dir):
+        # B's leg is downgraded to a close (GC-only account), so its
+        # standing short ES must be swept by A's reversal cleanup.
+        st.active_account = "Apex1"
+        st.follower_accounts = ["Apex2", "Cash1"]
+        st.account_profiles["Apex1"] = {"prop": True}
+        st.account_profiles["Apex2"] = {"prop": True, "symbols_allowed": ["GC"]}
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_DELAY", 0.001)
+        monkeypatch.setattr(st, "query_nt_positions", lambda a, port=36973: {})
+        monkeypatch.setattr(st, "query_nt_open_orders", lambda a, port=36973: [])
+        monkeypatch.setattr(st, "_prop_entry_blocked_now",
+                            lambda account, now_et=None: False)
+        state = {"pos": [("Apex2", "ES SEP26", -2), ("Cash1", "ES SEP26", -2)]}
+        monkeypatch.setattr(st, "nt_snapshot",
+                            lambda port=None, timeout=3.0: _snap(*state["pos"]))
+        closed = []
+        monkeypatch.setattr(st, "close_account_positions", lambda a: (
+            closed.append(a),
+            state.update(pos=[p for p in state["pos"] if p[0] != a]))[0] or ["ES SEP26"])
+        sig = "REVERSEPOSITION;Apex1;NQ 09-26;BUY;2;MARKET;;;DAY;;;NQ_Med;77"
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(sig)
+            _run_plans(plans)
+        assert closed == ["Apex2"]                # swept; Cash1 untouched
+        assert ("Cash1", "ES SEP26", -2) in state["pos"]
+
+    def test_preempt_exclude_spares_in_flight_reversers(self):
+        st.active_account = "Apex1"
+        st.follower_accounts = ["Apex2"]
+        st.account_profiles["Apex1"] = {"prop": True}
+        st.account_profiles["Apex2"] = {"prop": True}
+        plan = {"account": "Apex1", "instrument": "NQ 09-26", "action": "BUY"}
+        snap = _snap(("Apex2", "ES SEP26", -1))
+        swept, _ = st._prop_preempt_closures([plan], snap)
+        spared, _ = st._prop_preempt_closures([plan], snap, exclude={"Apex2"})
+        assert swept == {"Apex2": ["ES SEP26"]}
+        assert spared == {}
