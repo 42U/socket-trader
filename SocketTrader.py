@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.15.0"
+__version__ = "0.15.1"
 
 IS_WINDOWS = platform.system() == "Windows"
 

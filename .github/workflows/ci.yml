@@ -97,8 +97,19 @@ jobs:
           if ($errors) { $errors | ForEach-Object { Write-Error $_ }; exit 1 }
           Write-Host "install.ps1 parses cleanly"
 
-      - name: Run the installer end to end
+      - name: Simulate an installed NinjaTrader
+        # Without a NinjaTrader 8 folder the template-filing branch of step 4
+        # is dead code in CI — which is exactly how a Get-Content parameter
+        # error shipped in v0.15.0. Give the installer a folder to file into.
         shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path (
+            Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'NinjaTrader 8') | Out-Null
+
+      - name: Run the installer end to end
+        # Windows PowerShell 5.1 — the engine install.bat actually launches,
+        # not pwsh. The two disagree on more than you'd hope.
+        shell: powershell
         run: ./install.ps1 -InstallDir "$env:RUNNER_TEMP\st-install"
 
       - name: Verify what it produced
@@ -110,6 +121,17 @@ jobs:
           }
           if (-not (Get-ChildItem (Join-Path $dir 'strategy') -Filter *.xml)) {
             throw 'strategy templates were not installed'
+          }
+          # Step 4 must have routed every template into NinjaTrader's two
+          # template folders — ATMs and stops are read from separate places.
+          $nt   = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'NinjaTrader 8'
+          $atm  = Get-ChildItem (Join-Path $nt 'templates\AtmStrategy')  -Filter *.xml -ErrorAction SilentlyContinue
+          $stop = Get-ChildItem (Join-Path $nt 'templates\StopStrategy') -Filter *.xml -ErrorAction SilentlyContinue
+          $srcN = (Get-ChildItem (Join-Path $dir 'strategy') -Filter *.xml).Count
+          if (-not $atm)  { throw 'no ATM templates were filed into NinjaTrader' }
+          if (-not $stop) { throw 'no stop templates were filed into NinjaTrader (algoNQmed.xml routes there)' }
+          if ($atm.Count + $stop.Count -ne $srcN) {
+            throw "template routing lost files: $($atm.Count) ATM + $($stop.Count) stop != $srcN in strategy/"
           }
           # Import with the SAME interpreter the launcher will use. A Windows
           # box often has several Pythons; checking with a different one than

@@ -162,7 +162,9 @@ if (-not $ntRoot) {
     New-Item -ItemType Directory -Force -Path $stop | Out-Null
     $copied = 0; $kept = 0; $stopCount = 0
     foreach ($f in $xml) {
-        $head = Get-Content $f.FullName -TotalCount 5 -Raw
+        # -Raw cannot be combined with -TotalCount; PowerShell rejects the
+        # pair at run time, which killed this whole step on real installs.
+        $head = (Get-Content $f.FullName -TotalCount 5) -join "`n"
         # <StopStrategy> also appears NESTED inside an ATM template, so only
         # treat it as a stop template when it is the element right after the
         # <NinjaTrader> root.
