@@ -98,6 +98,10 @@ def reset_session_state():
     st._alert_ts = 0.0
     st._prop_autoflat_done.clear()
     st.strategy_symbols.clear()
+    st.pub_strategies_seen.clear()
+    st._seen_dirty = False
+    st._seen_save_last = 0.0
+    st.atm_aliases = {}
     yield
     st.active_account = None
     st.follower_accounts = []
@@ -4528,6 +4532,130 @@ class TestGlobalStrategySymbolFilter:
     def test_web_state_exposes_map(self):
         st.strategy_symbols["goldstrat"] = ["GC"]
         assert st.web_state()["strategy_symbols"] == {"goldstrat": ["GC"]}
+
+
+# ── Strategy filter: ATM-template naming + pickers ────────────────────
+
+
+class TestAtmBaseKey:
+    def test_root_prefix_and_separators_collapse(self):
+        assert st.atm_base_key("GC-MacroZoneB") == "macrozoneb"
+        assert st.atm_base_key("macro_zone_b") == "macrozoneb"
+        assert st.atm_base_key("MacroZoneB") == "macrozoneb"
+
+    def test_micro_root_prefix_strips_too(self):
+        assert st.atm_base_key("MGC-Scalp") == "scalp"
+
+    def test_unknown_prefix_is_kept(self):
+        assert st.atm_base_key("FOO-Bar") == "foobar"
+
+    def test_empty(self):
+        assert st.atm_base_key("") == ""
+        assert st.atm_base_key("  -  ") == ""
+
+
+class TestTemplateLinkedFilter:
+    def test_template_key_catches_wire_name_on_wrong_market(self):
+        # Filter saved under the ATM template name; the wire sends the
+        # publisher's snake_case id — must still block off-list entries.
+        st.strategy_symbols["gc-macrozoneb"] = ["GC"]
+        assert st.strategy_symbol_block("macro_zone_b", "NQ 09-26") is not None
+        assert st.strategy_symbol_block("macro_zone_b", "GC 12-26") is None
+        assert st.strategy_symbol_block("macro_zone_b", "MGC 12-26") is None  # twin
+
+    def test_wire_key_catches_template_name(self):
+        st.strategy_symbols["macro_zone_b"] = ["GC"]
+        assert st.strategy_symbol_block("GC-MacroZoneB", "NQ 09-26") is not None
+        assert st.strategy_symbol_block("NQ-MacroZoneB", "GC 12-26") is None
+
+    def test_duplicate_keys_union_regardless_of_spelling(self):
+        # Hand-edited config with two spellings of one strategy: every
+        # wire spelling must see the SAME union (exact key's roots lead),
+        # not a different answer per spelling.
+        st.strategy_symbols["macro_zone_b"] = ["GC"]
+        st.strategy_symbols["gc-macrozoneb"] = ["NQ"]
+        assert st.strategy_filter_symbols("macro_zone_b") == ["GC", "NQ"]
+        assert st.strategy_filter_symbols("MacroZoneB") == ["NQ", "GC"]
+        assert set(st.strategy_filter_symbols("GC-MacroZoneB")) == {"GC", "NQ"}
+
+    def test_alias_redirect_is_followed(self):
+        st.atm_aliases = {"sigma7": "GC-MacroZoneB"}
+        st.strategy_symbols["gc-macrozoneb"] = ["GC"]
+        assert st.strategy_symbol_block("sigma7", "NQ 09-26") is not None
+        assert st.strategy_symbol_block("sigma7", "GC 12-26") is None
+
+    def test_unrelated_strategy_still_unfiltered(self):
+        st.strategy_symbols["gc-macrozoneb"] = ["GC"]
+        assert st.strategy_filter_symbols("bread_n_butter") is None
+        assert st.strategy_filter_symbols("") is None
+
+
+class TestSeenStrategies:
+    def test_records_dedups_and_persists(self):
+        st._record_pub_strategy("macro_zone_b")
+        st._record_pub_strategy("bhorgini")
+        st._record_pub_strategy("macro_zone_b")   # re-seen → moves to front
+        assert st.pub_strategies_seen == ["macro_zone_b", "bhorgini"]
+        # Persistence is throttled (one config write per interval, so a
+        # hostile server can't spam writes) — force the pending flush.
+        st._flush_seen(force=True)
+        assert sorted(st.load_config()["strategies_seen"]) == ["bhorgini", "macro_zone_b"]
+
+    def test_write_throttle_bounds_config_churn(self):
+        writes = []
+        original = st.save_config
+        with patch.object(st, "save_config", side_effect=lambda c: (writes.append(1), original(c))):
+            for i in range(50):   # hostile server: ever-new field-11 names
+                st._record_pub_strategy(f"spam_{i}")
+        assert len(writes) <= 2   # first write + at most one more, not 50
+        st._flush_seen(force=True)
+        assert len(st.load_config()["strategies_seen"]) == st.MAX_SEEN_STRATEGIES
+
+    def test_blank_and_hostile_names_ignored(self):
+        st._record_pub_strategy("   ")
+        st._record_pub_strategy("\x1b[2Jbad")
+        assert st.pub_strategies_seen == ["[2Jbad"]  # control chars stripped
+
+    def test_capped(self):
+        for i in range(st.MAX_SEEN_STRATEGIES + 5):
+            st._record_pub_strategy(f"strat_{i}")
+        assert len(st.pub_strategies_seen) == st.MAX_SEEN_STRATEGIES
+        assert st.pub_strategies_seen[0] == f"strat_{st.MAX_SEEN_STRATEGIES + 4}"
+
+    def test_wire_signal_records_field_11(self):
+        msg = json.dumps({"signal":
+                          "PLACE;pub;GC 12-26;BUY;1;MARKET;;;DAY;;;gold_wave;id1", "ts": 1})
+        st.extract_signal_string(msg, "Sim101", "NQ_Med")
+        assert st.pub_strategies_seen == ["gold_wave"]
+
+
+class TestStrategyFilterChoices:
+    @pytest.fixture(autouse=True)
+    def _templates(self, monkeypatch):
+        monkeypatch.setattr(st, "list_atm_strategies",
+                            lambda: ["GC-MacroZoneB", "NQ_Goopi"])
+
+    def test_templates_lead_and_seen_names_dedup_by_base(self):
+        st.pub_strategies_seen.extend(["macro_zone_b", "mystery_strat"])
+        names = [(c["kind"], c["name"]) for c in st.strategy_filter_choices()]
+        # macro_zone_b collapses onto GC-MacroZoneB; mystery_strat survives
+        assert names == [("atm", "GC-MacroZoneB"), ("atm", "NQ_Goopi"),
+                         ("seen", "mystery_strat")]
+
+    def test_alias_collapses_seen_name_onto_template(self):
+        st.atm_aliases = {"sigma7": "MacroZoneB"}
+        st.pub_strategies_seen.append("sigma7")
+        kinds = [c["kind"] for c in st.strategy_filter_choices()]
+        assert kinds == ["atm", "atm"]
+
+    def test_orphaned_filter_key_still_editable(self):
+        st.strategy_symbols["deleted_strat"] = ["GC"]
+        choices = st.strategy_filter_choices()
+        assert {"name": "deleted_strat", "kind": "filter",
+                "base": "deletedstrat"} in choices
+
+    def test_web_state_exposes_choices(self):
+        assert isinstance(st.web_state()["strategy_choices"], list)
 
 
 # ── Second review round: pre-release fixes ────────────────────────────

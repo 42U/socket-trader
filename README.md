@@ -6,13 +6,13 @@
 
 [![VoidOrigin](https://img.shields.io/badge/VOIDORIGIN-voidorigin.com-0a0a0a?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiIHN0cm9rZT0iI2ZmNmIzNSIgc3Ryb2tlLXdpZHRoPSIyIi8+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iNCIgZmlsbD0iI2ZmNmIzNSIvPjwvc3ZnPg==&logoColor=ff6b35&labelColor=0a0a0a)](https://voidorigin.com)
 
-[![Version](https://img.shields.io/badge/v0.14.0-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
+[![Version](https://img.shields.io/badge/v0.15.0-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
 [![GitHub Stars](https://img.shields.io/github/stars/42U/socket-trader?style=for-the-badge&logo=github&color=gold)](https://github.com/42U/socket-trader)
 [![License: MIT](https://img.shields.io/github/license/42U/socket-trader?style=for-the-badge&logo=opensourceinitiative&color=blue)](https://opensource.org/licenses/MIT)
 [![CI](https://img.shields.io/github/actions/workflow/status/42U/socket-trader/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![NinjaTrader](https://img.shields.io/badge/NinjaTrader-8-ff6b00?style=for-the-badge)](https://ninjatrader.com)
-[![Tests](https://img.shields.io/badge/Tests-566_passing-brightgreen?style=for-the-badge&logo=pytest&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/Tests-586_passing-brightgreen?style=for-the-badge&logo=pytest&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
 
 **One WebSocket signal in — verified NinjaTrader orders out, across every account you run.**
 
@@ -421,7 +421,7 @@ Accounts without a profile behave exactly as before — identical copy of the le
 
 When a publisher strategy trades several markets but you only want some of them, a **global filter** restricts it in one place instead of per-account rule pairs: a listed strategy only *enters* trades on its listed symbols, **on every account** (micro twins included — `GC` covers `MGC`). Strategies not listed are unrestricted.
 
-Set it from the terminal (`S` → `8` → `G`), the web UI (STRATEGY modal → *Strategy symbol filters*), or config:
+Set it from the terminal (`S` → `8` → `G`), the web UI (STRATEGY modal → *Strategy → symbol filters*), or config:
 
 ```json
 "strategy_symbols": {
@@ -429,6 +429,10 @@ Set it from the terminal (`S` → `8` → `G`), the web UI (STRATEGY modal → *
   "NasdaqStrat": ["NQ"]
 }
 ```
+
+Nothing has to be typed from the log: both editors offer **clickable pickers** — strategies come from your installed ATM templates (★) and from names actually seen on the wire (remembered across restarts as `strategies_seen`), symbols from the futures catalog. In the web modal each filter is a **collapsible row**; expand it to toggle symbols on and off.
+
+Filters key on **ATM-template identity**, not the literal wire spelling: a filter saved against the template `GC-MacroZoneB` also catches the publisher's `macro_zone_b` (and any `atm_aliases` redirect), because both collapse to the same name once a known instrument-root prefix, case, and separators are stripped. So picking the template restricts the *strategy* — on every market it signals — and you never need to know how the publisher spells it.
 
 A blocked entry is dropped before any leg — including the round-robin draw — exists, so no rotation turn is burned. Exit priority holds everywhere: closes are never filtered, and a reversal for a filtered-out market is downgraded to a `CLOSEPOSITION` for every account so the old position still exits. Per-account scoped rules still apply on top for accounts that need to deviate from the global map.
 
@@ -696,6 +700,7 @@ Settings persist in `~/.voidorigin_config.json`:
 | `account_limits` | Per-account risk management settings |
 | `account_profiles` | Per-account trade profiles — allowed-symbols filter (`symbols_allowed`), size, contracts, direction, delay, stagger, ATM override, AI gate, and the prop-firm flag (`prop`, `prop_firm`, `prop_flat_et`, `prop_cutoff_et` — see [Prop Firm Mode](#prop-firm-mode)) |
 | `strategy_symbols` | Global strategy → symbol filter, e.g. `{ "GoldStrat": ["GC"] }` — a listed publisher strategy only **enters** trades on its listed markets, on every account (see [Global Strategy → Symbol Filter](#global-strategy--symbol-filter)) |
+| `strategies_seen` | Publisher strategy names seen on the wire (auto-maintained, capped at 20) — feeds the clickable strategy pickers so filters survive a restart without retyping |
 | `hedge_guard` | What to do when an entry fan-out would open **opposite sides** of one underlying across accounts — `warn` (default), `block`, or `off`; **auto-escalates to `block` when a prop account is involved**. See [Cross-account hedging](#cross-account-hedging) |
 | `webui_enabled` | Start the localhost web UI with the app (default `true`) |
 | `webui_port` | Web UI port (default `8720`, localhost only) |

@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.14.0"
+__version__ = "0.15.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -778,6 +778,94 @@ def toggle_micro_mode() -> bool:
 
 strategy_symbols: dict[str, list[str]] = {}   # publisher strategy (lowercase) -> roots
 
+# Publisher strategy names seen on the wire (field 11), most recent first.
+# Feeds the clickable strategy pickers in the terminal and web filter
+# editors so the user never has to transcribe a name from the log.
+MAX_SEEN_STRATEGIES = 20
+pub_strategies_seen: list[str] = []
+_seen_dirty = False
+_seen_save_last = 0.0
+_SEEN_SAVE_INTERVAL = 5.0   # seconds between config writes from the signal path
+
+
+def _flush_seen(force: bool = False):
+    """Persist pub_strategies_seen to config ("strategies_seen").
+
+    Throttled: at most one write per _SEEN_SAVE_INTERVAL, so a server
+    spamming ever-new field-11 names cannot turn the signal path into a
+    config-write loop. Later signals (exits included) flush what a burst
+    left pending; a name lost to an exit mid-window costs only picker
+    convenience. Best-effort — never breaks signal handling.
+    """
+    global _seen_dirty, _seen_save_last
+    if not _seen_dirty:
+        return
+    now = time.monotonic()
+    if not force and now - _seen_save_last < _SEEN_SAVE_INTERVAL:
+        return
+    _seen_save_last = now
+    _seen_dirty = False
+    try:
+        cfg = load_config()
+        cfg["strategies_seen"] = list(pub_strategies_seen)
+        save_config(cfg)
+    except OSError:
+        pass
+
+
+def _record_pub_strategy(name: str):
+    """Remember a publisher strategy name for the filter pickers.
+
+    Persisted only when a NEW name appears — strategies are few, so this
+    almost never writes on the signal path — via the throttled _flush_seen.
+    """
+    name = sanitize_ati(name.strip())
+    if not name:
+        return
+    if pub_strategies_seen and pub_strategies_seen[0] == name:
+        _flush_seen()
+        return
+    is_new = name not in pub_strategies_seen
+    if not is_new:
+        pub_strategies_seen.remove(name)
+    pub_strategies_seen.insert(0, name)
+    del pub_strategies_seen[MAX_SEEN_STRATEGIES:]
+    global _seen_dirty
+    _seen_dirty = _seen_dirty or is_new
+    _flush_seen()
+
+
+def _known_roots() -> set[str]:
+    """Every instrument root the app knows: catalog fulls + micros, plus
+    any user-configured micro-map pairs."""
+    roots: set[str] = set()
+    for full, _desc, micro, _months, _group in FUTURES_CATALOG:
+        roots.add(full)
+        if micro:
+            roots.add(micro)
+    for k, v in micro_map.items():
+        roots.add(k)
+        if v:
+            roots.add(v)
+    return roots
+
+
+def atm_base_key(name: str) -> str:
+    """Identity key linking a publisher strategy name to its ATM template.
+
+    The bundled templates carry instrument-prefixed PascalCase filenames
+    (GC-MacroZoneB.xml) while publishers send snake_case ids
+    (macro_zone_b); this collapses both — and MacroZoneB — to
+    'macrozoneb' by stripping a leading '<known root>-' prefix and then
+    normalizing away case and separators. Used so a filter keyed by the
+    template name still catches the strategy on OTHER instruments, which
+    is the whole point of the filter.
+    """
+    head, sep, tail = name.strip().partition("-")
+    if sep and tail.strip() and head.strip().upper() in _known_roots():
+        name = tail
+    return _norm_atm_name(name)
+
 
 def load_strategy_symbols(cfg: dict) -> dict[str, list[str]]:
     """Sanitize the config "strategy_symbols" map.
@@ -821,6 +909,37 @@ def save_strategy_symbols():
     logger.info(f"STRATEGY FILTERS SAVED  {strategy_symbols or 'none'}")
 
 
+def strategy_filter_symbols(pub_strategy: str) -> list[str] | None:
+    """Allowed roots for a publisher strategy, or None when unfiltered.
+
+    A filter key matches the raw signal name exactly (lowercased — the
+    legacy behavior), or by ATM-template identity: the key and the name
+    collapse to the same `atm_base_key`, so a filter saved against the
+    template 'GC-MacroZoneB' catches signals carrying 'macro_zone_b', and
+    a config `atm_aliases` redirect (publisher id → template) is followed
+    too. If several keys collapse onto one strategy (hand-edited config —
+    both editors consolidate duplicates), their allowed lists union with
+    the exact key's roots first, so the answer does not depend on which
+    spelling the wire happens to use.
+    """
+    strat = (pub_strategy or "").strip()
+    if not strat:
+        return None
+    exact = strategy_symbols.get(strat.lower())
+    merged: list[str] = list(exact) if exact else []
+    bases = {atm_base_key(strat)}
+    alias = atm_aliases.get(strat) or atm_aliases.get(strat.lower())
+    if alias:
+        bases.add(atm_base_key(alias))
+    bases.discard("")
+    for key, roots in sorted(strategy_symbols.items()):
+        if key != strat.lower() and atm_base_key(key) in bases:
+            for root in roots:
+                if root not in merged:
+                    merged.append(root)
+    return merged or None
+
+
 def strategy_symbol_block(pub_strategy: str, instrument: str) -> str | None:
     """Why the global filter refuses this ENTRY, or None to allow it.
 
@@ -829,10 +948,7 @@ def strategy_symbol_block(pub_strategy: str, instrument: str) -> str | None:
     through this at all — the caller only consults it for commands that
     open a position.
     """
-    strat = (pub_strategy or "").strip().lower()
-    if not strat:
-        return None
-    allowed = strategy_symbols.get(strat)
+    allowed = strategy_filter_symbols(pub_strategy)
     if not allowed:
         return None
     root = _instrument_root(instrument)
@@ -2775,6 +2891,42 @@ def resolve_publisher_atm(pub_strategy: str, instrument: str = "") -> str | None
             if candidate and candidate in by_norm:
                 return by_norm[candidate]
     return None
+
+
+def strategy_filter_choices(templates: list[str] | None = None) -> list[dict]:
+    """Clickable strategy names for the filter editors.
+
+    Installed ATM templates lead — the naming convention filters key on —
+    then publisher names seen on the wire that don't collapse onto an
+    installed template (directly or through an `atm_aliases` redirect),
+    then existing filter keys not otherwise covered, so a saved filter is
+    always editable even if its template was deleted. Each entry:
+    {"name", "kind": "atm"|"seen"|"filter", "base": atm_base_key(name)}.
+    Pass `templates` when the caller already globbed the ATM directory
+    (web_state does, twice a second) to avoid a second disk scan.
+    """
+    out: list[dict] = []
+    covered: set[str] = set()
+    for tmpl in (templates if templates is not None else list_atm_strategies()):
+        base = atm_base_key(tmpl)
+        if base in covered:
+            continue
+        out.append({"name": tmpl, "kind": "atm", "base": base})
+        covered.add(base)
+    for pub in pub_strategies_seen:
+        base = atm_base_key(pub)
+        alias = atm_aliases.get(pub) or atm_aliases.get(pub.lower())
+        if base in covered or (alias and atm_base_key(alias) in covered):
+            continue
+        out.append({"name": pub, "kind": "seen", "base": base})
+        covered.add(base)
+    for key in sorted(strategy_symbols):
+        base = atm_base_key(key)
+        if base in covered:
+            continue
+        out.append({"name": key, "kind": "filter", "base": base})
+        covered.add(base)
+    return out
 
 
 def is_trade_ready() -> bool:
@@ -5193,40 +5345,93 @@ async def _edit_account_profile(account: str):
 
 
 async def _edit_strategy_symbols():
-    """Global strategy → symbol filter editor (applies to every account)."""
+    """Global strategy → symbol filter editor (applies to every account).
+
+    Picker-driven: strategies are numbered from the installed ATM
+    templates and the publisher names seen on the wire (no transcription
+    from the log), and symbols are numbered from the futures catalog.
+    Filters key on ATM-template identity, so a filter set on
+    'GC-MacroZoneB' also catches the wire name 'macro_zone_b'.
+    """
     while True:
+        choices = strategy_filter_choices()
         lines = []
         if strategy_symbols:
             for name, roots in sorted(strategy_symbols.items()):
                 lines.append(f"{name[:24].ljust(24)} → {', '.join(roots)}"[:_PROF_INNER])
         else:
             lines.append("No filters — every strategy trades every symbol.")
+        if choices:
+            lines.append("")
+            lines.append("★ installed ATM template · ≈ seen from the server")
+            for i, c in enumerate(choices, 1):
+                mark = {"atm": "★", "seen": "≈"}.get(c["kind"], "·")
+                cur = strategy_filter_symbols(c["name"])
+                tail = f" → {', '.join(cur)}" if cur else ""
+                lines.append(f"{str(i).rjust(2)}. {mark} {c['name'][:32]}{tail}"[:_PROF_INNER])
         _prof_box("GLOBAL STRATEGY → SYMBOL FILTERS", lines, [
             "A listed strategy only ENTERS trades on its symbols —",
-            "on EVERY account. Micro twins included (GC covers MGC).",
-            "Exits are never filtered; a blocked reversal closes.",
-            "STRATEGY name to add/edit · ENTER = back",
+            "on EVERY account, under its template name OR the wire",
+            "name. Exits never filter; a blocked reversal closes.",
+            "STRATEGY number (or type a name) · ENTER = back",
         ])
         raw = (await _ask_line("STRATEGY")).strip()
         if not raw:
             return
+        if raw.isdigit() and 1 <= int(raw) <= len(choices):
+            raw = choices[int(raw) - 1]["name"]
         name = sanitize_ati(raw).lower()
         if not name:
             continue
-        current = ", ".join(strategy_symbols.get(name, []))
-        raw_s = await _ask_line(
-            f"SYMBOLS for '{raw}' e.g. 'GC' or 'NQ ES' (ENTER = remove"
-            + (f", now {current}" if current else "") + ")")
+        # Every key that currently governs this strategy (template-linked
+        # spellings included): editing consolidates them under the picked
+        # name and removing drops them ALL — leaving one behind would keep
+        # gating the strategy after a "filter removed" message.
+        base = atm_base_key(name)
+        matching = [k for k in sorted(strategy_symbols)
+                    if k == name or (base and atm_base_key(k) == base)]
+        current = ", ".join(strategy_filter_symbols(name) or [])
+        cat = [p["root"] for p in instrument_catalog()]
+        sym_lines, row = [], []
+        for i, root in enumerate(cat, 1):
+            row.append(f"{str(i).rjust(2)}.{root.ljust(4)}")
+            if len(row) == 6:
+                sym_lines.append(" ".join(row))
+                row = []
+        if row:
+            sym_lines.append(" ".join(row))
+        _prof_box(f"SYMBOLS — {raw[:40]}", sym_lines, [
+            "Numbers and/or roots, e.g. '2 8' or 'NQ GC' — micro",
+            "twins included (GC covers MGC).",
+            "ENTER = remove the filter" + (f" (now {current})"[:28] if current else ""),
+        ])
+        raw_s = await _ask_line("SYMBOLS")
         roots: list[str] = []
+        bad_nums: list[str] = []
         for tok in raw_s.replace(",", " ").split():
-            root = sanitize_ati(tok.strip().upper())
+            if tok.isdigit():
+                # A number is only ever a menu pick — out of range is a
+                # typo, not a symbol root named "99".
+                if not 1 <= int(tok) <= len(cat):
+                    bad_nums.append(tok)
+                    continue
+                root = cat[int(tok) - 1]
+            else:
+                root = sanitize_ati(tok.strip().upper())
             if root and root not in roots:
                 roots.append(root)
+        if bad_nums:
+            print(Fore.YELLOW + f"  ⚠  Ignored out-of-range number(s): "
+                  f"{', '.join(bad_nums)} — menu has 1–{len(cat)}." + Style.RESET_ALL)
         if roots:
+            for k in matching:
+                strategy_symbols.pop(k, None)
             strategy_symbols[name] = roots
             print(Fore.GREEN + f"  ✔  '{raw}' now only enters {', '.join(roots)} "
                   "(micro twins included) on every account." + Style.RESET_ALL)
-        elif strategy_symbols.pop(name, None) is not None:
+        elif not raw_s.strip() and matching:
+            for k in matching:
+                strategy_symbols.pop(k, None)
             print(Fore.GREEN + f"  ✔  '{raw}' filter removed — trades every symbol."
                   + Style.RESET_ALL)
         save_strategy_symbols()
@@ -6080,6 +6285,7 @@ def extract_signal_string(msg: str, account: str, atm: str, follow_publisher: bo
             # Resolve ATM strategy (field 11)
             if len(parts) >= 12:
                 pub_strategy = parts[11].strip()
+                _record_pub_strategy(pub_strategy)
                 resolved = None
                 if follow_publisher:
                     resolved = resolve_publisher_atm(
@@ -7876,6 +8082,7 @@ def web_state() -> dict:
             "profile": profile_summary(name),
             "limits": get_account_limits(name),
         })
+    atm_templates = list_atm_strategies()   # one disk glob, reused below
     return {
         "version": __version__,
         "state": _session_state,
@@ -7885,7 +8092,7 @@ def web_state() -> dict:
         "micro_mode": micro_mode,
         "atm_strategy": atm_strategy,
         "follow_publisher_strategy": follow_publisher_strategy,
-        "atm_available": list_atm_strategies(),
+        "atm_available": atm_templates,
         "accounts": accounts,
         "leader": active_account or "",
         "followers": list(follower_accounts),
@@ -7896,6 +8103,7 @@ def web_state() -> dict:
         "last_manual": dict(_last_manual),
         "micro_map": dict(micro_map),
         "strategy_symbols": {k: list(v) for k, v in strategy_symbols.items()},
+        "strategy_choices": strategy_filter_choices(atm_templates),
         "rule_defaults": dict(DEFAULT_RULE),
         "catalog": instrument_catalog(),
         "favorites": [f for f in (load_config().get("web_favorites") or [])
@@ -9033,6 +9241,13 @@ border:1px solid var(--edge2);border-radius:12px;padding:16px;box-shadow:var(--s
 #modal .sub{color:var(--dim);font-size:11.5px;margin:3px 0 12px}
 .fieldset{border-top:1px solid var(--edge);padding-top:10px;margin-top:12px}
 .fieldset:first-of-type{border-top:0;margin-top:0}
+.fold{border:1px solid var(--edge);border-radius:8px;margin-top:6px}
+.foldhead{display:flex;gap:6px;align-items:center;padding:7px 9px;cursor:pointer;
+user-select:none;font-size:12px}
+.foldhead:hover{color:var(--fg)}
+.foldhead .arr{color:var(--dim);width:10px;flex:none}
+.foldhead .fsum{color:var(--dim);margin-left:auto;font-size:11px;text-align:right}
+.foldbody{padding:0 9px 9px;border-top:1px solid var(--edge)}
 
 #toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);
 background:#171f2d;border:1px solid var(--cyan);border-radius:9px;padding:10px 16px;
@@ -9523,6 +9738,31 @@ function numField(parent,text,value){
   parent.appendChild(el("label",null,text));
   const i=el("input");i.type="number";i.value=value;parent.appendChild(i);return i}
 
+function fold(parent,open){
+  const w=el("div","fold"),hd=el("div","foldhead"),bd=el("div","foldbody");
+  const arr=el("span","arr",open?"▾":"▸"),ttl=el("span"),sum=el("span","fsum");
+  hd.appendChild(arr);hd.appendChild(ttl);hd.appendChild(sum);
+  if(!open)bd.style.display="none";
+  hd.onclick=()=>{const vis=bd.style.display!=="none";
+    bd.style.display=vis?"none":"";arr.textContent=vis?"▸":"▾"};
+  w.appendChild(hd);w.appendChild(bd);parent.appendChild(w);
+  return {body:bd,title:ttl,sum:sum}}
+
+/* Mirror of Python atm_base_key: link a wire strategy name to its ATM
+   template by stripping a '<known root>-' prefix and normalizing away
+   case and separators, so 'GC-MacroZoneB' ≡ 'macro_zone_b'. */
+function stratBase(n){
+  n=(""+n).trim();const i=n.indexOf("-");
+  if(i>0&&n.slice(i+1).trim()){const roots=new Set();
+    (S.catalog||[]).forEach(p=>{roots.add(p.root);if(p.micro)roots.add(p.micro)});
+    Object.entries(S.micro_map||{}).forEach(([k,v])=>{roots.add(k);if(v)roots.add(v)});
+    if(roots.has(n.slice(0,i).trim().toUpperCase()))n=n.slice(i+1)}
+  return n.toLowerCase().replace(/[^a-z0-9]/g,"")}
+function stratLabel(k){
+  const b=stratBase(k);
+  const c=(S.strategy_choices||[]).find(c=>c.kind==="atm"&&c.base===b);
+  return c?c.name:k}
+
 function accountModal(a){
   const prof=(S.profiles&&S.profiles[a.name])||{};
   const rule=Object.assign({},S.rule_defaults,prof.default||{});
@@ -9609,7 +9849,10 @@ function accountModal(a){
 
 function strategyModal(){
   openModal("STRATEGY","ATM template applied to entries.",m=>{
-    const f=el("div","fieldset");
+    const f1=fold(m,false);
+    f1.title.textContent="Session ATM template";
+    f1.sum.textContent=(S.atm_strategy||"—")+(S.follow_publisher_strategy?" · follow":"");
+    const f=f1.body;
     f.appendChild(el("label",null,"Session ATM template"));
     let chosen;
     const list=S.atm_available||[];
@@ -9621,34 +9864,74 @@ function strategyModal(){
       {label:"FOLLOW publisher",value:true}],S.follow_publisher_strategy);
     f.appendChild(btn("SAVE","wide on",()=>api("/api/strategy",
       {name:chosen.value,follow_publisher:mode.value}).then(closeModal)));
-    m.appendChild(f);
 
-    const G=el("div","fieldset");
-    G.appendChild(el("label",null,
-      "Strategy symbol filters — a listed strategy only ENTERS trades on its symbols, on every account. Exits are never filtered."));
+    const f2=fold(m,false);
+    f2.title.textContent="Strategy → symbol filters";
+    const G=f2.body;
+    G.appendChild(el("div","sub",
+      "A listed strategy only ENTERS trades on its symbols, on every account — matched by its ATM template, so the filter holds whatever name the wire uses. Exits are never filtered."));
     const map=JSON.parse(JSON.stringify(S.strategy_symbols||{}));
     const rows=el("div");G.appendChild(rows);
-    function redraw(){
-      rows.textContent="";
+    const addw=el("div");
+    function nFilters(){const n=Object.keys(map).length;
+      f2.sum.textContent=n?n+" filter"+(n>1?"s":""):"none"}
+    function redraw(openKey){
+      rows.textContent="";nFilters();
       const keys=Object.keys(map).sort();
-      if(!keys.length){rows.appendChild(el("div","sub","No filters — every strategy trades every symbol."));return}
+      if(!keys.length)rows.appendChild(el("div","sub","No filters — every strategy trades every symbol."));
       keys.forEach(k=>{
-        const row=el("div","sub");
-        row.appendChild(el("span",null,k+" → "+map[k].join(", ")+"  "));
-        row.appendChild(btn("REMOVE","sm",()=>{delete map[k];redraw()}));
-        rows.appendChild(row)})}
-    redraw();
-    G.appendChild(el("label",null,"Strategy name (as the publisher sends it)"));
-    const gn=el("input");G.appendChild(gn);
-    G.appendChild(el("label",null,"Symbols (e.g. GC, or NQ ES — micro twins included)"));
-    const gs=el("input");G.appendChild(gs);
-    G.appendChild(btn("ADD / UPDATE","wide sm",()=>{
-      const k=gn.value.trim();
-      const v=gs.value.trim().split(/[\s,]+/).filter(Boolean).map(s=>s.toUpperCase());
-      if(k&&v.length){map[k]=v;gn.value="";gs.value="";redraw()}}));
+        const fr=fold(rows,k===openKey);
+        const lbl=stratLabel(k);
+        fr.title.textContent=lbl+(lbl.toLowerCase()!==k?" · "+k:"");
+        const sum=()=>fr.sum.textContent=map[k].length
+          ?("→ "+map[k].join(", ")):"no symbols — row is dropped on save";
+        sum();
+        fr.body.appendChild(el("div","sub","Symbols this strategy may enter — micro twins included (GC covers MGC)."));
+        const sw=el("div","chiplist");
+        const roots=[...new Set([...(S.catalog||[]).map(p=>p.root),...map[k]])];
+        roots.forEach(r=>{
+          const b=el("div","pick"+(map[k].includes(r)?" on":""),r);
+          b.onclick=()=>{const i=map[k].indexOf(r);
+            if(i<0)map[k].push(r);else map[k].splice(i,1);
+            b.classList.toggle("on");sum()};
+          sw.appendChild(b)});
+        fr.body.appendChild(sw);
+        const xr=el("div","btnrow");xr.style.marginTop="8px";
+        const ci=el("input");ci.placeholder="other root, e.g. 6C";ci.style.maxWidth="130px";
+        xr.appendChild(ci);
+        xr.appendChild(btn("ADD SYMBOL","sm",()=>{
+          const r=ci.value.trim().toUpperCase().replace(/[^A-Z0-9]/g,"");
+          if(r&&!map[k].includes(r)){map[k].push(r);redraw(k)}}));
+        xr.appendChild(btn("REMOVE FILTER","sm danger",()=>{delete map[k];redraw();redrawAdd()}));
+        fr.body.appendChild(xr)})}
+    G.appendChild(addw);
+    function redrawAdd(){
+      addw.textContent="";
+      addw.appendChild(el("label",null,"Add a strategy — ★ installed ATM template, others were seen from the server"));
+      const covered=new Set(Object.keys(map).map(stratBase));
+      const av=(S.strategy_choices||[]).filter(c=>!covered.has(c.base));
+      if(av.length){
+        const cw=el("div","chiplist");
+        av.forEach(c=>{
+          const b=el("div","pick"+(c.kind==="atm"?" star":""),
+            (c.kind==="atm"?"★ ":"")+c.name);
+          b.onclick=()=>{const k=c.name.toLowerCase();
+            if(!map[k])map[k]=[];redraw(k);redrawAdd()};
+          cw.appendChild(b)});
+        addw.appendChild(cw)}
+      const ar=el("div","btnrow");ar.style.marginTop="6px";
+      const gi=el("input");gi.placeholder="or type a strategy name";ar.appendChild(gi);
+      ar.appendChild(btn("ADD","sm",()=>{
+        const k=gi.value.trim().toLowerCase().replace(/;/g,"");
+        if(!k)return;
+        const b=stratBase(k);
+        const dup=Object.keys(map).find(x=>x===k||(b&&stratBase(x)===b));
+        if(dup){redraw(dup);return}   // already filtered under another spelling — open it
+        map[k]=[];redraw(k);redrawAdd()}));
+      addw.appendChild(ar)}
+    redraw();redrawAdd();
     G.appendChild(btn("SAVE FILTERS","wide on",()=>api("/api/strategy_symbols",
-      {strategy_symbols:map}).then(closeModal)));
-    m.appendChild(G)})}
+      {strategy_symbols:map}).then(closeModal)))})}
 
 /* ================= render ================= */
 function renderChips(){
@@ -9764,6 +10047,11 @@ async def main():
     strategy_symbols.update(load_strategy_symbols(cfg))
     if strategy_symbols:
         logger.info(f"STRATEGY FILTERS LOADED  {strategy_symbols}")
+    pub_strategies_seen.clear()
+    pub_strategies_seen.extend(
+        sanitize_ati(str(s).strip()) for s in (cfg.get("strategies_seen") or [])
+        if isinstance(s, str) and sanitize_ati(str(s).strip()))
+    del pub_strategies_seen[MAX_SEEN_STRATEGIES:]
     account_profiles.clear()
     account_profiles.update(load_account_profiles(cfg))
     if account_profiles:
