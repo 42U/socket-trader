@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.15.1"
+__version__ = "0.16.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -1154,6 +1154,8 @@ def load_account_profiles(cfg: dict) -> dict[str, dict]:
                     cleaned.append(name)
             if cleaned:
                 entry["symbols_allowed"] = cleaned
+        if prof.get("close_before_open"):
+            entry["close_before_open"] = True
         if prof.get("prop"):
             entry["prop"] = True
             firm = str(prof.get("prop_firm", "")).strip().lower()
@@ -1201,6 +1203,8 @@ def save_account_profiles():
             entry["rules"] = rules
         if prof.get("symbols_allowed"):
             entry["symbols_allowed"] = prof["symbols_allowed"]
+        if prof.get("close_before_open"):
+            entry["close_before_open"] = True
         if prof.get("prop"):
             entry["prop"] = True
             for key in ("prop_firm", "prop_flat_et", "prop_cutoff_et"):
@@ -1326,6 +1330,21 @@ PROP_FIRM_PRESETS: dict[str, tuple[tuple[int, int], tuple[int, int]]] = {
 def is_prop_account(account: str) -> bool:
     """True when the account's profile carries "prop": true."""
     return bool(account_profiles.get(account, {}).get("prop"))
+
+
+def closes_before_open(account: str) -> bool:
+    """True when this account's ENTRIES run the close-before-open engine.
+
+    Every prop account does. `close_before_open: true` opts an ORDINARY
+    account into the same one-position-at-a-time entry behavior — the
+    close-everything-then-place the publisher's server used to provide —
+    without prop's time rules (no entry cutoff, no flat-by-close) and
+    without being swept by other accounts' cross-account hedge preemption
+    (that ban is a prop-firm rule, not theirs). Accounts with neither flag
+    are never preemptively closed: multi-market / multi-direction trading.
+    """
+    prof = account_profiles.get(account, {})
+    return bool(prof.get("prop") or prof.get("close_before_open"))
 
 
 def _parse_hhmm(raw) -> tuple[int, int] | None:
@@ -1485,6 +1504,8 @@ def profile_summary(account: str) -> str:
         fh, fm = prop_flat_time(account)
         firm = prof.get("prop_firm", "")
         bits.append(f"PROP{f' {firm}' if firm else ''} flat {fh:02d}:{fm:02d}")
+    elif prof.get("close_before_open"):
+        bits.append("CLOSE-B4-OPEN")
     if prof.get("symbols_allowed"):
         bits.append(f"only {','.join(prof['symbols_allowed'])}")
     if not base["enabled"]:
@@ -1730,6 +1751,28 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = "",
     cmd = parts[0].strip().upper() if parts else ""
     instrument = parts[2] if len(parts) >= 3 else ""
 
+    # Contract-month roll: a publisher still signalling an expiring or
+    # expired month gets every entry rejected broker-side ("Liquidation
+    # only, contract is about to be expired" — 2026-08-27 11:45:26), so
+    # the month is corrected to the known front BEFORE the fan-out.
+    # Exits are corrected too — a rolled entry lives in the NEW month, so
+    # its closes must follow — while the ORIGINAL month is kept as extra
+    # close legs below, so a position opened pre-roll in the old contract
+    # can never be stranded. Rolls only move FORWARD on cataloged roots;
+    # deliberate back-month signals and exotic contracts pass untouched.
+    stale_month_instr = None
+    if cmd in ("PLACE", "REVERSEPOSITION", "CLOSEPOSITION") and instrument:
+        fixed, was = correct_contract_month(instrument)
+        if was:
+            parts[2] = fixed
+            signal_text = ";".join(parts)
+            instrument = fixed
+            if cmd != "PLACE":
+                stale_month_instr = was
+            logger.warning(f"MONTH ROLL  {was} → {fixed}  cmd={cmd}")
+            _dash_set_alert(Fore.YELLOW + f"  ↷  ROLLED {was} → {fixed} "
+                            "(front month)" + Style.RESET_ALL)
+
     # Global strategy → symbol filter: gates the whole fan-out before any
     # leg — including the round-robin draw — exists. Entries for a
     # non-listed market are refused outright; a reversal is downgraded to
@@ -1809,12 +1852,13 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = "",
         base_deferred = final_cmd == "PLACE" and (
             rule["delay_ms"] > 0 or rule["delay_jitter_ms"] > 0
             or rule["stagger_entries"] > 1 or bool(rule["ai"]))
-        # A prop account's entry ALWAYS runs as a background leg: it must
-        # first close-and-CONFIRM whatever the account holds elsewhere
-        # (see the prop section), and that confirmation cannot sit on the
-        # signal intake path.
+        # A close-before-open account's entry (prop, or the opt-in flag)
+        # ALWAYS runs as a background leg: it must first close-and-CONFIRM
+        # whatever the account holds (see the prop section), and that
+        # confirmation cannot sit on the signal intake path.
         prop = is_prop_account(account)
-        deferred = base_deferred or (prop and final_cmd == "PLACE")
+        cbo = closes_before_open(account)
+        deferred = base_deferred or (cbo and final_cmd == "PLACE")
         files = [final]
         if final_cmd in ("CLOSESTRATEGY", "CANCEL", "CHANGE"):
             files = _expand_exit_ids(final, account)
@@ -1834,6 +1878,28 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = "",
                 alt = list(final_parts)
                 alt[2] = twin
                 files.append(";".join(alt))
+        if (stale_month_instr and " " in stale_month_instr
+                and final_cmd in ("CLOSEPOSITION", "REVERSEPOSITION")
+                and len(final_parts) >= 3 and final_parts[2]):
+            # The exit's month was rolled forward, but a position opened
+            # BEFORE the roll still sits in the old contract — send plain
+            # closes for the old month too (both contract sizes, matching
+            # the twin fan-out above). NT no-ops every variant the account
+            # does not hold. Always CLOSEPOSITION, never a reversal: an
+            # old-month reversal would open a fresh position in a dying
+            # contract.
+            old_tail = stale_month_instr.split(" ", 1)[1]
+            leg_acct = final_parts[1] if len(final_parts) >= 2 else ""
+            old_inst = f"{final_parts[2].split(' ', 1)[0]} {old_tail}"
+            old_twin = _apply_size(old_inst,
+                                   "full" if old_inst != to_full_instrument(old_inst)
+                                   else "micros")
+            for variant in (old_inst, old_twin):
+                if not variant:
+                    continue
+                sig2 = f"CLOSEPOSITION;{leg_acct};{variant};;;;;;;;;;"
+                if sig2 not in files:
+                    files.append(sig2)
         if meta["note"]:
             logger.info(f"LEG NOTE  account={account}  {meta['note']}  signal={canonical}")
         plans.append({
@@ -1850,10 +1916,12 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = "",
             "rr_pick": is_rr_pick,
             "manual": manual,
             "prop": prop,
-            # Simple prop entries (no delay/AI/stagger of their own) are
-            # batched into ONE close-confirm-enter wave so N accounts cost
-            # one snapshot and one confirmation instead of N.
-            "prop_group": prop and final_cmd == "PLACE" and not base_deferred,
+            "cbo": cbo,
+            # Simple close-before-open entries (no delay/AI/stagger of
+            # their own) are batched into ONE close-confirm-enter wave so
+            # N accounts cost one snapshot and one confirmation instead
+            # of N.
+            "prop_group": cbo and final_cmd == "PLACE" and not base_deferred,
         })
     plans = apply_hedge_guard(plans, skipped)
     return plans, skipped
@@ -2045,37 +2113,199 @@ def _get_prop_lock() -> asyncio.Lock:
     return _prop_entry_lock
 
 
+# ---------- In-flight opens ----------
+# An entry or reversal we WROTE but NinjaTrader has not yet shown as a
+# position is invisible to a positions-only dump — a limit entry can work
+# for minutes, and even a market fill lands a beat after the file write.
+# A later signal's close-before-open would read that account as clear and
+# stack a second market onto it. Every close-before-open account's opening
+# write is therefore registered here and merged into the preemption dump
+# as a pseudo-position until it ages out or a flatten kills it (flattening
+# cancels the account's working orders, so the unfilled order dies too).
+
+INFLIGHT_OPEN_TTL_S = 120.0   # covers write→fill→dump visibility for market
+                              # orders with margin; a LIMIT entry older than
+                              # this goes back to being invisible — documented
+_inflight_opens: dict[tuple[str, str], dict] = {}   # (account, ROOT) -> row
+_inflight_lock = threading.Lock()   # flatten paths run in worker threads
+
+
+def _note_inflight_open(account: str, instrument: str, action: str):
+    """Record one opening write (PLACE / REVERSEPOSITION) as pending."""
+    root = _alias_root(instrument).upper()
+    if not account or not root:
+        return
+    qty = 1 if (action or "").strip().upper() == "BUY" else -1
+    with _inflight_lock:
+        _inflight_opens[(account, root)] = {
+            "instrument": instrument, "qty": qty, "ts": time.monotonic()}
+
+
+def _clear_inflight_opens(account: str, instrument: str | None = None):
+    """Drop pending opens after a flatten — whole account, or one market."""
+    with _inflight_lock:
+        for key in list(_inflight_opens):
+            if key[0] != account:
+                continue
+            if instrument is None or key[1] == _alias_root(instrument).upper():
+                del _inflight_opens[key]
+
+
+def _inflight_open_rows() -> list[tuple[str, str, int]]:
+    """Fresh pending opens as (account, instrument, signed qty) rows,
+    pruning entries past their TTL."""
+    now = time.monotonic()
+    rows: list[tuple[str, str, int]] = []
+    with _inflight_lock:
+        for key in list(_inflight_opens):
+            row = _inflight_opens[key]
+            if now - row["ts"] > INFLIGHT_OPEN_TTL_S:
+                del _inflight_opens[key]
+                continue
+            rows.append((key[0], row["instrument"], row["qty"]))
+    return rows
+
+
+# ---------- Live-bridge book ----------
+# The AddOn broadcasts a FULL state line — every account, every open
+# position — on every account/position/price event plus a ~5s idle
+# heartbeat (see addon/SocketTraderBridge.cs). live_bridge_task caches
+# each line here, so when a signal lands the client already KNOWS whether
+# any prop account holds anything: a fresh book that shows nothing to
+# close lets the entry skip the pre-entry ATI snapshot and fire at once.
+# The book is only ever trusted to prove that NEGATIVE. The moment it
+# shows work to do — or cannot carry the weight (stale, disconnected, an
+# account missing, an outage-shaped balance) — the authoritative ATI dump
+# decides, and closes fire off THAT, never off the book.
+
+BRIDGE_BOOK_FRESH_S = 10.0   # 2× the AddOn heartbeat: one late line survives
+_bridge_book: dict | None = None   # {"ts": ..., "accounts": {name: {"cash", "positions"}}}
+
+
+def _bridge_ingest_book(accts: list):
+    """Cache one bridge line as the live book (fed by live_bridge_task).
+
+    Every line is a complete dump, so the previous book is replaced
+    wholesale — merging would resurrect closed positions. An account whose
+    position rows don't parse is left OUT of the book entirely: the book's
+    only job is proving "nothing to close", and a position we failed to
+    read is exactly the one that must not vanish into an all-flat read.
+    """
+    global _bridge_book
+    book: dict[str, dict] = {}
+    for a in accts if isinstance(accts, list) else []:
+        if not isinstance(a, dict):
+            continue
+        name = str(a.get("name") or "")
+        if not name:
+            continue
+        positions: list[tuple[str, int]] = []
+        # A missing/non-list positions field is UNKNOWN, not flat — the
+        # account is dropped so the fast path cannot prove it clear.
+        raw_pos = a.get("positions")
+        rows_ok = isinstance(raw_pos, list)
+        for p in raw_pos if rows_ok else []:
+            inst = str(p.get("inst") or "").strip() if isinstance(p, dict) else ""
+            try:
+                qty = int(p.get("qty"))
+            except (AttributeError, TypeError, ValueError):
+                qty = 0
+            if not inst or not qty:
+                rows_ok = False
+                break
+            positions.append((inst, qty))
+        if not rows_ok:
+            continue
+        try:
+            cash = float(a["cash"])
+        except (KeyError, TypeError, ValueError):
+            cash = None
+        book[name] = {"cash": cash, "positions": positions}
+    _bridge_book = {"ts": time.time(), "accounts": book}
+
+
+def _bridge_book_snapshot(plans: list[dict] | None = None) -> dict | None:
+    """The live-bridge book as a preemption snapshot, or None when it
+    cannot be trusted to prove an account flat.
+
+    Trust requires ALL of: the bridge enabled, authenticated and
+    streaming; the book younger than BRIDGE_BOOK_FRESH_S; and every
+    account the preemption would consult — each managed prop account,
+    plus every ENTERING account in `plans` (a `close_before_open` opt-in
+    need not be prop) — present in the dump with a believable balance.
+    A ~$0.00 cash against a known nonzero balance is NT answering while
+    its broker feed is down (_suspect_zero_balance) — position rows from
+    that state are exactly the ones that must not read as flat.
+    """
+    book = _bridge_book
+    if not (live_bridge_enabled and _live_bridge_connected and book):
+        return None
+    age = time.time() - book["ts"]
+    if age > BRIDGE_BOOK_FRESH_S:
+        return None
+    consulted: list[str] = [a for a in target_accounts() if is_prop_account(a)]
+    consulted += [p["account"] for p in plans or []
+                  if p["account"] not in consulted]
+    rows: list[dict] = []
+    for acct in consulted:
+        entry = book["accounts"].get(acct)
+        if entry is None:
+            return None
+        cash = entry["cash"]
+        if cash is None or _suspect_zero_balance(acct, cash):
+            return None
+        rows.extend({"account": acct, "instrument": inst, "qty": qty,
+                     "avg_price": None} for inst, qty in entry["positions"])
+    return {"ok": True, "accounts": {}, "working": {}, "ts": book["ts"],
+            "positions": rows, "age": age}
+
+
 def _prop_preempt_closures(plans: list[dict], snap: dict,
                            cross_account: bool = True,
-                           exclude: set[str] = frozenset()
+                           exclude: set[str] = frozenset(),
+                           entry_same_root: str = "close"
                            ) -> tuple[dict[str, list[str]], dict[str, bool]]:
-    """What must CLOSE before these prop entry legs may fire.
+    """What must CLOSE before these close-before-open entry legs may fire.
 
     Returns (to_close, keeps): to_close maps account -> position aliases to
     flatten; keeps flags accounts that RETAIN a position, so the flatten
     for them must stay scoped to the listed contracts (a whole-account
     flatten would also cancel the kept position's ATM bracket).
 
-    Per held position of an account that is ENTERING:
-      - same exact root as its entry (holds NQ, enters NQ): KEEP. NT nets
-        same-contract orders — the publisher's partial SELL against a long
-        is an exit, and pre-closing the long would turn that exit into a
-        fresh short.
-      - same underlying, different root (micro/full twin — holds MNQ,
-        enters NQ): CLOSE regardless of direction. Opposite is the classic
-        intra-account hedge; same-direction stacking across contract sizes
-        is the exact cap-evasion pattern MyFundedFutures names a breach.
-      - anything else: CLOSE — one position at a time.
-    Per held position of a managed prop account that is NOT entering
+    Per held position of a close-before-open account (prop, or the
+    `close_before_open` opt-in) that is ENTERING:
+      - entry_same_root="close" (the ENTRY path): CLOSE EVERYTHING the
+        account holds, the entry's own market included — an entry RESETS
+        the account to the new signal, the close-then-place the publisher's
+        server used to provide. Keeping the same market instead would let
+        an opposite entry NET the position while both ATM brackets stay
+        working (CLOSEPOSITION cancels an instrument's orders; a netting
+        fill cancels nothing), and let a same-direction re-entry stack
+        contracts past a firm's cap.
+      - entry_same_root="keep" (the REVERSAL-cleanup path): the entry's own
+        root is KEPT — the reversal is flipping that position mid-flight,
+        and closing it would flatten what should flip. Micro/full twins and
+        every other market still close (a twin is the classic intra-account
+        hedge one way and MFFU's named cap-evasion pattern the other).
+    Per held position of a managed PROP account that is NOT entering
     (cross_account=True): CLOSE only when it sits on the OPPOSITE side of
     the entry's product group — opposing correlated positions across
     accounts is the ban every firm agrees on (Tradeify scopes it to whole
-    product groups, so this matches groups, not bare symbols).
+    product groups, so this matches groups, not bare symbols). Non-prop
+    accounts are never swept cross-account: that ban is a prop-firm rule.
     """
     entering = {p["account"]: p for p in plans}
     pos_rows: dict[str, list[tuple[str, int]]] = {}
     for row in snap.get("positions", []):
         pos_rows.setdefault(row["account"], []).append((row["instrument"], row["qty"]))
+    # Merge opening writes NT has not shown as positions yet: a just-written
+    # entry or reversal must count as held, or a burst of signals seconds
+    # apart stacks a second market onto the account (see In-flight opens).
+    for acct, inst, qty in _inflight_open_rows():
+        root = _alias_root(inst).upper()
+        if any(_alias_root(i).upper() == root for i, _ in pos_rows.get(acct, [])):
+            continue    # the real position already showed up — it wins
+        pos_rows.setdefault(acct, []).append((inst, qty))
     group_sides = {(_product_group(p["instrument"]), (p["action"] or "").strip().upper())
                    for p in plans
                    if (p["action"] or "").strip().upper() in ("BUY", "SELL")}
@@ -2086,10 +2316,11 @@ def _prop_preempt_closures(plans: list[dict], snap: dict,
     to_close: dict[str, list[str]] = {}
     keeps: dict[str, bool] = {}
     for acct in target_accounts():
-        if not is_prop_account(acct):
-            continue
         plan = entering.get(acct)
-        if plan is None and (not cross_account or acct in exclude):
+        if plan is not None:
+            if not closes_before_open(acct):
+                continue    # plain accounts are never preemptively closed
+        elif not is_prop_account(acct) or not cross_account or acct in exclude:
             # `exclude` names accounts with their OWN in-flight leg of the
             # same action — closing their position out from under a
             # reversal that is mid-fill would flatten what should flip.
@@ -2101,7 +2332,9 @@ def _prop_preempt_closures(plans: list[dict], snap: dict,
                 # whatever alias NT broadcast ("NQU26", "@NQ"), and a
                 # mismatch here would flatten the very position the user
                 # just reversed into.
-                if _alias_root(alias).upper() == _alias_root(plan["instrument"]).upper():
+                if (entry_same_root == "keep"
+                        and _alias_root(alias).upper()
+                        == _alias_root(plan["instrument"]).upper()):
                     keeps[acct] = True
                 else:
                     to_close.setdefault(acct, []).append(alias)
@@ -2131,6 +2364,7 @@ def _prop_flatten_wave(to_close: dict[str, list[str]], keeps: dict[str, bool]):
         if keeps.get(acct):
             for c in contracts:
                 fire_close_position(acct, c)
+                _clear_inflight_opens(acct, c)
             logger.info(f"PROP PREEMPT  account={acct}  targeted close={contracts}")
         else:
             closed = close_account_positions(acct)
@@ -2204,6 +2438,22 @@ async def _prop_clear_for_entry(plans: list[dict]) -> tuple[bool, bool]:
     a position destroyed for an entry that was withheld must not vanish
     into an info-level log line.
     """
+    # Fast path: with the live bridge streaming, the book is already in
+    # hand when the signal lands. A fresh book that shows nothing to close
+    # clears the entry without the pre-entry ATI round-trip. It only ever
+    # proves that negative — anything to close, or an untrustworthy book,
+    # falls through to the authoritative dump, and closes fire off that.
+    book = _bridge_book_snapshot(plans)
+    if book is not None:
+        book_close, _ = _prop_preempt_closures(plans, book)
+        if not book_close:
+            logger.info(
+                f"PROP FAST PATH  bridge book ({book['age']:.1f}s old) shows "
+                f"nothing to close — entering  "
+                f"accounts={[p['account'] for p in plans]}")
+            return True, False
+        logger.info("PROP FAST PATH  bridge book shows positions to clear — "
+                    "confirming against a fresh ATI dump")
     snap = await _prop_snapshot()
     if snap is None:
         _prop_withhold(plans, "NinjaTrader would not prove its position state")
@@ -2318,7 +2568,8 @@ async def _prop_reversal_cleanup(plans: list[dict], cross_account: bool = True,
                 return
             to_close, keeps = _prop_preempt_closures(plans, snap,
                                                      cross_account=cross_account,
-                                                     exclude=exclude)
+                                                     exclude=exclude,
+                                                     entry_same_root="keep")
             if not to_close:
                 return
             detail = "; ".join(f"{a}: {', '.join(c)}" for a, c in sorted(to_close.items()))
@@ -2455,8 +2706,13 @@ async def execute_plans(plans: list[dict], sig_id: str | None = None) -> list[st
             written.append(account)
             if plan["command"] == "PLACE":
                 _record_stagger(plan["signal"], account, 1)
-            elif plan["command"] == "REVERSEPOSITION" and plan.get("prop"):
-                prop_reversals.append(plan)
+            elif plan["command"] == "REVERSEPOSITION":
+                if plan.get("cbo"):
+                    # A reversal OPENS the other side; until NT shows the
+                    # flipped position it must still count as held.
+                    _note_inflight_open(account, plan["instrument"], plan["action"])
+                if plan.get("prop"):
+                    prop_reversals.append(plan)
     if prop_reversals:
         # The reversals were never delayed (exit priority); now one task
         # sweeps every other market the reversing prop accounts hold AND
@@ -2513,7 +2769,7 @@ async def _run_deferred_leg(plan: dict, sig_id: str | None = None):
                     qty = ai_qty
 
         tranches = split_qty(qty, rule["stagger_entries"]) if qty >= 1 else [qty]
-        if plan.get("prop"):
+        if plan.get("cbo"):
             # Close-before-open, then write — all under the prop lock so no
             # other prop entry can slip between the confirmation and the
             # writes (the whole tranche run stays inside for the same
@@ -2581,6 +2837,11 @@ async def _write_entry_tranches(plan: dict, tranches: list[int],
             break
         placed += 1
         _note_contract(sig)
+        if plan.get("cbo"):
+            # Count this write as held until NT shows it — a positions-only
+            # dump would otherwise let the next signal stack a second market
+            # onto this account before the fill lands.
+            _note_inflight_open(account, plan["instrument"], plan["action"])
         if leader_first:
             add_pending_confirm(sig, sig_id, plan["instrument"], plan["action"], pre_pos)
     if placed:
@@ -3918,22 +4179,45 @@ def _active_months(spec) -> tuple[int, ...]:
     return tuple(range(1, 13)) if spec == "ALL" else tuple(spec)
 
 
-def contract_months(root_spec, now: datetime | None = None, count: int = 3
-                    ) -> list[tuple[int, int]]:
+def _roll_cutoff(group: str, year: int, month: int) -> datetime:
+    """ET moment after which contract (year, month) is stale for NEW entries.
+
+    Approximates when brokers stop accepting fresh positions, not when the
+    exchange delists: physically delivered metals/ags go liquidation-only
+    near first notice, which falls at the END of the month BEFORE the
+    delivery month (see 2026-08-27: SIL 09-26 rejected "Liquidation only,
+    contract is about to be expired"). Energy expires around the 20th of
+    the month before its delivery month. Financials trade well into the
+    contract month — NT's own rollover is ~8 days before the 3rd Friday.
+    Deliberately conservative toward rolling EARLY: the next contract is
+    tradeable a little sooner, while the old one hard-rejects.
+    """
+    if group in ("Metals", "Ags"):
+        return datetime(year, month, 1, tzinfo=ET) - timedelta(days=7)
+    if group == "Energy":
+        py, pm = (year - 1, 12) if month == 1 else (year, month - 1)
+        return datetime(py, pm, 13, tzinfo=ET)
+    return datetime(year, month, 11, tzinfo=ET)
+
+
+def contract_months(root_spec, now: datetime | None = None, count: int = 3,
+                    group: str = "") -> list[tuple[int, int]]:
     """The next `count` (year, month) contracts for a month cycle.
 
-    The current month is included only early in the month — most products
-    roll well before expiry, so late in a contract month the front month is
-    already stale. This is a picker convenience, not an exchange calendar:
-    the ticket always accepts a typed contract for anything unusual.
+    Contracts past their family's roll cutoff (_roll_cutoff) are excluded,
+    so the web picker and the signal-path month correction share one
+    calendar. This is a best-effort calendar, not an exchange one — the
+    bridge's NT-reported front months override it where available, and the
+    ticket always accepts a typed contract for anything unusual.
     """
     now = now or datetime.now(ET)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ET)
     months = _active_months(root_spec)
     out: list[tuple[int, int]] = []
     year, month = now.year, now.month
-    for _ in range(36):
-        if month in months and not (year == now.year and month == now.month
-                                    and now.day > 10):
+    for _ in range(40):
+        if month in months and now < _roll_cutoff(group, year, month):
             out.append((year, month))
             if len(out) >= count:
                 break
@@ -3949,12 +4233,184 @@ def instrument_catalog(now: datetime | None = None) -> list[dict]:
     out = []
     for root, name, micro, months, group in FUTURES_CATALOG:
         codes = [f"{root} {m:02d}-{str(y)[-2:]}"
-                 for y, m in contract_months(months, now)]
+                 for y, m in contract_months(months, now, group=group)]
         if not codes:
             continue
         out.append({"root": root, "name": name, "micro": micro,
                     "group": group, "contracts": codes})
     return out
+
+
+# ---------- Front months (contract expiry roll) ----------
+# Root → "MM-YY" of the contract NinjaTrader itself considers current, as
+# reported by the SocketTraderBridge AddOn (its instrument DB applies NT's
+# rollover schedule). Synced on every bridge connect and once per ET day,
+# and cached in config so a session without NT still has the last known
+# fronts. The signal path never queries anything: correct_contract_month
+# is a pure lookup against this map with the calendar as fallback.
+front_months: dict[str, str] = {}
+_front_months_date = ""          # ET date of the last successful bridge sync
+_front_months_attempt_date = ""  # ET date of the last attempt (bounds retries)
+_front_months_syncing = False
+
+_CONTRACT_FORM_RE = re.compile(r"^([A-Za-z0-9]{1,6}) (\d{2})-(\d{2})$")
+_MMYY_RE = re.compile(r"^\d{2}-\d{2}$")
+
+
+def _catalog_row(root: str) -> tuple | None:
+    """Catalog row for a full OR micro root, else None."""
+    r = (root or "").strip().upper()
+    for row in FUTURES_CATALOG:
+        if r == row[0] or (row[2] and r == row[2]):
+            return row
+    return None
+
+
+def front_contract(root: str, now: datetime | None = None) -> str | None:
+    """Calendar-computed front 'MM-YY' for a cataloged root, else None."""
+    row = _catalog_row(root)
+    if not row:
+        return None
+    got = contract_months(row[3], now, count=1, group=row[4])
+    if not got:
+        return None
+    y, m = got[0]
+    return f"{m:02d}-{str(y)[-2:]}"
+
+
+def expected_contract(root: str, now: datetime | None = None) -> str | None:
+    """Front 'MM-YY' for a root: the LATER of calendar and NT-reported.
+
+    NT rolls financials early by volume — follow it. A cached NT month
+    older than the calendar front is a stale cache (NT unreachable across
+    a roll) — the calendar wins there, so the map can only fail toward
+    the newer, still-tradeable contract.
+    """
+    row = _catalog_row(root)
+    if not row:
+        return None
+    cal = front_contract(root, now)
+    r = (root or "").strip().upper()
+    seen = front_months.get(r) or front_months.get(row[0]) or (
+        front_months.get(row[2]) if row[2] else None)
+    if seen and not _MMYY_RE.fullmatch(str(seen)):
+        seen = None
+
+    def key(tail: str) -> tuple[int, int]:
+        mm, yy = tail.split("-")
+        return (int(yy), int(mm))
+
+    cands = [c for c in (cal, seen) if c]
+    return max(cands, key=key) if cands else None
+
+
+def correct_contract_month(instrument: str, now: datetime | None = None
+                           ) -> tuple[str, str | None]:
+    """('SIL 12-26', 'SIL 09-26') when the month was stale, else (input, None).
+
+    Only 'ROOT MM-YY' instruments with a cataloged root are considered —
+    typed or exotic contracts pass through untouched. Rolls only ever move
+    FORWARD: a month at or beyond the known front (a deliberate back-month
+    trade) is left alone.
+    """
+    m = _CONTRACT_FORM_RE.match((instrument or "").strip())
+    if not m:
+        return instrument, None
+    root, mm, yy = m.group(1), m.group(2), m.group(3)
+    exp = expected_contract(root, now)
+    if not exp:
+        return instrument, None
+    exp_mm, exp_yy = exp.split("-")
+    if (int(yy), int(mm)) >= (int(exp_yy), int(exp_mm)):
+        return instrument, None
+    return f"{root} {exp}", instrument
+
+
+def load_front_months(cfg: dict):
+    """Load the cached NT-reported front months from config."""
+    global _front_months_date
+    front_months.clear()
+    raw = cfg.get("front_months")
+    if isinstance(raw, dict):
+        for root, tail in raw.items():
+            r = str(root).strip().upper()
+            t = str(tail).strip()
+            if _catalog_row(r) and _MMYY_RE.fullmatch(t):
+                front_months[r] = t
+    _front_months_date = str(cfg.get("front_months_date") or "")
+
+
+def _save_front_months():
+    cfg = load_config()
+    if front_months:
+        cfg["front_months"] = dict(front_months)
+        cfg["front_months_date"] = _front_months_date
+    else:
+        cfg.pop("front_months", None)
+        cfg.pop("front_months_date", None)
+    save_config(cfg)
+
+
+def refresh_front_months() -> int:
+    """Ask the AddOn for NT's current contract per catalog root (blocking).
+
+    Sends every full and micro root in one command; the AddOn resolves
+    each through Instrument.GetInstrument, which applies NT's rollover
+    schedule. Returns how many roots were accepted. Older AddOn builds
+    without the command refuse it — that leaves the calendar fallback in
+    charge, logged once.
+    """
+    global _front_months_date
+    roots: list[str] = []
+    for row in FUTURES_CATALOG:
+        roots.append(row[0])
+        if row[2]:
+            roots.append(row[2])
+    ack = _bridge_roundtrip({"cmd": "front_months", "roots": ",".join(roots)},
+                            timeout=6.0)
+    if not ack:
+        return 0
+    if not ack.get("ack"):
+        logger.info("FRONT MONTHS  AddOn refused the query — probably an "
+                    "older build; calendar fallback stays in charge. "
+                    "Recompile the AddOn to enable NT-synced rolls.")
+        return 0
+    months = ack.get("months")
+    if not isinstance(months, dict):
+        return 0
+    updated = 0
+    rolled: list[str] = []
+    for root, tail in months.items():
+        r = str(root).strip().upper()
+        t = str(tail).strip()
+        if not (_catalog_row(r) and _MMYY_RE.fullmatch(t)):
+            continue
+        if front_months.get(r) != t:
+            rolled.append(f"{r} {front_months.get(r) or '—'}→{t}")
+        front_months[r] = t
+        updated += 1
+    if updated:
+        _front_months_date = datetime.now(ET).strftime("%Y-%m-%d")
+        _save_front_months()
+        logger.info(f"FRONT MONTHS  {updated} roots synced from NT"
+                    + (f"  changed: {', '.join(rolled[:8])}" if rolled else ""))
+    return updated
+
+
+async def _front_months_sync():
+    """Background bridge sync, at most one in flight, one attempt per day
+    plus one per bridge (re)connect."""
+    global _front_months_syncing, _front_months_attempt_date
+    if _front_months_syncing:
+        return
+    _front_months_syncing = True
+    _front_months_attempt_date = datetime.now(ET).strftime("%Y-%m-%d")
+    try:
+        await asyncio.to_thread(refresh_front_months)
+    except Exception as exc:
+        logger.warning(f"front-month sync failed: {exc}")
+    finally:
+        _front_months_syncing = False
 
 
 DEFAULT_ACCOUNT = "Sim101"
@@ -6496,18 +6952,18 @@ def _nt_contract_aliases(name: str) -> list[str]:
     return aliases
 
 
-def bridge_send_command(cmd: dict, timeout: float = 2.0) -> bool:
-    """Send a JSON command line to the SocketTraderBridge AddOn.
+def _bridge_roundtrip(cmd: dict, timeout: float = 2.0) -> dict | None:
+    """One command → one ack against the SocketTraderBridge AddOn.
 
     Opens a short-lived TCP connection, fires one newline-delimited JSON
-    object, and drops. The AddOn accepts commands on the same socket it
-    uses for the state-push stream; one-shot connections keep this code
-    simple and avoid needing to share state with live_bridge_task.
-    Returns True on successful send (does not await an ack — the AddOn
-    logs its own result to NT's Output tab).
+    object, and returns the AddOn's parsed ack dict — None when the bridge
+    is off/unreachable or no parseable ack came back. The AddOn accepts
+    commands on the same socket it uses for the state-push stream;
+    one-shot connections keep this code simple and avoid needing to share
+    state with live_bridge_task.
     """
     if not (live_bridge_enabled and _live_bridge_connected):
-        return False
+        return None
     host = _nt_host(nt_port)
     s = None
     try:
@@ -6525,39 +6981,50 @@ def bridge_send_command(cmd: dict, timeout: float = 2.0) -> bool:
             pass
         # WAIT FOR THE ACK. sendall() only proves the kernel accepted the
         # bytes — not that the AddOn authenticated us, parsed the command,
-        # or executed it. Callers treat True as "this is done" and skip
-        # their fallback, so True must mean the AddOn said so.
+        # or executed it. Callers treat a reply as "this is done" and skip
+        # their fallback, so it must mean the AddOn said so.
         buf = b""
-        while b"\n" not in buf and len(buf) < 4096:
-            chunk = s.recv(1024)
+        while b"\n" not in buf and len(buf) < 65536:
+            chunk = s.recv(4096)
             if not chunk:
                 break
             buf += chunk
         line = buf.split(b"\n", 1)[0].decode("utf-8", errors="ignore").strip()
         if not line:
             logger.warning(f"bridge cmd UNCONFIRMED (no ack): {cmd}")
-            return False
+            return None
         try:
             ack = json.loads(line)
         except (ValueError, json.JSONDecodeError):
             logger.warning(f"bridge cmd UNCONFIRMED (bad ack {line[:80]!r}): {cmd}")
-            return False
-        # AddOn replies {"ack":true|false,"msg":"..."} — see SendAck().
-        if not ack.get("ack"):
-            logger.warning(f"bridge cmd REFUSED by AddOn: {cmd} · "
-                           f"{ack.get('msg') or ack}")
-            return False
-        logger.info(f"bridge cmd acked: {cmd}")
-        return True
+            return None
+        if not isinstance(ack, dict):
+            logger.warning(f"bridge cmd UNCONFIRMED (bad ack {line[:80]!r}): {cmd}")
+            return None
+        return ack
     except OSError as exc:
         logger.warning(f"bridge cmd failed: {cmd} · {exc}")
-        return False
+        return None
     finally:
         if s is not None:
             try:
                 s.close()
             except OSError:
                 pass
+
+
+def bridge_send_command(cmd: dict, timeout: float = 2.0) -> bool:
+    """Send a command to the AddOn; True only when it acked ok."""
+    ack = _bridge_roundtrip(cmd, timeout)
+    if ack is None:
+        return False
+    # AddOn replies {"ack":true|false,"msg":"..."} — see SendAck().
+    if not ack.get("ack"):
+        logger.warning(f"bridge cmd REFUSED by AddOn: {cmd} · "
+                       f"{ack.get('msg') or ack}")
+        return False
+    logger.info(f"bridge cmd acked: {cmd}")
+    return True
 
 
 def fire_close_position(account: str, contract: str):
@@ -6675,6 +7142,9 @@ def close_account_positions(account: str) -> list[str]:
     # refill after we close. Scoped by order ID — never CANCELALLORDERS,
     # which NT applies globally across all accounts and connections.
     fire_cancel_account_orders(account)
+    # Those cancels also void any opening writes still registered as
+    # in-flight — a phantom row here would keep re-triggering closes.
+    _clear_inflight_opens(account)
 
     closed: set[str] = set()
 
@@ -7097,9 +7567,12 @@ async def live_bridge_task():
 
     When connected, feeds `equity` (cash + unrealized) from the AddOn's
     JSON stream into session_current_balances[active_account] so the
-    existing balance_monitor trips stops/targets mid-trade. Falls back
-    silently to ATI CashValue polling (via balance_monitor) whenever the
-    AddOn is disabled, unreachable, or stale.
+    existing balance_monitor trips stops/targets mid-trade, and caches
+    every full state line as the live book (_bridge_ingest_book) so a
+    prop entry can skip its pre-entry ATI snapshot when the book proves
+    there is nothing to close. Falls back silently to ATI CashValue
+    polling (via balance_monitor) whenever the AddOn is disabled,
+    unreachable, or stale.
 
     Reconnects with exponential backoff up to 30s so NT restarts,
     temporary network hiccups, or AddOn recompiles auto-recover.
@@ -7184,6 +7657,15 @@ async def live_bridge_task():
                     _live_bridge_connected = True
                     backoff = 1.0
                     logger.info("live bridge authenticated and streaming")
+                    # NT is reachable — pull the front months it would
+                    # trade per root, so signal-time month correction is a
+                    # pure map lookup (see refresh_front_months).
+                    asyncio.create_task(_front_months_sync())
+                elif _front_months_attempt_date != datetime.now(ET).strftime("%Y-%m-%d"):
+                    # New ET day mid-session: contracts roll while the app
+                    # runs, so re-sync once per day off the stream's own
+                    # traffic (bounded by the attempt date, success or not).
+                    asyncio.create_task(_front_months_sync())
                 try:
                     obj = json.loads(line.decode("utf-8", errors="ignore"))
                 except (ValueError, json.JSONDecodeError):
@@ -7192,6 +7674,7 @@ async def live_bridge_task():
                 accts = obj.get("accounts") if isinstance(obj, dict) else None
                 if not accts:
                     continue
+                _bridge_ingest_book(accts)
                 for a in accts:
                     name = a.get("name")
                     if not name:
@@ -8104,6 +8587,11 @@ def web_state() -> dict:
         "micro_map": dict(micro_map),
         "strategy_symbols": {k: list(v) for k, v in strategy_symbols.items()},
         "strategy_choices": strategy_filter_choices(atm_templates),
+        # Raw wire names for the scoped-rule strategy picker: unlike the
+        # global filter above, profile rules match the publisher name
+        # exactly (case-insensitive), so the picker must offer the names
+        # actually seen on the wire, not ATM-template spellings.
+        "strategies_seen": list(pub_strategies_seen),
         "rule_defaults": dict(DEFAULT_RULE),
         "catalog": instrument_catalog(),
         "favorites": [f for f in (load_config().get("web_favorites") or [])
@@ -8111,9 +8599,11 @@ def web_state() -> dict:
         "events": list(_web_events),
         # Snapshot (the loop thread clears/repopulates this dict, and
         # json.dumps on the HTTP thread would raise mid-iteration), and
-        # strip the AI gate: the write path refuses to accept it, so the
-        # read path should not hand out its endpoint and key env var.
-        "profiles": _strip_ai_config(json.loads(json.dumps(account_profiles))),
+        # mask each AI gate down to its provider name: the write path
+        # refuses to accept gates, so the read path should not hand out
+        # their endpoints and key env vars — but the rules editor still
+        # has to show which rules carry one.
+        "profiles": _mask_ai_config(json.loads(json.dumps(account_profiles))),
         "server": _server_name,
         "output_directory": output_directory or "",
         "ts": time.time(),
@@ -8325,16 +8815,88 @@ def _strip_ai_config(raw):
     return raw
 
 
-def _restore_ai_config(cleaned: dict, previous: dict) -> dict:
-    """Carry each rule's existing AI gate across a web profile update."""
+def _mask_ai_config(raw):
+    """Reduce every `ai` config in a profiles payload to its provider name.
+
+    The web UI needs to KNOW a rule carries an AI gate — to show it, and so
+    deleting the rule visibly discards it — but the read path must not hand
+    out the gate's endpoint or API-key env var (see _strip_ai_config).
+    """
+    if isinstance(raw, dict):
+        out = {}
+        for k, v in raw.items():
+            if k == "ai":
+                if isinstance(v, dict) and v:
+                    out[k] = {"provider": str(v.get("provider", ""))}
+                continue
+            out[k] = _mask_ai_config(v)
+        return out
+    if isinstance(raw, list):
+        return [_mask_ai_config(v) for v in raw]
+    return raw
+
+
+def _extract_ai_hints(raw: dict) -> dict[str, list]:
+    """Pop the web rules editor's `_ai_idx` markers out of a profiles payload.
+
+    The editor can reorder, delete, and insert scoped rules, so each rule it
+    sends carries the index of the served rule it descends from (-1 on a rule
+    added in the editor). Markers are popped here so they never reach the
+    config file, and each returned list is aligned with the rules that will
+    survive load_account_profiles: a rule that coerces to nothing is skipped
+    by both. An account whose rules carry NO markers at all returns no entry,
+    which tells _restore_ai_config to fall back to positional matching — the
+    pre-marker behavior; an all-new-rules save from the editor still carries
+    its -1 markers, so old gates are not resurrected positionally there.
+    """
+    hints: dict[str, list] = {}
+    for acct, prof in raw.items():
+        if not isinstance(prof, dict) or not isinstance(prof.get("rules"), list):
+            continue
+        per: list = []
+        saw_marker = False
+        for rule in prof["rules"]:
+            if not isinstance(rule, dict):
+                continue
+            idx = rule.pop("_ai_idx", None)
+            is_marker = isinstance(idx, int) and not isinstance(idx, bool)
+            saw_marker = saw_marker or is_marker
+            if _coerce_rule(_strip_ai_config(rule), scoped=True):
+                per.append(idx if is_marker else None)
+        if per and saw_marker:
+            hints[str(acct)] = per
+    return hints
+
+
+def _restore_ai_config(cleaned: dict, previous: dict,
+                       hints: dict[str, list] | None = None) -> dict:
+    """Carry each rule's existing AI gate across a web profile update.
+
+    Gates only ever come from `previous` (server state), never from the
+    wire. Rules are matched through the client's `_ai_idx` markers when the
+    account sent any (the web editor reorders, deletes, and inserts rules),
+    positionally when it didn't (payloads predating the markers). A marker
+    that is out of range or already claimed restores nothing.
+    """
     for acct, prof in cleaned.items():
         old = previous.get(acct, {})
         if old.get("default", {}).get("ai") and prof.get("default") is not None:
             prof["default"]["ai"] = old["default"]["ai"]
         old_rules = old.get("rules", [])
+        acct_hints = (hints or {}).get(acct)
+        claimed: set[int] = set()
         for i, rule in enumerate(prof.get("rules", [])):
-            if i < len(old_rules) and old_rules[i].get("ai"):
-                rule["ai"] = old_rules[i]["ai"]
+            if acct_hints is None:
+                src = i
+            elif i < len(acct_hints):
+                src = acct_hints[i]
+            else:
+                src = None
+            if src is None or not 0 <= src < len(old_rules) or src in claimed:
+                continue
+            claimed.add(src)
+            if old_rules[src].get("ai"):
+                rule["ai"] = old_rules[src]["ai"]
     return cleaned
 
 
@@ -8344,8 +8906,9 @@ async def _web_set_profiles(raw) -> tuple[bool, str]:
     if not isinstance(raw, dict):
         return False, "profiles must be a JSON object keyed by account"
     previous = {a: json.loads(json.dumps(p)) for a, p in account_profiles.items()}
+    hints = _extract_ai_hints(raw)
     cleaned = load_account_profiles({"account_profiles": _strip_ai_config(raw)})
-    cleaned = _restore_ai_config(cleaned, previous)
+    cleaned = _restore_ai_config(cleaned, previous, hints)
     account_profiles.clear()
     account_profiles.update(cleaned)
     save_account_profiles()
@@ -9724,19 +10287,36 @@ function openModal(title,sub,build){
 function closeModal(){modalOpen=false;$("veil").classList.remove("show")}
 $("veil").onclick=e=>{if(e.target===$("veil"))closeModal()};
 
-function pickGroup(parent,options,current){
+function pickGroup(parent,options,current,onpick){
   const wrap=el("div","chiplist");const state={value:current};
   options.forEach(o=>{
     const b=el("div","pick"+(o.value===current?" on":""),o.label);
     b.onclick=()=>{state.value=o.value;
       [...wrap.children].forEach(c=>c.classList.remove("on"));
-      b.classList.add("on")};
+      b.classList.add("on");if(onpick)onpick(o.value)};
     wrap.appendChild(b)});
   parent.appendChild(wrap);return state}
 
 function numField(parent,text,value){
   parent.appendChild(el("label",null,text));
   const i=el("input");i.type="number";i.value=value;parent.appendChild(i);return i}
+
+/* Number input where an empty box means "inherit" (key absent from the
+   scoped rule) rather than zero. */
+function optNumField(parent,text,value){
+  parent.appendChild(el("label",null,text));
+  const i=el("input");i.type="number";i.placeholder="inherit";
+  if(value!=null)i.value=value;parent.appendChild(i);return i}
+
+/* Shared warning under a Direction picker, shown while INVERT is chosen. */
+function invertWarn(parent){
+  const w=el("div","sub");w.style.color="var(--yellow)";w.style.display="none";
+  w.textContent="⚠ INVERT fades the signal: BUY↔SELL flipped, limit/stop entries "+
+    "skipped, publisher CHANGE orders dropped — this side's own ATM manages its "+
+    "stops. Inverting some accounts or strategies while others trade them straight "+
+    "makes the fan-out hedge itself: fine when fading on your own broker account, "+
+    "an account-closure event on a prop firm (the hedge guard will warn).";
+  parent.appendChild(w);return w}
 
 function fold(parent,open){
   const w=el("div","fold"),hd=el("div","foldhead"),bd=el("div","foldbody");
@@ -9805,7 +10385,9 @@ function accountModal(a){
     const cap=numField(P,"Max contracts per entry (0 = none)",rule.max_contracts||0);
     P.appendChild(el("label",null,"Direction"));
     const dir=pickGroup(P,[{label:"NORMAL",value:"normal"},{label:"INVERT",value:"invert"}],
-      rule.direction||"normal");
+      rule.direction||"normal",v=>{dwarn.style.display=v==="invert"?"":"none"});
+    const dwarn=invertWarn(P);
+    if((rule.direction||"normal")==="invert")dwarn.style.display="";
     const dl=numField(P,"Entry delay ms",rule.delay_ms||0);
     const stg=numField(P,"Stagger tranches (1 = off)",rule.stagger_entries||1);
     P.appendChild(el("label",null,"ATM override (blank = session)"));
@@ -9814,6 +10396,160 @@ function accountModal(a){
     at.value=rule.atm||"";P.appendChild(at);
     if(rule.ai)P.appendChild(el("div","sub","AI gate: "+rule.ai.provider+
       " — configure from the terminal"));
+
+    /* ---- Scoped rules: per-symbol / per-strategy exceptions. Mirrors the
+       terminal's S → 8 → account → R editor; each rule carries only the
+       keys it overrides, everything else inherits from the default above.
+       _ai_idx marks which served rule an edited rule descends from so the
+       server can carry terminal-configured AI gates across reorders. ---- */
+    const rf=fold(P,false);
+    rf.title.textContent="Scoped rules";
+    const rules=JSON.parse(JSON.stringify(prof.rules||[]));
+    rules.forEach((r,i)=>r._ai_idx=i);
+    const RB=rf.body;
+    RB.appendChild(el("div","sub",
+      "Exceptions to the profile above for specific symbols and/or publisher "+
+      "strategies — the FIRST matching rule wins, so order matters. INHERIT "+
+      "fields fall back to the account default. Exits are never blocked."));
+    const rrows=el("div");RB.appendChild(rrows);
+    const lower=s=>(""+s).toLowerCase();
+    function rsum(){rf.sum.textContent=rules.length
+      ?rules.length+" rule"+(rules.length>1?"s":"")+" — first match wins":"none"}
+    function ruleScope(r){
+      return ((r.symbols||[]).join(", ")||"any symbol")+" · "+
+             ((r.strategies||[]).join(", ")||"any strategy")}
+    function ruleBits(r){
+      const b=[];
+      if(r.enabled===false)b.push("entries OFF");
+      if(r.enabled===true)b.push("entries on");
+      if(r.direction)b.push(r.direction==="invert"?"INVERT":"normal");
+      if(r.size)b.push(r.size==="inherit"?"size global":r.size);
+      if(r.qty_mode==="copy")b.push("qty copy");
+      if(r.qty_mode==="fixed")b.push("qty "+(r.qty_value!=null?r.qty_value:1));
+      if(r.qty_mode==="multiple")b.push("qty ×"+(r.qty_value!=null?r.qty_value:1));
+      if("max_contracts"in r)b.push("cap "+r.max_contracts);
+      if("delay_ms"in r)b.push("delay "+r.delay_ms+"ms");
+      if("stagger_entries"in r)b.push("stagger "+r.stagger_entries);
+      if(r.atm!=null)b.push("ATM "+(r.atm||"session"));
+      if(r.ai)b.push("AI:"+(r.ai.provider||"on"));
+      return b.join(" · ")||"no overrides yet"}
+    function drawRules(openIdx){
+      rrows.textContent="";rsum();
+      if(!rules.length)rrows.appendChild(el("div","sub",
+        "No scoped rules — the profile above covers every signal."));
+      rules.forEach((r,idx)=>{
+        const fr=fold(rrows,idx===openIdx);
+        const refresh=()=>{fr.title.textContent=(idx+1)+". "+ruleScope(r);
+          fr.sum.textContent=ruleBits(r)};
+        refresh();
+        const B=fr.body;
+        const set=(key,val,unset)=>{if(unset)delete r[key];else r[key]=val;refresh()};
+        const numSet=(input,key,parse)=>{input.oninput=()=>{
+          const v=parse(input.value);
+          set(key,v,input.value.trim()===""||isNaN(v))}};
+
+        B.appendChild(el("label",null,
+          "Symbols it applies to (none = any — micro twins included, NQ covers MNQ)"));
+        const sw2=el("div","chiplist");
+        const roots=[...new Set([...(S.catalog||[]).map(p=>p.root),...(r.symbols||[])])];
+        roots.forEach(root=>{
+          const b=el("div","pick"+((r.symbols||[]).includes(root)?" on":""),root);
+          b.onclick=()=>{const cur=r.symbols||[];const i=cur.indexOf(root);
+            if(i<0)cur.push(root);else cur.splice(i,1);
+            if(cur.length)r.symbols=cur;else delete r.symbols;
+            b.classList.toggle("on");refresh()};
+          sw2.appendChild(b)});
+        B.appendChild(sw2);
+
+        B.appendChild(el("label",null,
+          "Publisher strategies it applies to (none = any) — matched by the exact name the wire sends"));
+        const gw=el("div","chiplist");
+        const names=[];
+        [...(r.strategies||[]),...(S.strategies_seen||[])].forEach(n=>{
+          if(!names.some(x=>lower(x)===lower(n)))names.push(n)});
+        if(!names.length)B.appendChild(el("div","sub",
+          "No strategies seen from the publisher yet — type one below."));
+        names.forEach(name=>{
+          const on=(r.strategies||[]).some(x=>lower(x)===lower(name));
+          const b=el("div","pick"+(on?" on":""),name);
+          b.onclick=()=>{const cur=r.strategies||[];
+            const i=cur.findIndex(x=>lower(x)===lower(name));
+            if(i<0)cur.push(name);else cur.splice(i,1);
+            if(cur.length)r.strategies=cur;else delete r.strategies;
+            b.classList.toggle("on");refresh()};
+          gw.appendChild(b)});
+        B.appendChild(gw);
+        const srow=el("div","btnrow");srow.style.marginTop="6px";
+        const si=el("input");si.placeholder="or type a strategy name";
+        si.style.maxWidth="180px";srow.appendChild(si);
+        srow.appendChild(btn("ADD","sm",()=>{
+          const n=si.value.trim().replace(/;/g,"");if(!n)return;
+          const cur=r.strategies||[];
+          if(!cur.some(x=>lower(x)===lower(n)))cur.push(n);
+          r.strategies=cur;drawRules(idx)}));
+        B.appendChild(srow);
+
+        B.appendChild(el("label",null,"Entries"));
+        pickGroup(B,[{label:"INHERIT",value:"i"},{label:"ON",value:true},
+          {label:"OFF — exits only",value:false}],
+          "enabled"in r?r.enabled:"i",v=>set("enabled",v,v==="i"));
+        B.appendChild(el("label",null,"Contract size (GLOBAL = session micro toggle)"));
+        pickGroup(B,[{label:"INHERIT",value:"i"},{label:"MICROS",value:"micros"},
+          {label:"FULL",value:"full"},{label:"GLOBAL",value:"inherit"}],
+          "size"in r?r.size:"i",v=>set("size",v,v==="i"));
+        B.appendChild(el("label",null,"Contracts"));
+        pickGroup(B,[{label:"INHERIT",value:"i"},{label:"COPY",value:"copy"},
+          {label:"FIXED",value:"fixed"},{label:"MULTIPLE",value:"multiple"}],
+          "qty_mode"in r?r.qty_mode:"i",v=>set("qty_mode",v,v==="i"));
+        numSet(optNumField(B,"Value (count, or multiplier)",
+          "qty_value"in r?r.qty_value:null),"qty_value",parseFloat);
+        numSet(optNumField(B,"Max contracts per entry (0 = none)",
+          "max_contracts"in r?r.max_contracts:null),"max_contracts",
+          v=>parseInt(v,10));
+        B.appendChild(el("label",null,"Direction"));
+        let rw;
+        pickGroup(B,[{label:"INHERIT",value:"i"},{label:"NORMAL",value:"normal"},
+          {label:"INVERT",value:"invert"}],
+          "direction"in r?r.direction:"i",
+          v=>{set("direction",v,v==="i");rw.style.display=v==="invert"?"":"none"});
+        rw=invertWarn(B);
+        if(r.direction==="invert")rw.style.display="";
+        numSet(optNumField(B,"Entry delay ms","delay_ms"in r?r.delay_ms:null),
+          "delay_ms",v=>parseInt(v,10));
+        numSet(optNumField(B,"Stagger tranches (1 = off)",
+          "stagger_entries"in r?r.stagger_entries:null),
+          "stagger_entries",v=>parseInt(v,10));
+        B.appendChild(el("label",null,"ATM override"));
+        const at2=el("select");
+        const oi=el("option",null,"inherit");oi.value="__inh";at2.appendChild(oi);
+        if(r.atm===""){const o=el("option",null,"session default");o.value="";
+          at2.appendChild(o)}
+        (S.atm_available||[]).forEach(n=>{const o=el("option",null,n);o.value=n;
+          at2.appendChild(o)});
+        if(r.atm&&!(S.atm_available||[]).includes(r.atm)){
+          const o=el("option",null,r.atm+" (missing)");o.value=r.atm;
+          at2.appendChild(o)}
+        at2.value="atm"in r?r.atm:"__inh";
+        at2.onchange=()=>set("atm",at2.value,at2.value==="__inh");
+        B.appendChild(at2);
+        if(r.ai)B.appendChild(el("div","sub","AI gate: "+(r.ai.provider||"configured")+
+          " — configure from the terminal; deleting this rule discards it"));
+
+        const xr=el("div","btnrow");xr.style.marginTop="8px";
+        xr.appendChild(btn("▲ EARLIER","sm",()=>{if(idx>0){
+          rules.splice(idx-1,0,rules.splice(idx,1)[0]);drawRules(idx-1)}}));
+        xr.appendChild(btn("▼ LATER","sm",()=>{if(idx<rules.length-1){
+          rules.splice(idx+1,0,rules.splice(idx,1)[0]);drawRules(idx+1)}}));
+        xr.appendChild(btn("DELETE RULE","sm danger",()=>{
+          rules.splice(idx,1);drawRules()}));
+        B.appendChild(xr)})}
+    const arow=el("div","btnrow");arow.style.marginTop="8px";
+    /* _ai_idx:-1 = "new rule": keeps the payload marker-aware so the server
+       never falls back to positional AI-gate matching for this account. */
+    arow.appendChild(btn("ADD RULE","sm",()=>{rules.push({_ai_idx:-1});
+      drawRules(rules.length-1)}));
+    RB.appendChild(arow);
+    drawRules();
 
     P.appendChild(el("label",null,"Prop firm account (one trade at a time · flat by close)"));
     const pr=pickGroup(P,[{label:"OFF",value:false},{label:"PROP",value:true}],!!prof.prop);
@@ -9834,6 +10570,12 @@ function accountModal(a){
       if(at.value)d.atm=at.value;else delete d.atm;
       e.default=d;
       if(allowed.length)e.symbols_allowed=allowed;else delete e.symbols_allowed;
+      /* Drop rules with no real content (scope or override) — the server
+         drops the same ones, which keeps the _ai_idx lists aligned. The
+         masked `ai` marker is display-only and never counts as content. */
+      const keepRules=rules.filter(r=>
+        Object.keys(r).some(k=>k!=="_ai_idx"&&k!=="ai"));
+      if(keepRules.length)e.rules=keepRules;else delete e.rules;
       if(pr.value){e.prop=true;
         if(pfirm.value.trim())e.prop_firm=pfirm.value.trim();else delete e.prop_firm;
         if(pflat.value.trim())e.prop_flat_et=pflat.value.trim();else delete e.prop_flat_et;
@@ -10056,6 +10798,11 @@ async def main():
     account_profiles.update(load_account_profiles(cfg))
     if account_profiles:
         logger.info(f"PROFILES LOADED  accounts={sorted(account_profiles)}")
+    load_front_months(cfg)
+    if front_months:
+        logger.info(f"FRONT MONTHS LOADED  {len(front_months)} roots "
+                    f"(synced {_front_months_date or 'unknown'}) — bridge "
+                    "refresh replaces on connect; calendar guards staleness")
     global live_bridge_enabled, live_bridge_port, nt_host_override
     live_bridge_enabled = bool(cfg.get("live_bridge_enabled", False))
     if live_bridge_enabled:

@@ -404,13 +404,22 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void HandleCommand(string jsonLine, TcpClient client)
         {
-            // Tiny JSON parser — we only accept two shapes today:
+            // Tiny JSON parser — we only accept three shapes today:
             //   {"cmd":"flatten","account":"<name>"}
             //   {"cmd":"close_position","account":"<name>","instrument":"<inst>"}
+            //   {"cmd":"front_months","roots":"ES,NQ,SIL,..."}
             // Using a string-contains approach keeps this dependency-free
             // and safe when the rest of NT is running on .NET Framework 4.x
             // without Newtonsoft or System.Text.Json guaranteed available.
             string cmd = ExtractJsonString(jsonLine, "cmd");
+            if (cmd == "front_months")
+            {
+                // Account-independent: resolve each requested root against
+                // NT's instrument DB and reply with the contract NT itself
+                // considers current under its rollover schedule.
+                SendFrontMonths(client, ExtractJsonString(jsonLine, "roots"));
+                return;
+            }
             string accountName = ExtractJsonString(jsonLine, "account");
             if (string.IsNullOrEmpty(cmd) || string.IsNullOrEmpty(accountName))
             {
@@ -507,6 +516,53 @@ namespace NinjaTrader.NinjaScript.AddOns
                     return;
                 }
             }
+        }
+
+        private void SendFrontMonths(TcpClient client, string rootsCsv)
+        {
+            // Reply: {"ack":true,"msg":"front_months","months":{"SI":"12-26",...}}
+            // Instrument.GetInstrument on a bare root ("SI") resolves the
+            // contract NT's rollover schedule makes current, and FullName
+            // already carries it in the OIF "ROOT MM-YY" form the client
+            // wants — no date math on this side. Unknown roots are simply
+            // omitted so the client's calendar fallback covers them.
+            var sb = new StringBuilder();
+            sb.Append("{\"ack\":true,\"msg\":\"front_months\",\"months\":{");
+            bool first = true;
+            if (!string.IsNullOrEmpty(rootsCsv))
+            {
+                var seen = new HashSet<string>();
+                foreach (var raw in rootsCsv.Split(','))
+                {
+                    if (seen.Count >= 64) break;   // bound a hostile request
+                    var root = raw.Trim().ToUpperInvariant();
+                    if (root.Length == 0 || root.Length > 6 || !seen.Add(root))
+                        continue;
+                    string tail = null;
+                    try
+                    {
+                        var inst = Instrument.GetInstrument(root);
+                        var full = inst != null ? inst.FullName : null;   // "SI 12-26"
+                        if (full != null
+                            && full.StartsWith(root + " ", StringComparison.OrdinalIgnoreCase))
+                            tail = full.Substring(root.Length + 1).Trim();
+                    }
+                    catch { /* not in the instrument DB — skip */ }
+                    if (string.IsNullOrEmpty(tail)) continue;
+                    if (!first) sb.Append(",");
+                    first = false;
+                    sb.Append(JsonString(root)).Append(":").Append(JsonString(tail));
+                }
+            }
+            sb.Append("}}\n");
+            try
+            {
+                var bytes = Encoding.UTF8.GetBytes(sb.ToString());
+                var stream = client.GetStream();
+                stream.WriteTimeout = WriteTimeoutMs;
+                stream.Write(bytes, 0, bytes.Length);
+            }
+            catch { /* client dropped — SafeBroadcast will evict */ }
         }
 
         private void SendAck(TcpClient client, bool ok, string message)

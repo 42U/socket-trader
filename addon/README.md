@@ -15,6 +15,10 @@ tick and account event.
 - You want session stop / target limits to fire **during** an open trade,
   not just after the ATM template closes it.
 - You want to display live P&L in the Socket Trader dashboard.
+- You run **prop-marked accounts** and want entries to skip the
+  close-before-open snapshot: every stream line is a full position book,
+  so a book that already proves all prop accounts flat lets the entry
+  fire immediately instead of waiting on a pre-entry ATI state dump.
 
 If you're fine with NT's ATM template handling per-trade risk and
 Socket Trader only locking out future signals after a trade completes,
@@ -62,6 +66,21 @@ account/position/price event. Example during an open NQ short:
 ]}
 ```
 
+## Commands
+
+Socket Trader can also send one-line JSON commands over the same port
+(token-authenticated, one command per connection):
+
+- `{"cmd":"flatten","account":"…"}` — flatten every position on the account
+- `{"cmd":"close_position","account":"…","instrument":"…"}` — close one position
+- `{"cmd":"front_months","roots":"ES,NQ,SIL,…"}` — replies with the contract
+  NT itself considers current per root under its rollover schedule, e.g.
+  `{"ack":true,"msg":"front_months","months":{"SI":"12-26","ES":"09-26"}}`.
+  Socket Trader sends this on every bridge connect and once per day, and
+  uses the answer to auto-roll incoming signals that still name an expiring
+  contract month (see *Front-Month Roll Guard* in the main README). An
+  older AddOn build refuses the command harmlessly — recompile to enable.
+
 ## Changing the port
 
 Edit the `ListenPort` constant at the top of `SocketTraderBridge.cs`,
@@ -72,11 +91,15 @@ WSL with mirrored networking.
 
 ## Security notes
 
-- The stream is plaintext TCP with no authentication. Don't expose the
-  port to the public internet. Keep it on your LAN or a VPN.
-- The AddOn only *reads* account state and publishes it — it cannot
-  place, modify, or cancel orders. Order routing still goes through the
-  existing ATI incoming folder.
+- The stream is plaintext TCP gated by a shared token
+  (`SocketTraderBridge.token` in NT's user-data folder, written and
+  rotated by Socket Trader): no valid token, no data and no commands.
+  Still, don't expose the port to the public internet — keep it on your
+  LAN or a VPN.
+- The AddOn reads account state and accepts only the commands listed
+  above — it can flatten/close existing positions and report front
+  months, but it cannot place new orders. Order entry still goes through
+  the existing ATI incoming folder.
 
 ## Uninstalling
 
