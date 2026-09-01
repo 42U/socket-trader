@@ -6,13 +6,13 @@
 
 [![VoidOrigin](https://img.shields.io/badge/VOIDORIGIN-voidorigin.com-0a0a0a?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiIHN0cm9rZT0iI2ZmNmIzNSIgc3Ryb2tlLXdpZHRoPSIyIi8+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iNCIgZmlsbD0iI2ZmNmIzNSIvPjwvc3ZnPg==&logoColor=ff6b35&labelColor=0a0a0a)](https://voidorigin.com)
 
-[![Version](https://img.shields.io/badge/v0.16.0-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
+[![Version](https://img.shields.io/badge/v0.17.0-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
 [![GitHub Stars](https://img.shields.io/github/stars/42U/socket-trader?style=for-the-badge&logo=github&color=gold)](https://github.com/42U/socket-trader)
 [![License: MIT](https://img.shields.io/github/license/42U/socket-trader?style=for-the-badge&logo=opensourceinitiative&color=blue)](https://opensource.org/licenses/MIT)
 [![CI](https://img.shields.io/github/actions/workflow/status/42U/socket-trader/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![NinjaTrader](https://img.shields.io/badge/NinjaTrader-8-ff6b00?style=for-the-badge)](https://ninjatrader.com)
-[![Tests](https://img.shields.io/badge/Tests-586_passing-brightgreen?style=for-the-badge&logo=pytest&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/Tests-700_passing-brightgreen?style=for-the-badge&logo=pytest&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
 
 **One WebSocket signal in — verified NinjaTrader orders out, across every account you run.**
 
@@ -60,12 +60,14 @@ The sim account is automatically swapped with your real NinjaTrader account name
 | **Round-robin** | Link accounts into a rotation pool: each **entry** goes to exactly **one** pool account, drawn randomly with no repeats until every pool account has traded a round — alongside copy trading |
 | **Prop firm mode** | Mark an account `prop` and the router enforces the rules a funded account lives under: **one position at a time with confirmed close-before-open**, no opposite sides across accounts (product-group aware), and a **verified flat-by-close** with per-firm deadline presets — research on ten firms in [`PROP_RULES.md`](PROP_RULES.md) |
 | **Global strategy filter** | One map — *"GoldStrat only trades GC, NasdaqStrat only NQ"* — applied to every account before any leg exists; exits are never filtered |
+| **Multi-strategy mode** | Subscribe to **several publisher strategies sharing a market** without them trampling each other: each strategy's close-then-place pair is **scoped to its own position** — a close from a strategy that holds nothing here is skipped, a shared position closes only the sender's contracts, and **same-direction entries stack** (within `max_contracts`); opposite entries still reset the market first |
 | **Front-month roll guard** | A signal naming an **expiring contract month** (broker says *"liquidation only"*) is rolled to the known front before fan-out — synced from NinjaTrader's own rollover schedule via the AddOn, calendar fallback without it; old-month positions still get their closes |
 | **Per-account profiles** | Each account can filter which **symbols it trades**, trade micros or full-size, its own contract count, inverted direction, delayed or staggered entries, its own ATM template, and an optional **AI gate** — scoped per symbol / publisher strategy |
 | **Balance outage armor** | A NinjaTrader broker-feed outage that zeroes every account reading is quarantined: last known balances are **held and marked stale** instead of tripping phantom stops or poisoning session baselines |
 | **Live trade monitor** | Optional NinjaTrader AddOn streams live equity (cash + unrealized) so stops and targets trip **mid-trade**, with native `account.Flatten()` for closes — and a live **position book** that lets prop entries skip the close-before-open snapshot when every account is provably flat |
 | **Manual trading** | Press `O` (or use the web UI) to submit your own long/short market/limit order with an ATM template — it fans out through copy trading, round-robin, and profiles exactly like a publisher signal |
 | **Web UI** | A localhost control panel starts with the app: live dashboard, manual orders, pause/flatten/reconnect, micro toggle, accounts, strategy, limits, and profiles from the browser |
+| **P&L calendar** | A month-at-a-glance trading record in the web UI: green/red heat-mapped days, weekly totals, equity curve, and a per-day drill-down with win rate, profit factor, and **by-symbol / by-strategy / by-account** breakdowns — built entirely from data the app already tracks |
 | **Micro mode** | One toggle converts every signal to its CME micro contract — NQ→MNQ, ES→MES, RTY→M2K, GC→MGC, … |
 | **ATI integration** | Auto-detect accounts, live balances, and position closing via NinjaTrader ATI |
 | **Auto-detect directory** | Finds NinjaTrader 8 `incoming/` folder on Windows automatically |
@@ -437,6 +439,26 @@ Filters key on **ATM-template identity**, not the literal wire spelling: a filte
 
 A blocked entry is dropped before any leg — including the round-robin draw — exists, so no rotation turn is burned. Exit priority holds everywhere: closes are never filtered, and a reversal for a filtered-out market is downgraded to a `CLOSEPOSITION` for every account so the old position still exits. Per-account scoped rules still apply on top for accounts that need to deviate from the global map.
 
+### Multi-Strategy Mode
+
+Publishers that run **several strategies** typically send each entry as a stateless pair — `CLOSEPOSITION` on the instrument, then the `PLACE` — meaning *"reset my position, then open."* Perfect for one strategy; with two strategies sharing a market the pairs interleave, and strategy B's close flattens the position strategy A opened seconds earlier: **open → closed 2s later → reopened**, with the account ending up holding one strategy's size instead of both.
+
+```json
+"multi_strategy": true
+```
+
+turns the router strategy-aware. Every entry written is remembered in a **strategy ledger** (which strategy id opened what, per account and market), the publisher's envelope attributes each close to its sender, and each close is then answered per account:
+
+| The sender... | The close becomes |
+|---|---|
+| holds nothing on this market (or the account is flat) | **skipped** — nothing of theirs to close |
+| shares the position with other strategies | **`CLOSESTRATEGY` on its own entry ids** — its contracts close, its ATM bracket dies, teammates' positions stand |
+| is the sole holder | the original full close, unchanged |
+
+Same-direction entries then simply **stack** — each strategy holds its own position side by side, and `max_contracts` (when set) becomes the **aggregate cap** on the market: a full stack skips the entry, a partial fit resizes it. An **opposite-direction** entry never nets into a teammate's position: the market is fully closed first (the publisher's reset, restored), settled, then entered — and on `prop` / `close_before_open` accounts the close-confirm-enter engine handles it as always, now keeping a same-direction stack (cap required) instead of resetting it.
+
+Fail-safe by construction: scoping and skipping require the [live trade monitor](#optional-live-trade-monitor)'s fresh position book **and** a ledger that fully accounts for the position. No AddOn, no envelope attribution (manual orders, other publishers), a restart, unattributed contracts, direction drift, or a micro/full twin on the book — any of these and the close passes through **verbatim**, exactly as with the flag off. The mode can suppress churn; it can never leave a close unfired in a state it cannot prove.
+
 ### Front-Month Roll Guard
 
 A publisher still signalling an **expiring contract month** gets every entry rejected broker-side — deliverable metals go *"Liquidation only, contract is about to be expired"* near first notice, days before the month itself. SocketTrader corrects the month **before the fan-out**, from a front-month map it already holds when the signal lands (no lookup on the hot path):
@@ -512,12 +534,25 @@ It is a **trading companion**, not a replacement for the terminal: it does two j
 | **Account editor** | Risk limits (target/stop with OFF/SOFT/HARD buttons) and the trade profile — symbol filter chips, entries on/off, size, contracts mode + cap, direction, delay, stagger, ATM override — all clickable. A **Scoped rules** section adds, reorders and deletes per-symbol / per-strategy exception rules (invert one strategy, size another down, block a third), with strategy pickers fed by the names actually seen on the wire; fields left INHERIT fall back to the account default, and a terminal-configured AI gate survives web edits and follows its rule when reordered |
 | **Session** | Reconnect, micro toggle, reset P&L, session ATM strategy, and the live round-robin rotation state |
 | **Activity** | The same signal and alert feed shown in the terminal dashboard |
+| **P&L tab** | The trading calendar — month stats, equity curve, heat-mapped days, and a full per-day breakdown (see below) |
 
 **The account grid is real, live NinjaTrader data.** NinjaTrader answers `ACCOUNTS`, `POSITIONS` and `ORDERS` with the same full state dump, so the app takes one ATI round-trip every two seconds and parses it into accounts, positions and working orders (cached briefly so several browser tabs share a single poll) rather than querying per account.
 
 **The instrument picker never depends on history.** Contract months are computed per product family — quarterly (Mar/Jun/Sep/Dec) for equity index, rates and FX; every month for energy; Feb/Apr/Jun/Aug/Dec for gold; Mar/May/Jul/Sep/Dec for silver and copper — and rendered as `ROOT MM-YY` (e.g. `NQ 09-26`), the form the OIF signals use. Anything unusual can still be typed.
 
 Config keys: `webui_enabled` (default `true`, set `false` to disable) and `webui_port` (default `8720`; if busy, an ephemeral port is used and logged). The connection bootstrap (server, token, incoming directory) still happens in the terminal on first run, and **AI gates are terminal-only** — see below.
+
+### P&L calendar
+
+The **P&L** tab in the web UI is a standalone day-by-day trading record — no broker statement, no extra account data, nothing new asked of NinjaTrader. It is built from two things the app already watches: the same live account snapshot the dashboard polls, and the strategy identity every entry write already carries.
+
+- **Calendar** — the current month (navigable back through history) as a Mon–Fri grid with a weekly-totals column. Each day is washed green or red with intensity scaled to its P&L, and shows net, trade count and win rate. Days are keyed by **CME session close date**, so Sunday-evening trades land on Monday — the same convention as every session number in the app.
+- **Month statistics** — net P&L, green/red days, day and trade win rates, profit factor, average day, best/worst day, current streak, plus a cumulative **equity curve**.
+- **Day drill-down** — click any day for the full sheet: net P&L, trades, win rate, profit factor, average trade/win/loss, largest win/loss, gross profit/loss, long vs short split, average hold — then **by-symbol, by-strategy and by-account** breakdown tables, an intraday cumulative curve, and the complete trade log (time, account, symbol, side, qty, strategy, entry, hold time, P&L).
+
+**How the numbers are measured.** The per-day net is the change in each managed account's realized cash balance over the session — the same source and definition as the Session P&L tile, so commissions are included and the calendar always agrees with what you watched during the day. Trades are the drill-down layer: when a position closes, the account's cash move in that window is attributed to the market that closed, tagged with the strategy that opened it. When several markets close inside one poll window the move is split by contracts closed and the rows are marked `≈`; entry commissions and any other drift show up as their own **fees / unattributed** line instead of being hidden inside trade numbers. The balance-outage quarantine applies here too — a NinjaTrader feed drop can never mint phantom trades or a phantom red day.
+
+History is recorded from the moment this version first runs (there is nothing to backfill from), persisted atomically to `~/.voidorigin_pnl_history.json`, kept for ~13 months, and left untouched by **RESET P&L** — the calendar is a record, not a session counter.
 
 ### Web UI security
 
@@ -724,6 +759,7 @@ Settings persist in `~/.voidorigin_config.json`:
 | `strategy_symbols` | Global strategy → symbol filter, e.g. `{ "GoldStrat": ["GC"] }` — a listed publisher strategy only **enters** trades on its listed markets, on every account (see [Global Strategy → Symbol Filter](#global-strategy--symbol-filter)) |
 | `strategies_seen` | Publisher strategy names seen on the wire (auto-maintained, capped at 20) — feeds the clickable strategy pickers so filters survive a restart without retyping |
 | `hedge_guard` | What to do when an entry fan-out would open **opposite sides** of one underlying across accounts — `warn` (default), `block`, or `off`; **auto-escalates to `block` when a prop account is involved**. See [Cross-account hedging](#cross-account-hedging) |
+| `multi_strategy` | Coexist with a publisher running **several strategies on one market**: closes are scoped to the strategy that sent them, same-direction entries stack within `max_contracts`, opposite entries still reset first (default `false`; see [Multi-Strategy Mode](#multi-strategy-mode)) |
 | `webui_enabled` | Start the localhost web UI with the app (default `true`) |
 | `webui_port` | Web UI port (default `8720`, localhost only) |
 | `live_bridge_enabled` / `live_bridge_port` | The optional live trade monitor AddOn — streamed equity for mid-trade stop/target enforcement, plus the live position book that lets prop entries skip the close-before-open snapshot when every account is provably flat (see [Optional Live Trade Monitor](#optional-live-trade-monitor)) |

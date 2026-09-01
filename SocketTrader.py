@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.16.0"
+__version__ = "0.17.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -1347,6 +1347,24 @@ def closes_before_open(account: str) -> bool:
     return bool(prof.get("prop") or prof.get("close_before_open"))
 
 
+def multi_strategy_enabled() -> bool:
+    """`multi_strategy: true` — coexist with a publisher running SEVERAL
+    strategies whose entries arrive as stateless close-then-place pairs.
+
+    Off (the default) every publisher CLOSEPOSITION flattens the whole
+    instrument — correct for one strategy, but with two strategies sharing
+    a market each entry's paired close tramples the other's just-opened
+    position (open → closed 2s later → reopened; see 2026-08-31 01:10).
+    On, closes are scoped to the strategy that sent them via the strategy
+    ledger, same-direction entries stack (within `max_contracts`), and an
+    opposite entry still resets the market first. Every unprovable or
+    unattributable case falls back to the verbatim close — the flag never
+    makes a close less likely to fire than the publisher intended unless
+    the position provably belongs to a different live strategy.
+    """
+    return bool(load_config().get("multi_strategy", False))
+
+
 def _parse_hhmm(raw) -> tuple[int, int] | None:
     """Parse an 'HH:MM' Eastern-time string; None when unusable."""
     m = re.fullmatch(r"(\d{1,2}):(\d{2})", str(raw or "").strip())
@@ -1734,8 +1752,37 @@ def publisher_strategy_of(msg: str) -> str:
         return ""
 
 
+def publisher_envelope_of(msg: str) -> dict:
+    """Strategy attribution from the ws envelope, for multi-strategy mode.
+
+    The publisher tags every event with its originating strategy OUTSIDE
+    the ATI string — observed wire shapes (RAW ENVELOPE, 2026-08-31):
+      entry: {"event": "entry",          "strategy": "bread_n_butter",
+              "event_id": "ent:nq_bread_n_butter:...", "signal": "PLACE;..."}
+      close: {"event": "close_position", "strategy": "bread_n_butter",
+              "event_id": "ent:...:close", "signal": "CLOSEPOSITION;..."}
+    The ATI string itself can't carry this: a CLOSEPOSITION has no
+    strategy field, and field 11 of entries is overwritten with the local
+    ATM template before anything downstream sees it. Returns {} when the
+    envelope has no attribution — every consumer treats that as "smart
+    close handling unavailable" and keeps verbatim behavior.
+    """
+    try:
+        data = json.loads(msg)
+        if not isinstance(data, dict):
+            return {}
+        strategy = sanitize_ati(str(data.get("strategy") or "").strip())
+        if not strategy:
+            return {}
+        return {"strategy": strategy,
+                "event": str(data.get("event") or "").strip(),
+                "event_id": sanitize_ati(str(data.get("event_id") or "").strip())}
+    except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+        return {}
+
+
 def plan_signal_legs(signal_text: str, pub_strategy: str = "",
-                     manual: bool = False
+                     manual: bool = False, envelope: dict | None = None
                      ) -> tuple[list[dict], list[tuple[str, str]]]:
     """Resolve one canonical signal into per-account leg plans.
 
@@ -1744,11 +1791,24 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = "",
     entries run as a background task), and display metadata. With no
     profiles configured every leg is an instant identical copy — the classic
     fan-out.
+
+    `envelope` is publisher_envelope_of(raw ws message) — strategy
+    attribution that only exists outside the ATI string. With
+    multi_strategy mode on it lets a CLOSEPOSITION be scoped or skipped
+    per account and same-direction entries stack; absent (manual/web
+    paths, publishers without it) every leg keeps verbatim behavior.
     """
     plans: list[dict] = []
     skipped: list[tuple[str, str]] = []
+    ms_on = multi_strategy_enabled() and not manual
     parts = signal_text.split(";")
     cmd = parts[0].strip().upper() if parts else ""
+    # The command AS THE PUBLISHER SENT IT. Downgrades below (global
+    # filter, hedge guard, per-account transform) rewrite `cmd` to
+    # CLOSEPOSITION, but those closes carry REVERSAL exit intent — they
+    # must flatten whatever the account holds, whoever opened it — so
+    # smart-close scoping keys on this, never on the rewritten command.
+    publisher_cmd = cmd
     instrument = parts[2] if len(parts) >= 3 else ""
 
     # Contract-month roll: a publisher still signalling an expiring or
@@ -1900,6 +1960,73 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = "",
                 sig2 = f"CLOSEPOSITION;{leg_acct};{variant};;;;;;;;;;"
                 if sig2 not in files:
                     files.append(sig2)
+
+        # ---- Multi-strategy mode: per-account close scoping & stacking.
+        # Everything below is provable-state-only: no fresh bridge book,
+        # no envelope attribution, or any inconsistency → verbatim legs.
+        reset_first = False
+        if (ms_on and publisher_cmd == "CLOSEPOSITION"
+                and final_cmd == "CLOSEPOSITION"
+                and envelope and envelope.get("strategy")):
+            verdict, scoped, why = _smart_close_decision(
+                account, final_parts[2] if len(final_parts) >= 3 else "",
+                (envelope.get("strategy", ""), pub_strategy))
+            if verdict == "drop":
+                skipped.append((account, f"smart close: {why}"))
+                logger.info(f"SMART CLOSE  account={account}  suppressed — "
+                            f"{why}  signal={final}")
+                continue
+            if verdict == "scope":
+                files = scoped
+                note = f"smart close: {why}"
+                meta["note"] = f"{meta['note']}; {note}" if meta["note"] else note
+                logger.info(
+                    f"SMART CLOSE  account={account}  {why}  "
+                    f"ids={[f.split(';')[12] for f in scoped]}")
+            elif why not in ("no live book to prove state",
+                             "sole holder — full close"):
+                logger.info(f"SMART CLOSE  account={account}  pass-through — {why}")
+        elif ms_on and final_cmd == "PLACE":
+            inst = meta["instrument"] or (final_parts[2] if len(final_parts) >= 3 else "")
+            exp = _account_root_exposure(account, inst) if inst else None
+            if exp is not None and not exp["twin"]:
+                side = 1 if (meta["action"] or "").strip().upper() == "BUY" else -1
+                held = exp["shown"] if exp["shown"] else exp["inflight"]
+                if held and (held > 0) == (side > 0):
+                    # Same-direction stack. max_contracts (when set) is the
+                    # AGGREGATE cap on the root: skip a full stack — a
+                    # missed trade is recoverable, closing teammates'
+                    # positions to make room is not what anyone asked —
+                    # and resize an entry that only partly fits.
+                    cap = int(rule["max_contracts"] or 0)
+                    if cap > 0:
+                        room = cap - max(abs(exp["shown"]), abs(exp["inflight"]))
+                        if room <= 0:
+                            skipped.append(
+                                (account, f"stacked to max_contracts ({cap})"))
+                            logger.info(f"STACK FULL  account={account}  "
+                                        f"cap={cap}  entry skipped")
+                            if is_rr_pick:
+                                _rr_return(account)
+                            continue
+                        if meta["qty"] and meta["qty"] > room:
+                            final_parts[4] = str(room)
+                            final = ";".join(final_parts)
+                            files = [final]
+                            note = f"stack resized {meta['qty']}→{room} (max_contracts {cap})"
+                            logger.info(f"STACK RESIZE  account={account}  {note}")
+                            meta["qty"] = room
+                            meta["note"] = (f"{meta['note']}; {note}"
+                                            if meta["note"] else note)
+                elif held and not cbo:
+                    # Opposite side of a standing (teammate-strategy)
+                    # position: its paired close was scoped away, so this
+                    # entry restores the publisher's reset — full close
+                    # first, settle, then place. Close-before-open
+                    # accounts already do exactly this in their preempt.
+                    reset_first = True
+                    deferred = True
+
         if meta["note"]:
             logger.info(f"LEG NOTE  account={account}  {meta['note']}  signal={canonical}")
         plans.append({
@@ -1917,6 +2044,8 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = "",
             "manual": manual,
             "prop": prop,
             "cbo": cbo,
+            "reset_first": reset_first,
+            "strat_ident": ((envelope or {}).get("strategy", ""), pub_strategy),
             # Simple close-before-open entries (no delay/AI/stagger of
             # their own) are batched into ONE close-confirm-enter wave so
             # N accounts cost one snapshot and one confirmation instead
@@ -2130,15 +2259,30 @@ _inflight_opens: dict[tuple[str, str], dict] = {}   # (account, ROOT) -> row
 _inflight_lock = threading.Lock()   # flatten paths run in worker threads
 
 
-def _note_inflight_open(account: str, instrument: str, action: str):
-    """Record one opening write (PLACE / REVERSEPOSITION) as pending."""
+def _note_inflight_open(account: str, instrument: str, action: str,
+                        qty: int = 1):
+    """Record one opening write (PLACE / REVERSEPOSITION) as pending.
+
+    A fresh same-direction row ACCUMULATES — multi-strategy stacking can
+    write two entries on one root seconds apart, and the second signal's
+    cap math must see both. An opposite-direction or stale row is
+    replaced: the position it described is being flipped or is long past
+    the write→fill window."""
     root = _alias_root(instrument).upper()
     if not account or not root:
         return
-    qty = 1 if (action or "").strip().upper() == "BUY" else -1
+    try:
+        signed = max(1, int(qty)) * (1 if (action or "").strip().upper() == "BUY" else -1)
+    except (TypeError, ValueError):
+        signed = 1 if (action or "").strip().upper() == "BUY" else -1
     with _inflight_lock:
+        row = _inflight_opens.get((account, root))
+        if (row is not None
+                and time.monotonic() - row["ts"] <= INFLIGHT_OPEN_TTL_S
+                and (row["qty"] > 0) == (signed > 0)):
+            signed += row["qty"]
         _inflight_opens[(account, root)] = {
-            "instrument": instrument, "qty": qty, "ts": time.monotonic()}
+            "instrument": instrument, "qty": signed, "ts": time.monotonic()}
 
 
 def _clear_inflight_opens(account: str, instrument: str | None = None):
@@ -2164,6 +2308,122 @@ def _inflight_open_rows() -> list[tuple[str, str, int]]:
                 continue
             rows.append((key[0], row["instrument"], row["qty"]))
     return rows
+
+
+# ---------- Multi-strategy ledger ----------
+# Which strategy opened what. In multi_strategy mode every entry WRITE is
+# recorded here from the final per-account signal (real sized root, the
+# per-account/per-tranche strategy id actually sent), so a publisher's
+# stateless "CLOSEPOSITION NQ" from strategy X can be answered per
+# account: scoped to X's own strategy ids, suppressed when X holds
+# nothing here, or passed through verbatim the moment anything is
+# unattributed. In-memory only — a restart empties it, which degrades to
+# verbatim closes (fail-safe), never to a stranded position.
+
+LEDGER_TTL_S = 18 * 3600      # one session; older rows are stale bookkeeping
+_MAX_LEDGER_KEYS = 256
+_MAX_LEDGER_ENTRIES = 12      # per (account, root) — publisher strategies are few
+RESET_SETTLE_S = 1.5          # close→entry gap when an entry resets a market
+                              # itself (the publisher's own pairs run 1–3s)
+_strategy_ledger: dict[tuple[str, str], list[dict]] = {}  # (account, ROOT) -> rows
+_ledger_lock = threading.Lock()   # entry writes run on the loop, flattens in threads
+
+
+def _ledger_key(account: str, instrument: str) -> tuple[str, str]:
+    return (account, _alias_root(instrument).upper())
+
+
+def _ledger_fresh_rows(key: tuple[str, str]) -> list[dict]:
+    """Rows under key still inside the TTL. Caller holds _ledger_lock."""
+    now = time.monotonic()
+    return [r for r in _strategy_ledger.get(key, [])
+            if now - r["ts"] <= LEDGER_TTL_S]
+
+
+def _ledger_note_entry(account: str, instrument: str, action: str, qty,
+                       ident: tuple[str, str], sid: str, reset: bool = False):
+    """Record one opening write. `ident` is (envelope slug, field-11 name)
+    — both are kept because publishers have attributed by either. `sid` is
+    the strategy id as written (per-account ~suffix, per-tranche ~T
+    suffix included), the handle a scoped CLOSESTRATEGY targets later.
+    `reset=True` (REVERSEPOSITION / a full reset) replaces the market's
+    book — the flip just closed everything else this root held."""
+    key = _ledger_key(account, instrument)
+    if not key[0] or not key[1]:
+        return
+    try:
+        q = max(1, int(qty))
+    except (TypeError, ValueError):
+        q = 1
+    row = {"sid": sid or "",
+           "slug": (ident[0] or "").strip().casefold(),
+           "name": (ident[1] or "").strip().casefold(),
+           "qty": q,
+           "side": 1 if (action or "").strip().upper() == "BUY" else -1,
+           "ts": time.monotonic()}
+    with _ledger_lock:
+        rows = [] if reset else _ledger_fresh_rows(key)
+        rows.append(row)
+        _strategy_ledger[key] = rows[-_MAX_LEDGER_ENTRIES:]
+        while len(_strategy_ledger) > _MAX_LEDGER_KEYS:
+            _strategy_ledger.pop(next(iter(_strategy_ledger)))
+
+
+def _ledger_entries(account: str, instrument: str) -> list[dict]:
+    with _ledger_lock:
+        return list(_ledger_fresh_rows(_ledger_key(account, instrument)))
+
+
+def _ledger_clear(account: str, instrument: str | None = None):
+    """Forget attribution after a full flatten — whole account or one root."""
+    with _ledger_lock:
+        for key in list(_strategy_ledger):
+            if key[0] != account:
+                continue
+            if instrument is None or key[1] == _alias_root(instrument).upper():
+                del _strategy_ledger[key]
+
+
+def _ledger_prune_sids(account: str, sids: set[str],
+                       instrument: str | None = None):
+    """Drop specific entries once a scoped/targeted close covers them."""
+    with _ledger_lock:
+        for key in list(_strategy_ledger):
+            if key[0] != account:
+                continue
+            if instrument is not None and key[1] != _alias_root(instrument).upper():
+                continue
+            rows = [r for r in _ledger_fresh_rows(key) if r["sid"] not in sids]
+            if rows:
+                _strategy_ledger[key] = rows
+            else:
+                del _strategy_ledger[key]
+
+
+def _ident_matches(row: dict, ident: tuple[str, str]) -> bool:
+    """True when a ledger row belongs to this strategy identity. Publishers
+    attribute by envelope slug ("bread_n_butter") or by ATI field-11 name
+    ("NQ-MacroZoneB", 2026-08-18 era) — either non-empty match counts."""
+    given = {(s or "").strip().casefold() for s in ident} - {""}
+    mine = {row.get("slug", ""), row.get("name", "")} - {""}
+    return bool(given & mine)
+
+
+def _ledger_note_file(plan: dict, sig: str):
+    """Keep the ledger in step with one signal file the plan just wrote."""
+    parts = sig.split(";")
+    cmd = parts[0].strip().upper() if parts else ""
+    account = plan.get("account", "")
+    ident = plan.get("strat_ident") or ("", "")
+    if cmd in ("PLACE", "REVERSEPOSITION") and len(parts) >= 13:
+        _ledger_note_entry(account, parts[2], parts[3], parts[4], ident,
+                           parts[12], reset=(cmd == "REVERSEPOSITION"))
+        _pnl_note_open(account, parts[2], ident,
+                       manual=bool(plan.get("manual")))
+    elif cmd == "CLOSEPOSITION" and len(parts) >= 3 and parts[2]:
+        _ledger_clear(account, parts[2])
+    elif cmd == "CLOSESTRATEGY" and len(parts) >= 13 and parts[12]:
+        _ledger_prune_sids(account, {parts[12]})
 
 
 # ---------- Live-bridge book ----------
@@ -2260,6 +2520,120 @@ def _bridge_book_snapshot(plans: list[dict] | None = None) -> dict | None:
             "positions": rows, "age": age}
 
 
+def _account_root_exposure(account: str, instrument: str) -> dict | None:
+    """What one account holds on an instrument's root, per the live book.
+
+    Returns {"shown": signed qty the bridge book shows for this exact
+    root, "inflight": signed qty of fresh opening writes on it, "twin":
+    signed micro/full-twin qty shown} — or None when the book cannot
+    vouch for the account (bridge off/stale, account missing, or an
+    outage-shaped ~$0 balance). Smart-close and stack decisions REQUIRE
+    the book: without it an account's real state is unknowable in time,
+    and every caller must fall back to verbatim close-then-place.
+
+    For "is anything held" use shown, falling back to inflight only when
+    the book shows nothing — a shown position IS the write, matured.
+    For sizing a stack against a cap take max(|shown|, |inflight|):
+    over-counting just after a fill only delays a stack; under-counting
+    could breach a firm's contract cap.
+    """
+    book = _bridge_book
+    if not (live_bridge_enabled and _live_bridge_connected and book):
+        return None
+    if time.time() - book["ts"] > BRIDGE_BOOK_FRESH_S:
+        return None
+    entry = book["accounts"].get(account)
+    if entry is None:
+        return None
+    cash = entry["cash"]
+    if cash is None or _suspect_zero_balance(account, cash):
+        return None
+    root = _alias_root(instrument).upper()
+    under = _underlying_root(instrument)
+    shown = twin = 0
+    for inst, qty in entry["positions"]:
+        if _alias_root(inst).upper() == root:
+            shown += qty
+        elif _underlying_root(inst) == under:
+            twin += qty
+    inflight = 0
+    for acct, inst, qty in _inflight_open_rows():
+        if acct == account and _alias_root(inst).upper() == root:
+            inflight += qty
+    return {"shown": shown, "inflight": inflight, "twin": twin}
+
+
+def _smart_close_decision(account: str, instrument: str,
+                          ident: tuple[str, str]) -> tuple[str, list[str], str]:
+    """How one account honors a publisher CLOSEPOSITION in multi-strategy
+    mode. Returns (verdict, files, why):
+      "pass"  → send the close verbatim (files unused)
+      "drop"  → nothing to do for this account
+      "scope" → send `files` (CLOSESTRATEGY on the sender's OWN entry ids)
+                instead — its contracts close and its ATM bracket dies,
+                the other strategies' positions stand.
+
+    Doctrine: the close fires verbatim unless the account's state is
+    PROVEN — a fresh bridge book agreeing with the write ledger — to
+    belong to identified strategies, and even then the sender still
+    closes everything it owns. Restarts, bracket exits beyond the ledger,
+    manual positions, twins and direction drift all land on "pass":
+    trampling a teammate strategy costs churn, but suppressing a close
+    that should have fired strands a live position.
+    """
+    exp = _account_root_exposure(account, instrument)
+    if exp is None:
+        return "pass", [], "no live book to prove state"
+    if exp["twin"]:
+        return "pass", [], "micro/full twin position held"
+    held = exp["shown"] if exp["shown"] else exp["inflight"]
+    rows = _ledger_entries(account, instrument)
+    if not rows:
+        if held:
+            return "pass", [], "position not attributed to any strategy"
+        return "drop", [], "flat — nothing to close"
+    if not held:
+        # Ledger rows with nothing held or in flight: ATM brackets took
+        # everything out since. The close is a no-op; the rows are stale.
+        _ledger_clear(account, instrument)
+        return "drop", [], "flat — nothing to close"
+    total = sum(r["qty"] * r["side"] for r in rows)
+    if total == 0 or (held > 0) != (total > 0):
+        return "pass", [], "held direction contradicts the ledger"
+    if abs(held) > abs(total):
+        return "pass", [], "more contracts held than attributed"
+    own = [r for r in rows if _ident_matches(r, ident)]
+    others = [r for r in rows if not _ident_matches(r, ident)]
+    if not own:
+        names = sorted({r["slug"] or r["name"] or "?" for r in others})
+        return "drop", [], f"position belongs to {', '.join(names)}"
+    if not others:
+        return "pass", [], "sole holder — full close"
+    if any(not r["sid"] for r in own):
+        return "pass", [], "own entry carries no strategy id to scope by"
+    files = [f"CLOSESTRATEGY;{sanitize_ati(account)};;;;;;;;;;;{r['sid']}"
+             for r in own]
+    _ledger_prune_sids(account, {r["sid"] for r in own}, instrument)
+    n = len(own)
+    return "scope", files, f"scoped to {n} own entr{'y' if n == 1 else 'ies'}"
+
+
+def _reset_close_files(account: str, instrument: str) -> list[str]:
+    """Account-addressed CLOSEPOSITION files for a root — both contract
+    sizes, mirroring the twin fan-out every planned close performs."""
+    base = (f"CLOSEPOSITION;{sanitize_ati(account)};"
+            f"{sanitize_ati(instrument)};;;;;;;;;;")
+    files = [base]
+    twin = _apply_size(instrument,
+                       "full" if instrument != to_full_instrument(instrument)
+                       else "micros")
+    if twin and twin != instrument:
+        alt = base.split(";")
+        alt[2] = sanitize_ati(twin)
+        files.append(";".join(alt))
+    return files
+
+
 def _prop_preempt_closures(plans: list[dict], snap: dict,
                            cross_account: bool = True,
                            exclude: set[str] = frozenset(),
@@ -2282,6 +2656,14 @@ def _prop_preempt_closures(plans: list[dict], snap: dict,
         working (CLOSEPOSITION cancels an instrument's orders; a netting
         fill cancels nothing), and let a same-direction re-entry stack
         contracts past a firm's cap.
+        ONE exception, multi_strategy mode: a held SAME-root SAME-direction
+        position is KEPT when the account's `max_contracts` cap is set and
+        the stack fits under it — several publisher strategies sharing a
+        market each keep their own position instead of trampling each
+        other's. The netting hazard cannot arise (same direction), the cap
+        hazard is checked against the cap, and the micro/full twin still
+        closes (different alias root — MFFU's named cap-evasion pattern).
+        No cap configured, over cap, or opposite side → reset as ever.
       - entry_same_root="keep" (the REVERSAL-cleanup path): the entry's own
         root is KEPT — the reversal is flipping that position mid-flight,
         and closing it would flatten what should flip. Micro/full twins and
@@ -2313,6 +2695,34 @@ def _prop_preempt_closures(plans: list[dict], snap: dict,
     def opposite(qty: int, action: str) -> bool:
         return (qty > 0 and action == "SELL") or (qty < 0 and action == "BUY")
 
+    # Multi-strategy stacking: which ENTERING accounts may keep a held
+    # same-root same-direction position instead of resetting it. Requires
+    # the mode on, a configured max_contracts cap, and the stack fitting
+    # under it — sized against max(merged rows, raw in-flight writes), so
+    # a burst where one entry is already shown and the next is still
+    # in flight can't slip past the cap.
+    stack_ok: dict[str, bool] = {}
+    if entry_same_root == "close" and multi_strategy_enabled():
+        inflight_rows = _inflight_open_rows()
+        for acct, plan in entering.items():
+            action = (plan.get("action") or "").strip().upper()
+            try:
+                cap = int((plan.get("rule") or {}).get("max_contracts") or 0)
+                want_qty = max(0, int(plan.get("qty") or 0))
+            except (TypeError, ValueError):
+                continue
+            if cap <= 0 or want_qty <= 0 or action not in ("BUY", "SELL"):
+                continue
+            root = _alias_root(plan.get("instrument") or "").upper()
+            held = sum(q for i, q in pos_rows.get(acct, [])
+                       if _alias_root(i).upper() == root)
+            if held == 0 or opposite(held, action):
+                continue
+            inflight = sum(q for a2, i2, q in inflight_rows
+                           if a2 == acct and _alias_root(i2).upper() == root)
+            if max(abs(held), abs(inflight)) + want_qty <= cap:
+                stack_ok[acct] = True
+
     to_close: dict[str, list[str]] = {}
     keeps: dict[str, bool] = {}
     for acct in target_accounts():
@@ -2332,10 +2742,20 @@ def _prop_preempt_closures(plans: list[dict], snap: dict,
                 # whatever alias NT broadcast ("NQU26", "@NQ"), and a
                 # mismatch here would flatten the very position the user
                 # just reversed into.
-                if (entry_same_root == "keep"
-                        and _alias_root(alias).upper()
-                        == _alias_root(plan["instrument"]).upper()):
+                same_root = (_alias_root(alias).upper()
+                             == _alias_root(plan["instrument"]).upper())
+                if entry_same_root == "keep" and same_root:
                     keeps[acct] = True
+                elif (same_root and stack_ok.get(acct)
+                        and not opposite(qty, (plan.get("action") or "").strip().upper())):
+                    # Multi-strategy stack: same market, same side, cap
+                    # verified above — the entry ADDS to this position.
+                    # The per-row side re-check keeps a stray opposite row
+                    # (an old-month remnant sharing the root) closable.
+                    keeps[acct] = True
+                    logger.info(
+                        f"STACK  account={acct}  keeping {alias} ({qty:+d}) — "
+                        f"same-direction {plan.get('action')} entry adds to it")
                 else:
                     to_close.setdefault(acct, []).append(alias)
             else:
@@ -2698,6 +3118,7 @@ async def execute_plans(plans: list[dict], sig_id: str | None = None) -> list[st
             if res:
                 wrote_any = True
                 _note_contract(sig)
+                _ledger_note_file(plan, sig)
             else:
                 logger.error(f"DISPATCH FAIL  account={account}  result=None")
                 _dash_set_alert(
@@ -2706,11 +3127,16 @@ async def execute_plans(plans: list[dict], sig_id: str | None = None) -> list[st
             written.append(account)
             if plan["command"] == "PLACE":
                 _record_stagger(plan["signal"], account, 1)
+                # Until NT shows the fill, the write itself is the only
+                # record — a same-root signal seconds later needs it for
+                # exposure/stack math on EVERY account type.
+                _note_inflight_open(account, plan["instrument"], plan["action"],
+                                    plan.get("qty") or 1)
             elif plan["command"] == "REVERSEPOSITION":
-                if plan.get("cbo"):
-                    # A reversal OPENS the other side; until NT shows the
-                    # flipped position it must still count as held.
-                    _note_inflight_open(account, plan["instrument"], plan["action"])
+                # A reversal OPENS the other side; until NT shows the
+                # flipped position it must still count as held.
+                _note_inflight_open(account, plan["instrument"], plan["action"],
+                                    plan.get("qty") or 1)
                 if plan.get("prop"):
                     prop_reversals.append(plan)
     if prop_reversals:
@@ -2734,6 +3160,21 @@ async def _run_deferred_leg(plan: dict, sig_id: str | None = None):
     label = f"[{account}] " if len(target_accounts()) > 1 else ""
     try:
         manual = plan.get("manual", False)
+        if plan.get("reset_first"):
+            # Opposite-direction entry over a standing teammate-strategy
+            # position (its own paired close was scoped away): restore the
+            # publisher's reset semantics — full close now, a settle beat
+            # for NT to process it (the publisher's own close→place gap is
+            # 1–3s), then the normal entry flow.
+            for sig in _reset_close_files(account, plan["instrument"]):
+                write_signal_to_file(sig)
+            _ledger_clear(account, plan["instrument"])
+            _clear_inflight_opens(account, plan["instrument"])
+            logger.info(f"RESET  account={account}  closed {plan['instrument']} "
+                        "before opposite-direction entry")
+            if not await _interruptible_sleep(RESET_SETTLE_S, account, manual):
+                logger.info(f"LEG ABORTED  account={account}  during=reset settle")
+                return
         delay_s = (rule["delay_ms"]
                    + (random.uniform(0, rule["delay_jitter_ms"]) if rule["delay_jitter_ms"] else 0)
                    ) / 1000.0
@@ -2837,11 +3278,13 @@ async def _write_entry_tranches(plan: dict, tranches: list[int],
             break
         placed += 1
         _note_contract(sig)
-        if plan.get("cbo"):
-            # Count this write as held until NT shows it — a positions-only
-            # dump would otherwise let the next signal stack a second market
-            # onto this account before the fill lands.
-            _note_inflight_open(account, plan["instrument"], plan["action"])
+        _ledger_note_file(plan, sig)
+        # Count this write as held until NT shows it — a positions-only
+        # dump would otherwise let the next signal stack a second market
+        # onto a close-before-open account before the fill lands, and
+        # exposure/stack math needs it on every account type.
+        _note_inflight_open(account, plan["instrument"], plan["action"],
+                            tranche_qty)
         if leader_first:
             add_pending_confirm(sig, sig_id, plan["instrument"], plan["action"], pre_pos)
     if placed:
@@ -6861,7 +7304,8 @@ def _with_account(signal_text: str, account: str) -> str:
     return ";".join(parts)
 
 
-async def dispatch_signal(raw_signal: str, pub_strategy: str = "") -> list[str]:
+async def dispatch_signal(raw_signal: str, pub_strategy: str = "",
+                          envelope: dict | None = None) -> list[str]:
     """Fan one signal out to every tradeable account through its profile.
 
     With no profiles configured this is the classic copy-trade fan-out: one
@@ -6871,7 +7315,7 @@ async def dispatch_signal(raw_signal: str, pub_strategy: str = "") -> list[str]:
     the accounts whose file was written NOW; deferred legs report via the
     dashboard and log when they land.
     """
-    plans, skipped = plan_signal_legs(raw_signal, pub_strategy)
+    plans, skipped = plan_signal_legs(raw_signal, pub_strategy, envelope=envelope)
     written = await execute_plans(plans)
     deferred = [p["account"] for p in plans if p["deferred"]]
     if len(target_accounts()) > 1 or deferred or skipped:
@@ -7039,6 +7483,7 @@ def fire_close_position(account: str, contract: str):
     """
     if not output_directory:
         return
+    _ledger_clear(account, contract)   # a targeted flatten voids attribution
     aliases = _nt_contract_aliases(contract)
     for alias in aliases:
         cmd = f"CLOSEPOSITION;{sanitize_ati(account)};{sanitize_ati(alias)};;;;;;;;;;"
@@ -7143,8 +7588,10 @@ def close_account_positions(account: str) -> list[str]:
     # which NT applies globally across all accounts and connections.
     fire_cancel_account_orders(account)
     # Those cancels also void any opening writes still registered as
-    # in-flight — a phantom row here would keep re-triggering closes.
+    # in-flight — a phantom row here would keep re-triggering closes —
+    # and a whole-account flatten voids every strategy attribution too.
     _clear_inflight_opens(account)
+    _ledger_clear(account)
 
     closed: set[str] = set()
 
@@ -8192,7 +8639,9 @@ async def listen(token: str):
                             # trading); profiles can reshape, defer, or skip
                             # individual accounts' legs.
                             pub_strategy = publisher_strategy_of(msg)
-                            plans, skipped_legs = plan_signal_legs(raw_signal, pub_strategy)
+                            plans, skipped_legs = plan_signal_legs(
+                                raw_signal, pub_strategy,
+                                envelope=publisher_envelope_of(msg))
                             if not plans:
                                 _dash_add_signal(format_signal(raw_signal, signal_count, lat_str, tag="SKIPPED"))
                                 why = ", ".join(f"{a}: {r}" for a, r in skipped_legs[:3]) or "no tradeable accounts"
@@ -9207,6 +9656,329 @@ def _live_totals(rows: list[dict]) -> dict:
     }
 
 
+# ---------- Daily P&L history (calendar) ----------
+# A durable day-by-day trading record for the web P&L calendar, built from
+# data the app already watches: the same /api/live snapshot the dashboard
+# renders (ATI cash + positions) and the strategy identity each entry WRITE
+# already carries. Nothing new is asked of NinjaTrader.
+#
+# Two layers, deliberately separate in trustworthiness:
+#   · The per-day per-account NET (last cash − first cash of the session
+#     date) is authoritative — same source and same definition as the
+#     session P&L tile, fees included, no attribution involved.
+#   · Trades are the drill-down: when an (account, root) position shrinks
+#     between observations, the account's cash delta over that window is
+#     attributed to the root(s) that closed. One root closing (the normal
+#     case) is exact; several roots closing inside one poll window split
+#     the delta by closed contracts and are flagged "approx". The day's
+#     Σtrades can differ from the net by entry commissions and drift — the
+#     UI shows that remainder as its own line instead of hiding it.
+#
+# Days are keyed by get_session_id() (the CME close date), so Sunday-night
+# trades land on Monday like every other session number in the app.
+
+PNL_HISTORY_FILE = Path.home() / ".voidorigin_pnl_history.json"
+PNL_HISTORY_MAX_DAYS = 400      # ~13 months of calendar history
+PNL_TRACK_INTERVAL = 2.0        # seconds between live-view observations
+PNL_SAVE_MIN_GAP_S = 10.0       # batch disk writes; data loss window is tiny
+PNL_TRADES_PER_DAY_CAP = 2000   # runaway guard — a real day is nowhere close
+
+_pnl_lock = threading.Lock()    # history is read from web threads, fed by the loop
+_pnl_history: dict | None = None            # {"v": 1, "days": {date: {...}}}
+_pnl_prev: dict[str, dict] = {}             # account -> {"cash", "shape"} last observed
+_pnl_open_meta: dict[tuple[str, str], dict] = {}  # (account, ROOT) -> entry meta
+_pnl_dirty = False
+_pnl_last_save = 0.0
+
+
+def _pnl_load() -> dict:
+    """The history dict, loaded from disk once and cached. Never raises."""
+    global _pnl_history
+    with _pnl_lock:
+        if _pnl_history is not None:
+            return _pnl_history
+        data: dict = {}
+        try:
+            if PNL_HISTORY_FILE.exists():
+                with open(PNL_HISTORY_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.error(f"PNL HISTORY  load failed ({exc}) — starting empty")
+        days = data.get("days")
+        _pnl_history = {"v": 1, "days": days if isinstance(days, dict) else {}}
+        return _pnl_history
+
+
+def _pnl_save(force: bool = False):
+    """Atomically persist the history when dirty (throttled unless forced)."""
+    global _pnl_dirty, _pnl_last_save
+    with _pnl_lock:
+        if _pnl_history is None or not _pnl_dirty:
+            return
+        if not force and time.monotonic() - _pnl_last_save < PNL_SAVE_MIN_GAP_S:
+            return
+        # Prune ancient days so the file cannot grow without bound.
+        days = _pnl_history["days"]
+        for stale_key in sorted(days)[:-PNL_HISTORY_MAX_DAYS]:
+            del days[stale_key]
+        payload = json.dumps(_pnl_history)
+        _pnl_dirty = False
+        _pnl_last_save = time.monotonic()
+    try:
+        fd, tmp = tempfile.mkstemp(
+            dir=str(PNL_HISTORY_FILE.parent), suffix=".tmp", prefix=".voidorigin_"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            if not IS_WINDOWS:
+                os.chmod(tmp, 0o600)
+            os.replace(tmp, PNL_HISTORY_FILE)
+        except BaseException:
+            os.unlink(tmp)
+            raise
+    except OSError as exc:
+        logger.error(f"PNL HISTORY  save failed: {exc}")
+
+
+def _pnl_note_open(account: str, instrument: str, ident: tuple[str, str],
+                   manual: bool = False):
+    """Stage strategy attribution for an entry the write path just fired.
+
+    Called from _ledger_note_file, i.e. inside the dispatch path — it must
+    never raise and never do I/O. The observed position (pnl_tracker_task)
+    later adopts this label; stacked entries from different strategies on
+    one root accumulate, and the close joins them ("A + B")."""
+    try:
+        root = _alias_root(instrument).upper()
+        if not account or not root:
+            return
+        label = ((ident[1] or "").strip() or (ident[0] or "").strip()
+                 or ("Manual" if manual else ""))
+        meta = _pnl_open_meta.setdefault(
+            (account, root), {"strategies": [], "ts": None, "avg": None})
+        if label and label not in meta["strategies"]:
+            meta["strategies"].append(label)
+    except Exception as exc:      # bookkeeping must never block dispatch
+        logger.error(f"PNL HISTORY  note_open failed: {exc}")
+
+
+def _pnl_shape(row: dict) -> dict[str, int]:
+    """Signed contracts per root one live account row currently holds."""
+    shape: dict[str, int] = {}
+    for p in row.get("positions") or []:
+        root = _alias_root(str(p.get("instrument") or "")).upper()
+        try:
+            qty = int(p.get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if root and qty:
+            shape[root] = shape.get(root, 0) + qty
+    return shape
+
+
+def _pnl_avg_price(row: dict, root: str) -> float | None:
+    """Average entry price the snapshot reports for one root, if any."""
+    for p in row.get("positions") or []:
+        if _alias_root(str(p.get("instrument") or "")).upper() == root:
+            try:
+                avg = float(p.get("avg_price"))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(avg) and avg:
+                return avg
+    return None
+
+
+def _pnl_observe(live: dict, now: float | None = None,
+                 session_date: str | None = None):
+    """Feed one /api/live view into the daily history.
+
+    Only data that can be trusted moves the record: failed or stale
+    snapshots are skipped whole, quarantined balances (_ingest_balance's
+    outage guard) freeze their account's diff so a broker-feed drop can
+    never mint phantom closes, and out-of-session hours record nothing
+    because nothing can fill. A restart adopts open positions without
+    inventing trades for them."""
+    global _pnl_dirty
+    if not isinstance(live, dict) or not live.get("ok") or live.get("stale"):
+        return
+    date = session_date if session_date is not None else get_session_id()
+    if not date:
+        return
+    ts = now if now is not None else time.time()
+    hist = _pnl_load()
+    with _pnl_lock:
+        # Built detached and only kept if something lands in it — otherwise
+        # every quiet poll would mint an empty "$0.00 day" on the calendar.
+        day = hist["days"].get(date)
+        day_is_new = day is None
+        if day_is_new:
+            day = {"accounts": {}, "trades": []}
+        for row in live.get("accounts") or []:
+            if not row.get("managed"):
+                continue
+            name = row.get("name")
+            cash = row.get("cash")
+            if (not name or not isinstance(cash, (int, float))
+                    or not math.isfinite(cash)):
+                continue
+            if name in _balance_suspect_since:
+                continue    # outage-quarantined: hold the diff engine too
+            shape = _pnl_shape(row)
+
+            acct_day = day["accounts"].setdefault(name, {})
+            # Same seeding rule as every session baseline: a ~$0.00 first
+            # reading is an outage artifact or an untradeable account.
+            if "start" not in acct_day and abs(cash) > BALANCE_ZERO_EPS:
+                acct_day["start"] = cash
+                _pnl_dirty = True
+            if acct_day.get("last") != cash and "start" in acct_day:
+                acct_day["last"] = cash
+                _pnl_dirty = True
+
+            prev = _pnl_prev.get(name)
+            _pnl_prev[name] = {"cash": cash, "shape": shape}
+            if prev is None:
+                # First sight after boot: adopt what is already open as
+                # unattributed rather than pretending it just happened.
+                for root, qty in shape.items():
+                    meta = _pnl_open_meta.setdefault(
+                        (name, root), {"strategies": [], "ts": None, "avg": None})
+                    if meta.get("avg") is None:
+                        meta["avg"] = _pnl_avg_price(row, root)
+                continue
+
+            closes: list[dict] = []
+            for root in set(prev["shape"]) | set(shape):
+                q0 = prev["shape"].get(root, 0)
+                q1 = shape.get(root, 0)
+                flipped = bool(q0 and q1 and (q0 > 0) != (q1 > 0))
+                if flipped:
+                    closed, opened = abs(q0), abs(q1)
+                else:
+                    closed = max(0, abs(q0) - abs(q1))
+                    opened = max(0, abs(q1) - abs(q0))
+                key = (name, root)
+                if closed:
+                    meta = _pnl_open_meta.get(key) or {}
+                    closes.append({
+                        "root": root, "qty": closed,
+                        "side": "LONG" if q0 > 0 else "SHORT",
+                        "opened_ts": meta.get("ts"),
+                        "entry": meta.get("avg"),
+                        "strategy": " + ".join(meta.get("strategies") or []),
+                    })
+                if opened:
+                    meta = _pnl_open_meta.setdefault(
+                        key, {"strategies": [], "ts": None, "avg": None})
+                    if flipped:
+                        # The far side of a reversal is a fresh trade; only
+                        # the label staged by the reversal write survives.
+                        staged = meta["strategies"][-1:]
+                        meta.clear()
+                        meta.update({"strategies": staged, "ts": None, "avg": None})
+                    if not q0 or flipped or meta.get("ts") is None:
+                        meta["ts"] = ts
+                    meta["avg"] = _pnl_avg_price(row, root) or meta.get("avg")
+                elif q1 and _pnl_open_meta.get(key, {}).get("avg") is None:
+                    _pnl_open_meta.setdefault(
+                        key, {"strategies": [], "ts": None, "avg": None}
+                    )["avg"] = _pnl_avg_price(row, root)
+                if not q1:
+                    _pnl_open_meta.pop(key, None)
+
+            if not closes:
+                continue
+            dcash = cash - prev["cash"]
+            total_q = sum(c["qty"] for c in closes) or 1
+            trades = day["trades"]
+            for c in closes:
+                if len(trades) >= PNL_TRADES_PER_DAY_CAP:
+                    logger.warning("PNL HISTORY  trade cap reached for "
+                                   f"{date} — further trades not itemized")
+                    break
+                pnl = dcash if len(closes) == 1 else dcash * c["qty"] / total_q
+                trades.append({
+                    "ts": round(ts, 3),
+                    "account": name,
+                    "symbol": c["root"],
+                    "side": c["side"],
+                    "qty": c["qty"],
+                    "strategy": c["strategy"],
+                    "entry": c["entry"],
+                    "opened_ts": c["opened_ts"],
+                    "pnl": round(pnl, 2),
+                    "approx": len(closes) > 1,
+                })
+                _pnl_dirty = True
+        if day_is_new and (day["accounts"] or day["trades"]):
+            hist["days"][date] = day
+
+
+def _pnl_month(month: str) -> dict:
+    """One month of the calendar, rolled up for the web UI."""
+    hist = _pnl_load()
+    with _pnl_lock:
+        days: dict[str, dict] = {}
+        for date in sorted(hist["days"]):
+            if not date.startswith(month + "-"):
+                continue
+            rec = hist["days"][date]
+            accounts = {}
+            net = 0.0
+            for name, a in (rec.get("accounts") or {}).items():
+                start, last = a.get("start"), a.get("last")
+                pnl = (round(last - start, 2)
+                       if isinstance(start, (int, float))
+                       and isinstance(last, (int, float)) else None)
+                if pnl is not None:
+                    net += pnl
+                accounts[name] = {"start": start, "last": last, "pnl": pnl}
+            # A connected-but-idle day (baselines seeded, nothing happened)
+            # is not a trading day — showing a $0.00 cell for every session
+            # the app merely ran would bury the real record.
+            if not rec.get("trades") and abs(net) < 0.005:
+                continue
+            days[date] = {
+                "pnl": round(net, 2),
+                "accounts": accounts,
+                "trades": list(rec.get("trades") or []),
+            }
+        first = min(hist["days"]) if hist["days"] else None
+    return {"ok": True, "month": month, "days": days, "first": first,
+            "today": datetime.now(ET).strftime("%Y-%m-%d"),
+            "session": get_session_id()}
+
+
+async def pnl_tracker_task():
+    """Feed the daily P&L history from the shared live NinjaTrader view.
+
+    Rides web_live()'s 1s cache, so with a dashboard tab open this costs
+    zero extra ATI traffic; headless it is one state dump per interval —
+    the same class of load as balance_monitor. Purely observational:
+    nothing here can touch an order."""
+    try:
+        while not shutdown.is_set():
+            try:
+                await asyncio.sleep(PNL_TRACK_INTERVAL)
+            except asyncio.CancelledError:
+                return
+            try:
+                live = await asyncio.to_thread(web_live)
+                _pnl_observe(live)
+                await asyncio.to_thread(_pnl_save)
+            except Exception as exc:
+                logger.error(f"pnl_tracker error: {exc}")
+    finally:
+        # Best effort on the way out — the window since the last throttled
+        # save is at most a few seconds of bookkeeping.
+        try:
+            _pnl_save(force=True)
+        except Exception:
+            pass
+
+
 async def _web_set_sizing(account, mode, value) -> tuple[bool, str]:
     """Set one account's contract sizing straight from the grid.
 
@@ -9502,6 +10274,18 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
                     self._json({"ok": False, "message": "forbidden"}, 403)
                     return
                 self._json(web_live())
+            elif path == "/api/pnl":
+                if not self._token_ok():
+                    self._json({"ok": False, "message": "forbidden"}, 403)
+                    return
+                query = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(self.path).query)
+                month = (query.get("month") or [""])[0]
+                if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
+                    self._json({"ok": False,
+                                "message": "month must be YYYY-MM"}, 400)
+                    return
+                self._json(_pnl_month(month))
             else:
                 self._json({"ok": False, "message": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -9817,10 +10601,84 @@ background:#171f2d;border:1px solid var(--cyan);border-radius:9px;padding:10px 1
 display:none;max-width:92vw;z-index:99;box-shadow:var(--shadow);font-size:12.5px}
 #toast.bad{border-color:var(--red);color:#ffb9be}
 #toast.good{border-color:var(--green);color:#a4ecca}
+
+/* ---- P&L calendar tab ---- */
+.hide{display:none!important}
+.tabs{display:flex;border:1px solid var(--edge2);border-radius:8px;overflow:hidden;
+margin-left:8px}
+.tabs button{border:0;border-radius:0;padding:5px 13px;font-size:11px;
+letter-spacing:1.6px;background:transparent;color:var(--dim)}
+.tabs button+button{border-left:1px solid var(--edge2)}
+.tabs button.on{background:var(--cyan);color:#05202a;font-weight:700}
+.pwrap{padding:13px;display:grid;gap:12px;max-width:1240px;margin:0 auto}
+.pnav{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.pnav .pmonth{font-size:16px;font-weight:700;letter-spacing:1.2px;
+min-width:172px;text-align:center}
+.phero{margin-left:auto;text-align:right}
+.phero .k{font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:1.5px}
+.phero .v{font-size:29px;font-weight:700;line-height:1.15}
+.ptiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(116px,1fr));gap:7px}
+
+#pcal{overflow-x:auto}
+.pcal-head,.pcal-week{display:grid;gap:7px;min-width:460px;
+grid-template-columns:repeat(5,1fr) minmax(96px,.72fr)}
+.pcal-head{margin-bottom:7px}
+.pcal-head div{font-size:9.5px;color:var(--mute);text-transform:uppercase;
+letter-spacing:1.3px;text-align:center}
+.pcal-week{margin-bottom:7px}
+.pcal-week:last-child{margin-bottom:0}
+.dcell{position:relative;border:1px solid var(--edge);border-radius:9px;
+background:var(--panel2);min-height:78px;padding:7px 9px;display:flex;
+flex-direction:column;align-items:flex-start;gap:2px;font:inherit;color:var(--fg);
+cursor:pointer;transition:.12s;text-align:left}
+.dcell:hover{border-color:var(--cyan);transform:translateY(-1px)}
+.dcell:focus-visible{outline:2px solid var(--cyan);outline-offset:1px}
+.dcell.off{background:transparent;border-color:transparent;visibility:hidden}
+.dcell:disabled{opacity:1;cursor:default}
+.dcell.mute,.dcell.future{cursor:default}
+.dcell.mute:hover,.dcell.future:hover{border-color:var(--edge);transform:none}
+.dcell.future{opacity:.32}
+.dcell.today{box-shadow:inset 0 0 0 1px #245c6f}
+.dcell.sel{border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)}
+.dnum{font-size:10px;color:var(--dim)}
+.dpnl{font-size:14.5px;font-weight:700;letter-spacing:.3px}
+.dsub{font-size:10px;color:var(--dim)}
+.wcell{border:1px solid var(--edge);border-radius:9px;background:#0b101a;
+min-height:78px;padding:7px 9px;display:flex;flex-direction:column;gap:2px}
+.wcell .dnum{text-transform:uppercase;letter-spacing:1.1px;color:var(--mute)}
+.wcell .dpnl{font-size:12.5px}
+
+.eq svg{display:block;width:100%;height:auto}
+.pgrid3{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}
+.psec{font-size:10px;color:var(--dim);text-transform:uppercase;
+letter-spacing:1.6px;margin:14px 0 7px}
+.pday-title{font-size:14px;font-weight:700;letter-spacing:.5px}
+.bbar{position:relative;height:8px;border-radius:4px;background:#0b101a;
+min-width:64px;overflow:hidden}
+.bbar i{position:absolute;top:0;bottom:0}
+.bbar i.pos{background:var(--green);border-radius:0 4px 4px 0}
+.bbar i.neg{background:var(--red);border-radius:4px 0 0 4px}
+.bbar em{position:absolute;top:0;bottom:0;left:50%;width:1px;background:var(--edge2)}
+#ptip{position:fixed;z-index:80;background:#171f2d;border:1px solid var(--edge2);
+border-radius:8px;padding:8px 11px;font-size:11.5px;pointer-events:none;
+box-shadow:var(--shadow);max-width:280px}
+#ptip .tr{display:flex;justify-content:space-between;gap:12px;padding:1px 0}
+#ptip .tv{font-weight:700}
+#ptip .tk{color:var(--dim)}
+@media(max-width:640px){
+  .phero .v{font-size:23px}
+  .dcell,.wcell{min-height:62px;padding:5px 6px}
+  .dpnl{font-size:12px}
+  .dsub{font-size:9px}
+  .pcal-head,.pcal-week{gap:5px;min-width:430px;
+    grid-template-columns:repeat(5,1fr) minmax(74px,.72fr)}
+}
 </style></head><body>
 
 <div id="top">
   <div class="brand">SOCKET<span>TRADER</span></div>
+  <div class="tabs"><button class="on" id="tabTrade">TRADE</button><button
+    id="tabPnl">P&amp;L</button></div>
   <span class="chip" id="chState">connecting…</span>
   <span class="chip" id="chReady"></span>
   <span class="chip" id="chNt"></span>
@@ -9832,7 +10690,7 @@ display:none;max-width:92vw;z-index:99;box-shadow:var(--shadow);font-size:12.5px
   <button class="sm solid-red" id="btnFlatten">FLATTEN ALL</button>
 </div>
 
-<div class="wrap">
+<div class="wrap" id="viewTrade">
   <div class="col">
 
     <div class="card" id="ticket">
@@ -9916,7 +10774,36 @@ display:none;max-width:92vw;z-index:99;box-shadow:var(--shadow);font-size:12.5px
   </div>
 </div>
 
+<div class="pwrap hide" id="viewPnl">
+  <div class="card pnav">
+    <button class="sm" id="pmPrev" title="previous month">&lsaquo;</button>
+    <div class="pmonth" id="pmTitle">&mdash;</div>
+    <button class="sm" id="pmNext" title="next month">&rsaquo;</button>
+    <button class="sm ghost" id="pmToday">TODAY</button>
+    <div class="phero">
+      <div class="k">Month net P&amp;L</div>
+      <div class="v" id="pmNet">&mdash;</div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Month statistics <span class="hint" id="pmHint"></span></h2>
+    <div class="ptiles" id="pmTiles"></div>
+  </div>
+  <div class="card">
+    <h2>Equity curve — cumulative daily P&amp;L
+      <span class="hint" id="peqHint"></span></h2>
+    <div class="eq" id="pmEq"></div>
+  </div>
+  <div class="card">
+    <h2>Daily P&amp;L — trading days, session-close dated
+      <span class="hint" id="pcalHint"></span></h2>
+    <div id="pcal"></div>
+  </div>
+  <div class="card hide" id="pday"></div>
+</div>
+
 <div id="veil"><div id="modal"></div></div>
+<div id="ptip" class="hide"></div>
 <div id="toast"></div>
 
 <script>
@@ -10675,6 +11562,420 @@ function strategyModal(){
     G.appendChild(btn("SAVE FILTERS","wide on",()=>api("/api/strategy_symbols",
       {strategy_symbols:map}).then(closeModal)))})}
 
+/* ================= P&L calendar ================= */
+/* Standalone daily record served by /api/pnl — built from the app's own
+   trade tracking, no extra account data. Day net (balance-based) is the
+   authoritative number; per-trade rows are the drill-down and can differ
+   from the net by entry commissions ("fees / unattributed"). */
+const P={month:"",data:null,sel:null,timer:null};
+
+function pdate(s){const p=s.split("-");return new Date(+p[0],+p[1]-1,+p[2])}
+function monthAdd(m,d){const p=m.split("-");
+  const x=new Date(+p[0],+p[1]-1+d,1);
+  return x.getFullYear()+"-"+String(x.getMonth()+1).padStart(2,"0")}
+function monthLabel(m){return pdate(m+"-01")
+  .toLocaleDateString(undefined,{month:"long",year:"numeric"})}
+function dayLabel(s){return pdate(s)
+  .toLocaleDateString(undefined,{weekday:"long",month:"long",day:"numeric"})}
+function usd(v){return v==null?"—":(v<0?"-$":"+$")+Math.abs(v)
+  .toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
+function usdc(v){const a=Math.abs(v),s=v<0?"-$":"+$";
+  if(a>=1e6)return s+(a/1e6).toFixed(2)+"M";
+  if(a>=1e4)return s+(a/1e3).toFixed(1)+"K";
+  if(a>=1e3)return s+(a/1e3).toFixed(2)+"K";
+  return s+a.toFixed(0)}
+function pct(v){return v==null?"—":Math.round(v*100)+"%"}
+function held(sec){if(sec==null||sec<0)return "—";
+  if(sec<90)return Math.round(sec)+"s";
+  if(sec<5400)return Math.round(sec/60)+"m";
+  return Math.floor(sec/3600)+"h "+Math.round(sec%3600/60)+"m"}
+function pnlCls(v){return v>0?"pos":v<0?"neg":"dim"}
+
+/* ---- tooltip (enhances only — every value is also printed in a cell,
+   tile or table, so nothing is gated behind hover) ---- */
+function tipShow(e,rows){const t=$("ptip");clear(t);
+  rows.forEach(([v,k])=>{const r=el("div","tr");
+    r.appendChild(el("span","tv",v));
+    if(k!=null)r.appendChild(el("span","tk",k));
+    t.appendChild(r)});
+  t.classList.remove("hide");tipMove(e)}
+function tipMove(e){const t=$("ptip");if(t.classList.contains("hide"))return;
+  const w=t.offsetWidth,h=t.offsetHeight;
+  let x=e.clientX+14,y=e.clientY+12;
+  if(x+w>innerWidth-8)x=e.clientX-w-10;
+  if(y+h>innerHeight-8)y=e.clientY-h-10;
+  t.style.left=x+"px";t.style.top=y+"px"}
+function tipHide(){$("ptip").classList.add("hide")}
+
+/* ---- per-day / per-slice statistics ---- */
+function tradeStats(tr){
+  const wins=tr.filter(t=>t.pnl>0),losses=tr.filter(t=>t.pnl<0);
+  const gw=wins.reduce((s,t)=>s+t.pnl,0),gl=losses.reduce((s,t)=>s+t.pnl,0);
+  const decided=wins.length+losses.length;
+  const holds=tr.filter(t=>t.opened_ts!=null).map(t=>t.ts-t.opened_ts);
+  return{n:tr.length,wins:wins.length,losses:losses.length,gw:gw,gl:gl,
+    sum:tr.reduce((s,t)=>s+t.pnl,0),
+    wr:decided?wins.length/decided:null,
+    pf:gl<0?gw/-gl:(gw>0?Infinity:null),
+    avgW:wins.length?gw/wins.length:null,
+    avgL:losses.length?gl/losses.length:null,
+    maxW:wins.length?Math.max.apply(null,wins.map(t=>t.pnl)):null,
+    maxL:losses.length?Math.min.apply(null,losses.map(t=>t.pnl)):null,
+    exp:tr.length?tr.reduce((s,t)=>s+t.pnl,0)/tr.length:null,
+    longs:tr.filter(t=>t.side==="LONG"),
+    shorts:tr.filter(t=>t.side==="SHORT"),
+    hold:holds.length?holds.reduce((a,b)=>a+b,0)/holds.length:null}}
+
+function ptile(box,k,v,cls){const d=el("div","tile");
+  d.appendChild(el("div","k",k));
+  d.appendChild(el("div","v "+(cls||""),v));
+  box.appendChild(d)}
+
+function fmtPf(pf){return pf==null?"—":pf===Infinity?"∞":pf.toFixed(2)}
+
+/* ---- sparkline: 2px line + 10% area wash + zero hairline; crosshair
+   snaps to the nearest point and drives the tooltip ---- */
+function spark(parent,pts,color){
+  clear(parent);
+  if(pts.length<2){parent.appendChild(el("div","empty",
+    "needs at least two data points"));return}
+  const W=Math.max(320,parent.clientWidth||640),H=120,px=8,py=12;
+  let lo=Math.min(0,...pts.map(p=>p.v)),hi=Math.max(0,...pts.map(p=>p.v));
+  if(hi===lo){hi+=1;lo-=1}
+  const xs=i=>px+i*(W-2*px)/(pts.length-1);
+  const ys=v=>py+(hi-v)*(H-2*py)/(hi-lo);
+  const ns="http://www.w3.org/2000/svg";
+  const S_=(tag,at)=>{const n=document.createElementNS(ns,tag);
+    for(const k in at)n.setAttribute(k,at[k]);return n};
+  const svg=S_("svg",{viewBox:"0 0 "+W+" "+H});
+  const zero=ys(0);
+  svg.appendChild(S_("line",{x1:px,x2:W-px,y1:zero,y2:zero,
+    stroke:"#212a3b","stroke-width":1}));
+  let dLine="",dArea="";
+  pts.forEach((p,i)=>{const c=(i?"L":"M")+xs(i).toFixed(1)+","+ys(p.v).toFixed(1);
+    dLine+=c;dArea+=c});
+  dArea+="L"+xs(pts.length-1).toFixed(1)+","+zero.toFixed(1)+
+    "L"+xs(0).toFixed(1)+","+zero.toFixed(1)+"Z";
+  svg.appendChild(S_("path",{d:dArea,fill:color,"fill-opacity":.1}));
+  svg.appendChild(S_("path",{d:dLine,fill:"none",stroke:color,
+    "stroke-width":2,"stroke-linejoin":"round","stroke-linecap":"round"}));
+  const endV=pts[pts.length-1].v,endY=ys(endV);
+  const endDot=S_("circle",{cx:xs(pts.length-1),cy:endY,
+    r:4,fill:color,stroke:"#10151f","stroke-width":2});
+  svg.appendChild(endDot);
+  const endLbl=S_("text",{x:xs(pts.length-1)-9,
+    y:endY<H/2?endY+16:endY-9,"text-anchor":"end",
+    fill:"#dde4ef","font-size":11,"font-weight":700});
+  endLbl.textContent=usd(endV);
+  svg.appendChild(endLbl);
+  const hair=S_("line",{y1:py-4,y2:H-py+4,stroke:"#2d394f",
+    "stroke-width":1,visibility:"hidden"});
+  const dot=S_("circle",{r:4,fill:color,stroke:"#10151f","stroke-width":2,
+    visibility:"hidden"});
+  svg.appendChild(hair);svg.appendChild(dot);
+  svg.style.touchAction="none";
+  svg.addEventListener("pointermove",e=>{
+    const r=svg.getBoundingClientRect();
+    const fx=(e.clientX-r.left)*W/r.width;
+    let i=Math.round((fx-px)*(pts.length-1)/(W-2*px));
+    i=Math.max(0,Math.min(pts.length-1,i));
+    hair.setAttribute("x1",xs(i));hair.setAttribute("x2",xs(i));
+    hair.setAttribute("visibility","visible");
+    dot.setAttribute("cx",xs(i));dot.setAttribute("cy",ys(pts[i].v));
+    dot.setAttribute("visibility","visible");
+    tipShow(e,pts[i].rows||[[usd(pts[i].v),pts[i].k]])});
+  svg.addEventListener("pointerleave",()=>{
+    hair.setAttribute("visibility","hidden");
+    dot.setAttribute("visibility","hidden");tipHide()});
+  parent.appendChild(svg)}
+
+/* ---- diverging mini-bar: grows right (profit) or left (loss) from a
+   shared center baseline; rounded at the data end, square at center ---- */
+function bbar(v,max){const w=el("div","bbar");w.appendChild(el("em"));
+  const i=el("i",v>=0?"pos":"neg");
+  const half=Math.min(50,max?Math.abs(v)/max*50:0);
+  if(v>=0){i.style.left="50%";i.style.width=half+"%"}
+  else{i.style.right="50%";i.style.width=half+"%"}
+  w.appendChild(i);return w}
+
+function breakdown(tr,key){
+  const m={};
+  tr.forEach(t=>{const k=(key(t)||"unattributed");
+    (m[k]=m[k]||[]).push(t)});
+  return Object.keys(m).map(k=>{
+    const s=tradeStats(m[k]);
+    return{name:k,n:s.n,wr:s.wr,pnl:s.sum}})
+    .sort((a,b)=>b.pnl-a.pnl)}
+
+function breakTable(parent,title,rows){
+  const box=el("div");
+  box.appendChild(el("div","psec",title));
+  if(!rows.length){box.appendChild(el("div","empty","no trades"));
+    parent.appendChild(box);return}
+  const max=Math.max(...rows.map(r=>Math.abs(r.pnl)));
+  const t=el("table"),h=el("thead"),hr=el("tr");
+  [["",""],["Trades","num"],["Win %","num"],["",""],["P&L","num"]]
+    .forEach(([x,c])=>hr.appendChild(el("th",c,x)));
+  h.appendChild(hr);t.appendChild(h);
+  const tb=el("tbody");
+  rows.forEach(r=>{
+    const tr=el("tr");
+    tr.appendChild(td(null,r.name));
+    tr.appendChild(td("num dim",r.n));
+    tr.appendChild(td("num dim",pct(r.wr)));
+    const bc=el("td");bc.style.width="30%";bc.appendChild(bbar(r.pnl,max));
+    tr.appendChild(bc);
+    tr.appendChild(td("num "+pnlCls(r.pnl),usd(r.pnl)));
+    tb.appendChild(tr)});
+  t.appendChild(tb);
+  const w=el("div","tblwrap");w.appendChild(t);box.appendChild(w);
+  parent.appendChild(box)}
+
+/* ---- month view ---- */
+function pickDefaultDay(d){
+  const keys=Object.keys(d.days||{}).sort();
+  if(!keys.length)return null;
+  if(d.session&&d.days[d.session])return d.session;
+  const past=keys.filter(k=>k<=d.today);
+  return past.length?past[past.length-1]:keys[keys.length-1]}
+
+async function pnlLoad(){
+  if(!P.month)P.month=localMonth();
+  try{
+    const d=await get("/api/pnl?month="+P.month);
+    P.data=d;
+    if(P.sel==null||!(d.days&&d.days[P.sel]))P.sel=pickDefaultDay(d);
+    renderPnl();
+  }catch(e){$("pcalHint").textContent="app offline";}}
+
+function renderPnl(){
+  const d=P.data;
+  if(!d||d.month!==P.month)return;
+  if(!changed("pnl",[d.month,d.days,P.sel]))return;
+  tipHide();
+  $("pmTitle").textContent=monthLabel(P.month);
+  const nowMonth=(d.today||"").slice(0,7);
+  $("pmNext").disabled=nowMonth&&P.month>=nowMonth;
+  const days=d.days||{},keys=Object.keys(days).sort();
+  const allTrades=keys.reduce((a,k)=>a.concat(days[k].trades||[]),[]);
+  const net=keys.reduce((s,k)=>s+(days[k].pnl||0),0);
+
+  /* hero + stat tiles */
+  const hero=$("pmNet");
+  hero.textContent=keys.length?usd(net):"—";
+  hero.className="v "+(keys.length?pnlCls(net):"dim");
+  $("pmHint").textContent=keys.length?"":"no trading days recorded yet";
+  const tiles=$("pmTiles");clear(tiles);
+  const green=keys.filter(k=>days[k].pnl>0),red=keys.filter(k=>days[k].pnl<0);
+  const ts=tradeStats(allTrades);
+  const dayVals=keys.map(k=>days[k].pnl);
+  let streak=0;
+  for(let i=keys.length-1;i>=0;i--){const v=days[keys[i]].pnl;
+    if(!streak){streak=v>0?1:v<0?-1:0;if(!streak)break}
+    else if(streak>0&&v>0)streak++;
+    else if(streak<0&&v<0)streak--;
+    else break}
+  ptile(tiles,"Trading days",keys.length||"—");
+  ptile(tiles,"Green days",green.length,green.length?"pos":"dim");
+  ptile(tiles,"Red days",red.length,red.length?"neg":"dim");
+  ptile(tiles,"Day win rate",keys.length?pct(green.length/keys.length):"—");
+  ptile(tiles,"Trades",ts.n||"—");
+  ptile(tiles,"Trade win rate",pct(ts.wr));
+  ptile(tiles,"Profit factor",fmtPf(ts.pf),
+    ts.pf==null?"dim":ts.pf>=1?"pos":"neg");
+  ptile(tiles,"Avg day",keys.length?usd(net/keys.length):"—",
+    keys.length?pnlCls(net):"dim");
+  ptile(tiles,"Best day",dayVals.length?usd(Math.max(...dayVals)):"—","pos");
+  ptile(tiles,"Worst day",dayVals.length?usd(Math.min(...dayVals)):"—","neg");
+  ptile(tiles,"Streak",streak?Math.abs(streak)+(streak>0?" green":" red"):"—",
+    streak>0?"pos":streak<0?"neg":"dim");
+
+  /* equity curve */
+  let cum=0;
+  const pts=keys.map(k=>{cum+=days[k].pnl||0;
+    const lbl=pdate(k).toLocaleDateString(undefined,{month:"short",day:"numeric"});
+    return{v:cum,k:lbl,rows:[[usd(cum),"cumulative"],
+      [usd(days[k].pnl),"day P&L"],[lbl,(days[k].trades||[]).length+" trades"]]}});
+  $("peqHint").textContent=pts.length?"final "+usd(cum):"";
+  spark($("pmEq"),pts,"#4bb2d1");
+
+  /* calendar grid — Mon–Fri plus a week-total column (CME session dates
+     are weekdays; Sunday's overnight belongs to Monday's session) */
+  const cal=$("pcal");clear(cal);
+  const head=el("div","pcal-head");
+  ["Mon","Tue","Wed","Thu","Fri","Week"].forEach(x=>head.appendChild(el("div",null,x)));
+  cal.appendChild(head);
+  const first=pdate(P.month+"-01");
+  const dim_=new Date(first.getFullYear(),first.getMonth()+1,0).getDate();
+  const start=new Date(first);
+  start.setDate(1-((first.getDay()+6)%7));   // back to Monday
+  let wk=0;
+  for(let ws=new Date(start);ws<=new Date(first.getFullYear(),first.getMonth(),dim_);
+      ws.setDate(ws.getDate()+7)){
+    wk++;
+    const row=el("div","pcal-week");
+    let wPnl=0,wTr=0,wAny=false;
+    for(let i=0;i<7;i++){
+      const dt=new Date(ws);dt.setDate(ws.getDate()+i);
+      const iso=dt.getFullYear()+"-"+String(dt.getMonth()+1).padStart(2,"0")+
+        "-"+String(dt.getDate()).padStart(2,"0");
+      const rec=days[iso];
+      const inMonth=dt.getMonth()===first.getMonth();
+      if(rec&&inMonth){wPnl+=rec.pnl||0;wTr+=(rec.trades||[]).length;wAny=true}
+      if(i>=5)continue;                       // Sat/Sun fold into the week cell
+      const cell=el("button","dcell");
+      if(!inMonth){cell.className="dcell off";cell.disabled=true;
+        row.appendChild(cell);continue}
+      cell.appendChild(el("span","dnum",dt.getDate()));
+      if(iso===d.today)cell.classList.add("today");
+      if(rec){
+        const maxAbs=Math.max(...dayVals.map(Math.abs),1);
+        const a=0.08+0.34*Math.min(1,Math.abs(rec.pnl)/maxAbs);
+        if(rec.pnl>0)cell.style.background="rgba(47,191,132,"+a.toFixed(3)+")";
+        else if(rec.pnl<0)cell.style.background="rgba(239,88,101,"+a.toFixed(3)+")";
+        cell.appendChild(el("span","dpnl",usdc(rec.pnl)));
+        const st=tradeStats(rec.trades||[]);
+        cell.appendChild(el("span","dsub",
+          st.n+(st.n===1?" trade":" trades")+(st.wr!=null?" · "+pct(st.wr):"")));
+        if(iso===P.sel)cell.classList.add("sel");
+        cell.onclick=()=>{P.sel=iso;renderPnl()};
+        const rows=[[usd(rec.pnl),"net P&L"],[String(st.n),"trades"],
+          [pct(st.wr),"win rate"]];
+        Object.keys(rec.accounts||{}).slice(0,4).forEach(n=>{
+          const ap=rec.accounts[n].pnl;
+          if(ap!=null)rows.push([usd(ap),n])});
+        cell.addEventListener("pointerenter",e=>tipShow(e,rows));
+        cell.addEventListener("pointermove",tipMove);
+        cell.addEventListener("pointerleave",tipHide);
+        cell.addEventListener("focus",e=>{const r=cell.getBoundingClientRect();
+          tipShow({clientX:r.right,clientY:r.top},rows)});
+        cell.addEventListener("blur",tipHide);
+      }else{
+        cell.disabled=true;
+        cell.classList.add(iso>d.today?"future":"mute")}
+      row.appendChild(cell)}
+    const wc=el("div","wcell");
+    wc.appendChild(el("span","dnum","Week "+wk));
+    if(wAny){
+      wc.appendChild(el("span","dpnl "+pnlCls(wPnl),usdc(wPnl)));
+      wc.appendChild(el("span","dsub",wTr+(wTr===1?" trade":" trades")))}
+    else wc.appendChild(el("span","dsub","—"));
+    row.appendChild(wc);
+    cal.appendChild(row)}
+  $("pcalHint").textContent=keys.length
+    ?keys.length+" trading day"+(keys.length>1?"s":"")
+    :"records build as you trade";
+
+  renderDayPanel(days[P.sel],P.sel)}
+
+/* ---- day drill-down ---- */
+function renderDayPanel(day,date){
+  const box=$("pday");clear(box);
+  if(!day){box.classList.add("hide");return}
+  box.classList.remove("hide");
+  const tr=(day.trades||[]).slice().sort((a,b)=>a.ts-b.ts);
+  const s=tradeStats(tr);
+  const h=el("h2");
+  h.appendChild(el("span","pday-title",dayLabel(date)));
+  const hint=el("span","hint",usd(day.pnl)+" net · "+s.n+
+    (s.n===1?" trade":" trades"));
+  h.appendChild(hint);
+  box.appendChild(h);
+
+  const tiles=el("div","ptiles");
+  ptile(tiles,"Net P&L",usd(day.pnl),pnlCls(day.pnl));
+  ptile(tiles,"Trades",s.n||"—");
+  ptile(tiles,"Win rate",pct(s.wr));
+  ptile(tiles,"Profit factor",fmtPf(s.pf),
+    s.pf==null?"dim":s.pf>=1?"pos":"neg");
+  ptile(tiles,"Avg trade",usd(s.exp),pnlCls(s.exp||0));
+  ptile(tiles,"Avg win",s.avgW==null?"—":usd(s.avgW),"pos");
+  ptile(tiles,"Avg loss",s.avgL==null?"—":usd(s.avgL),"neg");
+  ptile(tiles,"Largest win",s.maxW==null?"—":usd(s.maxW),"pos");
+  ptile(tiles,"Largest loss",s.maxL==null?"—":usd(s.maxL),"neg");
+  ptile(tiles,"Gross profit",usd(s.gw),s.gw>0?"pos":"dim");
+  ptile(tiles,"Gross loss",usd(s.gl),s.gl<0?"neg":"dim");
+  const drift=day.pnl-s.sum;
+  ptile(tiles,"Fees / unattr",Math.abs(drift)<0.005?"$0.00":usd(drift),
+    Math.abs(drift)<0.005?"dim":pnlCls(drift));
+  ptile(tiles,"Longs",s.longs.length+(s.longs.length?" · "+usdc(
+    s.longs.reduce((a,t)=>a+t.pnl,0)):""),
+    pnlCls(s.longs.reduce((a,t)=>a+t.pnl,0)));
+  ptile(tiles,"Shorts",s.shorts.length+(s.shorts.length?" · "+usdc(
+    s.shorts.reduce((a,t)=>a+t.pnl,0)):""),
+    pnlCls(s.shorts.reduce((a,t)=>a+t.pnl,0)));
+  ptile(tiles,"Avg hold",held(s.hold));
+  box.appendChild(tiles);
+
+  if(tr.length>=2){
+    box.appendChild(el("div","psec","Intraday cumulative P&L (per closed trade)"));
+    let c=0;
+    const pts=tr.map(t=>{c+=t.pnl;
+      const when=new Date(t.ts*1000).toLocaleTimeString();
+      return{v:c,k:when,rows:[[usd(c),"cumulative"],[usd(t.pnl),
+        t.symbol+" "+t.side],[when,t.account]]}});
+    const eq=el("div","eq");box.appendChild(eq);
+    spark(eq,pts,"#4bb2d1")}
+
+  const grid=el("div","pgrid3");
+  breakTable(grid,"By symbol",breakdown(tr,t=>t.symbol));
+  breakTable(grid,"By strategy",breakdown(tr,t=>t.strategy));
+  const acctRows=Object.keys(day.accounts||{}).map(n=>{
+    const mine=tr.filter(t=>t.account===n);
+    return{name:n,n:mine.length,wr:tradeStats(mine).wr,
+      pnl:day.accounts[n].pnl!=null?day.accounts[n].pnl:0}})
+    .sort((a,b)=>b.pnl-a.pnl);
+  breakTable(grid,"By account",acctRows);
+  box.appendChild(grid);
+
+  box.appendChild(el("div","psec","Trade log"));
+  if(!tr.length){box.appendChild(el("div","empty",
+    "no round-trips recorded — the day net came from balance changes"));return}
+  const t=el("table"),th=el("thead"),hr=el("tr");
+  [["Time",""],["Account",""],["Symbol",""],["Side",""],["Qty","num"],
+   ["Strategy",""],["Entry","num"],["Held","num"],["P&L","num"]]
+    .forEach(([x,c])=>hr.appendChild(el("th",c,x)));
+  th.appendChild(hr);t.appendChild(th);
+  const tb=el("tbody");
+  tr.forEach(x=>{
+    const r=el("tr");
+    r.appendChild(td("dim",new Date(x.ts*1000).toLocaleTimeString()));
+    r.appendChild(td(null,x.account));
+    r.appendChild(td(null,x.symbol));
+    r.appendChild(td(x.side==="LONG"?"pos":"neg",x.side));
+    r.appendChild(td("num",x.qty));
+    r.appendChild(td("dim",x.strategy||"unattributed"));
+    r.appendChild(td("num dim",x.entry!=null?fmt(x.entry):"—"));
+    r.appendChild(td("num dim",
+      x.opened_ts!=null?held(x.ts-x.opened_ts):"—"));
+    const pc=td("num "+pnlCls(x.pnl),usd(x.pnl)+(x.approx?" ≈":""));
+    if(x.approx)pc.title="several markets closed in the same poll window — "+
+      "the cash move was split by contracts closed";
+    r.appendChild(pc);
+    tb.appendChild(r)});
+  t.appendChild(tb);
+  const w=el("div","tblwrap");w.appendChild(t);box.appendChild(w)}
+
+/* ---- tab plumbing ---- */
+function showView(v){
+  $("viewTrade").classList.toggle("hide",v==="pnl");
+  $("viewPnl").classList.toggle("hide",v!=="pnl");
+  $("tabTrade").classList.toggle("on",v!=="pnl");
+  $("tabPnl").classList.toggle("on",v==="pnl");
+  try{sessionStorage.setItem("st-view",v)}catch(e){}
+  clearInterval(P.timer);P.timer=null;
+  if(v==="pnl"){pnlLoad();
+    P.timer=setInterval(pnlLoad,15000)}
+  else tipHide()}
+function localMonth(){const n=new Date();
+  return n.getFullYear()+"-"+String(n.getMonth()+1).padStart(2,"0")}
+function pnlNav(delta){
+  const nowMonth=((P.data&&P.data.today)||"").slice(0,7)||localMonth();
+  const next=delta===0?nowMonth:monthAdd(P.month||nowMonth,delta);
+  if(next>nowMonth)return;
+  P.month=next;P.sel=null;P.data=null;
+  invalidate("pnl");pnlLoad()}
+
 /* ================= render ================= */
 function renderChips(){
   const st=$("chState");st.textContent=S.status_text||S.state;
@@ -10756,9 +12057,17 @@ $("btnMicro").onclick=()=>api("/api/micro",{});
 $("btnResetPnl").onclick=()=>{if(confirm("Reset session P&L and re-snapshot balances?"))
   api("/api/reset_pnl",{})};
 $("btnStrategy").onclick=()=>{if(S)strategyModal()};
+$("tabTrade").onclick=()=>showView("trade");
+$("tabPnl").onclick=()=>showView("pnl");
+$("pmPrev").onclick=()=>pnlNav(-1);
+$("pmNext").onclick=()=>pnlNav(1);
+$("pmToday").onclick=()=>pnlNav(0);
+addEventListener("resize",()=>{
+  if(!$("viewPnl").classList.contains("hide")){invalidate("pnl");renderPnl()}});
 document.addEventListener("keydown",e=>{if(e.key==="Escape"&&modalOpen)closeModal()});
 
 setSide("long");setType("market");renderQty();
+try{if(sessionStorage.getItem("st-view")==="pnl")showView("pnl")}catch(e){}
 refresh();refreshLive();
 setInterval(refresh,1500);
 setInterval(refreshLive,2000);
@@ -10832,6 +12141,7 @@ async def main():
             asyncio.create_task(pause_indicator()),
             asyncio.create_task(balance_monitor()),
             asyncio.create_task(live_bridge_task()),
+            asyncio.create_task(pnl_tracker_task()),
         ]
 
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

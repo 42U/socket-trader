@@ -117,6 +117,7 @@ def reset_session_state():
     st.atm_aliases = {}
     st._bridge_book = None
     st._inflight_opens.clear()
+    st._strategy_ledger.clear()
     yield
     st.expected_contract = _REAL_EXPECTED_CONTRACT
     st.active_account = None
@@ -124,6 +125,29 @@ def reset_session_state():
     st.account_stops.clear()
     st.account_profiles.clear()
     st._stagger_placed.clear()
+
+
+@pytest.fixture(autouse=True)
+def isolate_pnl_history(tmp_path_factory):
+    """Never let the suite touch the real ~/.voidorigin_pnl_history.json.
+
+    Same reasoning as isolate_config: that file is a live trading record.
+    Also resets the tracker's in-memory state so observations from one
+    test can never leak position shapes or attribution into the next.
+    """
+    original = st.PNL_HISTORY_FILE
+    st.PNL_HISTORY_FILE = tmp_path_factory.mktemp("pnl") / ".voidorigin_pnl_history.json"
+    st._pnl_history = None
+    st._pnl_prev.clear()
+    st._pnl_open_meta.clear()
+    st._pnl_dirty = False
+    st._pnl_last_save = 0.0
+    yield
+    st.PNL_HISTORY_FILE = original
+    st._pnl_history = None
+    st._pnl_prev.clear()
+    st._pnl_open_meta.clear()
+    st._pnl_dirty = False
 
 
 # ── sanitize_ati ──────────────────────────────────────────────────────
@@ -2872,6 +2896,12 @@ class _WebClient:
         hdrs.update(headers or {})
         return ur.urlopen(ur.Request(url, headers=hdrs), timeout=5)
 
+    def _expect_status(self, fn, code):
+        import urllib.error
+        with pytest.raises(urllib.error.HTTPError) as e:
+            fn()
+        assert e.value.code == code
+
 
 class TestWebServer(_WebClient):
     def test_serves_page_and_state(self, web):
@@ -2915,12 +2945,6 @@ class TestWebServer(_WebClient):
 
 class TestWebSecurity(_WebClient):
     """The web API controls real money — loopback is not the boundary."""
-
-    def _expect_status(self, fn, code):
-        import urllib.error
-        with pytest.raises(urllib.error.HTTPError) as e:
-            fn()
-        assert e.value.code == code
 
     def test_post_without_token_rejected(self, web):
         self._expect_status(
@@ -5507,3 +5531,774 @@ class TestSecondReviewFixes:
         spared, _ = st._prop_preempt_closures([plan], snap, exclude={"Apex2"})
         assert swept == {"Apex2": ["ES SEP26"]}
         assert spared == {}
+
+
+# ── Multi-strategy mode ───────────────────────────────────────────────
+# A publisher running several strategies sends each entry as a stateless
+# close-then-place pair; without scoping, strategy B's paired close
+# flattens the position strategy A opened seconds earlier (observed
+# 2026-08-31 01:10). These tests cover the strategy ledger, the smart
+# close decision, same-direction stacking, and — most important — that
+# with the flag off or any state unprovable, behavior is verbatim.
+
+ENV_BNB = {"strategy": "bread_n_butter", "event": "close_position",
+           "event_id": "ent:nq_bread_n_butter:Nasdaq:x:close"}
+
+
+def _book(*accts):
+    """Fake live-bridge book: (account, cash, [(inst, qty), ...])."""
+    return {"ts": time.time(),
+            "accounts": {n: {"cash": c, "positions": p} for n, c, p in accts}}
+
+
+@pytest.fixture
+def live_book():
+    """Enable the bridge flags so _account_root_exposure trusts st._bridge_book."""
+    st.live_bridge_enabled = True
+    st._live_bridge_connected = True
+    yield
+    st.live_bridge_enabled = False
+    st._live_bridge_connected = False
+
+
+@pytest.fixture
+def ms_on(monkeypatch):
+    monkeypatch.setattr(st, "multi_strategy_enabled", lambda: True)
+
+
+class TestPublisherEnvelopeOf:
+    def test_extracts_strategy_event_and_id(self):
+        msg = json.dumps({"signal": "CLOSEPOSITION;ACCOUNT;NQ 09-26;;;;;;;;;;",
+                          "strategy": "bread_n_butter", "event": "close_position",
+                          "event_id": "ent:nq_bread_n_butter:Nasdaq:t:close"})
+        env = st.publisher_envelope_of(msg)
+        assert env["strategy"] == "bread_n_butter"
+        assert env["event"] == "close_position"
+
+    def test_no_strategy_key_means_empty(self):
+        assert st.publisher_envelope_of(json.dumps({"signal": "PLACE;a;b"})) == {}
+
+    def test_junk_means_empty(self):
+        assert st.publisher_envelope_of("not json") == {}
+        assert st.publisher_envelope_of(json.dumps(["list"])) == {}
+
+
+class TestStrategyLedger:
+    def test_note_and_read_back(self):
+        st._ledger_note_entry("A1", "MNQ 09-26", "SELL", 2,
+                              ("bread_n_butter", "BreadNButter"), "sid-1")
+        rows = st._ledger_entries("A1", "MNQ DEC26")   # month-blind root key
+        assert len(rows) == 1
+        assert rows[0]["qty"] == 2 and rows[0]["side"] == -1
+        assert rows[0]["slug"] == "bread_n_butter"
+
+    def test_reset_replaces_market_book(self):
+        st._ledger_note_entry("A1", "NQ 09-26", "BUY", 1, ("a", ""), "s1")
+        st._ledger_note_entry("A1", "NQ 09-26", "SELL", 3, ("b", ""), "s2",
+                              reset=True)
+        rows = st._ledger_entries("A1", "NQ 09-26")
+        assert [(r["sid"], r["side"]) for r in rows] == [("s2", -1)]
+
+    def test_clear_scopes_by_root_and_account(self):
+        st._ledger_note_entry("A1", "NQ 09-26", "BUY", 1, ("a", ""), "s1")
+        st._ledger_note_entry("A1", "GC 12-26", "BUY", 1, ("a", ""), "s2")
+        st._ledger_note_entry("A2", "NQ 09-26", "BUY", 1, ("a", ""), "s3")
+        st._ledger_clear("A1", "NQ 09-26")
+        assert st._ledger_entries("A1", "NQ 09-26") == []
+        assert len(st._ledger_entries("A1", "GC 12-26")) == 1
+        assert len(st._ledger_entries("A2", "NQ 09-26")) == 1
+        st._ledger_clear("A1")
+        assert st._ledger_entries("A1", "GC 12-26") == []
+
+    def test_prune_sids(self):
+        st._ledger_note_entry("A1", "NQ 09-26", "BUY", 1, ("a", ""), "s1")
+        st._ledger_note_entry("A1", "NQ 09-26", "BUY", 1, ("b", ""), "s2")
+        st._ledger_prune_sids("A1", {"s1"})
+        assert [r["sid"] for r in st._ledger_entries("A1", "NQ 09-26")] == ["s2"]
+
+    def test_ident_matches_slug_or_name_any_case(self):
+        row = {"slug": "bread_n_butter", "name": "breadnbutter"}
+        assert st._ident_matches(row, ("Bread_N_Butter", ""))
+        assert st._ident_matches(row, ("", "BreadNButter"))
+        assert not st._ident_matches(row, ("regime_routed", "NQ-RegimeRoute"))
+        assert not st._ident_matches(row, ("", ""))
+
+    def test_note_file_place_close_and_closestrategy(self):
+        plan = {"account": "A1", "strat_ident": ("bnb", "BnB")}
+        st._ledger_note_file(plan, "PLACE;A1;NQ 09-26;BUY;2;MARKET;;;DAY;;;BnB;sid-9")
+        assert st._ledger_entries("A1", "NQ 09-26")[0]["sid"] == "sid-9"
+        st._ledger_note_file(plan, "CLOSESTRATEGY;A1;;;;;;;;;;;sid-9")
+        assert st._ledger_entries("A1", "NQ 09-26") == []
+        st._ledger_note_file(plan, "PLACE;A1;NQ 09-26;BUY;2;MARKET;;;DAY;;;BnB;sid-10")
+        st._ledger_note_file(plan, "CLOSEPOSITION;A1;NQ 12-26;;;;;;;;;;")
+        assert st._ledger_entries("A1", "NQ 09-26") == []   # root-wide clear
+
+    def test_close_account_positions_clears_ledger(self, monkeypatch):
+        st._ledger_note_entry("A1", "NQ 09-26", "BUY", 1, ("a", ""), "s1")
+        monkeypatch.setattr(st, "fire_cancel_account_orders", lambda a: 0)
+        monkeypatch.setattr(st, "query_nt_positions", lambda a, p: {})
+        with patch.object(st, "output_directory", ""):
+            st.close_account_positions("A1")
+        assert st._ledger_entries("A1", "NQ 09-26") == []
+
+
+class TestInflightAccumulation:
+    def test_same_direction_accumulates(self):
+        st._note_inflight_open("A1", "NQ 09-26", "SELL", 1)
+        st._note_inflight_open("A1", "NQ 09-26", "SELL", 2)
+        rows = st._inflight_open_rows()
+        assert rows == [("A1", "NQ 09-26", -3)]
+
+    def test_opposite_direction_replaces(self):
+        st._note_inflight_open("A1", "NQ 09-26", "SELL", 2)
+        st._note_inflight_open("A1", "NQ 09-26", "BUY", 1)
+        assert st._inflight_open_rows() == [("A1", "NQ 09-26", 1)]
+
+
+class TestAccountRootExposure:
+    def test_none_without_bridge(self):
+        st._bridge_book = _book(("A1", 50_000.0, [("NQ SEP26", 1)]))
+        assert st._account_root_exposure("A1", "NQ 09-26") is None
+
+    def test_shown_twin_and_inflight(self, live_book):
+        st._bridge_book = _book(
+            ("A1", 50_000.0, [("MNQ SEP26", -2), ("NQ DEC26", 1)]))
+        st._note_inflight_open("A1", "MNQ 09-26", "SELL", 1)
+        exp = st._account_root_exposure("A1", "MNQ 09-26")
+        assert exp == {"shown": -2, "inflight": -1, "twin": 1}
+
+    def test_none_when_stale_or_missing_account(self, live_book):
+        st._bridge_book = _book(("A1", 50_000.0, []))
+        assert st._account_root_exposure("Ghost", "NQ 09-26") is None
+        st._bridge_book["ts"] -= st.BRIDGE_BOOK_FRESH_S + 1
+        assert st._account_root_exposure("A1", "NQ 09-26") is None
+
+
+class TestSmartCloseDecision:
+    IDENT = ("bread_n_butter", "")
+
+    def test_pass_without_book(self):
+        verdict, _, why = st._smart_close_decision("A1", "NQ 09-26", self.IDENT)
+        assert verdict == "pass" and "book" in why
+
+    def test_drop_when_flat_and_unattributed(self, live_book):
+        st._bridge_book = _book(("A1", 50_000.0, []))
+        verdict, _, why = st._smart_close_decision("A1", "NQ 09-26", self.IDENT)
+        assert verdict == "drop" and "flat" in why
+
+    def test_pass_when_position_unattributed(self, live_book):
+        st._bridge_book = _book(("A1", 50_000.0, [("NQ SEP26", -1)]))
+        verdict, _, why = st._smart_close_decision("A1", "NQ 09-26", self.IDENT)
+        assert verdict == "pass" and "not attributed" in why
+
+    def test_drop_when_position_belongs_to_another_strategy(self, live_book):
+        st._bridge_book = _book(("A1", 50_000.0, [("NQ SEP26", -1)]))
+        st._ledger_note_entry("A1", "NQ 09-26", "SELL", 1,
+                              ("regime_routed", "NQ-RegimeRoute"), "sid-r")
+        verdict, _, why = st._smart_close_decision("A1", "NQ 09-26", self.IDENT)
+        assert verdict == "drop" and "regime_routed" in why
+        # the teammate's attribution is untouched
+        assert len(st._ledger_entries("A1", "NQ 09-26")) == 1
+
+    def test_scope_to_own_entries_when_shared(self, live_book):
+        st._bridge_book = _book(("A1", 50_000.0, [("NQ SEP26", -2)]))
+        st._ledger_note_entry("A1", "NQ 09-26", "SELL", 1,
+                              ("regime_routed", ""), "sid-r")
+        st._ledger_note_entry("A1", "NQ 09-26", "SELL", 1,
+                              ("bread_n_butter", ""), "sid-b")
+        verdict, files, _ = st._smart_close_decision("A1", "NQ 09-26", self.IDENT)
+        assert verdict == "scope"
+        assert files == ["CLOSESTRATEGY;A1;;;;;;;;;;;sid-b"]
+        assert st.validate_signal(files[0].split(";")) is None
+        # own rows pruned, teammate's kept
+        assert [r["sid"] for r in st._ledger_entries("A1", "NQ 09-26")] == ["sid-r"]
+
+    def test_pass_when_sole_holder(self, live_book):
+        st._bridge_book = _book(("A1", 50_000.0, [("NQ SEP26", -1)]))
+        st._ledger_note_entry("A1", "NQ 09-26", "SELL", 1,
+                              ("bread_n_butter", ""), "sid-b")
+        verdict, _, why = st._smart_close_decision("A1", "NQ 09-26", self.IDENT)
+        assert verdict == "pass" and "sole holder" in why
+
+    def test_pass_on_twin_exposure(self, live_book):
+        st._bridge_book = _book(("A1", 50_000.0, [("NQ SEP26", 1)]))
+        st._ledger_note_entry("A1", "MNQ 09-26", "BUY", 1,
+                              ("bread_n_butter", ""), "sid-b")
+        verdict, _, why = st._smart_close_decision("A1", "MNQ 09-26", self.IDENT)
+        assert verdict == "pass" and "twin" in why
+
+    def test_pass_when_more_held_than_attributed(self, live_book):
+        st._bridge_book = _book(("A1", 50_000.0, [("NQ SEP26", -3)]))
+        st._ledger_note_entry("A1", "NQ 09-26", "SELL", 1,
+                              ("regime_routed", ""), "sid-r")
+        verdict, _, why = st._smart_close_decision("A1", "NQ 09-26", self.IDENT)
+        assert verdict == "pass" and "more contracts" in why
+
+    def test_pass_on_direction_drift(self, live_book):
+        st._bridge_book = _book(("A1", 50_000.0, [("NQ SEP26", 2)]))
+        st._ledger_note_entry("A1", "NQ 09-26", "SELL", 2,
+                              ("regime_routed", ""), "sid-r")
+        verdict, _, why = st._smart_close_decision("A1", "NQ 09-26", self.IDENT)
+        assert verdict == "pass" and "direction" in why
+
+    def test_drop_and_selfheal_when_brackets_took_everything(self, live_book):
+        st._bridge_book = _book(("A1", 50_000.0, []))
+        st._ledger_note_entry("A1", "NQ 09-26", "SELL", 1,
+                              ("regime_routed", ""), "sid-r")
+        verdict, _, why = st._smart_close_decision("A1", "NQ 09-26", self.IDENT)
+        assert verdict == "drop" and "flat" in why
+        assert st._ledger_entries("A1", "NQ 09-26") == []
+
+    def test_inflight_write_counts_as_held(self, live_book):
+        # The churn window: A's entry written 1s ago, book not showing it
+        # yet, B's paired close arrives. The in-flight row must protect it.
+        st._bridge_book = _book(("A1", 50_000.0, []))
+        st._note_inflight_open("A1", "NQ 09-26", "SELL", 1)
+        st._ledger_note_entry("A1", "NQ 09-26", "SELL", 1,
+                              ("regime_routed", ""), "sid-r")
+        verdict, _, why = st._smart_close_decision("A1", "NQ 09-26", self.IDENT)
+        assert verdict == "drop" and "regime_routed" in why
+
+
+CLOSE_SIG = "CLOSEPOSITION;Sim101;NQ 06-26;;;;;;;;;;"
+
+
+class TestSmartClosePlanLegs:
+    def test_flag_off_close_verbatim_even_with_envelope(self, live_book):
+        st.active_account = "Sim101"
+        st._bridge_book = _book(("Sim101", 50_000.0, []))
+        plans, skipped = st.plan_signal_legs(CLOSE_SIG, envelope=ENV_BNB)
+        assert [p["command"] for p in plans] == ["CLOSEPOSITION"]
+        assert skipped == []
+
+    def test_trample_close_suppressed(self, ms_on, live_book):
+        st.active_account = "Sim101"
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1,
+                              ("regime_routed", ""), "sid-r")
+        plans, skipped = st.plan_signal_legs(CLOSE_SIG, envelope=ENV_BNB)
+        assert plans == []
+        assert skipped and skipped[0][0] == "Sim101"
+        assert "smart close" in skipped[0][1]
+
+    def test_shared_position_scoped_to_sender(self, ms_on, live_book):
+        st.active_account = "Sim101"
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -2)]))
+        st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1,
+                              ("regime_routed", ""), "sid-r")
+        st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1,
+                              ("bread_n_butter", ""), "sid-b")
+        plans, _ = st.plan_signal_legs(CLOSE_SIG, envelope=ENV_BNB)
+        assert plans[0]["files"] == ["CLOSESTRATEGY;Sim101;;;;;;;;;;;sid-b"]
+
+    def test_flat_account_close_dropped(self, ms_on, live_book):
+        st.active_account = "Sim101"
+        st._bridge_book = _book(("Sim101", 50_000.0, []))
+        plans, skipped = st.plan_signal_legs(CLOSE_SIG, envelope=ENV_BNB)
+        assert plans == []
+        assert "flat" in skipped[0][1]
+
+    def test_no_envelope_close_verbatim(self, ms_on, live_book):
+        st.active_account = "Sim101"
+        st._bridge_book = _book(("Sim101", 50_000.0, []))
+        plans, _ = st.plan_signal_legs(CLOSE_SIG)
+        assert [p["command"] for p in plans] == ["CLOSEPOSITION"]
+
+    def test_downgraded_reversal_close_never_scoped(self, ms_on, live_book):
+        # Entries disabled downgrades a REVERSEPOSITION to a close carrying
+        # exit intent — it must flatten whoever holds the market.
+        st.active_account = "Sim101"
+        st.account_profiles["Sim101"] = {"default": {"enabled": False}}
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1,
+                              ("regime_routed", ""), "sid-r")
+        rev = "REVERSEPOSITION;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-x"
+        plans, _ = st.plan_signal_legs(rev, envelope=ENV_BNB)
+        assert plans and plans[0]["command"] == "CLOSEPOSITION"
+        assert any("CLOSEPOSITION" in f for f in plans[0]["files"])
+
+    def test_unprovable_book_close_verbatim(self, ms_on):
+        st.active_account = "Sim101"
+        st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1,
+                              ("regime_routed", ""), "sid-r")
+        plans, _ = st.plan_signal_legs(CLOSE_SIG, envelope=ENV_BNB)
+        assert [p["command"] for p in plans] == ["CLOSEPOSITION"]
+
+
+ENTRY_ENV = {"strategy": "bread_n_butter", "event": "entry",
+             "event_id": "ent:nq_bread_n_butter:Nasdaq:x"}
+
+
+class TestStackingPlanLegs:
+    def test_same_direction_stack_places_and_attributes(self, ms_on, live_book):
+        st.active_account = "Sim101"
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        sell = "PLACE;Sim101;NQ 06-26;SELL;1;MARKET;;;DAY;;;BnB;sid-b"
+        plans, skipped = st.plan_signal_legs(sell, envelope=ENTRY_ENV)
+        assert skipped == []
+        assert plans[0]["deferred"] is False
+        assert plans[0]["reset_first"] is False
+        assert plans[0]["strat_ident"] == ("bread_n_butter", "")
+
+    def test_stack_skipped_at_cap(self, ms_on, live_book):
+        st.active_account = "Sim101"
+        st.account_profiles["Sim101"] = {"default": {"max_contracts": 2}}
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -2)]))
+        sell = "PLACE;Sim101;NQ 06-26;SELL;1;MARKET;;;DAY;;;BnB;sid-b"
+        plans, skipped = st.plan_signal_legs(sell, envelope=ENTRY_ENV)
+        assert plans == []
+        assert "max_contracts" in skipped[0][1]
+
+    def test_stack_resized_to_fit_cap(self, ms_on, live_book):
+        st.active_account = "Sim101"
+        st.account_profiles["Sim101"] = {"default": {"max_contracts": 3}}
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -2)]))
+        sell = "PLACE;Sim101;NQ 06-26;SELL;4;MARKET;;;DAY;;;BnB;sid-b"
+        plans, _ = st.plan_signal_legs(sell, envelope=ENTRY_ENV)
+        assert plans[0]["qty"] == 1
+        assert plans[0]["files"][0].split(";")[4] == "1"
+
+    def test_opposite_entry_resets_first(self, ms_on, live_book):
+        st.active_account = "Sim101"
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        buy = "PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"
+        plans, _ = st.plan_signal_legs(buy, envelope=ENTRY_ENV)
+        assert plans[0]["reset_first"] is True
+        assert plans[0]["deferred"] is True
+
+    def test_opposite_entry_on_cbo_account_uses_preempt_not_reset(
+            self, ms_on, live_book):
+        st.active_account = "Sim101"
+        st.account_profiles["Sim101"] = {"prop": True}
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        buy = "PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"
+        plans, _ = st.plan_signal_legs(buy, envelope=ENTRY_ENV)
+        assert plans[0]["reset_first"] is False
+        assert plans[0]["deferred"] is True     # the prop close-confirm rail
+
+    def test_flag_off_no_stack_logic(self, live_book):
+        st.active_account = "Sim101"
+        st.account_profiles["Sim101"] = {"default": {"max_contracts": 2}}
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -2)]))
+        sell = "PLACE;Sim101;NQ 06-26;SELL;1;MARKET;;;DAY;;;BnB;sid-b"
+        plans, skipped = st.plan_signal_legs(sell, envelope=ENTRY_ENV)
+        assert len(plans) == 1 and skipped == []
+        assert plans[0]["reset_first"] is False
+
+    def test_reset_close_files_cover_both_sizes(self):
+        files = st._reset_close_files("Sim101", "MNQ 09-26")
+        assert files[0].split(";")[2] == "MNQ 09-26"
+        assert any(f.split(";")[2] == "NQ 09-26" for f in files[1:])
+
+
+class TestPropStacking:
+    def _plan(self, qty=1, cap=5, action="BUY", account="Apex1",
+              instrument="NQ 09-26"):
+        return {"account": account, "instrument": instrument, "action": action,
+                "qty": qty, "rule": {"max_contracts": cap}}
+
+    def test_same_direction_within_cap_keeps(self, ms_on):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        to_close, keeps = st._prop_preempt_closures(
+            [self._plan()], _snap(("Apex1", "NQ SEP26", 2)))
+        assert to_close == {}
+        assert keeps["Apex1"] is True
+
+    def test_over_cap_resets_as_before(self, ms_on):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        to_close, keeps = st._prop_preempt_closures(
+            [self._plan(qty=1, cap=2)], _snap(("Apex1", "NQ SEP26", 2)))
+        assert to_close == {"Apex1": ["NQ SEP26"]}
+        assert not keeps.get("Apex1")
+
+    def test_no_cap_configured_resets(self, ms_on):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        to_close, _ = st._prop_preempt_closures(
+            [self._plan(cap=0)], _snap(("Apex1", "NQ SEP26", 1)))
+        assert to_close == {"Apex1": ["NQ SEP26"]}
+
+    def test_opposite_direction_resets(self, ms_on):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        to_close, _ = st._prop_preempt_closures(
+            [self._plan(action="SELL")], _snap(("Apex1", "NQ SEP26", 2)))
+        assert to_close == {"Apex1": ["NQ SEP26"]}
+
+    def test_twin_still_closed_while_same_root_kept(self, ms_on):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        to_close, keeps = st._prop_preempt_closures(
+            [self._plan()],
+            _snap(("Apex1", "NQ SEP26", 1), ("Apex1", "MNQ SEP26", 2)))
+        assert to_close == {"Apex1": ["MNQ SEP26"]}
+        assert keeps["Apex1"] is True   # targeted close spares the kept stack
+
+    def test_other_market_still_closed_while_stack_kept(self, ms_on):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        to_close, keeps = st._prop_preempt_closures(
+            [self._plan()],
+            _snap(("Apex1", "NQ SEP26", 1), ("Apex1", "GC DEC26", 1)))
+        assert to_close == {"Apex1": ["GC DEC26"]}
+        assert keeps["Apex1"] is True
+
+    def test_inflight_burst_counts_toward_cap(self, ms_on):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        # 2 shown + 2 written seconds ago (accumulated in-flight row):
+        # a 1-lot entry under cap 3 must NOT stack (max(2, 2+2*)=…).
+        st._note_inflight_open("Apex1", "NQ 09-26", "BUY", 2)
+        st._note_inflight_open("Apex1", "NQ 09-26", "BUY", 2)
+        to_close, _ = st._prop_preempt_closures(
+            [self._plan(qty=1, cap=3)], _snap(("Apex1", "NQ SEP26", 2)))
+        assert to_close == {"Apex1": ["NQ SEP26"]}
+
+    def test_flag_off_same_direction_resets(self):
+        st.active_account = "Apex1"
+        st.account_profiles["Apex1"] = {"prop": True}
+        to_close, _ = st._prop_preempt_closures(
+            [self._plan()], _snap(("Apex1", "NQ SEP26", 2)))
+        assert to_close == {"Apex1": ["NQ SEP26"]}
+
+    def test_multi_strategy_flag_reads_config(self):
+        assert st.multi_strategy_enabled() is False
+        st.save_config({"multi_strategy": True})
+        assert st.multi_strategy_enabled() is True
+
+
+class TestMultiStrategyEndToEnd:
+    """Replay of the observed 2026-08-31 01:10 trample, through the real
+    plan → execute pipeline with real file writes."""
+
+    def _dispatch(self, sig, env, out):
+        with patch.object(st, "output_directory", str(out)):
+            plans, skipped = st.plan_signal_legs(sig, envelope=env)
+            written = _run_plans(plans)
+        return plans, skipped, written
+
+    def _files(self, out):
+        got = []
+        for f in sorted(Path(out).iterdir()):
+            got.append(f.read_text())
+            f.unlink()
+        return got
+
+    def test_two_strategies_share_a_market_without_trampling(
+            self, ms_on, live_book, tmp_output_dir):
+        st.active_account = "Sim101"
+        env_close_r = {"strategy": "regime_routed", "event": "close_position",
+                       "event_id": "ent:r:close"}
+        env_entry_r = {"strategy": "regime_routed", "event": "entry",
+                       "event_id": "ent:r"}
+        close = "CLOSEPOSITION;Sim101;NQ 06-26;;;;;;;;;;"
+        p_bnb = "PLACE;Sim101;NQ 06-26;SELL;1;MARKET;;;DAY;;;BnB;sid-bnb"
+        p_reg = "PLACE;Sim101;NQ 06-26;SELL;1;MARKET;;;DAY;;;Reg;sid-reg"
+
+        # Flat book. bnb's paired close: nothing to close — suppressed.
+        st._bridge_book = _book(("Sim101", 50_000.0, []))
+        plans, skipped, _ = self._dispatch(close, ENV_BNB, tmp_output_dir)
+        assert plans == [] and "flat" in skipped[0][1]
+        assert self._files(tmp_output_dir) == []
+
+        # bnb's entry writes and is attributed (instant, not deferred).
+        _, _, written = self._dispatch(p_bnb, ENV_BNB, tmp_output_dir)
+        assert written == ["Sim101"]
+        assert self._files(tmp_output_dir) == [p_bnb]
+        assert [r["sid"] for r in st._ledger_entries("Sim101", "NQ 06-26")] == ["sid-bnb"]
+
+        # 2s later, regime's paired close arrives — the fill may not even
+        # be on the book yet (in-flight row covers it). It must NOT
+        # flatten bnb's fresh position: suppressed.
+        plans, skipped, _ = self._dispatch(close, env_close_r, tmp_output_dir)
+        assert plans == []
+        assert "bread_n_butter" in skipped[0][1]
+        assert self._files(tmp_output_dir) == []
+
+        # regime's entry stacks alongside (same direction, no cap set).
+        _, _, written = self._dispatch(p_reg, env_entry_r, tmp_output_dir)
+        assert written == ["Sim101"]
+        assert self._files(tmp_output_dir) == [p_reg]
+        sids = [r["sid"] for r in st._ledger_entries("Sim101", "NQ 06-26")]
+        assert sids == ["sid-bnb", "sid-reg"]
+
+        # Both fills now on the book: bnb re-signals (its 01:10 pair).
+        # Its close touches ONLY its own entry — scoped CLOSESTRATEGY.
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -2)]))
+        st._inflight_opens.clear()
+        plans, _, written = self._dispatch(close, ENV_BNB, tmp_output_dir)
+        assert written == ["Sim101"]
+        assert self._files(tmp_output_dir) == ["CLOSESTRATEGY;Sim101;;;;;;;;;;;sid-bnb"]
+        assert [r["sid"] for r in st._ledger_entries("Sim101", "NQ 06-26")] == ["sid-reg"]
+
+        # And bnb's re-entry stacks back in next to regime's position.
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        _, _, written = self._dispatch(p_bnb, ENV_BNB, tmp_output_dir)
+        assert written == ["Sim101"]
+        sids = [r["sid"] for r in st._ledger_entries("Sim101", "NQ 06-26")]
+        assert sids == ["sid-reg", "sid-bnb"]
+
+    def test_opposite_flip_still_resets_the_market(
+            self, ms_on, live_book, tmp_output_dir):
+        # regime holds a long; mss signals SHORT: its close is suppressed
+        # (not its position) but its entry must reset the market first —
+        # close files, settle, then the entry. No netting, no dual brackets.
+        st.active_account = "Sim101"
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", 1)]))
+        st._ledger_note_entry("Sim101", "NQ 06-26", "BUY", 1,
+                              ("regime_routed", ""), "sid-reg")
+        env_mss = {"strategy": "mss_de_composite", "event": "close_position",
+                   "event_id": "ent:m:close"}
+        plans, skipped, _ = self._dispatch(
+            "CLOSEPOSITION;Sim101;NQ 06-26;;;;;;;;;;", env_mss, tmp_output_dir)
+        assert plans == [] and "regime_routed" in skipped[0][1]
+
+        sell = "PLACE;Sim101;NQ 06-26;SELL;1;MARKET;;;DAY;;;Mss;sid-mss"
+        with patch.object(st, "RESET_SETTLE_S", 0.01), \
+             patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(
+                sell, envelope={"strategy": "mss_de_composite",
+                                "event": "entry", "event_id": "ent:m"})
+            assert plans[0]["reset_first"] is True
+            written = _run_plans(plans)
+        assert written == []            # deferred legs report via task
+        files = self._files(tmp_output_dir)
+        # full close (both sizes) first, then the entry — in that order
+        assert files[0].startswith("CLOSEPOSITION;Sim101;NQ 06-26")
+        assert any(f.startswith("CLOSEPOSITION;Sim101;MNQ 06-26") for f in files)
+        assert files[-1] == sell
+        # the reset voided regime's attribution; mss owns the market now
+        assert [r["sid"] for r in st._ledger_entries("Sim101", "NQ 06-26")] == ["sid-mss"]
+
+
+# ── Daily P&L history (calendar) ──────────────────────────────────────
+
+
+def _prow(name, cash, positions=(), managed=True):
+    return {"name": name, "managed": managed, "cash": cash,
+            "positions": list(positions)}
+
+
+def _plive(*rows, ok=True, stale=False):
+    """A /api/live-shaped view with just the fields the tracker reads."""
+    return {"ok": ok, "stale": stale, "accounts": list(rows)}
+
+
+def _ppos(inst, qty, avg=None):
+    return {"instrument": inst, "qty": qty, "avg_price": avg}
+
+
+class TestPnlObserve:
+    D = "2026-09-01"
+
+    def obs(self, live, now, date=None):
+        st._pnl_observe(live, now=now, session_date=date or self.D)
+
+    def day(self, date=None):
+        return st._pnl_month((date or self.D)[:7])["days"].get(date or self.D)
+
+    def test_day_net_is_balance_delta_fees_included(self):
+        self.obs(_plive(_prow("Sim101", 50_000.0)), 100.0)
+        self.obs(_plive(_prow("Sim101", 50_250.5)), 200.0)
+        day = self.day()
+        assert day["pnl"] == 250.5
+        assert day["accounts"]["Sim101"] == {
+            "start": 50_000.0, "last": 50_250.5, "pnl": 250.5}
+
+    def test_close_attributes_cash_delta_and_write_meta(self):
+        self.obs(_plive(_prow("Sim101", 50_000.0)), 100.0)
+        st._pnl_note_open("Sim101", "NQ 09-26",
+                          ("bread_n_butter", "NQ-MacroZoneB"))
+        self.obs(_plive(_prow("Sim101", 49_996.0,
+                              [_ppos("NQ 09-26", 2, 23_450.25)])), 110.0)
+        self.obs(_plive(_prow("Sim101", 50_150.0)), 180.0)
+        day = self.day()
+        assert day["pnl"] == 150.0            # net: commissions included
+        t = day["trades"][0]
+        assert t["symbol"] == "NQ" and t["side"] == "LONG" and t["qty"] == 2
+        assert t["pnl"] == 154.0              # close-window delta
+        assert t["strategy"] == "NQ-MacroZoneB"
+        assert t["entry"] == 23_450.25 and t["opened_ts"] == 110.0
+        assert t["approx"] is False
+        assert ("Sim101", "NQ") not in st._pnl_open_meta
+
+    def test_reversal_closes_the_old_side(self):
+        self.obs(_plive(_prow("Sim101", 50_000.0,
+                              [_ppos("NQ 09-26", 2)])), 100.0)
+        self.obs(_plive(_prow("Sim101", 49_940.0,
+                              [_ppos("NQ 09-26", -2)])), 150.0)
+        t = self.day()["trades"][0]
+        assert t["side"] == "LONG" and t["qty"] == 2 and t["pnl"] == -60.0
+        # the new short is a fresh trade with its own open timestamp
+        assert st._pnl_open_meta[("Sim101", "NQ")]["ts"] == 150.0
+
+    def test_partial_close_keeps_entry_meta(self):
+        self.obs(_plive(_prow("Sim101", 50_000.0)), 90.0)
+        self.obs(_plive(_prow("Sim101", 50_000.0,
+                              [_ppos("NQ 09-26", 3, 23_000.0)])), 100.0)
+        self.obs(_plive(_prow("Sim101", 50_100.0,
+                              [_ppos("NQ 09-26", 1, 23_000.0)])), 160.0)
+        t = self.day()["trades"][0]
+        assert t["qty"] == 2 and t["pnl"] == 100.0
+        meta = st._pnl_open_meta[("Sim101", "NQ")]
+        assert meta["ts"] == 100.0 and meta["avg"] == 23_000.0
+
+    def test_multi_root_close_splits_by_contracts_and_flags_approx(self):
+        self.obs(_plive(_prow("Sim101", 50_000.0,
+                              [_ppos("NQ 09-26", 2), _ppos("GC 12-26", 1)])), 100.0)
+        self.obs(_plive(_prow("Sim101", 50_300.0)), 200.0)
+        trades = sorted(self.day()["trades"], key=lambda t: t["symbol"])
+        assert [t["symbol"] for t in trades] == ["GC", "NQ"]
+        assert trades[0]["pnl"] == 100.0 and trades[1]["pnl"] == 200.0
+        assert all(t["approx"] for t in trades)
+
+    def test_restart_adopts_open_positions_without_minting_trades(self):
+        self.obs(_plive(_prow("Sim101", 50_000.0,
+                              [_ppos("NQ 09-26", 2, 23_100.0)])), 100.0)
+        assert self.day() is None             # nothing happened yet
+        self.obs(_plive(_prow("Sim101", 50_080.0)), 150.0)
+        t = self.day()["trades"][0]
+        assert t["pnl"] == 80.0 and t["strategy"] == ""
+        assert t["opened_ts"] is None and t["entry"] == 23_100.0
+
+    def test_untrusted_snapshots_are_skipped_whole(self):
+        self.obs(_plive(_prow("Sim101", 50_000.0)), 100.0)
+        self.obs(_plive(_prow("Sim101", 49_000.0), ok=False), 110.0)
+        self.obs(_plive(_prow("Sim101", 49_000.0), stale=True), 120.0)
+        day = self.day()
+        assert day is None or day["accounts"]["Sim101"]["last"] == 50_000.0
+
+    def test_quarantined_account_freezes_the_diff(self):
+        self.obs(_plive(_prow("Sim101", 50_000.0,
+                              [_ppos("NQ 09-26", 1)])), 100.0)
+        st._balance_suspect_since["Sim101"] = 1.0
+        # outage renders the account flat at a phantom balance
+        self.obs(_plive(_prow("Sim101", 0.0)), 110.0)
+        assert self.day() is None
+        del st._balance_suspect_since["Sim101"]
+        self.obs(_plive(_prow("Sim101", 50_040.0)), 120.0)
+        t = self.day()["trades"][0]
+        assert t["symbol"] == "NQ" and t["pnl"] == 40.0
+
+    def test_out_of_session_hours_record_nothing(self):
+        with patch.object(st, "get_session_id", lambda: None):
+            st._pnl_observe(_plive(_prow("Sim101", 50_000.0)), now=100.0)
+        assert st._pnl_month("2026-09")["days"] == {}
+
+    def test_zero_cash_never_seeds_a_baseline(self):
+        self.obs(_plive(_prow("Sim101", 0.0)), 100.0)
+        assert self.day() is None
+        self.obs(_plive(_prow("Sim101", 50_000.0)), 110.0)
+        self.obs(_plive(_prow("Sim101", 50_010.0)), 120.0)
+        assert self.day()["accounts"]["Sim101"]["start"] == 50_000.0
+
+    def test_unmanaged_accounts_are_ignored(self):
+        self.obs(_plive(_prow("Other", 99_000.0, managed=False)), 100.0)
+        self.obs(_plive(_prow("Other", 98_000.0, managed=False)), 110.0)
+        assert self.day() is None
+
+    def test_idle_connected_day_hidden_from_month(self):
+        self.obs(_plive(_prow("Sim101", 50_000.0)), 100.0)
+        self.obs(_plive(_prow("Sim101", 50_000.0)), 200.0)
+        assert self.day() is None
+
+    def test_stacked_strategies_join_on_close(self):
+        self.obs(_plive(_prow("Sim101", 50_000.0)), 90.0)
+        st._pnl_note_open("Sim101", "NQ 09-26", ("", "Alpha"))
+        self.obs(_plive(_prow("Sim101", 50_000.0,
+                              [_ppos("NQ 09-26", 1)])), 100.0)
+        st._pnl_note_open("Sim101", "NQ 09-26", ("", "Beta"))
+        self.obs(_plive(_prow("Sim101", 50_000.0,
+                              [_ppos("NQ 09-26", 2)])), 110.0)
+        self.obs(_plive(_prow("Sim101", 50_090.0)), 150.0)
+        assert self.day()["trades"][0]["strategy"] == "Alpha + Beta"
+
+    def test_manual_writes_are_labeled_manual(self):
+        plan = {"account": "Sim101", "strat_ident": ("", ""), "manual": True}
+        st._ledger_note_file(
+            plan, "PLACE;Sim101;NQ 09-26;BUY;1;MARKET;;;DAY;;;NQ_Med;sid1;")
+        assert st._pnl_open_meta[("Sim101", "NQ")]["strategies"] == ["Manual"]
+
+    def test_trade_cap_stops_itemizing_but_net_survives(self):
+        with patch.object(st, "PNL_TRADES_PER_DAY_CAP", 1):
+            self.obs(_plive(_prow("Sim101", 50_000.0,
+                                  [_ppos("NQ 09-26", 1)])), 100.0)
+            self.obs(_plive(_prow("Sim101", 50_010.0)), 110.0)
+            self.obs(_plive(_prow("Sim101", 50_010.0,
+                                  [_ppos("NQ 09-26", 1)])), 120.0)
+            self.obs(_plive(_prow("Sim101", 50_030.0)), 130.0)
+        day = self.day()
+        assert len(day["trades"]) == 1 and day["pnl"] == 30.0
+
+
+class TestPnlPersistence:
+    def test_save_load_roundtrip(self):
+        st._pnl_observe(_plive(_prow("Sim101", 50_000.0)),
+                        now=100.0, session_date="2026-09-01")
+        st._pnl_observe(_plive(_prow("Sim101", 50_100.0)),
+                        now=200.0, session_date="2026-09-01")
+        st._pnl_save(force=True)
+        assert st.PNL_HISTORY_FILE.exists()
+        st._pnl_history = None
+        st._pnl_prev.clear()
+        day = st._pnl_month("2026-09")["days"]["2026-09-01"]
+        assert day["pnl"] == 100.0
+
+    def test_corrupt_file_starts_empty(self):
+        st.PNL_HISTORY_FILE.write_text("{not json")
+        assert st._pnl_month("2026-09")["days"] == {}
+
+    def test_prune_keeps_only_newest_days(self):
+        for i in range(1, 9):
+            st._pnl_observe(_plive(_prow("Sim101", 50_000.0)),
+                            now=100.0, session_date=f"2026-08-{i:02d}")
+            st._pnl_observe(_plive(_prow("Sim101", 50_000.0 + i)),
+                            now=200.0, session_date=f"2026-08-{i:02d}")
+            st._pnl_prev.clear()
+        with patch.object(st, "PNL_HISTORY_MAX_DAYS", 3):
+            st._pnl_save(force=True)
+        kept = sorted(st._pnl_history["days"])
+        assert kept == ["2026-08-06", "2026-08-07", "2026-08-08"]
+
+    def test_month_rollup_filters_and_reports_first(self):
+        for date, cash2 in (("2026-08-29", 50_050.0), ("2026-09-01", 49_900.0)):
+            st._pnl_observe(_plive(_prow("Sim101", 50_000.0)),
+                            now=100.0, session_date=date)
+            st._pnl_observe(_plive(_prow("Sim101", cash2)),
+                            now=200.0, session_date=date)
+            st._pnl_prev.clear()
+        m = st._pnl_month("2026-09")
+        assert m["ok"] is True and list(m["days"]) == ["2026-09-01"]
+        assert m["days"]["2026-09-01"]["pnl"] == -100.0
+        assert m["first"] == "2026-08-29"
+
+
+class TestWebPnl(_WebClient):
+    def _seed(self):
+        st._pnl_observe(_plive(_prow("Sim101", 50_000.0)),
+                        now=100.0, session_date="2026-09-01")
+        st._pnl_observe(_plive(_prow("Sim101", 50_150.0)),
+                        now=200.0, session_date="2026-09-01")
+
+    def test_pnl_requires_token(self, web):
+        self._expect_status(
+            lambda: self._get(web + "/api/pnl?month=2026-09", token=False), 403)
+
+    def test_pnl_month_param_validated(self, web):
+        for bad in ("", "2026-13", "junk", "2026-9"):
+            self._expect_status(
+                lambda: self._get(web + "/api/pnl?month=" + bad), 400)
+
+    def test_pnl_served_with_day_rollup(self, web):
+        self._seed()
+        data = json.loads(self._get(web + "/api/pnl?month=2026-09").read())
+        assert data["ok"] is True and data["month"] == "2026-09"
+        assert data["days"]["2026-09-01"]["pnl"] == 150.0
+        assert data["days"]["2026-09-01"]["accounts"]["Sim101"]["pnl"] == 150.0
+        assert "today" in data and "session" in data
+
+    def test_page_carries_the_pnl_tab(self, web):
+        html = self._get(web + "/").read().decode()
+        assert 'id="viewPnl"' in html and "/api/pnl" in html
