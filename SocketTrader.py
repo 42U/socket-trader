@@ -11579,11 +11579,11 @@ function dayLabel(s){return pdate(s)
   .toLocaleDateString(undefined,{weekday:"long",month:"long",day:"numeric"})}
 function usd(v){return v==null?"—":(v<0?"-$":"+$")+Math.abs(v)
   .toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
-function usdc(v){const a=Math.abs(v),s=v<0?"-$":"+$";
-  if(a>=1e6)return s+(a/1e6).toFixed(2)+"M";
-  if(a>=1e4)return s+(a/1e3).toFixed(1)+"K";
-  if(a>=1e3)return s+(a/1e3).toFixed(2)+"K";
-  return s+a.toFixed(0)}
+function usdc(v){const m=Math.abs(v),s=v<0?"-$":"+$";
+  if(m>=1e6)return s+(m/1e6).toFixed(2)+"M";
+  if(m>=1e4)return s+(m/1e3).toFixed(1)+"K";
+  if(m>=1e3)return s+(m/1e3).toFixed(2)+"K";
+  return s+m.toFixed(0)}
 function pct(v){return v==null?"—":Math.round(v*100)+"%"}
 function held(sec){if(sec==null||sec<0)return "—";
   if(sec<90)return Math.round(sec)+"s";
@@ -11705,7 +11705,7 @@ function breakdown(tr,key){
   return Object.keys(m).map(k=>{
     const s=tradeStats(m[k]);
     return{name:k,n:s.n,wr:s.wr,pnl:s.sum}})
-    .sort((a,b)=>b.pnl-a.pnl)}
+    .sort((x,y)=>y.pnl-x.pnl)}
 
 function breakTable(parent,title,rows){
   const box=el("div");
@@ -11757,7 +11757,7 @@ function renderPnl(){
   const nowMonth=(d.today||"").slice(0,7);
   $("pmNext").disabled=nowMonth&&P.month>=nowMonth;
   const days=d.days||{},keys=Object.keys(days).sort();
-  const allTrades=keys.reduce((a,k)=>a.concat(days[k].trades||[]),[]);
+  const allTrades=keys.reduce((acc,k)=>acc.concat(days[k].trades||[]),[]);
   const net=keys.reduce((s,k)=>s+(days[k].pnl||0),0);
 
   /* hero + stat tiles */
@@ -11830,9 +11830,9 @@ function renderPnl(){
       if(iso===d.today)cell.classList.add("today");
       if(rec){
         const maxAbs=Math.max(...dayVals.map(Math.abs),1);
-        const a=0.08+0.34*Math.min(1,Math.abs(rec.pnl)/maxAbs);
-        if(rec.pnl>0)cell.style.background="rgba(47,191,132,"+a.toFixed(3)+")";
-        else if(rec.pnl<0)cell.style.background="rgba(239,88,101,"+a.toFixed(3)+")";
+        const heat=(0.08+0.34*Math.min(1,Math.abs(rec.pnl)/maxAbs)).toFixed(3);
+        if(rec.pnl>0)cell.style.background="rgba(47,191,132,"+heat+")";
+        else if(rec.pnl<0)cell.style.background="rgba(239,88,101,"+heat+")";
         cell.appendChild(el("span","dpnl",usdc(rec.pnl)));
         const st=tradeStats(rec.trades||[]);
         cell.appendChild(el("span","dsub",
@@ -11873,7 +11873,7 @@ function renderDayPanel(day,date){
   const box=$("pday");clear(box);
   if(!day){box.classList.add("hide");return}
   box.classList.remove("hide");
-  const tr=(day.trades||[]).slice().sort((a,b)=>a.ts-b.ts);
+  const tr=(day.trades||[]).slice().sort((x,y)=>x.ts-y.ts);
   const s=tradeStats(tr);
   const h=el("h2");
   h.appendChild(el("span","pday-title",dayLabel(date)));
@@ -11924,7 +11924,7 @@ function renderDayPanel(day,date){
     const mine=tr.filter(t=>t.account===n);
     return{name:n,n:mine.length,wr:tradeStats(mine).wr,
       pnl:day.accounts[n].pnl!=null?day.accounts[n].pnl:0}})
-    .sort((a,b)=>b.pnl-a.pnl);
+    .sort((x,y)=>y.pnl-x.pnl);
   breakTable(grid,"By account",acctRows);
   box.appendChild(grid);
 
