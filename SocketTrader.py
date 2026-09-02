@@ -11838,7 +11838,14 @@ function renderPnl(){
         cell.appendChild(el("span","dsub",
           st.n+(st.n===1?" trade":" trades")+(st.wr!=null?" · "+pct(st.wr):"")));
         if(iso===P.sel)cell.classList.add("sel");
-        cell.onclick=()=>{P.sel=iso;renderPnl()};
+        /* A click must visibly land somewhere: the drill-down renders in
+           the card BELOW the calendar, which sits off-screen on most
+           windows — without the scroll, clicking the (often already
+           auto-selected) day looks like it did nothing. */
+        cell.onclick=()=>{P.sel=iso;renderPnl();
+          const pd=$("pday");
+          if(!pd.classList.contains("hide"))
+            pd.scrollIntoView({behavior:"smooth",block:"start"})};
         const rows=[[usd(rec.pnl),"net P&L"],[String(st.n),"trades"],
           [pct(st.wr),"win rate"]];
         Object.keys(rec.accounts||{}).slice(0,4).forEach(n=>{
@@ -11852,7 +11859,8 @@ function renderPnl(){
         cell.addEventListener("blur",tipHide);
       }else{
         cell.disabled=true;
-        cell.classList.add(iso>d.today?"future":"mute")}
+        cell.classList.add(iso>d.today?"future":"mute");
+        if(iso<=d.today)cell.title="no trading recorded this day"}
       row.appendChild(cell)}
     const wc=el("div","wcell");
     wc.appendChild(el("span","dnum","Week "+wk));
