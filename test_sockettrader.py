@@ -5,8 +5,11 @@ Run: pytest test_sockettrader.py -v
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import logging
 import os
+import random
 import re
 import tempfile
 import threading
@@ -75,6 +78,7 @@ def reset_session_state():
     """Reset global session state between tests."""
     st.session_start_balances.clear()
     st.session_current_balances.clear()
+    st.session_adjustments.clear()
     st._balance_suspect_since.clear()
     st.session_contracts.clear()
     st.soft_stopped = False
@@ -127,6 +131,29 @@ def reset_session_state():
     st._stagger_placed.clear()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def isolate_log_file():
+    """Never let the suite write into ~/.voidorigin_signals.log.
+
+    Importing SocketTrader attaches a RotatingFileHandler to the real
+    trading log, so without this every line the tests emit lands in a
+    financial record: it burns the 5 MB rotation budget that holds actual
+    trading history, and seeds the file with fake accounts and balances
+    that read as genuine during an incident review. Both happened — a
+    forensic pass over a real P&L discrepancy turned up hundreds of
+    "BALANCE SUSPECT ... Apex1" lines that were nothing but this suite.
+
+    caplog is unaffected: it attaches to the root logger, which this one
+    still propagates to.
+    """
+    st.logger.removeHandler(st._log_handler)
+    try:
+        st._log_handler.close()
+    except Exception:
+        pass
+    yield
+
+
 @pytest.fixture(autouse=True)
 def isolate_pnl_history(tmp_path_factory):
     """Never let the suite touch the real ~/.voidorigin_pnl_history.json.
@@ -137,16 +164,29 @@ def isolate_pnl_history(tmp_path_factory):
     """
     original = st.PNL_HISTORY_FILE
     st.PNL_HISTORY_FILE = tmp_path_factory.mktemp("pnl") / ".voidorigin_pnl_history.json"
+    st.PNL_DIR = tmp_path_factory.mktemp("pnlarchive")
     st._pnl_history = None
+    st._pnl_hot_month = None
+    st._pnl_cache.clear()
+    st._pnl_migrated = False
     st._pnl_prev.clear()
     st._pnl_open_meta.clear()
+    st._pnl_recent.clear()
+    st._pnl_stable.clear()
+    st._pnl_unclassified.clear()
     st._pnl_dirty = False
     st._pnl_last_save = 0.0
     yield
     st.PNL_HISTORY_FILE = original
     st._pnl_history = None
+    st._pnl_hot_month = None
+    st._pnl_cache.clear()
+    st._pnl_migrated = False
     st._pnl_prev.clear()
     st._pnl_open_meta.clear()
+    st._pnl_recent.clear()
+    st._pnl_stable.clear()
+    st._pnl_unclassified.clear()
     st._pnl_dirty = False
 
 
@@ -6076,9 +6116,9 @@ class TestMultiStrategyEndToEnd:
 # ── Daily P&L history (calendar) ──────────────────────────────────────
 
 
-def _prow(name, cash, positions=(), managed=True):
+def _prow(name, cash, positions=(), managed=True, realized=None):
     return {"name": name, "managed": managed, "cash": cash,
-            "positions": list(positions)}
+            "realized": realized, "positions": list(positions)}
 
 
 def _plive(*rows, ok=True, stale=False):
@@ -6096,6 +6136,15 @@ class TestPnlObserve:
     def obs(self, live, now, date=None):
         st._pnl_observe(live, now=now, session_date=date or self.D)
 
+    def settle(self, live, now, date=None):
+        """Poll the same view until the tracker trusts it.
+
+        The transfer identity is only read on a quiet feed — a settlement
+        lag that stalls looks exactly like a still account — so anything
+        asserting on `adj` has to let PNL_SETTLE_POLLS go by."""
+        for i in range(st.PNL_SETTLE_POLLS):
+            self.obs(live, now + i * 0.1, date)
+
     def day(self, date=None):
         return st._pnl_month((date or self.D)[:7])["days"].get(date or self.D)
 
@@ -6105,7 +6154,7 @@ class TestPnlObserve:
         day = self.day()
         assert day["pnl"] == 250.5
         assert day["accounts"]["Sim101"] == {
-            "start": 50_000.0, "last": 50_250.5, "pnl": 250.5}
+            "start": 50_000.0, "last": 50_250.5, "pnl": 250.5, "adj": 0.0}
 
     def test_close_attributes_cash_delta_and_write_meta(self):
         self.obs(_plive(_prow("Sim101", 50_000.0)), 100.0)
@@ -6118,7 +6167,13 @@ class TestPnlObserve:
         assert day["pnl"] == 150.0            # net: commissions included
         t = day["trades"][0]
         assert t["symbol"] == "NQ" and t["side"] == "LONG" and t["qty"] == 2
-        assert t["pnl"] == 154.0              # close-window delta
+        # $154 came back in the close window, $4 went out in the open
+        # window. The round trip owns both, so the trade row and the day
+        # net agree — a trade that only counts the close half reads
+        # better than the balance and walks profit factor above 1 on a
+        # losing month.
+        assert t["pnl"] == 150.0
+        assert t["pnl"] == day["pnl"]
         assert t["strategy"] == "NQ-MacroZoneB"
         assert t["entry"] == 23_450.25 and t["opened_ts"] == 110.0
         assert t["approx"] is False
@@ -6221,6 +6276,154 @@ class TestPnlObserve:
             plan, "PLACE;Sim101;NQ 09-26;BUY;1;MARKET;;;DAY;;;NQ_Med;sid1;")
         assert st._pnl_open_meta[("Sim101", "NQ")]["strategies"] == ["Manual"]
 
+    def test_fill_settling_after_its_close_is_not_lost(self):
+        # NinjaTrader can drop the position from the snapshot a poll before
+        # the cash lands. The close is then seen with no money attached,
+        # and the money turns up where nothing changed. Discarded, that
+        # costs a whole leg — which is why a quiet day of big trades could
+        # drift further from its balance than a busy day of small ones.
+        self.obs(_plive(_prow("A", 1_000.0, realized=0.0)), 100.0)
+        self.obs(_plive(_prow("A", 998.0, [_ppos("NQ 09-26", 1)],
+                              realized=0.0)), 102.0)
+        self.obs(_plive(_prow("A", 998.0, realized=498.0)), 104.0)  # gone, no cash
+        self.settle(_plive(_prow("A", 1_498.0, realized=498.0)), 106.0)  # lands
+        day = self.day()
+        assert [t["pnl"] for t in day["trades"]] == [498.0]
+        assert sum(t["pnl"] for t in day["trades"]) == day["pnl"] == 498.0
+
+    def test_trade_pnl_comes_from_realized_so_commission_is_included(self):
+        # $2 to open, $498 back on the close; NT books the round trip at
+        # $500 net. The row must say what NT says, not the close window.
+        self.obs(_plive(_prow("A", 1_000.0, realized=0.0)), 100.0)
+        self.obs(_plive(_prow("A", 998.0, [_ppos("NQ 09-26", 1)],
+                              realized=0.0)), 102.0)
+        self.settle(_plive(_prow("A", 1_498.0, realized=498.0)), 104.0)
+        assert self.day()["trades"][0]["pnl"] == 498.0
+
+    def test_late_settlement_splits_across_the_legs_it_belongs_to(self):
+        self.obs(_plive(_prow("A", 1_000.0, [_ppos("NQ 09-26", 3),
+                                             _ppos("ES 09-26", 1)],
+                              realized=0.0)), 100.0)
+        self.obs(_plive(_prow("A", 1_000.0, realized=0.0)), 102.0)  # both gone
+        self.obs(_plive(_prow("A", 1_400.0, realized=400.0)), 104.0)  # cash lands
+        rows = {t["symbol"]: t["pnl"] for t in self.day()["trades"]}
+        assert rows == {"NQ": 300.0, "ES": 100.0}       # by contracts, 3:1
+        assert sum(rows.values()) == self.day()["pnl"] == 400.0
+
+    def test_orphan_realized_becomes_an_unseen_row_so_the_day_adds_up(self, caplog):
+        # A whole round trip inside polls nobody saw — a truncated ATI
+        # dump, an outage, a restart. Nothing to hand it to, so a row is
+        # minted rather than letting the day's trades stop adding up.
+        with caplog.at_level(logging.WARNING):
+            self.obs(_plive(_prow("A", 1_000.0, realized=0.0)), 100.0)
+            self.obs(_plive(_prow("A", 1_200.0, realized=200.0)), 102.0)
+        day = self.day()
+        t = day["trades"][0]
+        assert t["unseen"] is True and t["pnl"] == 200.0
+        # NT's amount is real; nothing else about the fill is known, and
+        # none of it may be invented to look like an observed trade.
+        assert t["symbol"] == "" and t["side"] == "" and t["qty"] == 0
+        assert sum(x["pnl"] for x in day["trades"]) == day["pnl"] == 200.0
+        assert any("no poll observed" in r.message for r in caplog.records)
+
+    def test_gap_after_a_restart_lands_on_the_trade_that_earned_it(self):
+        # The real 2026-09-17 shape: a profitable short whose cash reached
+        # the balance after its close, in a window lost before a restart.
+        # In-memory state is gone, but the row is still in the day record,
+        # and that row — not a placeholder — is where the money belongs.
+        hist = st._pnl_load("2026-09")
+        hist["days"][self.D] = {
+            "accounts": {"A": {"start": 1_000.0, "last": 1_000.0,
+                               "start_realized": 0.0}},
+            "trades": [
+                {"ts": 1.0, "account": "A", "symbol": "MNQ", "side": "LONG",
+                 "qty": 1, "strategy": "NQ-MSSComp", "entry": None,
+                 "opened_ts": 0.5, "pnl": -36.88, "approx": False},
+                {"ts": 2.0, "account": "A", "symbol": "MES", "side": "SHORT",
+                 "qty": 1, "strategy": "ES-BreakFail", "entry": None,
+                 "opened_ts": 1.5, "pnl": 5.62, "approx": False},
+                {"ts": 10.0, "account": "A", "symbol": "NQ", "side": "LONG",
+                 "qty": 1, "strategy": "", "entry": None, "opened_ts": 5.0,
+                 "pnl": -170.74, "approx": False},
+                {"ts": 20.0, "account": "A", "symbol": "NQ", "side": "SHORT",
+                 "qty": 1, "strategy": "", "entry": None, "opened_ts": 15.0,
+                 "pnl": -5.74, "approx": False}]}
+        st.session_start_balances["A"] = 1_000.0
+        self.settle(_plive(_prow("A", 1_022.26, realized=22.26)), 100.0)
+        day = self.day()
+        # The short was the winner; recorded as −5.74 it read as a scratch
+        # because only its commission had reached the balance in time.
+        assert [t["pnl"] for t in day["trades"]] == [-36.88, 5.62,
+                                                     -170.74, 224.26]
+        assert day["trades"][-1]["late"] is True     # flagged, not silent
+        assert len(day["trades"]) == 4               # no placeholder minted
+        assert day["pnl"] == 22.26
+        assert sum(t["pnl"] for t in day["trades"]) == pytest.approx(22.26)
+
+    def test_an_unseen_row_is_never_labelled_a_manual_trade(self):
+        # Blank strategy + an opened_ts borrowed from staged entry meta
+        # would otherwise read as a chart trade. It is not one.
+        st._pnl_note_open("A", "NQ 09-26", ("", "Alpha"))
+        self.obs(_plive(_prow("A", 1_000.0, realized=0.0)), 100.0)
+        self.obs(_plive(_prow("A", 1_200.0, realized=200.0)), 102.0)
+        t = self.day()["trades"][0]
+        assert t["unseen"] is True
+        assert t["symbol"] == "NQ"          # staged entry, account is flat
+        assert t["strategy"] == "Alpha"
+
+    def test_late_settlement_never_reaches_across_a_session_boundary(self):
+        self.obs(_plive(_prow("A", 1_000.0, [_ppos("NQ 09-26", 1)],
+                              realized=0.0)), 100.0)
+        self.obs(_plive(_prow("A", 1_500.0, realized=500.0)), 102.0)
+        assert self.day()["trades"][0]["pnl"] == 500.0
+        # New session: realized moves again with no close of its own. It
+        # must not be added to yesterday's row.
+        self.obs(_plive(_prow("A", 1_700.0, realized=700.0)), 200.0,
+                 date="2026-09-02")
+        assert self.day()["trades"][0]["pnl"] == 500.0
+
+    def test_manual_writes_carry_the_surface_that_fired_them(self):
+        # Every surface that dispatches an order names itself, so a blank
+        # label downstream can only mean a trade the app never fired.
+        for source, expect in (("Web UI", "Web UI"), ("Terminal", "Terminal"),
+                               ("", "Manual")):
+            st._pnl_open_meta.clear()
+            plan = {"account": "Sim101", "strat_ident": ("", ""),
+                    "manual": True, "manual_source": source}
+            st._ledger_note_file(
+                plan, "PLACE;Sim101;NQ 09-26;BUY;1;MARKET;;;DAY;;;NQ_Med;sid1;")
+            assert st._pnl_open_meta[("Sim101", "NQ")]["strategies"] == [expect]
+
+    def test_a_chart_trade_stages_no_label_at_all(self):
+        # Taken straight off a NinjaTrader chart: nothing is dispatched, so
+        # nothing is staged, and the tracker only ever sees the position
+        # appear. The blank label plus a real open timestamp is what the UI
+        # reads as Manual.
+        self.obs(_plive(_prow("Sim101", 50_000.0)), 90.0)
+        self.obs(_plive(_prow("Sim101", 50_000.0,
+                              [_ppos("NQ 09-26", 1)])), 100.0)
+        self.obs(_plive(_prow("Sim101", 50_120.0)), 160.0)
+        t = self.day()["trades"][0]
+        assert t["strategy"] == "" and t["opened_ts"] == 100.0
+
+    def test_restart_adopted_position_stays_genuinely_unlabelled(self):
+        # Also blank, but the app never watched it open — the label is lost,
+        # not absent, so the UI must not call this one Manual.
+        self.obs(_plive(_prow("Sim101", 50_000.0,
+                              [_ppos("NQ 09-26", 1)])), 100.0)
+        self.obs(_plive(_prow("Sim101", 50_050.0)), 150.0)
+        t = self.day()["trades"][0]
+        assert t["strategy"] == "" and t["opened_ts"] is None
+
+    def test_web_ui_labels_a_blank_strategy_by_its_open_timestamp(self):
+        # The rule lives in the embedded JS; guard both call sites use it.
+        js = st.WEB_UI_HTML
+        assert 'return t.strategy||' \
+               '(!t.unseen&&t.opened_ts!=null?"Manual":"")}' in js
+        assert "breakdown(tr,stratOf)" in js
+        assert 'td("dim",stratOf(x)' in js       # trade log goes through it
+        assert "t=>t.strategy" not in js      # no unlabelled path left
+
     def test_trade_cap_stops_itemizing_but_net_survives(self):
         with patch.object(st, "PNL_TRADES_PER_DAY_CAP", 1):
             self.obs(_plive(_prow("Sim101", 50_000.0,
@@ -6232,6 +6435,587 @@ class TestPnlObserve:
         day = self.day()
         assert len(day["trades"]) == 1 and day["pnl"] == 30.0
 
+    def test_partial_close_hands_back_only_its_share_of_entry_cost(self):
+        self.obs(_plive(_prow("Sim101", 50_000.0)), 90.0)
+        self.obs(_plive(_prow("Sim101", 49_994.0,      # $6 on to open 3
+                              [_ppos("NQ 09-26", 3)])), 100.0)
+        self.obs(_plive(_prow("Sim101", 50_094.0,      # 2 out, $100 back
+                              [_ppos("NQ 09-26", 1)])), 160.0)
+        self.obs(_plive(_prow("Sim101", 50_144.0)), 200.0)   # runner, $50
+        first, second = self.day()["trades"]
+        assert first["qty"] == 2 and first["pnl"] == 96.0    # 100 − 6×2/3
+        assert second["qty"] == 1 and second["pnl"] == 48.0  # 50 − 6×1/3
+        # whatever the split, the parts still add up to the balance
+        assert first["pnl"] + second["pnl"] == self.day()["pnl"] == 144.0
+
+    def test_trades_reconcile_to_the_net_so_profit_factor_agrees(self):
+        # A winner and a loser that net negative once the cost of getting
+        # on is counted. Profit factor is computed off these rows, so if
+        # they sum positive while the balance says otherwise the month
+        # shows a factor above 1 over a losing period.
+        for cash, pos in ((50_000.0, None), (49_990.0, 1), (50_260.0, None),
+                          (50_250.0, 1), (50_000.0, None)):
+            self.obs(_plive(_prow(
+                "Sim101", cash,
+                [_ppos("NQ 09-26", pos)] if pos else [])), 100.0)
+        day = self.day()
+        assert sum(t["pnl"] for t in day["trades"]) == day["pnl"] == 0.0
+        assert [t["pnl"] for t in day["trades"]] == [260.0, -260.0]
+
+    def test_deposit_is_not_profit(self):
+        self.obs(_plive(_prow("Sim101", 50_000.0, realized=0.0)), 100.0)
+        self.settle(_plive(_prow("Sim101", 51_500.0, realized=0.0)), 200.0)
+        m = st._pnl_month("2026-09")
+        assert self.day() is None          # funding is not a trading day
+        assert m["transfers"] == 1500.0    # but the money is still shown
+
+    def test_withdrawal_is_not_a_loss(self):
+        self.obs(_plive(_prow("Sim101", 50_000.0, realized=0.0)), 100.0)
+        self.settle(_plive(_prow("Sim101", 48_500.0, realized=0.0)), 200.0)
+        m = st._pnl_month("2026-09")
+        assert self.day() is None
+        assert m["transfers"] == -1500.0
+
+    def test_transfer_lands_while_a_position_is_open(self):
+        # Position state alone cannot see this one — nothing opened and
+        # nothing closed, the account just got funded mid-trade.
+        self.obs(_plive(_prow("Sim101", 50_000.0, [_ppos("NQ 09-26", 1)],
+                              realized=0.0)), 100.0)
+        self.obs(_plive(_prow("Sim101", 51_500.0, [_ppos("NQ 09-26", 1)],
+                              realized=0.0)), 200.0)
+        self.settle(_plive(_prow("Sim101", 51_600.0, realized=100.0)), 300.0)
+        day = self.day()
+        assert day["pnl"] == 100.0                       # the trade only
+        assert day["accounts"]["Sim101"]["adj"] == 1500.0
+        assert day["trades"][0]["pnl"] == 100.0
+
+    def test_cash_moving_with_realized_stays_in_pnl(self):
+        # Realized P&L moved with the cash, so a fill is behind it even
+        # though this tracker never saw the position. That is P&L.
+        self.obs(_plive(_prow("Sim101", 50_000.0, realized=0.0)), 100.0)
+        self.settle(_plive(_prow("Sim101", 50_250.0, realized=250.0)), 200.0)
+        assert self.day()["pnl"] == 250.0
+        assert self.day()["accounts"]["Sim101"]["adj"] == 0.0
+
+    def test_no_realized_feed_keeps_the_money_in_pnl(self):
+        # Without RealizedPnL a deposit and an unattributed fill are
+        # indistinguishable. The balance-derived net is authoritative so
+        # that a missed attribution cannot erase a real day — so the safe
+        # reading wins and the money stays in P&L.
+        self.obs(_plive(_prow("Sim101", 50_000.0)), 100.0)
+        self.obs(_plive(_prow("Sim101", 51_500.0)), 200.0)
+        day = self.day()
+        assert day["pnl"] == 1500.0
+        assert day["accounts"]["Sim101"]["adj"] == 0.0
+        assert st._pnl_month("2026-09")["transfers"] == 0.0
+
+    def test_deposit_that_landed_while_the_app_was_down_is_still_found(self):
+        # The case a forward-delta watcher can never see: the money moved
+        # before this process existed, so there is no delta to catch. The
+        # realized identity finds it on the first poll instead — no replay,
+        # nothing to repair by hand. These are the real numbers from the
+        # session that exposed it.
+        hist = st._pnl_load("2026-09")
+        hist["days"]["2026-09-16"] = {          # written by the old tracker:
+            "accounts": {"A": {"start": 143.31, "last": 143.31}},
+            "trades": []}                       # no adj, no start_realized
+        st.session_start_balances["A"] = 143.31
+        st.session_current_balances["A"] = 2002.57
+        # $1,500 in and a $359.26 trade both happened while nothing watched.
+        self.settle(_plive(_prow("A", 2002.57, realized=359.26)), 100.0,
+                    date="2026-09-16")
+        day = st._pnl_month("2026-09")["days"]["2026-09-16"]
+        assert day["accounts"]["A"]["adj"] == 1500.0
+        assert day["pnl"] == 359.26             # not 1859.26
+        assert st.session_pnl("A") == 359.26    # the tile agrees with NT
+
+    def test_withdrawal_that_landed_while_the_app_was_down_is_still_found(self):
+        hist = st._pnl_load("2026-09")
+        hist["days"][self.D] = {
+            "accounts": {"A": {"start": 10_000.0, "last": 10_000.0}},
+            "trades": []}
+        st.session_start_balances["A"] = 10_000.0
+        self.settle(_plive(_prow("A", 8_400.0, realized=-100.0)), 100.0)
+        day = self.day()
+        assert day["accounts"]["A"]["adj"] == -1500.0   # not a $1,600 loss
+        assert day["pnl"] == -100.0
+
+    def test_a_settling_fill_is_never_mistaken_for_a_withdrawal(self):
+        # Between the close and the cash landing, the transfer identity
+        # says the account lost money to the outside. It did not, and that
+        # reading would reach balance_monitor's stop check as profit — so
+        # the feed has to go quiet before the identity is believed.
+        self.settle(_plive(_prow("A", 1_000.0, realized=0.0)), 100.0)
+        self.obs(_plive(_prow("A", 998.0, [_ppos("NQ 09-26", 1)],
+                              realized=0.0)), 110.0)
+        for i in range(2):              # closed; cash has not arrived yet
+            self.obs(_plive(_prow("A", 998.0, realized=498.0)), 120.0 + i)
+        assert (self.day()["accounts"]["A"].get("adj") or 0.0) == 0.0
+        assert st.session_adjustments.get("A", 0.0) == 0.0
+        self.settle(_plive(_prow("A", 1_498.0, realized=498.0)), 130.0)
+        assert (self.day()["accounts"]["A"].get("adj") or 0.0) == 0.0
+
+    def test_reconciliation_is_derived_not_accumulated(self):
+        # Polled every two seconds: an accumulator would stack the same
+        # deposit over and over. Deriving it makes repolling a no-op.
+        st.session_start_balances["A"] = 1_000.0
+        for i in range(5):
+            st._pnl_observe(_plive(_prow("A", 1_000.0, realized=0.0)),
+                            now=100.0 + i, session_date=self.D)
+        for i in range(5):
+            st._pnl_observe(_plive(_prow("A", 2_500.0, realized=0.0)),
+                            now=200.0 + i, session_date=self.D)
+        # Pure funding, so the day is correctly not a trading day at all —
+        # read the stored record and the month's transfer total instead.
+        rec = st._pnl_load("2026-09")["days"][self.D]["accounts"]["A"]
+        assert rec["adj"] == 1500.0                             # not 7500
+        assert self.day() is None
+        assert st._pnl_month(self.D[:7])["transfers"] == 1500.0
+        assert st.session_adjustments["A"] == 1500.0
+
+    def test_entry_commission_on_an_open_position_is_not_a_transfer(self):
+        # Mid-trade, cash has already paid the commission while realized
+        # still books nothing. Reconciling there would flicker $2.87 onto
+        # the calendar as a withdrawal, so it waits until flat.
+        st.session_start_balances["A"] = 1_000.0
+        st._pnl_observe(_plive(_prow("A", 1_000.0, realized=0.0)),
+                        now=100.0, session_date=self.D)
+        st._pnl_observe(_plive(_prow("A", 997.13, [_ppos("NQ 09-26", 1)],
+                                     realized=0.0)),
+                        now=110.0, session_date=self.D)
+        day = self.day()
+        assert (day["accounts"]["A"].get("adj") or 0.0) == 0.0
+        assert day["pnl"] == -2.87        # the commission is real P&L
+
+    def test_reconciliation_needs_realized_and_never_guesses_without_it(self):
+        st.session_start_balances["A"] = 1_000.0
+        st._pnl_observe(_plive(_prow("A", 1_000.0)), now=100.0,
+                        session_date=self.D)
+        st._pnl_observe(_plive(_prow("A", 2_500.0)), now=200.0,
+                        session_date=self.D)
+        day = self.day()
+        assert (day["accounts"]["A"].get("adj") or 0.0) == 0.0
+        assert day["pnl"] == 1500.0       # safe reading: stays in P&L
+
+    def test_unclassifiable_cash_move_warns_once_per_day(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            for i, cash in enumerate((50_000.0, 51_500.0, 53_000.0)):
+                self.obs(_plive(_prow("Sim101", cash)), 100.0 + i)
+        hits = [r for r in caplog.records if "no RealizedPnL" in r.message]
+        assert len(hits) == 1          # said out loud, but only once
+
+
+class TestPnlEntryCommission:
+    """NinjaTrader books an entry's commission into RealizedPnL as the
+    order fills — routinely a poll or more before the position reaches the
+    snapshot. Read naively that is "realized moved, nothing closed", which
+    used to hand the money to the PREVIOUS trade (so every row in the log
+    carried the next trade's entry bill and wore a `late` flag for it), or,
+    for the first entry of a session with no previous trade to take it,
+    mint a phantom `unseen` row for the commission itself."""
+
+    D = "2026-09-01"
+    A = "1632306"
+
+    def obs(self, live, now, date=None):
+        st._pnl_observe(live, now=now, session_date=date or self.D)
+
+    def day(self, date=None):
+        return st._pnl_month((date or self.D)[:7])["days"].get(date or self.D)
+
+    def trades(self):
+        return (self.day() or {}).get("trades", [])
+
+    def quiet(self, cash, realized, t0, n=None):
+        """Hold one reading still long enough for the tracker to trust it."""
+        for i in range(n if n is not None else st.PNL_SETTLE_POLLS):
+            self.obs(_plive(_prow(self.A, cash, realized=realized)), t0 + i)
+
+    def test_entry_commission_lands_on_the_trade_that_paid_it(self):
+        # Flat and quiet, then an entry is dispatched and its commission
+        # reaches RealizedPnL before the position does.
+        self.quiet(586.14, 0.0, 100.0, n=5)
+        st._pnl_note_open(self.A, "MNQ 12-26", ("", "NQ-Sweeper"), now=105.0)
+        self.obs(_plive(_prow(self.A, 585.20, realized=-0.94)), 105.0)
+        assert self.trades() == []      # no phantom for the commission
+        pos = [_ppos("MNQ 12-26", -1, 30_771.25)]
+        self.obs(_plive(_prow(self.A, 585.20, pos, realized=-0.94)), 108.0)
+        # Closes +20.00 gross; NT's realized now carries both commissions.
+        self.obs(_plive(_prow(self.A, 605.20, realized=19.06)), 111.0)
+        t = self.trades()
+        assert len(t) == 1
+        assert t[0]["strategy"] == "NQ-Sweeper"
+        assert t[0]["pnl"] == 19.06     # 20.00 gross less its own 0.94
+        assert not t[0].get("late")     # it is this trade's cost, not drift
+        assert not t[0].get("unseen")
+
+    def test_commission_and_position_arriving_together_still_park(self):
+        # The common case in production: NinjaTrader books the entry
+        # commission in the very poll that first shows the position. Asking
+        # only "is the book flat NOW" missed it, so the first entry of
+        # every session minted a phantom row for its own commission.
+        self.quiet(562.97, 0.0, 100.0, n=5)
+        st._pnl_note_open(self.A, "MNQ 12-26", ("", "Gooping"), now=105.0)
+        pos = [_ppos("MNQ 12-26", -1, 30_790.0)]
+        self.obs(_plive(_prow(self.A, 562.03, pos, realized=-0.94)), 105.0)
+        assert self.trades() == []          # nothing phantom minted
+        self.obs(_plive(_prow(self.A, 590.30, realized=27.33)), 108.0)
+        t = self.trades()
+        assert len(t) == 1 and not t[0].get("unseen")
+        assert t[0]["pnl"] == 27.33         # 28.27 gross less its own 0.94
+        assert not t[0].get("late")
+
+    def test_a_debit_with_a_position_already_on_still_goes_to_the_late_path(self):
+        # Book not flat at the previous poll: realized moving without a
+        # close is the genuinely ambiguous case, and must not be claimed
+        # as some pending entry's cost.
+        self.quiet(1_000.0, 0.0, 100.0, n=4)
+        pos = [_ppos("MES 12-26", -1)]
+        self.obs(_plive(_prow(self.A, 1_000.0, pos, realized=0.0)), 108.0)
+        st._pnl_note_open(self.A, "MNQ 12-26", ("", "Gooping"), now=110.0)
+        self.obs(_plive(_prow(self.A, 999.06, pos, realized=-0.94)), 110.0)
+        meta = st._pnl_open_meta.get((self.A, "MNQ")) or {}
+        assert not meta.get("cost")         # not parked on the pending entry
+
+    def test_a_second_entry_does_not_backdate_its_cost_onto_the_last_trade(self):
+        self.quiet(586.14, 0.0, 100.0, n=5)
+        st._pnl_note_open(self.A, "MNQ 12-26", ("", "NQ-Sweeper"), now=105.0)
+        self.obs(_plive(_prow(self.A, 585.20, realized=-0.94)), 105.0)
+        pos = [_ppos("MNQ 12-26", -1, 30_771.25)]
+        self.obs(_plive(_prow(self.A, 585.20, pos, realized=-0.94)), 108.0)
+        self.obs(_plive(_prow(self.A, 605.20, realized=19.06)), 111.0)
+        # Second entry, well after the first closed.
+        st._pnl_note_open(self.A, "MNQ 12-26", ("", "Gooping"), now=120.0)
+        self.obs(_plive(_prow(self.A, 604.26, realized=18.12)), 120.0)
+        self.obs(_plive(_prow(self.A, 604.26, pos, realized=18.12)), 123.0)
+        self.obs(_plive(_prow(self.A, 594.26, realized=8.12)), 126.0)
+        t = self.trades()
+        assert [x["strategy"] for x in t] == ["NQ-Sweeper", "Gooping"]
+        assert t[0]["pnl"] == 19.06 and not t[0].get("late")
+        assert t[1]["pnl"] == -10.94 and not t[1].get("late")
+        # The whole point of the exercise: the rows still add up to the
+        # balance, they are just attributed to the right trades now.
+        assert round(sum(x["pnl"] for x in t), 2) == round(594.26 - 586.14, 2)
+
+    def test_parked_entry_cost_is_not_read_as_a_settle_up_gap(self):
+        # Cash has moved and no trade row explains it yet. That is exactly
+        # the shape _pnl_settle_session mints an `unseen` row for, and it
+        # must not here — the money is already spoken for.
+        self.quiet(586.14, 0.0, 100.0, n=5)
+        st._pnl_note_open(self.A, "MNQ 12-26", ("", "Gooping"), now=105.0)
+        self.quiet(585.20, -0.94, 105.0, n=6)
+        assert self.trades() == []
+
+    def test_money_arriving_while_an_entry_is_pending_is_not_entry_cost(self):
+        # An entry costs, it never pays. Realized moving UP while flat is
+        # P&L however recently an order went out, and still belongs to the
+        # late-settlement path.
+        self.quiet(1_000.0, 0.0, 100.0, n=5)
+        st._pnl_note_open(self.A, "NQ 09-26", ("", "Alpha"), now=105.0)
+        self.obs(_plive(_prow(self.A, 1_200.0, realized=200.0)), 105.0)
+        t = self.trades()
+        assert len(t) == 1 and t[0]["unseen"] is True
+        assert t[0]["pnl"] == 200.0
+
+
+class TestPnlStagedEntryExpiry:
+    """A dispatched entry is a claim on money that has not arrived yet. It
+    has to expire: an order that never filled once went on lending its
+    market and strategy to unrelated amounts for the rest of the session,
+    which is how a rejected Silver entry came to own a day's largest win
+    and largest loss."""
+
+    D = "2026-09-01"
+    A = "1632306"
+
+    def obs(self, live, now, date=None):
+        st._pnl_observe(live, now=now, session_date=date or self.D)
+
+    def day(self, date=None):
+        return st._pnl_month((date or self.D)[:7])["days"].get(date or self.D)
+
+    def test_a_never_filled_entry_stops_lending_its_name(self):
+        st._pnl_note_open(self.A, "SIL 12-26", ("", "SI-Squeeze"), now=100.0)
+        for i in range(5):
+            self.obs(_plive(_prow(self.A, 586.14, realized=0.0)), 100.0 + i)
+        assert (self.A, "SIL") in st._pnl_open_meta
+        # Long past the point where that order could still fill.
+        late = 100.0 + st.PNL_STAGED_TTL_S + 30
+        self.obs(_plive(_prow(self.A, 586.14, realized=0.0)), late)
+        assert (self.A, "SIL") not in st._pnl_open_meta
+        # An unrelated amount turning up now gets an honest blank, not the
+        # name of an order that never traded.
+        for i in range(st.PNL_SETTLE_POLLS + 1):
+            self.obs(_plive(_prow(self.A, 2_000.0, realized=1_413.86)),
+                     late + 3 + i)
+        rows = self.day()["trades"]
+        assert len(rows) == 1 and rows[0]["unseen"] is True
+        assert rows[0]["symbol"] == "" and rows[0]["strategy"] == ""
+
+    def test_a_slow_fill_inside_the_window_keeps_its_label(self):
+        st._pnl_note_open(self.A, "MNQ 12-26", ("", "Gooping"), now=100.0)
+        for i in range(5):
+            self.obs(_plive(_prow(self.A, 586.14, realized=0.0)), 100.0 + i)
+        # Still inside the window when the position finally shows up.
+        slow = 100.0 + st.PNL_STAGED_TTL_S - 10
+        pos = [_ppos("MNQ 12-26", -1, 30_771.25)]
+        self.obs(_plive(_prow(self.A, 586.14, pos, realized=0.0)), slow)
+        self.obs(_plive(_prow(self.A, 606.14, realized=20.0)), slow + 3)
+        t = self.day()["trades"]
+        assert len(t) == 1 and t[0]["strategy"] == "Gooping"
+
+    def test_an_adopted_position_is_never_expired(self):
+        # A position already open at startup has no staged_ts — dispatch
+        # never put it there. It is real, and must survive the sweep that
+        # clears dead entries.
+        pos = [_ppos("NQ 09-26", 2, 23_100.0)]
+        self.obs(_plive(_prow("Sim101", 50_000.0, pos)), 100.0)
+        assert ("Sim101", "NQ") in st._pnl_open_meta
+        self.obs(_plive(_prow("Sim101", 50_000.0, pos)),
+                 100.0 + st.PNL_STAGED_TTL_S + 60)
+        assert ("Sim101", "NQ") in st._pnl_open_meta
+
+    def test_unconfirmed_drops_the_stage_at_once(self):
+        st._pnl_note_open(self.A, "SIL 12-26", ("", "SI-Squeeze"), now=100.0)
+        assert (self.A, "SIL") in st._pnl_open_meta
+        st._pnl_drop_staged(self.A, "SIL 12-26")
+        assert (self.A, "SIL") not in st._pnl_open_meta
+
+    def test_dropping_a_stage_never_touches_an_observed_position(self):
+        pos = [_ppos("MNQ 12-26", -1, 30_771.25)]
+        st._pnl_note_open(self.A, "MNQ 12-26", ("", "Gooping"), now=100.0)
+        self.obs(_plive(_prow(self.A, 586.14, pos, realized=0.0)), 100.0)
+        st._pnl_drop_staged(self.A, "MNQ 12-26")   # a stale confirm timeout
+        assert (self.A, "MNQ") in st._pnl_open_meta
+
+
+class TestTradeStatsExcludeUnseen:
+    """`unseen` rows are bare amounts with no market, side or size. Letting
+    them into the trade statistics is what put a session-rollover artifact
+    on the dashboard as both the largest win and the largest loss."""
+
+    def _body(self):
+        i = st.WEB_UI_HTML.index("function tradeStats(tr)")
+        return st.WEB_UI_HTML[i:i + 1400]
+
+    def test_statistics_are_built_from_observed_rows_only(self):
+        body = self._body()
+        assert "const ob=tr.filter(t=>!t.unseen)" in body
+        for field in ("maxW:", "maxL:", "wins=", "losses="):
+            assert field in body
+        # Every trade-shaped statistic reads `ob`, never the raw list.
+        assert "wins=ob.filter" in body and "losses=ob.filter" in body
+        assert "n:ob.length" in body and "exp:ob.length" in body
+
+    def test_the_sum_still_spans_every_row(self):
+        # The "Fees / unattr" tile is precisely the remainder between the
+        # balance and the rows, so hiding a row from `sum` would invent
+        # drift that is not there.
+        assert "sum:tr.reduce((s,t)=>s+t.pnl,0)" in self._body()
+
+
+class TestPnlLegBoundary:
+    """Trade rows are cut from the CHANGE in net position between polls,
+    so a close and a same-side same-size re-entry inside one interval is
+    arithmetically invisible: -1 then -1, nothing closed, nothing opened.
+    On 2026-09-22 gooping fired four times and the log showed three — the
+    07:15 and 07:35 legs merged into one row carrying the 07:15 entry and
+    a 30-minute hold neither trade had. Dispatch knows a close was fired;
+    the observer has to be told."""
+
+    D, A = "2026-09-01", "1632306"
+    POS = [_ppos("MNQ 12-26", -1, 30_790.0)]
+
+    def obs(self, cash, realized, now, positions=()):
+        st._pnl_observe(_plive(_prow(self.A, cash, positions, realized=realized)),
+                        now=now, session_date=self.D)
+
+    def trades(self):
+        rec = st._pnl_days(self.D[:7]).get(self.D) or {}
+        return rec.get("trades", [])
+
+    def _open_first_leg(self):
+        st._pnl_note_open(self.A, "MNQ 12-26", ("", "Gooping"), now=100.0)
+        self.obs(1_000.0, 0.0, 100.0)
+        self.obs(1_000.0, 0.0, 102.0, self.POS)
+
+    def test_a_close_and_same_side_reentry_are_two_rows(self):
+        self._open_first_leg()
+        # Close fired, then a fresh entry the same way, both between polls.
+        st._pnl_note_close(self.A, "MNQ 12-26", now=104.0)
+        st._pnl_note_open(self.A, "MNQ 12-26", ("", "Gooping"), now=104.5)
+        self.obs(1_020.0, 20.0, 106.0, self.POS)     # first leg made +20
+        self.obs(1_050.0, 50.0, 108.0)               # second leg made +30
+        t = self.trades()
+        assert len(t) == 2, [x["pnl"] for x in t]
+        assert [x["pnl"] for x in t] == [20.0, 30.0]
+        assert [x["strategy"] for x in t] == ["Gooping", "Gooping"]
+        # The second leg is its own trade, not a continuation of the first.
+        assert t[1]["opened_ts"] == 106.0
+        assert t[0]["opened_ts"] == 102.0
+
+    def test_without_the_close_the_position_is_still_one_trade(self):
+        # Same shape, no close dispatched: a position that simply stayed on
+        # must not be split just because the quantity held steady.
+        self._open_first_leg()
+        self.obs(1_000.0, 0.0, 106.0, self.POS)   # still on, nothing booked
+        self.obs(1_050.0, 50.0, 108.0)           # closes once, for +50
+        t = self.trades()
+        assert len(t) == 1 and t[0]["pnl"] == 50.0
+        assert t[0]["opened_ts"] == 102.0
+
+    def test_a_stale_close_flag_never_splits_a_later_trade(self):
+        self._open_first_leg()
+        st._pnl_note_close(self.A, "MNQ 12-26", now=104.0)
+        # Nothing re-entered; the flag ages out well past its window.
+        late = 104.0 + st.PNL_STAGED_TTL_S + 60
+        self.obs(1_000.0, 0.0, late, self.POS)
+        self.obs(1_050.0, 50.0, late + 2)
+        t = self.trades()
+        assert len(t) == 1 and t[0]["pnl"] == 50.0
+
+    def test_a_close_is_only_noted_for_a_position_believed_open(self):
+        # A CLOSEPOSITION on a flat book stages nothing to re-leg.
+        st._pnl_note_close(self.A, "MNQ 12-26", now=100.0)
+        assert (self.A, "MNQ") not in st._pnl_open_meta
+
+
+class TestPhantomPairsHealOnLoad:
+    """The rollover phantoms are fixed at the source, but the rows are
+    already written. They cancel, so stripping both leaves every total
+    exactly where it was — and it happens on load, so the record heals
+    itself on the next restart."""
+
+    def test_a_cancelling_pair_is_dropped_and_totals_hold(self):
+        days = {"2026-09-22": {"accounts": {}, "trades": [
+            {"ts": 100.0, "pnl": 1_413.86, "unseen": True, "symbol": "SIL"},
+            {"ts": 104.0, "pnl": -1_413.86, "unseen": True, "symbol": "SIL"},
+            {"ts": 200.0, "pnl": -27.38, "symbol": "MNQ"},
+        ]}}
+        before = sum(t["pnl"] for t in days["2026-09-22"]["trades"])
+        assert st._pnl_strip_phantom_pairs(days) == 2
+        rows = days["2026-09-22"]["trades"]
+        assert len(rows) == 1 and rows[0]["symbol"] == "MNQ"
+        assert round(sum(t["pnl"] for t in rows), 2) == round(before, 2)
+
+    def test_real_unseen_rows_are_left_alone(self):
+        # Entry commissions are real money that left the account. They do
+        # not cancel, and removing them would stop the day adding up.
+        days = {"2026-09-22": {"accounts": {}, "trades": [
+            {"ts": 100.0, "pnl": -0.94, "unseen": True, "symbol": ""},
+            {"ts": 104.0, "pnl": -2.18, "unseen": True, "symbol": ""},
+        ]}}
+        assert st._pnl_strip_phantom_pairs(days) == 0
+        assert len(days["2026-09-22"]["trades"]) == 2
+
+    def test_observed_trades_that_happen_to_cancel_are_kept(self):
+        # Two real fills can net to zero. Only `unseen` rows are candidates.
+        days = {"2026-09-22": {"accounts": {}, "trades": [
+            {"ts": 100.0, "pnl": 50.0, "symbol": "MNQ"},
+            {"ts": 104.0, "pnl": -50.0, "symbol": "MNQ"},
+        ]}}
+        assert st._pnl_strip_phantom_pairs(days) == 0
+
+    def test_a_pair_too_far_apart_is_not_one_of_these(self):
+        days = {"2026-09-22": {"accounts": {}, "trades": [
+            {"ts": 100.0, "pnl": 500.0, "unseen": True, "symbol": ""},
+            {"ts": 100.0 + st.PNL_PHANTOM_PAIR_S + 60, "pnl": -500.0,
+             "unseen": True, "symbol": ""},
+        ]}}
+        assert st._pnl_strip_phantom_pairs(days) == 0
+
+
+class TestRealizedCounterRestart:
+    """NinjaTrader's RealizedPnL is a session-scoped counter that restarts
+    at zero. Differencing it across that restart reports the whole previous
+    session as one fill, sign inverted — which minted an `unseen` row for
+    the phantom, then its exact negation when the settle-up closed the gap
+    the first had opened. Reproduced from the archive: account 1632306
+    ended 2026-09-21 at -1413.86, and 2026-09-22 opened with a +1413.86 /
+    -1413.86 pair four seconds apart."""
+
+    OLD, NEW, A = "2026-09-21", "2026-09-22", "1632306"
+
+    def obs(self, cash, realized, date, now, positions=()):
+        st._pnl_observe(
+            _plive(_prow(self.A, cash, positions, realized=realized)),
+            now=now, session_date=date)
+
+    def rows(self, date):
+        rec = st._pnl_month(date[:7])["days"].get(date) or {}
+        return rec.get("trades", [])
+
+    def acct(self, date):
+        # The raw day record — _pnl_month is a rollup for the web UI and
+        # does not carry the realized baseline.
+        rec = st._pnl_days(date[:7]).get(date) or {}
+        return (rec.get("accounts") or {}).get(self.A, {})
+
+    def test_the_session_rollover_mints_no_phantom_pair(self):
+        t = 1000.0
+        for _ in range(6):                       # prior session, its total
+            self.obs(586.14, -1413.86, self.OLD, t); t += 2.0
+        for _ in range(8):                       # counter restarts with it
+            self.obs(586.14, 0.0, self.NEW, t); t += 2.0
+        assert self.rows(self.NEW) == []
+        assert self.acct(self.NEW)["start_realized"] == 0.0
+
+    def test_a_restart_off_the_app_boundary_rebaselines_the_day(self):
+        # The day turns over first and NinjaTrader restarts a few polls
+        # later, so the new day was seeded from the OLD counter. Left
+        # alone, every `adj` for the rest of the day is out by a session.
+        t = 1000.0
+        for _ in range(6):
+            self.obs(586.14, -1413.86, self.OLD, t); t += 2.0
+        for _ in range(3):
+            self.obs(586.14, -1413.86, self.NEW, t); t += 2.0
+        assert self.acct(self.NEW)["start_realized"] == -1413.86
+        for _ in range(8):
+            self.obs(586.14, 0.0, self.NEW, t); t += 2.0
+        assert self.rows(self.NEW) == []
+        assert self.acct(self.NEW)["start_realized"] == 0.0
+
+    def test_a_restart_carries_the_days_own_pnl_across(self):
+        # A restart mid-day must not erase what the day already booked:
+        # the baseline moves so that realized-minus-baseline still
+        # describes this session.
+        t = 1000.0
+        for _ in range(4):
+            self.obs(1_000.0, 0.0, self.NEW, t); t += 2.0
+        pos = [_ppos("MNQ 12-26", -1)]
+        self.obs(1_000.0, 0.0, self.NEW, t, pos); t += 2.0
+        self.obs(1_050.0, 50.0, self.NEW, t); t += 2.0     # closed +50
+        assert [r["pnl"] for r in self.rows(self.NEW)] == [50.0]
+        for _ in range(4):                                 # counter restarts
+            self.obs(1_050.0, 0.0, self.NEW, t); t += 2.0
+        # 50.0 of this day's P&L is still on the old counter's side of the
+        # restart, so the new baseline has to sit that far below zero.
+        assert self.acct(self.NEW)["start_realized"] == -50.0
+        assert [r["pnl"] for r in self.rows(self.NEW)] == [50.0]
+
+    def test_a_losing_close_is_never_mistaken_for_a_restart(self):
+        # Realized moving down to zero WITH a position leaving the
+        # snapshot is a trade, not a counter restart.
+        t = 1000.0
+        pos = [_ppos("MNQ 12-26", -1)]
+        for _ in range(3):
+            self.obs(1_050.0, 50.0, self.NEW, t, pos); t += 2.0
+        self.obs(1_000.0, 0.0, self.NEW, t); t += 2.0
+        r = self.rows(self.NEW)
+        assert len(r) == 1 and r[0]["pnl"] == -50.0
+        assert not r[0].get("unseen")
+
+    def test_a_late_settlement_that_misses_zero_is_still_a_fill(self):
+        # Money arriving while flat is the late-settlement case. Only a
+        # reading that lands ON zero from somewhere else is a restart.
+        t = 1000.0
+        for _ in range(4):
+            self.obs(1_000.0, 10.0, self.NEW, t); t += 2.0
+        for _ in range(4):
+            self.obs(1_200.0, 210.0, self.NEW, t); t += 2.0
+        r = self.rows(self.NEW)
+        assert len(r) == 1 and r[0]["pnl"] == 200.0 and r[0]["unseen"] is True
+
 
 class TestPnlPersistence:
     def test_save_load_roundtrip(self):
@@ -6240,27 +7024,122 @@ class TestPnlPersistence:
         st._pnl_observe(_plive(_prow("Sim101", 50_100.0)),
                         now=200.0, session_date="2026-09-01")
         st._pnl_save(force=True)
-        assert st.PNL_HISTORY_FILE.exists()
+        assert (st.PNL_DIR / "2026-09.json").exists()
         st._pnl_history = None
+        st._pnl_hot_month = None
+        st._pnl_cache.clear()
         st._pnl_prev.clear()
         day = st._pnl_month("2026-09")["days"]["2026-09-01"]
         assert day["pnl"] == 100.0
 
-    def test_corrupt_file_starts_empty(self):
-        st.PNL_HISTORY_FILE.write_text("{not json")
-        assert st._pnl_month("2026-09")["days"] == {}
+    def test_a_month_that_will_not_parse_costs_only_that_month(self):
+        # One damaged file must not read as "no history at all", and must
+        # never be overwritten — it is the only copy of that month.
+        st._pnl_observe(_plive(_prow("Sim101", 50_000.0)),
+                        now=100.0, session_date="2026-09-01")
+        st._pnl_observe(_plive(_prow("Sim101", 50_100.0)),
+                        now=200.0, session_date="2026-09-01")
+        st._pnl_save(force=True)
+        broken = st.PNL_DIR / "2026-08.json"
+        broken.write_text("{not json")
+        assert st._pnl_month("2026-08")["days"] == {}          # shown empty
+        assert broken.read_text() == "{not json"               # left for recovery
+        assert st._pnl_month("2026-09")["days"]["2026-09-01"]["pnl"] == 100.0
 
-    def test_prune_keeps_only_newest_days(self):
-        for i in range(1, 9):
-            st._pnl_observe(_plive(_prow("Sim101", 50_000.0)),
-                            now=100.0, session_date=f"2026-08-{i:02d}")
-            st._pnl_observe(_plive(_prow("Sim101", 50_000.0 + i)),
-                            now=200.0, session_date=f"2026-08-{i:02d}")
-            st._pnl_prev.clear()
-        with patch.object(st, "PNL_HISTORY_MAX_DAYS", 3):
+    def test_nothing_is_ever_deleted_however_deep_the_history(self):
+        # The archive has no retention limit at all — this is the whole
+        # point of one file per month instead of one growing file.
+        for month in ("2024-01", "2025-06", "2026-08"):
+            for i in (1, 2):
+                st._pnl_observe(_plive(_prow("Sim101", 50_000.0)),
+                                now=100.0, session_date=f"{month}-0{i}")
+                st._pnl_observe(_plive(_prow("Sim101", 50_000.0 + i)),
+                                now=200.0, session_date=f"{month}-0{i}")
+                st._pnl_prev.clear()
             st._pnl_save(force=True)
-        kept = sorted(st._pnl_history["days"])
-        assert kept == ["2026-08-06", "2026-08-07", "2026-08-08"]
+        assert st._pnl_months() == ["2024-01", "2025-06", "2026-08"]
+        for month in ("2024-01", "2025-06", "2026-08"):
+            assert len(st._pnl_month(month)["days"]) == 2, month
+        assert st._pnl_month("2026-08")["first"] == "2024-01-01"
+        assert st._pnl_month("2026-08")["first_month"] == "2024-01"
+
+    def test_legacy_single_file_is_split_into_months_and_kept(self):
+        st.PNL_HISTORY_FILE.write_text(json.dumps({"v": 1, "days": {
+            "2026-07-15": {"accounts": {"Sim101": {"start": 1.0, "last": 3.0}},
+                           "trades": []},
+            "2026-08-20": {"accounts": {"Sim101": {"start": 3.0, "last": 9.0}},
+                           "trades": []}}}))
+        assert st._pnl_month("2026-07")["days"]["2026-07-15"]["pnl"] == 2.0
+        assert st._pnl_month("2026-08")["days"]["2026-08-20"]["pnl"] == 6.0
+        assert sorted(st._pnl_months()) == ["2026-07", "2026-08"]
+        # the original is a trading record: renamed, never deleted
+        assert not st.PNL_HISTORY_FILE.exists()
+        assert st.PNL_HISTORY_FILE.with_name(
+            st.PNL_HISTORY_FILE.name + ".migrated").exists()
+
+    def test_rolling_into_a_new_month_flushes_the_old_one(self):
+        st._pnl_observe(_plive(_prow("Sim101", 50_000.0)),
+                        now=100.0, session_date="2026-09-30")
+        st._pnl_observe(_plive(_prow("Sim101", 50_400.0)),
+                        now=200.0, session_date="2026-09-30")
+        st._pnl_prev.clear()
+        # first poll of the new month must not strand September in memory
+        st._pnl_observe(_plive(_prow("Sim101", 50_400.0)),
+                        now=300.0, session_date="2026-10-01")
+        assert (st.PNL_DIR / "2026-09.json").exists()
+        assert st._pnl_month("2026-09")["days"]["2026-09-30"]["pnl"] == 400.0
+
+    def test_month_payload_carries_the_account_roster_and_their_transfers(self):
+        # The per-account view needs both — and needs a transfer to survive
+        # a day that gets dropped for containing no trading at all.
+        st._pnl_observe(_plive(_prow("A", 1_000.0, realized=0.0),
+                               _prow("B", 5_000.0, realized=0.0)),
+                        now=100.0, session_date="2026-09-01")
+        for i in range(st.PNL_SETTLE_POLLS):
+            st._pnl_observe(_plive(_prow("A", 2_500.0, realized=0.0),  # deposit
+                                   _prow("B", 5_000.0, realized=0.0)),
+                            now=200.0 + i, session_date="2026-09-01")
+        m = st._pnl_month("2026-09")
+        assert m["accounts"] == ["A", "B"]
+        assert m["transfers_accounts"] == {"A": 1500.0, "B": 0.0}
+        assert m["days"] == {}              # pure funding is not a day
+        assert m["transfers"] == 1500.0     # yet the money is still shown
+
+    def test_the_log_stays_owner_only_across_a_rollover(self, tmp_path):
+        # Chmodding once at startup is not enough — a rollover makes a new
+        # file at the umask, so the LIVE log drifts world-readable while
+        # only the rotated copies stay 0600. It holds account numbers,
+        # balances and per-trade P&L.
+        if st.IS_WINDOWS:
+            pytest.skip("POSIX file modes only")
+        path = tmp_path / "rot.log"
+        h = st._OwnerOnlyRotatingFileHandler(str(path), maxBytes=200,
+                                             backupCount=2, encoding="utf-8")
+        try:
+            h._secure()
+            assert oct(path.stat().st_mode)[-3:] == "600"
+            for i in range(60):          # force several rollovers
+                h.emit(logging.LogRecord("t", logging.INFO, __file__, 1,
+                                         "x" * 40, None, None))
+            assert oct(path.stat().st_mode)[-3:] == "600"
+            for rotated in tmp_path.glob("rot.log.*"):
+                assert oct(rotated.stat().st_mode)[-3:] == "600", rotated
+        finally:
+            h.close()
+
+    def test_web_ui_account_filter_reads_every_number_through_one_path(self):
+        # If the month render reaches into days[k].pnl directly anywhere,
+        # that number silently ignores the account filter.
+        js = st.WEB_UI_HTML
+        for fn in ("function dayPnl(rec)", "function dayAdj(rec)",
+                   "function dayTrades(rec)", "function dayActive(rec)",
+                   "function renderAccts(d)"):
+            assert fn in js, fn
+        assert "days[k].pnl" not in js
+        assert "days[k].trades" not in js
+        assert "rec.pnl||0" in js           # only inside dayPnl's all-branch
+        # "a." stays reserved for live account rows (see check_webui.py)
+        assert "const a=(rec.accounts" not in js
 
     def test_month_rollup_filters_and_reports_first(self):
         for date, cash2 in (("2026-08-29", 50_050.0), ("2026-09-01", 49_900.0)):
@@ -6273,6 +7152,226 @@ class TestPnlPersistence:
         assert m["ok"] is True and list(m["days"]) == ["2026-09-01"]
         assert m["days"]["2026-09-01"]["pnl"] == -100.0
         assert m["first"] == "2026-08-29"
+
+
+class TestPnlInvariants:
+    """Property test: whatever NinjaTrader throws at the tracker, the books
+    must close. Modelled on the broker semantics proven against the live
+    account — realized is prompt and commission-inclusive, cash can lag —
+    with dropped polls, restarts, outage quarantine and a vanishing
+    RealizedPnL feed mixed in. Disabling any one of the attribution fixes
+    makes ~85% of these seeds fail, so it is a test that can actually
+    fail."""
+
+    ROOTS = ("NQ", "ES", "GC")
+    D = "2026-09-10"
+
+    def _sim(self, seed):
+        rnd = random.Random(seed)
+        cash, realized, transfers = 10_000.0, 0.0, 0.0
+        pos, lots, queue = {}, {}, []
+        now = 100.0
+
+        def emit(dc, dr):
+            queue.append([rnd.choice([0, 0, 0, 1, 2]), dc,
+                          rnd.choice([0, 0, 0, 0, 1]), dr])
+
+        def tick():
+            rc, rr = cash, realized
+            for it in queue:
+                if it[0] > 0:
+                    rc -= it[1]
+                if it[2] > 0:
+                    rr -= it[3]
+            for it in queue:
+                it[0] = max(0, it[0] - 1)
+                it[2] = max(0, it[2] - 1)
+            queue[:] = [i for i in queue if i[0] or i[2]]
+            return round(rc, 2), round(rr, 2)
+
+        def poll(rc, rr, realized_missing=False):
+            st._pnl_observe({"ok": True, "stale": False, "accounts": [{
+                "name": "A", "managed": True, "cash": rc,
+                "realized": None if realized_missing else rr,
+                "positions": [{"instrument": k + " 12-26", "qty": v,
+                               "avg_price": 100.0}
+                              for k, v in pos.items() if v]}]},
+                now=now, session_date=self.D)
+
+        st.session_start_balances["A"] = cash
+        poll(cash, 0.0)
+        for _ in range(rnd.randint(8, 50)):
+            act = rnd.random()
+            if act < 0.30:                                   # open
+                root, qty = rnd.choice(self.ROOTS), rnd.choice([1, 1, 2, 3])
+                pos[root] = pos.get(root, 0) + qty
+                for _ in range(qty):
+                    c = round(rnd.uniform(1.0, 3.0), 2)
+                    lots.setdefault(root, []).append(c)
+                    cash -= c
+                    emit(-c, 0.0)
+            elif act < 0.62 and pos:                         # close
+                root = rnd.choice(list(pos))
+                held = pos[root]
+                qty = rnd.choice([1, 1, abs(held)])
+                if qty > abs(held):
+                    qty = abs(held)
+                pos[root] = held - (qty if held > 0 else -qty)
+                if not pos[root]:
+                    pos.pop(root)
+                for _ in range(qty):
+                    ce = lots[root].pop(0)
+                    cx = round(rnd.uniform(1, 3), 2)
+                    gross = round(rnd.uniform(-900, 900), 2)
+                    realized += gross - ce - cx
+                    cash += gross - cx
+                    emit(gross - cx, gross - ce - cx)
+            elif act < 0.68:                                 # transfer
+                amt = round(rnd.choice([1, -1]) * rnd.uniform(50, 2000), 2)
+                cash += amt
+                transfers += amt
+                emit(amt, 0.0)
+            for _ in range(rnd.randint(1, 3)):
+                rc, rr = tick()
+                now += 2.0
+                roll = rnd.random()
+                if roll < 0.12:
+                    continue                          # truncated dump
+                if roll < 0.16:                       # restart
+                    st._pnl_prev.clear(); st._pnl_recent.clear()
+                    st._pnl_open_meta.clear()
+                    continue
+                if roll < 0.19:                       # broker feed down
+                    st._pnl_observe({"ok": True, "stale": True,
+                                     "accounts": []},
+                                    now=now, session_date=self.D)
+                    continue
+                if roll < 0.22:
+                    st._balance_suspect_since["A"] = 1.0
+                else:
+                    st._balance_suspect_since.pop("A", None)
+                poll(rc, rr, realized_missing=rnd.random() < 0.08)
+
+        for root in list(pos):                               # flatten
+            held = pos.pop(root)
+            for _ in range(abs(held)):
+                ce = lots[root].pop(0)
+                cx = round(rnd.uniform(1, 3), 2)
+                gross = round(rnd.uniform(-900, 900), 2)
+                realized += gross - ce - cx
+                cash += gross - cx
+                emit(gross - cx, gross - ce - cx)
+        st._balance_suspect_since.pop("A", None)
+        for _ in range(12):
+            rc, rr = tick()
+            now += 2.0
+            poll(rc, rr)
+        return realized, transfers
+
+    @pytest.mark.parametrize("seed", range(40))
+    def test_books_close_whatever_the_feed_does(self, seed):
+        realized, transfers = self._sim(seed)
+        rec = st._pnl_load("2026-09")["days"][self.D]
+        acct = rec["accounts"]["A"]
+        rows = sum(t["pnl"] for t in rec["trades"])
+        # every dollar of P&L reached a trade row
+        assert rows == pytest.approx(realized, abs=0.02)
+        # and nothing but a transfer was ever called one
+        assert (acct.get("adj") or 0.0) == pytest.approx(transfers, abs=0.02)
+        # so the day net and the rows agree, which is what the UI shows
+        assert acct["last"] - acct["start"] == pytest.approx(
+            realized + transfers, abs=0.02)
+
+
+class TestSessionPnlExcludesTransfers:
+    """A deposit is not profit and a withdrawal is not a loss — including
+    to the stop/target check, where counting one is a risk failure."""
+
+    def test_deposit_is_netted_out_of_session_pnl(self):
+        st.session_start_balances["Sim101"] = 50_000.0
+        st.session_current_balances["Sim101"] = 51_500.0
+        assert st.session_pnl("Sim101") == 1500.0     # before it is known
+        st.session_adjustments["Sim101"] = 1500.0
+        assert st.session_pnl("Sim101") == 0.0
+
+    def test_withdrawal_is_netted_out_of_session_pnl(self):
+        st.session_start_balances["Sim101"] = 50_000.0
+        st.session_current_balances["Sim101"] = 48_500.0
+        st.session_adjustments["Sim101"] = -1500.0
+        assert st.session_pnl("Sim101") == 0.0
+
+    def test_no_baseline_means_no_number(self):
+        st.session_current_balances["Sim101"] = 51_500.0
+        assert st.session_pnl("Sim101") is None
+
+    def test_a_deposit_cannot_push_a_loss_out_of_the_stops_reach(self):
+        # The dangerous direction. Down $600 against a $500 stop with a
+        # $1,000 deposit landing: counted as P&L the account reads +$400
+        # and the stop never fires while the loss keeps running.
+        st.session_start_balances["Sim101"] = 50_000.0
+        st.session_current_balances["Sim101"] = 50_400.0   # −600 then +1000
+        st.session_adjustments["Sim101"] = 1000.0
+        pnl = st.session_pnl("Sim101")
+        assert pnl == -600.0
+        assert pnl <= -500.0            # balance_monitor's stop comparison
+
+    def test_a_deposit_cannot_trip_a_target_nobody_traded_for(self):
+        st.session_start_balances["Sim101"] = 50_000.0
+        st.session_current_balances["Sim101"] = 51_000.0   # purely funding
+        st.session_adjustments["Sim101"] = 1000.0
+        assert not st.session_pnl("Sim101") >= 500.0       # target untouched
+
+    def test_risk_check_refuses_the_flattering_direction(self):
+        st.session_start_balances["Sim101"] = 50_000.0
+        st.session_current_balances["Sim101"] = 49_400.0      # down $600
+        st.session_adjustments["Sim101"] = -500.0             # withdrawal-shaped
+        # The display tells the truth: only $100 of that was trading.
+        assert st.session_pnl("Sim101") == -100.0
+        # The stop check refuses it. Cash a fill owes but has not settled
+        # yet looks identical to a withdrawal, and believing it here would
+        # hold the stop off an account that is actually down $600.
+        assert st.session_pnl("Sim101", risk=True) == -600.0
+
+    def test_risk_check_still_applies_a_deposit(self):
+        st.session_start_balances["Sim101"] = 50_000.0
+        st.session_current_balances["Sim101"] = 51_400.0
+        st.session_adjustments["Sim101"] = 1500.0
+        # A deposit only ever makes the number worse, so it is safe to use.
+        assert st.session_pnl("Sim101", risk=True) == -100.0
+
+    def test_stop_check_compares_the_transfer_adjusted_number(self):
+        # Guards the risk path by construction. Driving one iteration of
+        # balance_monitor would also fire the 4:20 reset, the prop-flat
+        # sweep and the state persist, so the call site is asserted
+        # directly — the same style as the web UI sink guards.
+        src = inspect.getsource(st.balance_monitor)
+        assert "session_pnl(acct, current, risk=True)" in src
+        assert "current - session_start_balances[acct]" not in src
+
+    def test_new_baseline_drops_the_adjustment_it_already_contains(self):
+        st.session_adjustments["Sim101"] = 1500.0
+        st._seed_start_balance("Sim101", 51_500.0)
+        assert "Sim101" not in st.session_adjustments
+
+    def test_reset_clears_adjustments_with_the_baselines(self):
+        st.session_start_balances["Sim101"] = 50_000.0
+        st.session_current_balances["Sim101"] = 51_500.0
+        st.session_adjustments["Sim101"] = 1500.0
+        st.reset_session_pnl()
+        assert st.session_adjustments == {}
+        assert st.session_pnl("Sim101") == 0.0    # baseline is the new zero
+
+    def test_observed_transfer_reaches_the_live_session_number(self):
+        # One deposit, seen once, must move the calendar AND the dashboard
+        # tile — they cannot disagree about the same $1,500.
+        st.session_start_balances["1632306"] = 143.31
+        st._pnl_observe(_plive(_prow("1632306", 143.31, realized=0.0)),
+                        now=100.0, session_date="2026-09-16")
+        for i in range(st.PNL_SETTLE_POLLS):
+            st._pnl_observe(_plive(_prow("1632306", 1643.31, realized=0.0)),
+                            now=200.0 + i, session_date="2026-09-16")
+        assert st.session_adjustments["1632306"] == 1500.0
+        assert st.session_pnl("1632306", 1643.31) == 0.0
 
 
 class TestWebPnl(_WebClient):

@@ -23,7 +23,7 @@ import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.17.0"
+__version__ = "0.17.1"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -175,6 +175,10 @@ def note_connection_up():
 # ---------- Risk management ----------
 session_start_balances: dict[str, float] = {}   # account -> starting balance
 session_current_balances: dict[str, float] = {}  # account -> latest polled CashValue (realized cash)
+# Money that crossed the account boundary since the baseline (deposits
+# positive, withdrawals negative). Subtracted out of every session P&L so a
+# transfer is never read as a trading result — see session_pnl().
+session_adjustments: dict[str, float] = {}      # account -> transferred since baseline
 session_contracts: set[str] = set()              # instruments traded this session
 soft_stopped = False                              # True if soft stop triggered
 hard_stopped = False                              # True if hard stop triggered
@@ -263,6 +267,8 @@ def _seed_start_balance(account: str, cash):
         return
     if account not in session_start_balances and abs(cash) > BALANCE_ZERO_EPS:
         session_start_balances[account] = cash
+        # Anything transferred before this baseline is already inside it.
+        session_adjustments.pop(account, None)
 
 
 def _held_balance(account: str, polled) -> float | None:
@@ -280,6 +286,39 @@ def _held_balance(account: str, polled) -> float | None:
     if held is None and v is not None and math.isfinite(v):
         held = v
     return held
+
+
+def session_pnl(account: str, current: float | None = None,
+                risk: bool = False) -> float | None:
+    """One account's session P&L: the balance move since its baseline, less
+    any money that crossed the account boundary. None without a baseline.
+
+    A deposit is not profit and a withdrawal is not a loss. Netting them out
+    matters most to balance_monitor's stop/target check: counted as P&L, a
+    deposit pushes a real loss out of the stop's reach and can trip a profit
+    target nobody earned, and a withdrawal trips a stop against a position
+    that never lost anything.
+
+    Transfers are identified in _pnl_observe against NinjaTrader's
+    RealizedPnL, so with no such feed this is exactly the old subtraction —
+    it can only ever remove money it has positive evidence about."""
+    start = session_start_balances.get(account)
+    if current is None:
+        current = session_current_balances.get(account)
+    if start is None or current is None:
+        return None
+    adj = session_adjustments.get(account, 0.0)
+    if risk and adj < 0:
+        # Asked on behalf of the stop check, where the two directions do
+        # not cost the same. A deposit (adj > 0) held out of P&L only ever
+        # makes the number worse, so it is safe to apply. A withdrawal
+        # (adj < 0) makes it BETTER, and cash owed by a fill that has not
+        # settled yet is indistinguishable from one — so a mis-read there
+        # would hold a stop off a losing account. Refusing the flattering
+        # direction costs at worst an early stop on a real withdrawal,
+        # which is the failure worth having.
+        adj = 0.0
+    return current - start - adj
 
 # Auto-reset: futures session ends ~4:15 PM ET, reset P&L at 4:20 PM ET
 try:
@@ -361,6 +400,9 @@ def save_session_state():
     cfg["session"] = {
         "id": session_id,
         "start_balances": dict(session_start_balances),
+        # Without this a crash mid-session would resurrect the baseline but
+        # not the transfer, and the deposit would read as profit again.
+        "adjustments": dict(session_adjustments),
         "contracts": list(session_contracts),
         "signal_count": signal_count,
         "rr": {"pool": sorted(roundrobin_accounts),
@@ -404,6 +446,15 @@ def restore_session_state() -> bool:
                 continue
             if math.isfinite(bal) and abs(bal) > BALANCE_ZERO_EPS:
                 session_start_balances[name] = bal
+        for name, adj in (saved.get("adjustments") or {}).items():
+            try:
+                adj = float(adj)
+            except (TypeError, ValueError):
+                continue
+            # Only where the baseline itself came back: an adjustment whose
+            # baseline was refused would net against the wrong number.
+            if math.isfinite(adj) and name in session_start_balances:
+                session_adjustments[name] = adj
         session_contracts.update(saved.get("contracts", []))
         signal_count = saved.get("signal_count", 0)
         # Resume the round-robin rotation only if the pool is unchanged —
@@ -476,6 +527,9 @@ def reset_session_pnl():
             session_start_balances[name] = bal
         else:
             session_start_balances.pop(name, None)
+    # Every baseline just moved to the current balance, so whatever was
+    # transferred before now sits inside it and must not be netted out twice.
+    session_adjustments.clear()
     _no_baseline_warned.clear()
     session_contracts.clear()
     account_stops.clear()
@@ -603,16 +657,42 @@ LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per file
 LOG_BACKUP_COUNT = 3             # keep 3 rotated copies (.log.1, .log.2, .log.3)
 logger = logging.getLogger("sockettrader")
 logger.setLevel(logging.INFO)
-_log_handler = logging.handlers.RotatingFileHandler(
+
+
+class _OwnerOnlyRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler that keeps the log owner-only across rollovers.
+
+    Chmodding once at startup is not enough: every rollover creates a
+    brand new file at the process umask, so the live log drifts back to
+    world-readable while only the rotated copies stay 0600. This file
+    carries account numbers, balances and per-trade P&L, so the mode is
+    re-applied to each new file as it is opened.
+    """
+
+    def _secure(self):
+        if IS_WINDOWS:
+            return
+        try:
+            os.chmod(self.baseFilename, 0o600)
+        except OSError:
+            pass          # logging must never take the app down
+
+    def _open(self):
+        stream = super()._open()
+        self._secure()
+        return stream
+
+    def doRollover(self):
+        super().doRollover()
+        self._secure()
+
+
+_log_handler = _OwnerOnlyRotatingFileHandler(
     str(LOG_FILE), maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"
 )
 _log_handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 logger.addHandler(_log_handler)
-if not IS_WINDOWS:
-    try:
-        os.chmod(LOG_FILE, 0o600)
-    except OSError:
-        pass
+_log_handler._secure()
 
 # ---------- Duplicate detection ----------
 # Track recent signal IDs (the unique number at the end of each signal)
@@ -1782,7 +1862,8 @@ def publisher_envelope_of(msg: str) -> dict:
 
 
 def plan_signal_legs(signal_text: str, pub_strategy: str = "",
-                     manual: bool = False, envelope: dict | None = None
+                     manual: bool = False, envelope: dict | None = None,
+                     source: str = ""
                      ) -> tuple[list[dict], list[tuple[str, str]]]:
     """Resolve one canonical signal into per-account leg plans.
 
@@ -2042,6 +2123,9 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = "",
             "note": meta["note"],
             "rr_pick": is_rr_pick,
             "manual": manual,
+            # Which surface fired it, so the P&L calendar can tell a click
+            # in the web UI from one in the terminal from a chart trade.
+            "manual_source": source,
             "prop": prop,
             "cbo": cbo,
             "reset_first": reset_first,
@@ -2419,9 +2503,11 @@ def _ledger_note_file(plan: dict, sig: str):
         _ledger_note_entry(account, parts[2], parts[3], parts[4], ident,
                            parts[12], reset=(cmd == "REVERSEPOSITION"))
         _pnl_note_open(account, parts[2], ident,
-                       manual=bool(plan.get("manual")))
+                       manual=bool(plan.get("manual")),
+                       source=plan.get("manual_source") or "")
     elif cmd == "CLOSEPOSITION" and len(parts) >= 3 and parts[2]:
         _ledger_clear(account, parts[2])
+        _pnl_note_close(account, parts[2])
     elif cmd == "CLOSESTRATEGY" and len(parts) >= 13 and parts[12]:
         _ledger_prune_sids(account, {parts[12]})
 
@@ -3363,7 +3449,7 @@ def _ai_context(plan: dict) -> dict:
     start = session_start_balances.get(account)
     current = session_current_balances.get(account)
     if start is not None and current is not None:
-        ctx["session_pnl_usd"] = round(current - start, 2)
+        ctx["session_pnl_usd"] = round(session_pnl(account, current), 2)
     try:
         positions = query_nt_positions(account, nt_port)
         ctx["open_position_this_instrument"] = positions.get(plan["instrument"], 0)
@@ -4019,10 +4105,6 @@ def find_ninjatrader_incoming(deep_scan: bool = True) -> str | None:
             return found
 
     return None
-
-
-# Back-compat alias for any external callers
-find_ninjatrader_incoming_windows = find_ninjatrader_incoming
 
 
 def detect_or_ask_directory(cfg: dict) -> str | None:
@@ -5098,7 +5180,7 @@ def _build_controls_line():
         stale = "  ⚠ stale" if active_account in _balance_suspect_since else ""
         stale_colored = (Fore.YELLOW + stale + Fore.CYAN + Style.DIM) if stale else ""
         if start is not None and current is not None:
-            pnl = current - start
+            pnl = session_pnl(active_account, current)
             pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
             acct_info = f"{lead}: ${current:,.2f} (${pnl:+,.2f}){stale}"
             acct_info_colored = f"{lead}: ${current:,.2f} (" + pnl_color + f"${pnl:+,.2f}" + Fore.CYAN + Style.DIM + ")" + stale_colored
@@ -5222,7 +5304,6 @@ DASH_SIGNAL_COUNT = 5        # visible signal slots
 DASH_ROW_SEP2 = 7            # ─── separator ───  (SIGNAL_START + COUNT)
 DASH_ROW_MOTD = 8            # server MOTD / maintenance notices
 DASH_ROW_ALERT = 9           # system alerts / fill confirmations
-DASH_TOTAL_ROWS = 10
 
 _signal_buffer: deque[str] = deque(maxlen=DASH_SIGNAL_COUNT)
 _motd_text = ""
@@ -5455,9 +5536,6 @@ async def boot_sequence():
 
 
 # ---------- Animated signal pulse ----------
-PULSE_FRAMES = ["·", "•", "●", "◉", "●", "•", "·", " "]
-
-
 async def signal_pulse(label="SIGNAL RECEIVED"):
     _dash_set_alert(Fore.GREEN + f"  ● {label}" + Style.RESET_ALL, stamp=False)
     await asyncio.sleep(0.4)
@@ -6836,7 +6914,7 @@ async def show_balances():
             marker = ""
         start = session_start_balances.get(name)
         if start is not None:
-            pnl = cash - start
+            pnl = session_pnl(name, cash)
             pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
             line = f"{name.ljust(max_name)}  ${cash:>12,.2f}  "
             pnl_str = f"P&L: ${pnl:+,.2f}{marker}"
@@ -7734,12 +7812,17 @@ def build_manual_signal(side, instrument, qty, order_type: str = "market",
 
 
 async def submit_manual_trade(side, instrument, qty, order_type: str = "market",
-                              limit_price=None, atm: str = ""
+                              limit_price=None, atm: str = "",
+                              source: str = "Manual"
                               ) -> tuple[bool, str]:
     """Fire a manual order through the normal dispatch pipeline.
 
     Returns (ok, message) for the terminal and web UI alike. Session locks
     block it; pause does not (pause mutes the publisher, not the trader).
+
+    `source` names the surface that fired it and becomes the trade's label
+    on the P&L calendar, so hand-fired trades stay separable by where they
+    came from instead of collapsing into one bucket.
     """
     global signal_count
     if hard_stopped:
@@ -7752,7 +7835,7 @@ async def submit_manual_trade(side, instrument, qty, order_type: str = "market",
                                       limit_price, atm)
     if err:
         return False, err
-    plans, skipped = plan_signal_legs(signal, manual=True)
+    plans, skipped = plan_signal_legs(signal, manual=True, source=source)
     if not plans:
         why = ", ".join(f"{a}: {r}" for a, r in skipped[:3]) or "no eligible accounts"
         return False, f"no legs to fire — {why}"
@@ -7831,7 +7914,8 @@ async def manual_trade_menu():
         if confirm != "y":
             print(Fore.WHITE + Style.DIM + "  Cancelled." + Style.RESET_ALL)
             return
-        ok, msg = await submit_manual_trade(raw_side, instr, qty, otype, price, atm)
+        ok, msg = await submit_manual_trade(raw_side, instr, qty, otype, price,
+                                            atm, source="Terminal")
         if ok:
             _last_manual["instrument"] = str(instr).strip().upper()
             try:
@@ -7916,6 +8000,11 @@ def check_pending_confirms():
                 logger.warning(f"UNCONFIRMED  id={entry['id']}  {instrument}  "
                                f"{entry['action']}  pos unchanged at {pre_pos}, "
                                f"balance unchanged  elapsed={elapsed:.1f}s")
+                # No position and no money moved, so there is nothing for
+                # the P&L record to wait on. Left staged, this dead entry
+                # keeps its slot and can hand its market and strategy to an
+                # unrelated amount hours later.
+                _pnl_drop_staged(active_account, instrument)
                 continue  # drop from pending
 
             still_pending.append(entry)
@@ -8266,7 +8355,10 @@ async def balance_monitor():
                 if limits["target"] == 0 and limits["stop"] == 0:
                     continue
 
-                pnl = current - session_start_balances[acct]
+                # Transfers netted out: a deposit counted as profit pushes a
+                # real loss out of the stop's reach, and trips a target that
+                # was never traded for.
+                pnl = session_pnl(acct, current, risk=True)
 
                 # Check stop (loss limit)
                 if limits["stop"] != 0 and pnl <= limits["stop"]:
@@ -8512,7 +8604,7 @@ async def listen(token: str):
                     for name in session_start_balances:
                         cur = session_current_balances.get(name)
                         if cur is not None:
-                            pnl_parts.append(f"{name}: ${cur - session_start_balances[name]:+,.2f}")
+                            pnl_parts.append(f"{name}: ${session_pnl(name, cur):+,.2f}")
                     _dash_set_alert(
                         Fore.CYAN + Style.BRIGHT +
                         f"  🔄  Session P&L restored ({', '.join(pnl_parts) if pnl_parts else 'no data'})" +
@@ -9005,7 +9097,7 @@ def web_state() -> dict:
             role = "round-robin"
         start = session_start_balances.get(name)
         current = session_current_balances.get(name)
-        pnl = (current - start) if (start is not None and current is not None) else None
+        pnl = session_pnl(name, current)
         accounts.append({
             "name": name, "role": role, "start": start, "current": current,
             "pnl": pnl, "stop": account_stops.get(name),
@@ -9446,15 +9538,6 @@ async def _web_set_favorites(raw) -> tuple[bool, str]:
     return True, f"{len(favs[:12])} favourite(s) saved"
 
 
-def _web_nt_accounts() -> list[str]:
-    """Account names NinjaTrader reports, for click-to-pick in the web UI."""
-    try:
-        return [a["name"] for a in query_nt_accounts(nt_port)]
-    except Exception as exc:
-        logger.error(f"WEB NT ACCOUNTS  {exc}")
-        return []
-
-
 _live_cache: dict = {"ts": 0.0, "data": None}
 LIVE_ZERO_FREEZE_S = 180        # how long zeroed AccountItems freeze the live view
 _live_zeroed_since: float | None = None   # wall-clock start of the current zeroed run
@@ -9527,14 +9610,16 @@ def web_live(force: bool = False) -> dict:
                 role = ""
             start = session_start_balances.get(name)
             cash = _held_balance(name, info.get("cash"))  # outage zeros → last known
-            session_pnl = (cash - start) if (start is not None and cash is not None) else None
+            # Named apart from session_pnl() deliberately: binding the name
+            # locally here would shadow the function for the whole scope.
+            sess_pnl = session_pnl(name, cash)
             rows.append({
                 "name": name,
                 "role": role,
                 "managed": name in managed,
                 "cash": cash,
                 "realized": info.get("realized"),
-                "session_pnl": session_pnl,
+                "session_pnl": sess_pnl,
                 "working": snap["working"].get(name, 0),
                 "stop": account_stops.get(name),
                 "profile": profile_summary(name),
@@ -9664,103 +9749,448 @@ def _live_totals(rows: list[dict]) -> dict:
 #
 # Two layers, deliberately separate in trustworthiness:
 #   · The per-day per-account NET (last cash − first cash of the session
-#     date) is authoritative — same source and same definition as the
-#     session P&L tile, fees included, no attribution involved.
+#     date, less money that crossed the account boundary) is authoritative
+#     — same source and same definition as the session P&L tile, fees
+#     included, no attribution involved.
 #   · Trades are the drill-down: when an (account, root) position shrinks
 #     between observations, the account's cash delta over that window is
 #     attributed to the root(s) that closed. One root closing (the normal
 #     case) is exact; several roots closing inside one poll window split
 #     the delta by closed contracts and are flagged "approx". The day's
-#     Σtrades can differ from the net by entry commissions and drift — the
-#     UI shows that remainder as its own line instead of hiding it.
+#     Σtrades can still differ from the net by drift — the UI shows that
+#     remainder as its own line instead of hiding it.
+#
+# Every cash movement lands in exactly one of three buckets, because a
+# dollar that belongs to none of them is a dollar that makes the headline
+# net and the trade-derived stats disagree with no way to see why:
+#   · a window that CLOSES something → that trade's P&L;
+#   · a window that only OPENS something → entry cost, parked on the
+#     position and paid back into the trade when it closes;
+#   · a window with no position activity at all → a transfer (deposit,
+#     withdrawal, fee sweep), held out of P&L and reported separately.
 #
 # Days are keyed by get_session_id() (the CME close date), so Sunday-night
 # trades land on Monday like every other session number in the app.
 
-PNL_HISTORY_FILE = Path.home() / ".voidorigin_pnl_history.json"
-PNL_HISTORY_MAX_DAYS = 400      # ~13 months of calendar history
+# The record is kept as ONE FILE PER MONTH under PNL_DIR, forever. Three
+# reasons it is not one growing file:
+#   · Nothing is ever deleted. A single file had to be pruned to stay a
+#     sane size to load and rewrite; a month only ever rewrites itself, so
+#     the archive can keep every year of it for the cost of one small file.
+#   · Paging back a month reads that month — about 50 KB — instead of
+#     every day ever recorded, so browsing stays flat no matter how deep
+#     the history gets.
+#   · A file that cannot be parsed costs one month, not the whole record,
+#     and is never overwritten unless that month is the live one.
+PNL_DIR = Path.home() / ".voidorigin_pnl"
+PNL_HISTORY_FILE = Path.home() / ".voidorigin_pnl_history.json"   # legacy, migrated once
 PNL_TRACK_INTERVAL = 2.0        # seconds between live-view observations
 PNL_SAVE_MIN_GAP_S = 10.0       # batch disk writes; data loss window is tiny
 PNL_TRADES_PER_DAY_CAP = 2000   # runaway guard — a real day is nowhere close
+PNL_SETTLE_POLLS = 3            # quiet polls before the transfer identity is trusted
+PNL_MONTH_CACHE = 6             # past months held in memory while paging
+# How long a dispatched entry may sit unfilled before the record stops
+# believing in it. NinjaTrader books an entry's commission into RealizedPnL
+# before the position reaches the snapshot, so there is always a window
+# where money has moved and no position explains it; inside this window it
+# is read as that order's entry cost. Generous against CONFIRM_TIMEOUT so a
+# slow fill keeps its strategy label, and bounded so a never-filled order
+# cannot keep claiming money — or lending its name to it — all session.
+PNL_STAGED_TTL_S = 120.0
+# How far apart two `unseen` rows may sit and still be read as one
+# rollover artifact and its negation. They were minted a poll or two
+# apart; this is generous against that and far short of anything a pair
+# of real fills would do.
+PNL_PHANTOM_PAIR_S = 30.0
 
 _pnl_lock = threading.Lock()    # history is read from web threads, fed by the loop
-_pnl_history: dict | None = None            # {"v": 1, "days": {date: {...}}}
+_pnl_history: dict | None = None            # LIVE month only: {"v": 2, "days": {...}}
+_pnl_hot_month: str | None = None           # which month _pnl_history holds
+_pnl_cache: "OrderedDict[str, dict]" = OrderedDict()   # past month -> days, for paging
+_pnl_migrated = False                       # legacy split attempted this run
 _pnl_prev: dict[str, dict] = {}             # account -> {"cash", "shape"} last observed
 _pnl_open_meta: dict[tuple[str, str], dict] = {}  # (account, ROOT) -> entry meta
+# account -> (session date, the rows written for its most recent close), so
+# a fill whose cash lands a poll after the position vanished can still be
+# handed to the trade that earned it instead of falling on the floor.
+_pnl_recent: dict[str, tuple[str, list[dict]]] = {}
+# account -> [cash, realized, consecutive polls unchanged]. Guards the
+# transfer identity against being read mid-settlement — see _pnl_observe.
+_pnl_stable: dict[str, list] = {}
 _pnl_dirty = False
 _pnl_last_save = 0.0
 
 
-def _pnl_load() -> dict:
-    """The history dict, loaded from disk once and cached. Never raises."""
-    global _pnl_history
-    with _pnl_lock:
-        if _pnl_history is not None:
-            return _pnl_history
-        data: dict = {}
-        try:
-            if PNL_HISTORY_FILE.exists():
-                with open(PNL_HISTORY_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.error(f"PNL HISTORY  load failed ({exc}) — starting empty")
-        days = data.get("days")
-        _pnl_history = {"v": 1, "days": days if isinstance(days, dict) else {}}
-        return _pnl_history
+_PNL_SHARD_RE = re.compile(r"^\d{4}-\d\d$")
 
 
-def _pnl_save(force: bool = False):
-    """Atomically persist the history when dirty (throttled unless forced)."""
-    global _pnl_dirty, _pnl_last_save
-    with _pnl_lock:
-        if _pnl_history is None or not _pnl_dirty:
-            return
-        if not force and time.monotonic() - _pnl_last_save < PNL_SAVE_MIN_GAP_S:
-            return
-        # Prune ancient days so the file cannot grow without bound.
-        days = _pnl_history["days"]
-        for stale_key in sorted(days)[:-PNL_HISTORY_MAX_DAYS]:
-            del days[stale_key]
-        payload = json.dumps(_pnl_history)
-        _pnl_dirty = False
-        _pnl_last_save = time.monotonic()
+def _pnl_shard(month: str) -> Path:
+    return PNL_DIR / f"{month}.json"
+
+
+def _pnl_dir_ready() -> bool:
+    """Make sure the archive directory exists and is private. Never raises."""
     try:
-        fd, tmp = tempfile.mkstemp(
-            dir=str(PNL_HISTORY_FILE.parent), suffix=".tmp", prefix=".voidorigin_"
-        )
+        PNL_DIR.mkdir(parents=True, exist_ok=True)
+        if not IS_WINDOWS:
+            os.chmod(PNL_DIR, 0o700)
+        return True
+    except OSError as exc:
+        logger.error(f"PNL HISTORY  archive directory unusable ({exc})")
+        return False
+
+
+def _pnl_read_shard(month: str) -> dict:
+    """One month's day records, {} when there are none. Never raises.
+
+    A month that will not parse is reported and served empty rather than
+    taken as "no history" for everything — and because only the live
+    month is ever written, a damaged old month is never overwritten."""
+    try:
+        with open(_pnl_shard(month), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.error(f"PNL HISTORY  {month} could not be read ({exc}) — that "
+                     "month shows empty; the file is left alone for recovery")
+        return {}
+    days = data.get("days") if isinstance(data, dict) else None
+    if not isinstance(days, dict):
+        return {}
+    healed = _pnl_strip_phantom_pairs(days)
+    if healed:
+        logger.info(
+            f"PNL HISTORY  {month}: dropped {healed} rollover phantom row(s) "
+            "left by the RealizedPnL counter restart — they cancelled, so "
+            "every total is unchanged")
+    return days
+
+
+def _pnl_write_shard(month: str, payload: str):
+    """Atomically replace one month's file. Never raises."""
+    if not _pnl_dir_ready():
+        return
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(PNL_DIR), prefix=".pnl", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(payload)
             if not IS_WINDOWS:
                 os.chmod(tmp, 0o600)
-            os.replace(tmp, PNL_HISTORY_FILE)
+            os.replace(tmp, _pnl_shard(month))
         except BaseException:
             os.unlink(tmp)
             raise
     except OSError as exc:
-        logger.error(f"PNL HISTORY  save failed: {exc}")
+        logger.error(f"PNL HISTORY  save failed for {month}: {exc}")
+
+
+def _pnl_months() -> list[str]:
+    """Every month on record, oldest first. Never raises."""
+    try:
+        return sorted(p.stem for p in PNL_DIR.glob("*.json")
+                      if _PNL_SHARD_RE.match(p.stem))
+    except OSError:
+        return []
+
+
+def _pnl_migrate_legacy():
+    """Split the old single-file history into months, once.
+
+    The original file is renamed rather than deleted — it is a trading
+    record, and a migration that eats one is not a migration."""
+    global _pnl_migrated
+    if _pnl_migrated:
+        return
+    _pnl_migrated = True
+    try:
+        if not PNL_HISTORY_FILE.exists():
+            return
+        with open(PNL_HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.error(f"PNL HISTORY  legacy file not migrated ({exc}) — it is "
+                     "left in place untouched")
+        return
+    days = (data or {}).get("days") or {}
+    by_month: dict[str, dict] = {}
+    for date, rec in days.items():
+        if isinstance(date, str) and len(date) >= 7:
+            by_month.setdefault(date[:7], {})[date] = rec
+    for month, recs in by_month.items():
+        merged = dict(recs)
+        merged.update(_pnl_read_shard(month))   # anything already sharded wins
+        _pnl_write_shard(month, json.dumps({"v": 2, "days": merged}))
+    try:
+        PNL_HISTORY_FILE.rename(
+            PNL_HISTORY_FILE.with_name(PNL_HISTORY_FILE.name + ".migrated"))
+    except OSError:
+        pass
+    logger.info(f"PNL HISTORY  migrated {len(days)} day(s) into "
+                f"{len(by_month)} monthly file(s) under {PNL_DIR}")
+
+
+def _pnl_hot(month: str) -> dict:
+    """Day records for `month`, loaded as the live month. Caller holds the lock.
+
+    Switching months flushes the one being left, so a session that rolls
+    over midnight on the 1st cannot strand the previous month's last
+    trades in memory."""
+    global _pnl_history, _pnl_hot_month, _pnl_dirty
+    if _pnl_hot_month == month and _pnl_history is not None:
+        return _pnl_history["days"]
+    if _pnl_dirty and _pnl_hot_month and _pnl_history is not None:
+        _pnl_write_shard(_pnl_hot_month,
+                         json.dumps({"v": 2, "days": _pnl_history["days"]}))
+        _pnl_dirty = False
+    _pnl_migrate_legacy()
+    _pnl_hot_month = month
+    _pnl_history = {"v": 2, "days": _pnl_read_shard(month)}
+    # _pnl_read_shard heals rollover phantoms on the way in; the live month
+    # is the one that gets written back, so make sure the cleaned copy is.
+    _pnl_dirty = True
+    _pnl_cache.pop(month, None)          # the live copy supersedes any cached one
+    return _pnl_history["days"]
+
+
+def _pnl_days(month: str) -> dict:
+    """Day records for any month — live from memory, past from disk.
+    Caller holds the lock."""
+    if _pnl_hot_month == month and _pnl_history is not None:
+        return _pnl_history["days"]
+    _pnl_migrate_legacy()
+    cached = _pnl_cache.get(month)
+    if cached is None:
+        cached = _pnl_read_shard(month)
+        _pnl_cache[month] = cached
+        while len(_pnl_cache) > PNL_MONTH_CACHE:
+            _pnl_cache.popitem(last=False)
+    else:
+        _pnl_cache.move_to_end(month)
+    return cached
+
+
+def _pnl_load(month: str | None = None) -> dict:
+    """The live month's record, hot-loading `month` when one is named.
+
+    Kept as the way to reach the in-memory day map directly; everything
+    that only wants to read a month should use _pnl_month()."""
+    with _pnl_lock:
+        m = month or _pnl_hot_month or (get_session_id() or "")[:7]
+        if not m:
+            return {"v": 2, "days": {}}
+        _pnl_hot(m)
+        return _pnl_history
+
+
+def _pnl_save(force: bool = False):
+    """Atomically persist the live month when dirty (throttled unless forced).
+
+    Only the current month is ever rewritten, so the cost of a save does
+    not grow with the depth of the archive."""
+    global _pnl_dirty, _pnl_last_save
+    with _pnl_lock:
+        if _pnl_history is None or not _pnl_dirty or not _pnl_hot_month:
+            return
+        if not force and time.monotonic() - _pnl_last_save < PNL_SAVE_MIN_GAP_S:
+            return
+        month = _pnl_hot_month
+        payload = json.dumps({"v": 2, "days": _pnl_history["days"]})
+        _pnl_dirty = False
+        _pnl_last_save = time.monotonic()
+    _pnl_write_shard(month, payload)
 
 
 def _pnl_note_open(account: str, instrument: str, ident: tuple[str, str],
-                   manual: bool = False):
+                   manual: bool = False, source: str = "",
+                   now: float | None = None):
     """Stage strategy attribution for an entry the write path just fired.
 
     Called from _ledger_note_file, i.e. inside the dispatch path — it must
     never raise and never do I/O. The observed position (pnl_tracker_task)
     later adopts this label; stacked entries from different strategies on
-    one root accumulate, and the close joins them ("A + B")."""
+    one root accumulate, and the close joins them ("A + B").
+
+    Staging also starts a clock. Until a snapshot actually shows the
+    position, this entry is the only explanation the record has for money
+    NinjaTrader books before the fill becomes visible, and the only name it
+    could lend to an orphaned amount — both of which have to expire, or an
+    order that never filled goes on claiming trades hours later.
+
+    A hand-fired entry is labelled by the surface it came from, so the
+    calendar separates a click in the web UI from one in the terminal.
+    Neither can be confused with a trade taken straight off a NinjaTrader
+    chart: that one never reaches this function at all, and is recognised
+    downstream by having no staged label despite an observed open."""
     try:
         root = _alias_root(instrument).upper()
         if not account or not root:
             return
-        label = ((ident[1] or "").strip() or (ident[0] or "").strip()
-                 or ("Manual" if manual else ""))
+        label = (ident[1] or "").strip() or (ident[0] or "").strip()
+        if not label and manual:
+            label = (source or "").strip() or "Manual"
         meta = _pnl_open_meta.setdefault(
-            (account, root), {"strategies": [], "ts": None, "avg": None})
+            (account, root), {"strategies": [], "ts": None, "avg": None,
+                              "cost": 0.0, "staged_ts": None})
+        if meta.get("ts") is None:
+            # Nothing has been observed on this root yet, so this dispatch
+            # is what the record is waiting on. Adding to an already-open
+            # position must not restart the clock: that position is real
+            # and its meta is no longer pending anything.
+            meta["staged_ts"] = time.time() if now is None else now
         if label and label not in meta["strategies"]:
             meta["strategies"].append(label)
     except Exception as exc:      # bookkeeping must never block dispatch
         logger.error(f"PNL HISTORY  note_open failed: {exc}")
+
+
+def _pnl_note_close(account: str, instrument: str, now: float | None = None):
+    """Record that a close was fired for a root that still holds a position.
+
+    Trade rows are cut from the CHANGE in net position between two polls,
+    which cannot see a leg that opens and closes inside one interval. Close
+    one contract and take another the same way two seconds later and the
+    snapshot reads -1 then -1: nothing closed, nothing opened, and two
+    round trips collapse into a single row carrying the first one's entry
+    price and open time, with a hold spanning both.
+
+    Polling faster would not fix it — there is always an interval. The
+    dispatch path is the only place that knows, so it says so here, and
+    the observer treats the next open on this root as a fresh leg however
+    the quantity happens to line up.
+
+    Never raises and never does I/O: it is called from inside dispatch."""
+    try:
+        key = (account, _alias_root(instrument).upper())
+        meta = _pnl_open_meta.get(key)
+        if meta is not None and meta.get("ts") is not None:
+            # Only a position the record believes is OPEN can be re-legged.
+            meta["close_fired"] = time.time() if now is None else now
+    except Exception as exc:      # bookkeeping must never block dispatch
+        logger.error(f"PNL HISTORY  note_close failed: {exc}")
+
+
+def _pnl_strip_phantom_pairs(days: dict) -> int:
+    """Drop equal-and-opposite `unseen` rows minted moments apart.
+
+    Before RealizedPnL was recognised as a session-scoped counter, every
+    session rollover differenced it across its restart and booked the
+    previous session as a fill, then booked its exact negation when the
+    settle-up closed the gap that opened. One pair per account per
+    rollover, four figures apiece on a one-lot book.
+
+    The cause is fixed, but the rows are already written, and they are
+    what a reader sees. They cancel, so removing both leaves every total
+    in the archive exactly where it was — which is also the check: a pair
+    that does not sum to zero is not one of these and is left alone.
+
+    Runs on load, so the record heals itself on the next restart instead
+    of needing a maintenance pass with the trader stopped."""
+    dropped = 0
+    for rec in days.values():
+        trades = (rec or {}).get("trades")
+        if not isinstance(trades, list) or len(trades) < 2:
+            continue
+        uns = [(i, t) for i, t in enumerate(trades)
+               if isinstance(t, dict) and t.get("unseen")
+               and isinstance(t.get("pnl"), (int, float))
+               and isinstance(t.get("ts"), (int, float))]
+        drop: set[int] = set()
+        for a, (i, t) in enumerate(uns):
+            if i in drop or abs(t["pnl"]) < 0.005:
+                continue
+            for j, u in uns[a + 1:]:
+                if (j not in drop
+                        and abs(u["ts"] - t["ts"]) <= PNL_PHANTOM_PAIR_S
+                        and abs(u["pnl"] + t["pnl"]) < 0.005):
+                    drop.update((i, j))
+                    break
+        if drop:
+            rec["trades"] = [t for i, t in enumerate(trades) if i not in drop]
+            dropped += len(drop)
+    return dropped
+
+
+def _pnl_staged_pending(account: str, shape: dict[str, int],
+                        ts: float) -> list[tuple[tuple[str, str], dict]]:
+    """Entries dispatched for `account` that no snapshot has shown yet.
+
+    An entry is pending only while all three hold: no poll has ever seen
+    the position (`ts` is None), the current snapshot does not show it, and
+    the dispatch is still inside PNL_STAGED_TTL_S. That last clause is the
+    whole point — without it a rejected order stays 'pending' forever and
+    keeps answering for money it had nothing to do with."""
+    out = []
+    for key, meta in _pnl_open_meta.items():
+        if key[0] != account or key[1] in shape:
+            continue
+        if meta.get("ts") is not None:
+            continue
+        staged = meta.get("staged_ts")
+        if staged is None or ts - staged > PNL_STAGED_TTL_S:
+            continue
+        out.append((key, meta))
+    return out
+
+
+def _pnl_expire_staged(account: str, shape: dict[str, int], date: str,
+                       trades: list, ts: float) -> bool:
+    """Drop dispatched entries that never became a position.
+
+    Anything parked on one is money that did leave the balance, so it is
+    handed back to the late-settlement path on the way out rather than
+    dropped — the day has to keep adding up even when the guess about
+    which order spent it turns out to be wrong."""
+    changed = False
+    for key in [k for k, m in _pnl_open_meta.items()
+                if k[0] == account and k[1] not in shape
+                and m.get("ts") is None]:
+        meta = _pnl_open_meta[key]
+        staged = meta.get("staged_ts")
+        # No staged_ts means dispatch never put this here — it is a
+        # position adopted at startup, which is real and simply has not
+        # been seen closing yet. Only a dispatched entry can go stale.
+        if staged is None or ts - staged <= PNL_STAGED_TTL_S:
+            continue
+        _pnl_open_meta.pop(key, None)
+        cost = round(float(meta.get("cost") or 0.0), 2)
+        if abs(cost) >= 0.005:
+            logger.info(
+                f"PNL HISTORY  {account}: {key[1]} never filled — releasing "
+                f"${cost:+,.2f} of entry cost back for attribution")
+            if _pnl_settle_late(account, cost, date, trades, ts, shape):
+                changed = True
+    return changed
+
+
+def _pnl_drop_staged(account: str, instrument: str) -> None:
+    """Forget an entry the confirm path just declared dead.
+
+    check_pending_confirms already knows an order produced no position and
+    no balance move; without telling the record, that dead entry keeps its
+    place in _pnl_open_meta and can later lend its market and strategy to
+    an unrelated amount.
+
+    Two things have to hold before anything is dropped. It must have come
+    from dispatch — a position adopted at startup carries no staged_ts and
+    is real however little is known about it. And the last snapshot must
+    not show a position on that root: an order rejected on top of an
+    existing position times out exactly the same way, and dropping there
+    would take the live trade's entry price, open time and parked cost
+    with it."""
+    try:
+        key = (account, _alias_root(instrument).upper())
+        meta = _pnl_open_meta.get(key)
+        if meta is None or meta.get("ts") is not None:
+            return
+        if meta.get("staged_ts") is None:
+            return
+        if key[1] in ((_pnl_prev.get(account) or {}).get("shape") or {}):
+            return
+        _pnl_open_meta.pop(key, None)
+    except Exception as exc:      # bookkeeping must never block the poll
+        logger.error(f"PNL HISTORY  drop_staged failed: {exc}")
 
 
 def _pnl_shape(row: dict) -> dict[str, int]:
@@ -9790,6 +10220,254 @@ def _pnl_avg_price(row: dict, root: str) -> float | None:
     return None
 
 
+_pnl_unclassified: set[tuple[str, str]] = set()   # (date, account) warned
+
+
+def _pnl_warn_unclassified(date: str, name: str, dcash: float):
+    """Say once a day when a cash move cannot be told apart from P&L.
+
+    Without RealizedPnL a flat account whose cash moved is either a
+    transfer or a fill nobody attributed, and the two are identical from
+    here. The safe reading wins — it stays in the day's P&L — but a
+    feature that quietly never fires is worse than one that says it
+    cannot decide, so it is said out loud, once."""
+    if (date, name) in _pnl_unclassified:
+        return
+    if len(_pnl_unclassified) > 4000:     # only unbounded across years
+        _pnl_unclassified.clear()
+    _pnl_unclassified.add((date, name))
+    logger.warning(
+        f"PNL HISTORY  {name} {date}: ${dcash:+,.2f} moved with the account "
+        "flat and no RealizedPnL reported — a transfer and an unattributed "
+        "fill are indistinguishable here, so it stays in the day's P&L. "
+        "Deposits and withdrawals are only held out for accounts where "
+        "NinjaTrader reports RealizedPnL.")
+
+
+def _pnl_settle_late(account: str, amount: float, date: str,
+                     trades: list, ts: float,
+                     shape: dict[str, int]) -> bool:
+    """Give trading cash that arrived after its close to the trade it made.
+
+    NinjaTrader can drop a position from the snapshot a poll before the
+    fill reaches CashValue. The close is then seen with no money attached
+    — the tell is a trade row of exactly $0.00 — and the money turns up in
+    a later window where no position changed, which used to be discarded.
+
+    What that loses is a whole leg, not a commission. It is why a quiet
+    session of a few big trades could drift further from its balance than
+    a busy one: the gap follows the size of the fills that settled late,
+    never the number of trades.
+
+    With nothing to hand it to — a whole round trip inside polls nobody
+    saw, which a truncated ATI dump, an outage or a restart all produce —
+    a row is minted for it instead, so the day's trades never stop adding
+    up to the day's balance. That row is marked `unseen` and carries only
+    what the dispatch path had already staged, so it can never be read as
+    an observed fill."""
+    have = _pnl_recent.get(account)
+    rows = have[1] if have and have[0] == date else None
+    if not rows:
+        # In-memory state is gone (a restart), but the day's rows are not:
+        # the account's last close is still the trade this money came
+        # from. Falling back to it is what puts a late-settling winner
+        # back on the trade that earned it instead of somewhere else.
+        mine = [t for t in trades if t.get("account") == account
+                and not t.get("unseen")]
+        rows = mine[-1:] if mine else None
+    if not rows:
+        return _pnl_unseen_row(account, amount, date, trades, ts, shape)
+    total = sum(abs(r.get("qty") or 0) for r in rows)
+    for r in rows:
+        share = (amount if len(rows) == 1 else
+                 amount * (abs(r.get("qty") or 0)) / total if total else
+                 amount / len(rows))
+        r["pnl"] = round(r["pnl"] + share, 2)
+        r["late"] = True
+    return True
+
+
+def _pnl_unseen_row(account: str, amount: float, date: str,
+                    trades: list, ts: float, shape: dict[str, int]) -> bool:
+    """Record realized P&L from a fill no poll ever saw, as its own row.
+
+    Marked `unseen` and filled only from what the dispatch path had
+    already staged. The amount is NinjaTrader's own; the market, side and
+    size are genuinely unknown and are left empty rather than guessed,
+    because a plausible-looking market on a trading record is worse than
+    an admitted blank."""
+    if len(trades) >= PNL_TRADES_PER_DAY_CAP:
+        return False
+    # Borrow the market from a staged entry only when the account is flat
+    # and exactly one entry is still pending — anything else would be a
+    # guess. Pending is the operative word: an order that was rejected
+    # hours ago is not evidence about this money, and letting it answer
+    # here is how a strategy that never filled ends up owning the day's
+    # biggest win.
+    pending = _pnl_staged_pending(account, shape, ts) if not shape else []
+    key, meta = pending[0] if len(pending) == 1 else (None, {})
+    trades.append({
+        "ts": round(ts, 3),
+        "account": account,
+        "symbol": key[1] if key else "",
+        "side": "",
+        "qty": 0,
+        "strategy": " + ".join(meta.get("strategies") or []),
+        "entry": meta.get("avg"),
+        "opened_ts": meta.get("ts"),
+        "pnl": round(amount, 2),
+        "approx": True,
+        "unseen": True,
+    })
+    logger.warning(
+        f"PNL HISTORY  {account} {date}: ${amount:+,.2f} of realized P&L from "
+        "a fill no poll observed — recorded as an unseen trade so the day "
+        "still adds up; its market and side are not known")
+    return True
+
+
+def _pnl_realized_restarted(name: str, acct_day: dict, prev: dict,
+                            date: str, realized: float | None,
+                            shape: dict[str, int]) -> bool:
+    """True when RealizedPnL is no longer the counter it was last poll.
+
+    NinjaTrader's RealizedPnL is session-scoped: it restarts at zero with
+    the trading session. It is a counter, and the one thing that may never
+    be done with a counter is difference it across a restart — the answer
+    is the whole previous session, sign inverted, and nothing about it is
+    a fill. Once a day at the rollover that produced a pair of `unseen`
+    rows per account: one for the phantom delta, and its exact negation
+    moments later when the settle-up closed the gap the first had opened.
+    Both amounts equal to the account's previous session, which is why a
+    quiet day could show a four-figure "largest win" on a one-lot book.
+
+    Two ways the epoch ends. The session date turning over is the expected
+    one and needs no evidence — that boundary is already known, and the
+    new day's baseline is read off the new counter. The other is
+    NinjaTrader restarting at an instant that is not this app's boundary,
+    recognised only by its signature: the reading lands on zero, from
+    somewhere else, with no position in either snapshot that could have
+    closed to put it there.
+
+    Deliberately strict. Missing a restart costs a pair of rows that
+    cancel and are excluded from every trade statistic; mistaking a real
+    fill for a restart would quietly drop money out of the record, and
+    the day would stop adding up to its balance with nothing to say why.
+
+    Re-anchors the day's realized baseline onto the new counter, carrying
+    across whatever this day had already booked on the old one, so the
+    transfer identity keeps describing this session and not the last."""
+    pr = prev.get("realized")
+    if realized is None or not isinstance(pr, (int, float)):
+        return False
+    if prev.get("date") != date:
+        # A new session day is a new counter by definition, and the fresh
+        # acct_day was seeded from the new one — nothing to re-anchor.
+        return True
+    if (abs(realized) >= BALANCE_ZERO_EPS or abs(pr) < BALANCE_ZERO_EPS
+            or shape or prev.get("shape")):
+        return False
+    base = acct_day.get("start_realized")
+    if isinstance(base, (int, float)):
+        acct_day["start_realized"] = round(realized - (pr - base), 2)
+    logger.info(
+        f"PNL HISTORY  {name}: NinjaTrader's RealizedPnL restarted "
+        f"(${pr:+,.2f} to ${realized:+,.2f}) — re-baselined rather than "
+        "booked as a fill")
+    return True
+
+
+def _pnl_reconcile(name: str, acct_day: dict, cash: float,
+                   realized: float | None, shape: dict[str, int],
+                   settled: bool) -> bool:
+    """Re-derive how much of an account's balance move was not trading.
+
+    Watching deltas go by can only ever find a transfer the app was
+    running for. This asks a different question, and asks it from scratch
+    every time: NinjaTrader's RealizedPnL resets with the session and
+    books commissions into itself, so across a whole session
+
+        (cash − session baseline) − realized  ==  money from outside
+
+    exactly. A deposit that landed while the app was down, or before any
+    of this existed, still falls straight out of that subtraction.
+
+    Derived, never accumulated, so it is idempotent — a restart, a replay
+    or a double poll all land on the same number instead of stacking.
+
+    Only while FLAT. An open position has already paid its entry
+    commission out of cash while realized still books nothing, and that
+    gap is not a transfer; reconciling mid-trade would flicker it into
+    the calendar as one. Flat, every fill is settled and the identity is
+    exact, so the value simply holds until the position closes.
+
+    Returns True when the stored value changed."""
+    if realized is None or shape or not settled or "start" not in acct_day:
+        return False
+    base_r = acct_day.get("start_realized")
+    if base_r is None:
+        # Written before this was recorded. The baseline is that session's
+        # first reading and NT's realized restarts at the session too, so
+        # the pair describes one window and realized began it at zero.
+        base_r = 0.0
+        acct_day["start_realized"] = 0.0
+    adj = round((cash - acct_day["start"]) - (realized - base_r), 2)
+    if abs(adj) < 0.005:
+        adj = 0.0
+    # The dashboard tile and the risk check read the same money from here.
+    sb = session_start_balances.get(name)
+    if sb is not None:
+        session_adjustments[name] = round((cash - sb) - (realized - base_r), 2)
+    changed = acct_day.get("adj", 0.0) != adj
+    if changed:
+        if adj:
+            logger.info(
+                f"PNL HISTORY  {name}: ${adj:+,.2f} of the session's balance "
+                "move is not trading P&L (NinjaTrader's realized accounts "
+                "for the rest) — booked as a transfer, held out of every "
+                "P&L number")
+        acct_day["adj"] = adj
+    return changed
+
+
+def _pnl_settle_session(name: str, acct_day: dict, cash: float,
+                        shape: dict[str, int], trades: list,
+                        date: str, ts: float, settled: bool) -> bool:
+    """Close the gap between an account's trade rows and its day net.
+
+    The backstop, and deliberately the LAST thing each poll does, so the
+    precise per-window attribution always gets first refusal — running it
+    earlier would mint a row for money the same poll was about to attach
+    to a real trade.
+
+    Flat, NinjaTrader's realized is the session's whole trading result, so
+    anything the rows do not account for is P&L that never got one: fills
+    lost to a truncated ATI dump, an outage, or a restart landing between
+    the open and the close. It becomes an `unseen` row rather than a
+    number on the unattributed line that nobody can read.
+
+    Needs a baseline and a flat book; mid-trade the cash has already paid
+    a commission that realized has not booked, and that is not a gap."""
+    # Same quiet-window rule as _pnl_reconcile: mid-settlement the balance
+    # is behind the rows, and "closing the gap" would move a trade's P&L
+    # back and forth under the reader until the cash caught up.
+    if (shape or not settled or "start" not in acct_day
+            or "last" not in acct_day):
+        return False
+    mine = [t for t in trades if t.get("account") == name]
+    # Money already parked on an entry that has not reached the snapshot is
+    # spent but not yet recordable. It is not a gap, and minting a row for
+    # it here would take the commission straight back off the position it
+    # was just attached to.
+    parked = sum(float(m.get("cost") or 0.0)
+                 for _, m in _pnl_staged_pending(name, shape, ts))
+    gap = round((cash - acct_day["start"] - (acct_day.get("adj") or 0.0))
+                - sum(t["pnl"] for t in mine) - parked, 2)
+    if abs(gap) < 0.005:
+        return False
+    return _pnl_settle_late(name, gap, date, trades, ts, shape)
+
+
 def _pnl_observe(live: dict, now: float | None = None,
                  session_date: str | None = None):
     """Feed one /api/live view into the daily history.
@@ -9807,11 +10485,12 @@ def _pnl_observe(live: dict, now: float | None = None,
     if not date:
         return
     ts = now if now is not None else time.time()
-    hist = _pnl_load()
     with _pnl_lock:
+        # The live month, flushing any previous one on the way in.
+        hist_days = _pnl_hot(date[:7])
         # Built detached and only kept if something lands in it — otherwise
         # every quiet poll would mint an empty "$0.00 day" on the calendar.
-        day = hist["days"].get(date)
+        day = hist_days.get(date)
         day_is_new = day is None
         if day_is_new:
             day = {"accounts": {}, "trades": []}
@@ -9827,79 +10506,239 @@ def _pnl_observe(live: dict, now: float | None = None,
                 continue    # outage-quarantined: hold the diff engine too
             shape = _pnl_shape(row)
 
+            realized = row.get("realized")
+            if not isinstance(realized, (int, float)) or not math.isfinite(realized):
+                realized = None
+
             acct_day = day["accounts"].setdefault(name, {})
             # Same seeding rule as every session baseline: a ~$0.00 first
             # reading is an outage artifact or an untradeable account.
             if "start" not in acct_day and abs(cash) > BALANCE_ZERO_EPS:
                 acct_day["start"] = cash
+                # Pinned together so the two always describe one window.
+                acct_day["start_realized"] = realized
                 _pnl_dirty = True
             if acct_day.get("last") != cash and "start" in acct_day:
                 acct_day["last"] = cash
                 _pnl_dirty = True
 
             prev = _pnl_prev.get(name)
-            _pnl_prev[name] = {"cash": cash, "shape": shape}
+            # Cash and realized only describe the same instant once the
+            # feed has gone quiet. Mid-settlement they do not: NT can book
+            # a fill into RealizedPnL a poll or more before it reaches
+            # CashValue, and reconciling in that window invents a transfer
+            # the size of the trade. That is not a cosmetic flicker —
+            # session_adjustments feeds the dashboard tile AND
+            # balance_monitor's stop check, and a phantom withdrawal there
+            # reads as profit, which is the direction that holds a stop
+            # off. One still poll is not enough either: a lag that stalls
+            # looks exactly like a quiet account, so the pair has to hold
+            # still across PNL_SETTLE_POLLS of them before it is believed.
+            stable = _pnl_stable.get(name)
+            if stable and stable[0] == cash and stable[1] == realized:
+                stable[2] += 1
+            else:
+                stable = _pnl_stable[name] = [cash, realized, 1]
+            settled = stable[2] >= PNL_SETTLE_POLLS
+
+            # Before the prev/delta machinery, and independent of it: this
+            # is what recognises a deposit the app was not running for.
+            if _pnl_reconcile(name, acct_day, cash, realized, shape, settled):
+                _pnl_dirty = True
+
+            # Independent of the delta machinery too, and on every path: an
+            # order that was dispatched and never became a position has to
+            # stop being treated as one, whether or not anything else
+            # happened this poll.
+            if _pnl_expire_staged(name, shape, date, day["trades"], ts):
+                _pnl_dirty = True
+
+            _pnl_prev[name] = {"cash": cash, "shape": shape,
+                               "realized": realized, "date": date}
             if prev is None:
                 # First sight after boot: adopt what is already open as
                 # unattributed rather than pretending it just happened.
                 for root, qty in shape.items():
                     meta = _pnl_open_meta.setdefault(
-                        (name, root), {"strategies": [], "ts": None, "avg": None})
+                        (name, root), {"strategies": [], "ts": None,
+                                       "avg": None, "cost": 0.0})
                     if meta.get("avg") is None:
                         meta["avg"] = _pnl_avg_price(row, root)
+                # Falls through to the session settle-up below: a restart
+                # is one of the ways a fill goes unseen in the first place.
+                if _pnl_settle_session(name, acct_day, cash, shape,
+                                       day["trades"], date, ts, settled):
+                    _pnl_dirty = True
                 continue
 
+            dcash = cash - prev["cash"]
+            # NinjaTrader books a fill's whole result into RealizedPnL the
+            # moment it closes, commissions included, so the CHANGE in
+            # realized is what the trade made. Cash only agrees eventually
+            # — it can lag a poll behind the position disappearing — which
+            # is why realized, not the balance delta, decides attribution
+            # wherever NT reports it.
+            pr = prev.get("realized")
+            if _pnl_realized_restarted(name, acct_day, prev, date,
+                                       realized, shape):
+                pr = None
+            dreal = (realized - pr
+                     if realized is not None and isinstance(pr, (int, float))
+                     else None)
             closes: list[dict] = []
+            opens: list[dict] = []
             for root in set(prev["shape"]) | set(shape):
                 q0 = prev["shape"].get(root, 0)
                 q1 = shape.get(root, 0)
+                key = (name, root)
                 flipped = bool(q0 and q1 and (q0 > 0) != (q1 > 0))
-                if flipped:
+                # A close was dispatched for this root and a position is
+                # still showing. The snapshot cannot tell "never left" from
+                # "left and came straight back the same size" — the two are
+                # the same arithmetic. Dispatch can, and said so, so this
+                # is the far side of a new leg however the quantities line
+                # up. Consumed on read: it describes one transition.
+                fired = (_pnl_open_meta.get(key) or {}).pop("close_fired", None)
+                relegged = bool(q0 and q1 and not flipped
+                                and isinstance(fired, (int, float))
+                                and ts - fired <= PNL_STAGED_TTL_S)
+                if flipped or relegged:
                     closed, opened = abs(q0), abs(q1)
                 else:
                     closed = max(0, abs(q0) - abs(q1))
                     opened = max(0, abs(q1) - abs(q0))
-                key = (name, root)
                 if closed:
                     meta = _pnl_open_meta.get(key) or {}
+                    # What it cost to get on rides back out with the
+                    # contracts leaving, pro rata, so a partial close hands
+                    # back its share and the runner keeps the rest.
+                    cost = float(meta.get("cost") or 0.0)
+                    share = cost * closed / (abs(q0) or closed)
+                    if meta:
+                        meta["cost"] = cost - share
                     closes.append({
                         "root": root, "qty": closed,
                         "side": "LONG" if q0 > 0 else "SHORT",
                         "opened_ts": meta.get("ts"),
                         "entry": meta.get("avg"),
                         "strategy": " + ".join(meta.get("strategies") or []),
+                        "cost": share,
                     })
                 if opened:
                     meta = _pnl_open_meta.setdefault(
-                        key, {"strategies": [], "ts": None, "avg": None})
-                    if flipped:
-                        # The far side of a reversal is a fresh trade; only
-                        # the label staged by the reversal write survives.
+                        key, {"strategies": [], "ts": None, "avg": None,
+                              "cost": 0.0})
+                    if flipped or relegged:
+                        # The far side of a reversal — or of a close the
+                        # poll never saw — is a fresh trade; only the label
+                        # staged by the write that opened it survives.
                         staged = meta["strategies"][-1:]
                         meta.clear()
-                        meta.update({"strategies": staged, "ts": None, "avg": None})
-                    if not q0 or flipped or meta.get("ts") is None:
+                        meta.update({"strategies": staged, "ts": None,
+                                     "avg": None, "cost": 0.0})
+                    if not q0 or flipped or relegged or meta.get("ts") is None:
                         meta["ts"] = ts
                     meta["avg"] = _pnl_avg_price(row, root) or meta.get("avg")
+                    opens.append({"key": key, "qty": opened})
                 elif q1 and _pnl_open_meta.get(key, {}).get("avg") is None:
                     _pnl_open_meta.setdefault(
-                        key, {"strategies": [], "ts": None, "avg": None}
+                        key, {"strategies": [], "ts": None, "avg": None,
+                              "cost": 0.0}
                     )["avg"] = _pnl_avg_price(row, root)
                 if not q1:
                     _pnl_open_meta.pop(key, None)
 
             if not closes:
+                # An entry whose position became visible in THIS poll is
+                # the same situation as one still invisible: NinjaTrader
+                # booked the commission in the very window that showed the
+                # fill. Only asking "is the book flat NOW" missed exactly
+                # that case, and it is the common one — which is why the
+                # first entry of every session still minted a phantom row
+                # for its own commission while later ones quietly wore a
+                # `late` flag instead.
+                cands = [k for k, _ in _pnl_staged_pending(name, shape, ts)]
+                if not prev["shape"]:
+                    cands += [o["key"] for o in opens
+                              if (_pnl_open_meta.get(o["key"]) or {})
+                              .get("staged_ts") is not None]
+                if (dreal is not None and dreal <= -0.005
+                        and not prev["shape"] and len(cands) == 1):
+                    # NinjaTrader books an entry's commission into
+                    # RealizedPnL as the order fills, routinely a poll or
+                    # more before the position reaches the snapshot. Read
+                    # literally that is "realized moved, nothing closed",
+                    # and the branch below would hand it to the PREVIOUS
+                    # trade — which is how every row in the log came to
+                    # carry the next trade's entry bill and wear a `late`
+                    # flag for it, and how the first entry of a session,
+                    # with no previous trade to take it, minted a phantom
+                    # row for its own commission. It belongs to the
+                    # position about to open, so it waits there.
+                    #
+                    # Only while flat, with exactly one entry pending, and
+                    # only for money LEAVING: an entry costs, it never
+                    # pays, so realized moving up while flat is P&L and
+                    # belongs to the late path however recently an order
+                    # went out. With a position still on, even a debit is
+                    # ambiguous, and a confident wrong answer there is
+                    # worse than an honest `late`.
+                    meta = _pnl_open_meta.get(cands[0])
+                    if meta is not None:
+                        meta["cost"] = round(
+                            float(meta.get("cost") or 0.0) + dreal, 2)
+                elif dreal is not None and abs(dreal) >= 0.005:
+                    # Realized moved with nothing closing here: a fill that
+                    # settled after its position had already gone from the
+                    # snapshot. Hand it back to the trade it belongs to.
+                    if _pnl_settle_late(name, dreal, date, day["trades"],
+                                        ts, shape):
+                        _pnl_dirty = True
+                elif dreal is None and opens and dcash:
+                    # Nothing closed, so this cash is what it cost to get
+                    # on — commission, and whatever else the broker books
+                    # against cash at entry. Park it on the position
+                    # instead of dropping it: dropped, every round trip
+                    # reads better than the balance does and Σtrades walks
+                    # away from the day net by the entry bill.
+                    total_o = sum(o["qty"] for o in opens) or 1
+                    for o in opens:
+                        meta = _pnl_open_meta.get(o["key"])
+                        if meta is None:
+                            continue
+                        meta["cost"] = float(meta.get("cost") or 0.0) + (
+                            dcash if len(opens) == 1
+                            else dcash * o["qty"] / total_o)
+                elif (dcash and realized is None
+                        and not prev["shape"] and not shape):
+                    # No realized feed, so _pnl_reconcile never runs and a
+                    # deposit cannot be told from a fill nobody attributed.
+                    # The safe reading keeps the money in the day's P&L.
+                    _pnl_warn_unclassified(date, name, dcash)
+                if _pnl_settle_session(name, acct_day, cash, shape,
+                                       day["trades"], date, ts, settled):
+                    _pnl_dirty = True
                 continue
-            dcash = cash - prev["cash"]
             total_q = sum(c["qty"] for c in closes) or 1
+            # Realized is exact and already net of every commission — but
+            # only of the commissions NinjaTrader booked inside THIS
+            # window. An entry's commission was booked when the order
+            # filled, polls earlier, so the delta measured across the close
+            # does not contain it. Whatever was parked on the position back
+            # then has to come back here, for the same reason the balance
+            # fallback always needed it: leave it behind and every round
+            # trip reads better than the balance does.
+            pool = dcash if dreal is None else dreal
             trades = day["trades"]
+            fresh: list[dict] = []
             for c in closes:
                 if len(trades) >= PNL_TRADES_PER_DAY_CAP:
                     logger.warning("PNL HISTORY  trade cap reached for "
                                    f"{date} — further trades not itemized")
                     break
-                pnl = dcash if len(closes) == 1 else dcash * c["qty"] / total_q
-                trades.append({
+                pnl = pool if len(closes) == 1 else pool * c["qty"] / total_q
+                pnl += c["cost"]
+                fresh.append({
                     "ts": round(ts, 3),
                     "account": name,
                     "symbol": c["root"],
@@ -9911,42 +10750,83 @@ def _pnl_observe(live: dict, now: float | None = None,
                     "pnl": round(pnl, 2),
                     "approx": len(closes) > 1,
                 })
+                trades.append(fresh[-1])
+                _pnl_dirty = True
+            if fresh:
+                # Whatever settles late belongs to these.
+                _pnl_recent[name] = (date, fresh)
+            # Last word each poll, after everything else had its chance.
+            if _pnl_settle_session(name, acct_day, cash, shape,
+                                   day["trades"], date, ts, settled):
                 _pnl_dirty = True
         if day_is_new and (day["accounts"] or day["trades"]):
-            hist["days"][date] = day
+            hist_days[date] = day
 
 
 def _pnl_month(month: str) -> dict:
-    """One month of the calendar, rolled up for the web UI."""
-    hist = _pnl_load()
+    """One month of the calendar, rolled up for the web UI.
+
+    Reads only that month's file, so paging back stays the same cost at
+    any depth of history."""
     with _pnl_lock:
+        src = _pnl_days(month)
         days: dict[str, dict] = {}
-        for date in sorted(hist["days"]):
+        transfers = 0.0
+        # Rolled up per account as well as in total, because the per-account
+        # view has to keep working on days dropped below — a month whose
+        # only record for an account is a deposit still has to show it.
+        xfer_by: dict[str, float] = {}
+        names: list[str] = []
+        for date in sorted(src):
             if not date.startswith(month + "-"):
                 continue
-            rec = hist["days"][date]
+            rec = src[date]
             accounts = {}
             net = 0.0
+            adj_day = 0.0
             for name, a in (rec.get("accounts") or {}).items():
                 start, last = a.get("start"), a.get("last")
-                pnl = (round(last - start, 2)
+                adj = a.get("adj") or 0.0
+                # The balance moved by P&L AND by money crossing the
+                # boundary; only the first half is a trading result.
+                pnl = (round(last - start - adj, 2)
                        if isinstance(start, (int, float))
                        and isinstance(last, (int, float)) else None)
                 if pnl is not None:
                     net += pnl
-                accounts[name] = {"start": start, "last": last, "pnl": pnl}
+                adj_day += adj
+                xfer_by[name] = round(xfer_by.get(name, 0.0) + adj, 2)
+                if name not in names:
+                    names.append(name)
+                accounts[name] = {"start": start, "last": last, "pnl": pnl,
+                                  "adj": round(adj, 2)}
+            # Counted for the month even when the day itself is dropped
+            # below, so a deposit never just disappears from the view.
+            transfers += adj_day
             # A connected-but-idle day (baselines seeded, nothing happened)
-            # is not a trading day — showing a $0.00 cell for every session
-            # the app merely ran would bury the real record.
+            # is not a trading day, and neither is one whose only movement
+            # was funding. Showing a $0.00 cell for every session the app
+            # merely ran would bury the real record; showing a funded day
+            # as a green one would invent a record that never happened.
             if not rec.get("trades") and abs(net) < 0.005:
                 continue
             days[date] = {
                 "pnl": round(net, 2),
+                "adj": round(adj_day, 2),
                 "accounts": accounts,
                 "trades": list(rec.get("trades") or []),
             }
-        first = min(hist["days"]) if hist["days"] else None
+        months = _pnl_months()
+        # Earliest day on record, for the UI to stop paging back at.
+        oldest = _pnl_days(months[0]) if months else {}
+        first = min(oldest) if oldest else None
     return {"ok": True, "month": month, "days": days, "first": first,
+            # Oldest month on record, so the UI can stop paging back at the
+            # beginning instead of into empty months forever.
+            "first_month": months[0] if months else None,
+            "transfers": round(transfers, 2),
+            "accounts": sorted(names),
+            "transfers_accounts": xfer_by,
             "today": datetime.now(ET).strftime("%Y-%m-%d"),
             "session": get_session_id()}
 
@@ -10329,7 +11209,7 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
                 ok, msg = _web_run(submit_manual_trade(
                     data.get("side"), data.get("instrument"), data.get("qty"),
                     data.get("order_type", "market"), data.get("limit_price"),
-                    data.get("atm", "")))
+                    data.get("atm", ""), source="Web UI"))
             elif path == "/api/pause":
                 ok, msg = _web_run(_web_toggle_pause(data.get("paused", True)))
             elif path == "/api/close_all":
@@ -10618,6 +11498,15 @@ min-width:172px;text-align:center}
 .phero .k{font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:1.5px}
 .phero .v{font-size:29px;font-weight:700;line-height:1.15}
 .ptiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(116px,1fr));gap:7px}
+.pacct{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+.pacct .k{font-size:9px;color:var(--dim);text-transform:uppercase;
+letter-spacing:1.5px;margin-right:3px}
+.pacct button{padding:5px 11px;font-size:11.5px;border-radius:999px;
+background:transparent;color:var(--dim);border:1px solid var(--edge2)}
+.pacct button:hover{color:var(--fg)}
+.pacct button.on{background:var(--cyan);color:#05202a;font-weight:700;
+border-color:var(--cyan)}
+.pacct .amt{font-size:10px;opacity:.74;margin-left:7px;font-variant-numeric:tabular-nums}
 
 #pcal{overflow-x:auto}
 .pcal-head,.pcal-week{display:grid;gap:7px;min-width:460px;
@@ -10785,6 +11674,7 @@ box-shadow:var(--shadow);max-width:280px}
       <div class="v" id="pmNet">&mdash;</div>
     </div>
   </div>
+  <div class="card pacct hide" id="pAccts"></div>
   <div class="card">
     <h2>Month statistics <span class="hint" id="pmHint"></span></h2>
     <div class="ptiles" id="pmTiles"></div>
@@ -11564,10 +12454,12 @@ function strategyModal(){
 
 /* ================= P&L calendar ================= */
 /* Standalone daily record served by /api/pnl — built from the app's own
-   trade tracking, no extra account data. Day net (balance-based) is the
-   authoritative number; per-trade rows are the drill-down and can differ
-   from the net by entry commissions ("fees / unattributed"). */
-const P={month:"",data:null,sel:null,timer:null};
+   trade tracking, no extra account data. Day net (balance-based, less any
+   money that crossed the account boundary) is the authoritative number;
+   per-trade rows are the drill-down and can still differ from the net by
+   attribution drift, which is shown as "fees / unattributed". Deposits and
+   withdrawals are never P&L and appear only under "transfers". */
+const P={month:"",data:null,sel:null,timer:null,acct:null};
 
 function pdate(s){const p=s.split("-");return new Date(+p[0],+p[1]-1,+p[2])}
 function monthAdd(m,d){const p=m.split("-");
@@ -11609,11 +12501,20 @@ function tipHide(){$("ptip").classList.add("hide")}
 
 /* ---- per-day / per-slice statistics ---- */
 function tradeStats(tr){
-  const wins=tr.filter(t=>t.pnl>0),losses=tr.filter(t=>t.pnl<0);
+  /* Every statistic that describes a TRADE is built from the rows that
+     were observed as one. An `unseen` row is a bare amount with no market,
+     side or size — counting it is what let a session-rollover artifact
+     stand as both the largest win and the largest loss of the month.
+     `sum` is the deliberate exception and stays over every row: the
+     "Fees / unattr" tile is exactly the remainder between the balance and
+     the rows, so hiding a row from it would invent drift that isn't
+     there. */
+  const ob=tr.filter(t=>!t.unseen);
+  const wins=ob.filter(t=>t.pnl>0),losses=ob.filter(t=>t.pnl<0);
   const gw=wins.reduce((s,t)=>s+t.pnl,0),gl=losses.reduce((s,t)=>s+t.pnl,0);
   const decided=wins.length+losses.length;
-  const holds=tr.filter(t=>t.opened_ts!=null).map(t=>t.ts-t.opened_ts);
-  return{n:tr.length,wins:wins.length,losses:losses.length,gw:gw,gl:gl,
+  const holds=ob.filter(t=>t.opened_ts!=null).map(t=>t.ts-t.opened_ts);
+  return{n:ob.length,wins:wins.length,losses:losses.length,gw:gw,gl:gl,
     sum:tr.reduce((s,t)=>s+t.pnl,0),
     wr:decided?wins.length/decided:null,
     pf:gl<0?gw/-gl:(gw>0?Infinity:null),
@@ -11621,9 +12522,9 @@ function tradeStats(tr){
     avgL:losses.length?gl/losses.length:null,
     maxW:wins.length?Math.max.apply(null,wins.map(t=>t.pnl)):null,
     maxL:losses.length?Math.min.apply(null,losses.map(t=>t.pnl)):null,
-    exp:tr.length?tr.reduce((s,t)=>s+t.pnl,0)/tr.length:null,
-    longs:tr.filter(t=>t.side==="LONG"),
-    shorts:tr.filter(t=>t.side==="SHORT"),
+    exp:ob.length?ob.reduce((s,t)=>s+t.pnl,0)/ob.length:null,
+    longs:ob.filter(t=>t.side==="LONG"),
+    shorts:ob.filter(t=>t.side==="SHORT"),
     hold:holds.length?holds.reduce((a,b)=>a+b,0)/holds.length:null}}
 
 function ptile(box,k,v,cls){const d=el("div","tile");
@@ -11698,6 +12599,64 @@ function bbar(v,max){const w=el("div","bbar");w.appendChild(el("em"));
   else{i.style.right="50%";i.style.width=half+"%"}
   w.appendChild(i);return w}
 
+/* A trade with no staged label never went through the app's dispatch
+   path — every surface that fires an order writes its own name. Watching
+   the position open anyway means it came straight off a NinjaTrader
+   chart, so it is Manual. Blank with no open timestamp is different: that
+   is a position adopted at restart, whose label is lost rather than
+   absent, and calling it Manual would be a guess. */
+function stratOf(t){
+  return t.strategy||(!t.unseen&&t.opened_ts!=null?"Manual":"")}
+
+/* ---- account filter ----
+   P.acct null means every managed account. Every number the page shows is
+   read through these four, so one account and "all" walk the same code
+   path and cannot drift apart. The payload already carries per-account
+   P&L and tags each trade with its account, so filtering never refetches. */
+/* `ar`, never `a` — "a." is reserved for live account rows, and the web
+   UI guard checks every a.<field> against what /api/live actually sends. */
+function dayPnl(rec){if(!P.acct)return rec.pnl||0;
+  const ar=(rec.accounts||{})[P.acct];
+  return ar&&ar.pnl!=null?ar.pnl:0}
+function dayAdj(rec){if(!P.acct)return rec.adj||0;
+  const ar=(rec.accounts||{})[P.acct];return ar?(ar.adj||0):0}
+function dayTrades(rec){const t=rec.trades||[];
+  return P.acct?t.filter(x=>x.account===P.acct):t}
+/* A day the selected account sat out is not one of ITS trading days, so
+   it must not count toward its day win rate or dilute its averages. */
+function dayActive(rec){
+  return dayTrades(rec).length>0||Math.abs(dayPnl(rec))>=0.005}
+
+function netFor(d,acct){
+  const days=d.days||{};
+  return Object.keys(days).reduce((s,k)=>{
+    const rec=days[k];
+    if(!acct)return s+(rec.pnl||0);
+    const ar=(rec.accounts||{})[acct];
+    return s+(ar&&ar.pnl!=null?ar.pnl:0)},0)}
+
+function renderAccts(d){
+  const box=$("pAccts");clear(box);
+  const names=d.accounts||[];
+  /* One account is not a choice — don't spend a row of screen on it. */
+  if(names.length<2){box.classList.add("hide");return}
+  box.classList.remove("hide");
+  box.appendChild(el("span","k","Account"));
+  const chip=(label,val)=>{
+    const b=el("button",P.acct===val?"on":null,label);
+    const n=netFor(d,val);
+    const amt=el("span","amt "+(P.acct===val?"":pnlCls(n)),usdc(n));
+    b.appendChild(amt);
+    b.onclick=()=>{P.acct=val;
+      /* The drill-down may be showing a day this account sat out; re-pick
+         against the new filter (pickDefaultDay reads P.acct, now set). */
+      if(!P.sel||!d.days[P.sel]||!dayActive(d.days[P.sel]))
+        P.sel=pickDefaultDay(d);
+      renderPnl()};
+    box.appendChild(b)};
+  chip("All",null);
+  names.forEach(n=>chip(n,n))}
+
 function breakdown(tr,key){
   const m={};
   tr.forEach(t=>{const k=(key(t)||"unattributed");
@@ -11733,9 +12692,9 @@ function breakTable(parent,title,rows){
 
 /* ---- month view ---- */
 function pickDefaultDay(d){
-  const keys=Object.keys(d.days||{}).sort();
+  const keys=Object.keys(d.days||{}).sort().filter(k=>dayActive(d.days[k]));
   if(!keys.length)return null;
-  if(d.session&&d.days[d.session])return d.session;
+  if(d.session&&keys.indexOf(d.session)>=0)return d.session;
   const past=keys.filter(k=>k<=d.today);
   return past.length?past[past.length-1]:keys[keys.length-1]}
 
@@ -11744,33 +12703,42 @@ async function pnlLoad(){
   try{
     const d=await get("/api/pnl?month="+P.month);
     P.data=d;
-    if(P.sel==null||!(d.days&&d.days[P.sel]))P.sel=pickDefaultDay(d);
+    /* A month this account never traded in has no chip to stay on. */
+    if(P.acct&&(d.accounts||[]).indexOf(P.acct)<0)P.acct=null;
+    if(P.sel==null||!(d.days&&d.days[P.sel])||!dayActive(d.days[P.sel]))
+      P.sel=pickDefaultDay(d);
     renderPnl();
   }catch(e){$("pcalHint").textContent="app offline";}}
 
 function renderPnl(){
   const d=P.data;
   if(!d||d.month!==P.month)return;
-  if(!changed("pnl",[d.month,d.days,P.sel]))return;
+  if(!changed("pnl",[d.month,d.days,P.sel,P.acct]))return;
   tipHide();
   $("pmTitle").textContent=monthLabel(P.month);
   const nowMonth=(d.today||"").slice(0,7);
   $("pmNext").disabled=nowMonth&&P.month>=nowMonth;
-  const days=d.days||{},keys=Object.keys(days).sort();
-  const allTrades=keys.reduce((acc,k)=>acc.concat(days[k].trades||[]),[]);
-  const net=keys.reduce((s,k)=>s+(days[k].pnl||0),0);
+  $("pmPrev").disabled=!!(d.first_month&&P.month<=d.first_month);
+  renderAccts(d);
+  const days=d.days||{};
+  const keys=Object.keys(days).sort().filter(k=>dayActive(days[k]));
+  const allTrades=keys.reduce((acc,k)=>acc.concat(dayTrades(days[k])),[]);
+  const net=keys.reduce((s,k)=>s+dayPnl(days[k]),0);
 
   /* hero + stat tiles */
   const hero=$("pmNet");
   hero.textContent=keys.length?usd(net):"—";
   hero.className="v "+(keys.length?pnlCls(net):"dim");
-  $("pmHint").textContent=keys.length?"":"no trading days recorded yet";
+  $("pmHint").textContent=keys.length?""
+    :(P.acct?"nothing recorded for "+P.acct+" this month"
+            :"no trading days recorded yet");
   const tiles=$("pmTiles");clear(tiles);
-  const green=keys.filter(k=>days[k].pnl>0),red=keys.filter(k=>days[k].pnl<0);
+  const green=keys.filter(k=>dayPnl(days[k])>0);
+  const red=keys.filter(k=>dayPnl(days[k])<0);
   const ts=tradeStats(allTrades);
-  const dayVals=keys.map(k=>days[k].pnl);
+  const dayVals=keys.map(k=>dayPnl(days[k]));
   let streak=0;
-  for(let i=keys.length-1;i>=0;i--){const v=days[keys[i]].pnl;
+  for(let i=keys.length-1;i>=0;i--){const v=dayPnl(days[keys[i]]);
     if(!streak){streak=v>0?1:v<0?-1:0;if(!streak)break}
     else if(streak>0&&v>0)streak++;
     else if(streak<0&&v<0)streak--;
@@ -11783,19 +12751,33 @@ function renderPnl(){
   ptile(tiles,"Trade win rate",pct(ts.wr));
   ptile(tiles,"Profit factor",fmtPf(ts.pf),
     ts.pf==null?"dim":ts.pf>=1?"pos":"neg");
+  /* Profit factor and win rate are built from the trade rows; the hero net
+     is built from account balances. Without this tile the two can disagree
+     in sign (a positive factor over a losing month) with nothing on screen
+     to say why — so the remainder between them is always shown. */
+  const drift=net-ts.sum;
+  ptile(tiles,"Fees / unattr",
+    !keys.length?"—":Math.abs(drift)<0.005?"$0.00":usd(drift),
+    !keys.length||Math.abs(drift)<0.005?"dim":pnlCls(drift));
   ptile(tiles,"Avg day",keys.length?usd(net/keys.length):"—",
     keys.length?pnlCls(net):"dim");
   ptile(tiles,"Best day",dayVals.length?usd(Math.max(...dayVals)):"—","pos");
   ptile(tiles,"Worst day",dayVals.length?usd(Math.min(...dayVals)):"—","neg");
   ptile(tiles,"Streak",streak?Math.abs(streak)+(streak>0?" green":" red"):"—",
     streak>0?"pos":streak<0?"neg":"dim");
+  /* Deposits and withdrawals, held out of every P&L number above. Kept
+     deliberately neutral in colour — funding an account is not a green
+     day and pulling money out is not a red one. */
+  const xfer=P.acct?((d.transfers_accounts||{})[P.acct]||0):(d.transfers||0);
+  ptile(tiles,"Transfers",Math.abs(xfer)<0.005?"—":usd(xfer),"dim");
 
   /* equity curve */
   let cum=0;
-  const pts=keys.map(k=>{cum+=days[k].pnl||0;
+  const pts=keys.map(k=>{cum+=dayPnl(days[k]);
     const lbl=pdate(k).toLocaleDateString(undefined,{month:"short",day:"numeric"});
     return{v:cum,k:lbl,rows:[[usd(cum),"cumulative"],
-      [usd(days[k].pnl),"day P&L"],[lbl,(days[k].trades||[]).length+" trades"]]}});
+      [usd(dayPnl(days[k])),"day P&L"],
+      [lbl,dayTrades(days[k]).length+" trades"]]}});
   $("peqHint").textContent=pts.length?"final "+usd(cum):"";
   spark($("pmEq"),pts,"#4bb2d1");
 
@@ -11819,9 +12801,11 @@ function renderPnl(){
       const dt=new Date(ws);dt.setDate(ws.getDate()+i);
       const iso=dt.getFullYear()+"-"+String(dt.getMonth()+1).padStart(2,"0")+
         "-"+String(dt.getDate()).padStart(2,"0");
-      const rec=days[iso];
+      /* Filtered out for this account, so the cell is blank rather than
+         showing somebody else's day. */
+      const rec=days[iso]&&dayActive(days[iso])?days[iso]:null;
       const inMonth=dt.getMonth()===first.getMonth();
-      if(rec&&inMonth){wPnl+=rec.pnl||0;wTr+=(rec.trades||[]).length;wAny=true}
+      if(rec&&inMonth){wPnl+=dayPnl(rec);wTr+=dayTrades(rec).length;wAny=true}
       if(i>=5)continue;                       // Sat/Sun fold into the week cell
       const cell=el("button","dcell");
       if(!inMonth){cell.className="dcell off";cell.disabled=true;
@@ -11829,12 +12813,13 @@ function renderPnl(){
       cell.appendChild(el("span","dnum",dt.getDate()));
       if(iso===d.today)cell.classList.add("today");
       if(rec){
+        const dp=dayPnl(rec);
         const maxAbs=Math.max(...dayVals.map(Math.abs),1);
-        const heat=(0.08+0.34*Math.min(1,Math.abs(rec.pnl)/maxAbs)).toFixed(3);
-        if(rec.pnl>0)cell.style.background="rgba(47,191,132,"+heat+")";
-        else if(rec.pnl<0)cell.style.background="rgba(239,88,101,"+heat+")";
-        cell.appendChild(el("span","dpnl",usdc(rec.pnl)));
-        const st=tradeStats(rec.trades||[]);
+        const heat=(0.08+0.34*Math.min(1,Math.abs(dp)/maxAbs)).toFixed(3);
+        if(dp>0)cell.style.background="rgba(47,191,132,"+heat+")";
+        else if(dp<0)cell.style.background="rgba(239,88,101,"+heat+")";
+        cell.appendChild(el("span","dpnl",usdc(dp)));
+        const st=tradeStats(dayTrades(rec));
         cell.appendChild(el("span","dsub",
           st.n+(st.n===1?" trade":" trades")+(st.wr!=null?" · "+pct(st.wr):"")));
         if(iso===P.sel)cell.classList.add("sel");
@@ -11846,9 +12831,10 @@ function renderPnl(){
           const pd=$("pday");
           if(!pd.classList.contains("hide"))
             pd.scrollIntoView({behavior:"smooth",block:"start"})};
-        const rows=[[usd(rec.pnl),"net P&L"],[String(st.n),"trades"],
+        const rows=[[usd(dp),"net P&L"],[String(st.n),"trades"],
           [pct(st.wr),"win rate"]];
-        Object.keys(rec.accounts||{}).slice(0,4).forEach(n=>{
+        /* Only worth breaking out when looking at the accounts together. */
+        if(!P.acct)Object.keys(rec.accounts||{}).slice(0,4).forEach(n=>{
           const ap=rec.accounts[n].pnl;
           if(ap!=null)rows.push([usd(ap),n])});
         cell.addEventListener("pointerenter",e=>tipShow(e,rows));
@@ -11874,24 +12860,27 @@ function renderPnl(){
     ?keys.length+" trading day"+(keys.length>1?"s":"")
     :"records build as you trade";
 
-  renderDayPanel(days[P.sel],P.sel)}
+  renderDayPanel(
+    P.sel&&days[P.sel]&&dayActive(days[P.sel])?days[P.sel]:null,P.sel)}
 
 /* ---- day drill-down ---- */
 function renderDayPanel(day,date){
   const box=$("pday");clear(box);
   if(!day){box.classList.add("hide");return}
   box.classList.remove("hide");
-  const tr=(day.trades||[]).slice().sort((x,y)=>x.ts-y.ts);
+  const tr=dayTrades(day).slice().sort((x,y)=>x.ts-y.ts);
   const s=tradeStats(tr);
+  const dnet=dayPnl(day);
   const h=el("h2");
-  h.appendChild(el("span","pday-title",dayLabel(date)));
-  const hint=el("span","hint",usd(day.pnl)+" net · "+s.n+
+  h.appendChild(el("span","pday-title",dayLabel(date)
+    +(P.acct?" · "+P.acct:"")));
+  const hint=el("span","hint",usd(dnet)+" net · "+s.n+
     (s.n===1?" trade":" trades"));
   h.appendChild(hint);
   box.appendChild(h);
 
   const tiles=el("div","ptiles");
-  ptile(tiles,"Net P&L",usd(day.pnl),pnlCls(day.pnl));
+  ptile(tiles,"Net P&L",usd(dnet),pnlCls(dnet));
   ptile(tiles,"Trades",s.n||"—");
   ptile(tiles,"Win rate",pct(s.wr));
   ptile(tiles,"Profit factor",fmtPf(s.pf),
@@ -11903,9 +12892,13 @@ function renderDayPanel(day,date){
   ptile(tiles,"Largest loss",s.maxL==null?"—":usd(s.maxL),"neg");
   ptile(tiles,"Gross profit",usd(s.gw),s.gw>0?"pos":"dim");
   ptile(tiles,"Gross loss",usd(s.gl),s.gl<0?"neg":"dim");
-  const drift=day.pnl-s.sum;
+  const drift=dnet-s.sum;
   ptile(tiles,"Fees / unattr",Math.abs(drift)<0.005?"$0.00":usd(drift),
     Math.abs(drift)<0.005?"dim":pnlCls(drift));
+  /* Only on the days it actually happened — a transfer is the exception
+     and earns a tile when present rather than a "$0.00" on every day. */
+  const dxf=dayAdj(day);
+  if(Math.abs(dxf)>=0.005)ptile(tiles,"Transfers",usd(dxf),"dim");
   ptile(tiles,"Longs",s.longs.length+(s.longs.length?" · "+usdc(
     s.longs.reduce((a,t)=>a+t.pnl,0)):""),
     pnlCls(s.longs.reduce((a,t)=>a+t.pnl,0)));
@@ -11916,7 +12909,14 @@ function renderDayPanel(day,date){
   box.appendChild(tiles);
 
   if(tr.length>=2){
-    box.appendChild(el("div","psec","Intraday cumulative P&L (per closed trade)"));
+    /* This curve sums trade rows, while the Net P&L tile right above it
+       comes from the balance. Letting it end on a number that silently
+       contradicts that tile is exactly how "why does it say -207.74"
+       happens — so when they differ, the heading says by how much. */
+    const lbl="Intraday cumulative P&L (per closed trade)";
+    const gap=dnet-s.sum;
+    box.appendChild(el("div","psec",Math.abs(gap)<0.005?lbl
+      :lbl+" — ends at "+usd(s.sum)+", "+usd(gap)+" unattributed"));
     let c=0;
     const pts=tr.map(t=>{c+=t.pnl;
       const when=new Date(t.ts*1000).toLocaleTimeString();
@@ -11927,11 +12927,13 @@ function renderDayPanel(day,date){
 
   const grid=el("div","pgrid3");
   breakTable(grid,"By symbol",breakdown(tr,t=>t.symbol));
-  breakTable(grid,"By strategy",breakdown(tr,t=>t.strategy));
-  const acctRows=Object.keys(day.accounts||{}).map(n=>{
-    const mine=tr.filter(t=>t.account===n);
-    return{name:n,n:mine.length,wr:tradeStats(mine).wr,
-      pnl:day.accounts[n].pnl!=null?day.accounts[n].pnl:0}})
+  breakTable(grid,"By strategy",breakdown(tr,stratOf));
+  const acctRows=Object.keys(day.accounts||{})
+    .filter(n=>!P.acct||n===P.acct)
+    .map(n=>{
+      const mine=tr.filter(t=>t.account===n);
+      return{name:n,n:mine.length,wr:tradeStats(mine).wr,
+        pnl:day.accounts[n].pnl!=null?day.accounts[n].pnl:0}})
     .sort((x,y)=>y.pnl-x.pnl);
   breakTable(grid,"By account",acctRows);
   box.appendChild(grid);
@@ -11949,15 +12951,27 @@ function renderDayPanel(day,date){
     const r=el("tr");
     r.appendChild(td("dim",new Date(x.ts*1000).toLocaleTimeString()));
     r.appendChild(td(null,x.account));
-    r.appendChild(td(null,x.symbol));
-    r.appendChild(td(x.side==="LONG"?"pos":"neg",x.side));
-    r.appendChild(td("num",x.qty));
-    r.appendChild(td("dim",x.strategy||"unattributed"));
+    /* An `unseen` row is NinjaTrader's realized P&L for a fill no poll
+       ever saw. The amount is real; the market, side and size are not
+       known, so they are dashes rather than plausible-looking values. */
+    r.appendChild(td(x.unseen?"dim":null,x.symbol||"—"));
+    r.appendChild(td(x.unseen?"dim":x.side==="LONG"?"pos":"neg",
+      x.unseen?"—":x.side));
+    r.appendChild(td("num"+(x.unseen?" dim":""),x.unseen?"—":x.qty));
+    r.appendChild(td("dim",stratOf(x)
+      ||(x.unseen?"unobserved fill":"unattributed")));
     r.appendChild(td("num dim",x.entry!=null?fmt(x.entry):"—"));
     r.appendChild(td("num dim",
-      x.opened_ts!=null?held(x.ts-x.opened_ts):"—"));
-    const pc=td("num "+pnlCls(x.pnl),usd(x.pnl)+(x.approx?" ≈":""));
-    if(x.approx)pc.title="several markets closed in the same poll window — "+
+      !x.unseen&&x.opened_ts!=null?held(x.ts-x.opened_ts):"—"));
+    const pc=td("num "+pnlCls(x.pnl),
+      usd(x.pnl)+(x.approx||x.late?" ≈":""));
+    if(x.late)pc.title="includes P&L that reached the balance after the "+
+      "position had already closed — reconciled against NinjaTrader's own "+
+      "realized total for the session";
+    else if(x.unseen)pc.title="NinjaTrader's realized P&L moved while no poll "+
+      "saw the position — a truncated dump, an outage or a restart. The "+
+      "amount is NT's own; the market, side and size are unknown.";
+    else if(x.approx)pc.title="several markets closed in the same poll window — "+
       "the cash move was split by contracts closed";
     r.appendChild(pc);
     tb.appendChild(r)});
@@ -11981,6 +12995,10 @@ function pnlNav(delta){
   const nowMonth=((P.data&&P.data.today)||"").slice(0,7)||localMonth();
   const next=delta===0?nowMonth:monthAdd(P.month||nowMonth,delta);
   if(next>nowMonth)return;
+  /* The archive knows where it begins, so stop there rather than let the
+     reader page back through empty months forever looking for data. */
+  const firstM=(P.data&&P.data.first_month)||"";
+  if(firstM&&next<firstM)return;
   P.month=next;P.sel=null;P.data=null;
   invalidate("pnl");pnlLoad()}
 
@@ -12207,7 +13225,7 @@ def print_exit_summary():
     if active_account and active_account in session_start_balances:
         final_bal = session_current_balances.get(active_account)
         if final_bal is not None:
-            pnl = final_bal - session_start_balances[active_account]
+            pnl = session_pnl(active_account, final_bal)
             pnl_str = f"${pnl:+,.2f}"
             pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
             pnl_line = f"Session P&L: {pnl_str}"[:inner]
