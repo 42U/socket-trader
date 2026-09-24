@@ -7711,6 +7711,34 @@ class TestSnapshotStream:
         assert st._accounts_now(3.0) == [{"name": "A", "cash": 1.0}]
         assert st._pre_position("A", "NQ 09-26") == 3       # alias-folded, direct query
 
+    def test_a_poller_stopped_mid_dump_never_publishes_into_the_next_stream(
+            self, monkeypatch):
+        # stop_snapshot_poller joins for half a second and a fake
+        # NinjaTrader that takes a full second outlives it. That thread used
+        # to be revived by the next start (one shared stop flag, cleared)
+        # and publish its stale, position-less dump over the new stream —
+        # CI's test_close_all_stays_leader_first_on_one_dump read exactly
+        # that and closed nothing. Each start now owns its events.
+        published = []
+        real_publish = st._snapshot_publish
+        monkeypatch.setattr(st, "_snapshot_publish",
+                            lambda snap: published.append(snap) or real_publish(snap))
+
+        def slow(port=None, timeout=3.0, retry=True, stall=None):
+            time.sleep(1.0)
+            return _stream_snap()                        # no positions
+        monkeypatch.setattr(st, "nt_snapshot", slow)
+        st.start_snapshot_poller()
+        time.sleep(0.05)
+        st.stop_snapshot_poller()                        # join times out: still mid-dump
+        assert sum(t.name == "nt-snapshot" for t in threading.enumerate()) == 1
+        _Stream(monkeypatch, delay=0.05, snap_fn=lambda: _stream_snap(
+            positions=[("A", "NQ SEP26", 1)]))
+        time.sleep(1.3)                                  # the slow dump has returned by now
+        assert published and all(p["positions"] for p in published)
+        assert sum(t.name == "nt-snapshot" for t in threading.enumerate()) == 1
+        assert st._snap_latest["positions"]
+
     def test_readers_never_open_a_dump_before_the_first_one_lands(self, monkeypatch):
         # Start-up under a slow NinjaTrader: the stream is running but has
         # published nothing. Readers get an empty read — never a stream of
@@ -7857,10 +7885,14 @@ class TestStreamFlatten:
             return _stream_snap(positions=[("A", "NQ SEP26", 1)] if held else [])
         s = _Stream(monkeypatch, snap_fn=state)
         assert st.snapshot_cached(5.0)["positions"]          # held, pre-close
-        flat_from["t"] = time.time() + 0.1                   # "closes land" shortly
-        t0 = time.monotonic()
+        # One clock for the fill and the stopwatch: the fake decides "flat"
+        # on time.time(), and on Windows that clock ticks in ~16 ms steps,
+        # so a monotonic stopwatch started after it read 93 ms for a wait
+        # the wall clock had already called 100 (CI, 2026-09-24).
+        t0 = time.time()
+        flat_from["t"] = t0 + 0.1                            # "closes land" shortly
         still = asyncio.run(st.verify_flat(["A"]))
-        elapsed = time.monotonic() - t0
+        elapsed = time.time() - t0
         assert still == []
         assert 0.1 <= elapsed < 0.9          # after the fill, well inside the old fixed pause
         assert s.request_thread_calls() == []

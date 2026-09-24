@@ -12,7 +12,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/42U/socket-trader/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![NinjaTrader](https://img.shields.io/badge/NinjaTrader-8-ff6b00?style=for-the-badge)](https://ninjatrader.com)
-[![Tests](https://img.shields.io/badge/Tests-864_passing-brightgreen?style=for-the-badge&logo=pytest&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/Tests-865_passing-brightgreen?style=for-the-badge&logo=pytest&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
 
 **One WebSocket signal in — verified NinjaTrader orders out, across every account you run.**
 

@@ -4801,8 +4801,10 @@ def _snapshot_publish(snap: dict):
         _snap_cond.notify_all()
 
 
-def _snapshot_poller_loop():
-    while not _snap_stop.is_set():
+def _snapshot_poller_loop(stop: threading.Event, wake: threading.Event):
+    """One generation of the stream. `stop` and `wake` are THIS thread's
+    own events (see start_snapshot_poller), so a stop is final for it."""
+    while not stop.is_set():
         req = time.time()
         try:
             snap = nt_snapshot(nt_port, timeout=SNAPSHOT_TIMEOUT, retry=False,
@@ -4812,7 +4814,7 @@ def _snapshot_poller_loop():
             snap = {"ok": False, "accounts": {}, "positions": [], "working": {},
                     "open_orders": {}, "ts": time.time(), "partial": False}
         snap["req_ts"] = req
-        if _snap_stop.is_set():
+        if stop.is_set():
             break                 # stopped mid-dump: never publish over a reset
         _snapshot_publish(snap)
         done = time.time()
@@ -4820,18 +4822,28 @@ def _snapshot_poller_loop():
             pause = SNAPSHOT_DOWN_BACKOFF      # nothing came back — NT is down
         else:
             pause = max(req + SNAPSHOT_INTERVAL - done, SNAPSHOT_MIN_GAP)
-        if _snap_wake.wait(pause):
-            _snap_wake.clear()
+        if wake.wait(pause):
+            wake.clear()
 
 
 def start_snapshot_poller():
     """Start the shared stream (idempotent)."""
-    global _snap_thread
+    global _snap_thread, _snap_stop, _snap_wake
     if snapshot_poller_running():
         return
-    _snap_stop.clear()
-    _snap_wake.clear()
+    # Fresh events for this generation. stop_snapshot_poller never waits
+    # out a dump in flight, so a thread from an earlier start can still be
+    # inside a slow NinjaTrader read when the next start comes. It keeps
+    # its own, already-set, stop event: it can neither be revived here nor
+    # publish into this stream when its dump finally returns. Clearing one
+    # shared event did both — a stop-then-start woke the stopped poller,
+    # and two pollers then ran, the old one publishing a foreign dump over
+    # the new stream (which is how CI read a position-less snapshot on a
+    # flatten and closed nothing).
+    _snap_stop = threading.Event()
+    _snap_wake = threading.Event()
     _snap_thread = threading.Thread(target=_snapshot_poller_loop,
+                                    args=(_snap_stop, _snap_wake),
                                     name="nt-snapshot", daemon=True)
     _snap_thread.start()
 
