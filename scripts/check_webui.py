@@ -153,6 +153,51 @@ check("state read requires a token", "_token_ok" in get)
 profiles = inspect.getsource(st._web_set_profiles)
 check("web profile writes strip AI gate config", "_strip_ai_config" in profiles)
 
+# ---- 6. the page must stay responsive ------------------------------------
+# These are the behaviours that made the dashboard feel sluggish once:
+# ticket chips torn down on every state poll (hover lost, clicks eaten),
+# account/position rows rebuilt on every fill (buttons vanishing under
+# the cursor), a click during an in-flight request dropped without a
+# word, and polls queuing up behind a slow one.
+for fn in ("renderPicker", "renderFavs", "renderSelected", "renderAlt",
+           "renderQty", "renderAtm"):
+    m_fn = re.search(r"function " + fn + r"\(\)\{(.*?)\n\}|function " + fn
+                     + r"\(\)\{(.*?)\}\n", JS, re.S)
+    body = JS[JS.find("function " + fn + "("):]
+    body = body[:body.find("\nfunction ", 1)] if "\nfunction " in body[1:] else body
+    check(f"{fn} renders only on change", "changed(" in body)
+check("account grid updates numbers in place", "updateAccountNumbers" in JS
+      and "acctStructure" in JS)
+check("positions table updates numbers in place", "posCells" in JS)
+check("a click while busy is answered, not dropped",
+      re.search(r"if\(busy\)\{toast\(", JS) is not None)
+check("polls never queue behind a slow one",
+      "if(stateInFlight)return" in JS and "if(liveInFlight)return" in JS)
+check("a click starts a live-poll burst", "liveBurst()" in JS)
+
+# ---- 7. NinjaTrader reads go through the shared stream --------------------
+# A web click must never wait on a state dump of its own, and no reader
+# may open a second stream while the shared one runs.
+trade = inspect.getsource(st.submit_manual_trade)
+check("manual orders take the pre-position from the stream",
+      "_pre_position" in trade and "query_nt_positions" not in trade)
+flat = inspect.getsource(st.close_account_positions)
+check("flattens read one shared snapshot", "_flatten_snapshot" in flat)
+verify = inspect.getsource(st.verify_flat)
+watch = inspect.getsource(st._watch_closed)
+check("flatten verification watches post-close witnesses, never a dump of its own",
+      "_watch_closed" in verify and "_snapshot_requested_after" in watch
+      and "book_flat(since)" in watch and "nt_snapshot(" not in verify + watch)
+check("prop close-before-open verification shares that watch",
+      "_watch_closed" in inspect.getsource(st._prop_verify_cleared))
+check("bridge acks are found past the AddOn's state pushes",
+      '"ack" in obj' in inspect.getsource(st._bridge_roundtrip))
+readers = inspect.getsource(st._stream_snapshot)
+check("stream readers never open a second dump", "query_nt" not in readers
+      and "nt_snapshot" not in readers)
+check("the web server keeps connections alive",
+      st._WebHandler.protocol_version == "HTTP/1.1")
+
 print("-" * 62)
 for n in notes:
     print(f"  note: {n}")

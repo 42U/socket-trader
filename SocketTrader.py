@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.17.1"
+__version__ = "0.18.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -2606,6 +2606,64 @@ def _bridge_book_snapshot(plans: list[dict] | None = None) -> dict | None:
             "positions": rows, "age": age}
 
 
+def _bridge_book_after(since: float) -> dict | None:
+    """The live book as a POST-CLOSE witness for a flatten: the bridge
+    enabled and streaming, the book fresh, and RECEIVED at least
+    BRIDGE_VERIFY_MARGIN_S after `since` (the moment the closes went out),
+    so the line was built by the AddOn after them. Both stamps are this
+    machine's clock. None when it cannot be trusted for that."""
+    book = _bridge_book
+    if not (live_bridge_enabled and _live_bridge_connected and book):
+        return None
+    if book["ts"] < since + BRIDGE_VERIFY_MARGIN_S:
+        return None
+    if time.time() - book["ts"] > BRIDGE_BOOK_FRESH_S:
+        return None
+    return book
+
+
+def _book_entry_trusted(book: dict, account: str) -> dict | None:
+    """One account's book entry, or None when the book cannot vouch for it
+    — absent from the dump, or a ~$0.00 balance against a known nonzero
+    one (NT answering while its broker feed is down)."""
+    entry = book["accounts"].get(account)
+    if entry is None:
+        return None
+    cash = entry["cash"]
+    if cash is None or _suspect_zero_balance(account, cash):
+        return None
+    return entry
+
+
+def _bridge_book_shows_flat(accounts: list[str], since: float) -> bool:
+    """True only when a trusted post-close book line shows every one of
+    `accounts` holding nothing."""
+    book = _bridge_book_after(since)
+    if book is None:
+        return False
+    for acct in accounts:
+        entry = _book_entry_trusted(book, acct)
+        if entry is None or entry["positions"]:
+            return False
+    return True
+
+
+def _bridge_book_shows_cleared(targets: set[tuple[str, str]], since: float) -> bool:
+    """True only when a trusted post-close book line shows none of the
+    (account, ROOT) targets still held — a KEPT same-market position on
+    another root is not in the way."""
+    book = _bridge_book_after(since)
+    if book is None:
+        return False
+    for acct, root in targets:
+        entry = _book_entry_trusted(book, acct)
+        if entry is None:
+            return False
+        if any(_alias_root(inst).upper() == root for inst, _qty in entry["positions"]):
+            return False
+    return True
+
+
 def _account_root_exposure(account: str, instrument: str) -> dict | None:
     """What one account holds on an instrument's root, per the live book.
 
@@ -2878,14 +2936,16 @@ def _prop_flatten_wave(to_close: dict[str, list[str]], keeps: dict[str, bool]):
 
 
 async def _prop_snapshot() -> dict | None:
-    """One complete NT state dump, or None when NT can't prove its state."""
+    """One complete NT state dump requested now, or None when NT can't
+    prove its state. "Now" is load-bearing: the guard must see a fill that
+    landed a second ago, so a cached read is never enough here."""
     for _ in range(2):
         try:
-            snap = await asyncio.to_thread(nt_snapshot, nt_port)
+            snap = await _snapshot_requested_after(time.time(), VERIFY_SNAPSHOT_WAIT)
         except Exception as exc:
             logger.error(f"PROP GUARD  snapshot failed: {exc}")
             continue
-        if snap.get("ok"):
+        if snap is not None and snap.get("ok"):
             return snap
         logger.warning("PROP GUARD  incomplete NT dump — retrying")
     return None
@@ -2902,23 +2962,13 @@ async def _prop_verify_cleared(to_close: dict[str, list[str]]) -> bool:
     the other."""
     targets = {(acct, _alias_root(c).upper())
                for acct, contracts in to_close.items() for c in contracts}
-    for attempt in range(PROP_VERIFY_TRIES):
-        await asyncio.sleep(FLATTEN_VERIFY_DELAY)
-        try:
-            snap = await asyncio.to_thread(nt_snapshot, nt_port)
-        except Exception as exc:
-            logger.error(f"PROP VERIFY  snapshot failed: {exc}")
-            continue
-        if not snap.get("ok"):
-            logger.warning("PROP VERIFY  incomplete dump — cannot confirm")
-            continue
-        open_roots = {(p["account"], _alias_root(p["instrument"]).upper())
-                      for p in snap["positions"]}
-        still = targets & open_roots
-        if not still:
-            return True
-        logger.info(f"PROP VERIFY  attempt {attempt + 1}: still open {sorted(still)}")
-    return False
+    gone, _remaining, _confirmed = await _watch_closed(
+        lambda positions: [p for p in positions
+                           if (p["account"], _alias_root(p["instrument"]).upper()) in targets],
+        lambda since: _bridge_book_shows_cleared(targets, since),
+        PROP_VERIFY_TRIES, (PROP_VERIFY_TRIES + 1) * FLATTEN_VERIFY_DELAY,
+        "PROP VERIFY")
+    return gone
 
 
 def _prop_withhold(plans: list[dict], why: str):
@@ -3137,7 +3187,7 @@ async def _check_prop_flat_by_close(now_et: datetime):
         # nor vanish unraised.
         try:
             try:
-                pre = await asyncio.to_thread(query_nt_positions, acct, nt_port)
+                pre = await asyncio.to_thread(_positions_now, acct, BALANCE_POLL_INTERVAL)
             except Exception:
                 pre = {}
             if not pre and await verify_flat([acct]) == []:
@@ -3225,6 +3275,10 @@ async def execute_plans(plans: list[dict], sig_id: str | None = None) -> list[st
                                     plan.get("qty") or 1)
                 if plan.get("prop"):
                     prop_reversals.append(plan)
+    if written:
+        # The dashboard's next read should show the fill as soon as
+        # NinjaTrader does — start the stream's next dump now.
+        _snapshot_nudge()
     if prop_reversals:
         # The reversals were never delayed (exit priority); now one task
         # sweeps every other market the reversing prop accounts hold AND
@@ -3351,11 +3405,8 @@ async def _write_entry_tranches(plan: dict, tranches: list[int],
         leader_first = (i == 0 and account == active_account)
         pre_pos = 0
         if leader_first:
-            try:
-                pre = await asyncio.to_thread(query_nt_positions, account, nt_port)
-                pre_pos = pre.get(plan["instrument"], 0)
-            except Exception:
-                pre_pos = 0
+            pre_pos = await asyncio.to_thread(
+                _pre_position, account, plan["instrument"])
         path = write_signal_to_file(sig)
         if not path:
             logger.error(f"LEG WRITE FAIL  account={account}  tranche={i + 1}  signal={sig}")
@@ -4393,7 +4444,8 @@ def ati_response_complete(text: str) -> bool:
     return text.endswith(("ATI\x00True\x00", "ATI\x00False\x00"))
 
 
-def _query_ati(command: str, port: int = 36973, timeout: float = 2.0) -> str:
+def _query_ati(command: str, port: int = 36973, timeout: float = 2.0,
+               stall: float | None = None) -> str:
     """Send a command to NinjaTrader ATI and return the raw response text.
 
     Reads until NT's end-of-dump marker rather than until the stream goes
@@ -4403,18 +4455,34 @@ def _query_ati(command: str, port: int = 36973, timeout: float = 2.0) -> str:
     and simply comes back missing whatever had not arrived yet. That made
     accounts and positions blink in and out of existence.
 
+    `timeout` caps the whole exchange; `stall` (default: the same value,
+    so plain callers behave as before) is the longest silence tolerated
+    between two chunks. The shared snapshot stream passes a long cap with
+    a short stall: a dump that is still arriving is read to its end
+    instead of being cut at a fixed wall and re-requested — the live log
+    shows 40–70 KB dumps cut at 3.0 s through the busiest hours, and each
+    retry added one more stream to the congestion that caused it — while
+    a NinjaTrader that has gone quiet is given up on quickly.
+
     A response without the marker is returned anyway (callers may still
     want a partial), but is logged so truncation is never silent.
     """
+    stall = timeout if stall is None else min(stall, timeout)
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    deadline = started + timeout
+    last_rx = started
     buf = b""
     try:
-        s.settimeout(timeout)
+        # A connect that does not complete within one stall window is a
+        # NinjaTrader that is not answering — no reason to hold the caller
+        # for the whole cap.
+        s.settimeout(stall)
         s.connect((_nt_host(port), port))
         s.sendall(f"{command}\n".encode())
         while True:
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            remaining = min(deadline - now, last_rx + stall - now)
             if remaining <= 0:
                 break
             s.settimeout(min(remaining, 0.5))
@@ -4425,6 +4493,7 @@ def _query_ati(command: str, port: int = 36973, timeout: float = 2.0) -> str:
             if not chunk:
                 break             # NT closed the connection
             buf += chunk
+            last_rx = time.monotonic()
             if buf.endswith(_ATI_END):
                 break
     except Exception:
@@ -4433,8 +4502,11 @@ def _query_ati(command: str, port: int = 36973, timeout: float = 2.0) -> str:
         s.close()
     text = buf.decode("utf-8", errors="ignore")
     if text and not ati_response_complete(text):
+        elapsed = time.monotonic() - started
+        why = "stalled" if elapsed < timeout - 0.05 else "hit the cap"
         logger.warning(f"ATI TRUNCATED  command={command}  got={len(text)} bytes "
-                       f"without end marker after {timeout}s")
+                       f"without end marker after {elapsed:.1f}s ({why}; "
+                       f"cap {timeout}s, stall {stall}s)")
     return text
 
 
@@ -4575,23 +4647,34 @@ def _pick_alias(names: list[str]) -> str:
     return (spaced or names)[0]
 
 
-def nt_snapshot(port: int | None = None, timeout: float = 3.0) -> dict:
+def nt_snapshot(port: int | None = None, timeout: float = 3.0,
+                retry: bool = True, stall: float | None = None) -> dict:
     """One ATI state dump parsed into everything the UI needs.
 
     NinjaTrader answers ACCOUNTS / POSITIONS / ORDERS with the *same* full
     state dump, so a single request yields every account's cash, realized
     P&L and buying power, every open position with its average entry, and
-    each account's working orders. Polling one snapshot beats the old
-    per-account queries: one socket round-trip instead of N.
+    each account's working orders (count in `working`, ids in
+    `open_orders`). Polling one snapshot beats the old per-account
+    queries: one socket round-trip instead of N.
+
+    `req_ts` is the wall clock at the moment the request went out: the
+    dump describes NinjaTrader at that instant or later, which is what a
+    verifier means by "a state read taken after the closes were written".
     """
+    req_ts = time.time()
     # One retry on a truncated dump: a partial response parses cleanly and
     # would otherwise look like accounts and positions having disappeared.
-    text = _query_ati("ACCOUNTS", port or nt_port, timeout)
-    if text and not ati_response_complete(text):
-        text = _query_ati("ACCOUNTS", port or nt_port, timeout)
+    # The shared snapshot stream passes retry=False — its next tick IS the
+    # retry, without doubling the load on a NinjaTrader that is already
+    # too slow to finish one dump.
+    text = _query_ati("ACCOUNTS", port or nt_port, timeout, stall)
+    if retry and text and not ati_response_complete(text):
+        text = _query_ati("ACCOUNTS", port or nt_port, timeout, stall)
     complete = bool(text) and ati_response_complete(text)
     snap: dict = {"ok": complete, "accounts": {}, "positions": [],
-                  "working": {}, "ts": time.time(), "partial": bool(text) and not complete}
+                  "working": {}, "open_orders": {}, "ts": time.time(),
+                  "req_ts": req_ts, "partial": bool(text) and not complete}
     if not text:
         return snap
 
@@ -4652,12 +4735,276 @@ def nt_snapshot(port: int | None = None, timeout: float = 3.0) -> dict:
 
     for account, ids in order_ids.items():
         if account:
-            snap["working"][account] = sum(
-                1 for oid in ids if order_status.get(oid) in OPEN_ORDER_STATES)
+            open_ids = [oid for oid in ids
+                        if order_status.get(oid) in OPEN_ORDER_STATES]
+            snap["working"][account] = len(open_ids)
+            snap["open_orders"][account] = open_ids
 
     snap["accounts"] = accounts
     snap["positions"].sort(key=lambda p: (p["account"], p["instrument"]))
     return snap
+
+
+# ---------- Shared NinjaTrader snapshot stream ----------
+# Every consumer of NinjaTrader's state — the web dashboard, the P&L
+# tracker, the balance monitor, fill confirmation, flattens and their
+# verification — used to take its own ATI dump. That is four to five
+# overlapping 40–70 KB streams a second through the busiest hours, and
+# the live log shows what it cost: dumps cut at the 3 s wall 169 times in
+# six days, each cut followed by a retry that added one more stream, and
+# a web click that had to wait for a dump of its own before an order file
+# was written (a close-all took 3 s to reach its first CLOSEPOSITION).
+#
+# One daemon thread now takes dumps back-to-back, never two at once, and
+# publishes each with the time its request went out. Readers pick the
+# freshness they need:
+#   snapshot_cached(max_age)  — the latest, if requested within max_age
+#   snapshot_after(t)         — block for one requested at or after t (a
+#                               verifier's "read taken after the closes")
+# Both fall back to the direct per-caller query when the stream is not
+# running (the terminal tools, the test suite), so nothing below depends
+# on it for correctness — only for speed and for keeping NinjaTrader's
+# ATI down to a single stream.
+SNAPSHOT_INTERVAL = 1.0        # seconds from one request to the next when nobody is waiting
+SNAPSHOT_MIN_GAP = 0.25        # breathing room after a slow dump before the next one
+SNAPSHOT_TIMEOUT = 10.0        # wall-clock cap on one dump …
+SNAPSHOT_STALL = 2.0           # … and the silence that ends one early (see _query_ati)
+SNAPSHOT_DOWN_BACKOFF = 2.0    # NinjaTrader unreachable: how long before asking again
+SNAPSHOT_FIRST_WAIT = 3.0      # the first dashboard poll waits this long for a first dump
+
+_snap_cond = threading.Condition()
+_snap_latest: dict | None = None      # newest snapshot, complete or not
+_snap_latest_ok: dict | None = None   # newest COMPLETE snapshot (end marker seen)
+_snap_seq = 0
+_snap_thread: threading.Thread | None = None
+_snap_stop = threading.Event()
+_snap_wake = threading.Event()        # a reader wants the next dump now
+
+
+def snapshot_poller_running() -> bool:
+    return _snap_thread is not None and _snap_thread.is_alive()
+
+
+def _snapshot_nudge():
+    """Ask the stream for its next dump now (no-op without the stream)."""
+    _snap_wake.set()
+
+
+def _snapshot_publish(snap: dict):
+    global _snap_latest, _snap_latest_ok, _snap_seq
+    with _snap_cond:
+        _snap_seq += 1
+        snap["seq"] = _snap_seq
+        _snap_latest = snap
+        if snap.get("ok"):
+            _snap_latest_ok = snap
+        _snap_cond.notify_all()
+
+
+def _snapshot_poller_loop():
+    while not _snap_stop.is_set():
+        req = time.time()
+        try:
+            snap = nt_snapshot(nt_port, timeout=SNAPSHOT_TIMEOUT, retry=False,
+                               stall=SNAPSHOT_STALL)
+        except Exception as exc:
+            logger.error(f"SNAPSHOT STREAM  dump failed: {exc}")
+            snap = {"ok": False, "accounts": {}, "positions": [], "working": {},
+                    "open_orders": {}, "ts": time.time(), "partial": False}
+        snap["req_ts"] = req
+        if _snap_stop.is_set():
+            break                 # stopped mid-dump: never publish over a reset
+        _snapshot_publish(snap)
+        done = time.time()
+        if not snap.get("accounts") and not snap.get("ok"):
+            pause = SNAPSHOT_DOWN_BACKOFF      # nothing came back — NT is down
+        else:
+            pause = max(req + SNAPSHOT_INTERVAL - done, SNAPSHOT_MIN_GAP)
+        if _snap_wake.wait(pause):
+            _snap_wake.clear()
+
+
+def start_snapshot_poller():
+    """Start the shared stream (idempotent)."""
+    global _snap_thread
+    if snapshot_poller_running():
+        return
+    _snap_stop.clear()
+    _snap_wake.clear()
+    _snap_thread = threading.Thread(target=_snapshot_poller_loop,
+                                    name="nt-snapshot", daemon=True)
+    _snap_thread.start()
+
+
+def stop_snapshot_poller():
+    global _snap_thread, _snap_latest, _snap_latest_ok
+    _snap_stop.set()
+    _snap_wake.set()
+    with _snap_cond:
+        _snap_cond.notify_all()
+    t = _snap_thread
+    _snap_thread = None
+    if t is not None:
+        t.join(timeout=0.5)     # never waits out a dump in flight — daemon thread
+    _snap_latest = None
+    _snap_latest_ok = None
+
+
+def snapshot_cached(max_age: float) -> dict | None:
+    """The newest snapshot if its request went out within `max_age`
+    seconds (age is measured from the request, the conservative end),
+    else None."""
+    snap = _snap_latest
+    if snap is None or time.time() - snap["req_ts"] > max_age:
+        return None
+    return snap
+
+
+def snapshot_after(after: float, timeout: float) -> dict | None:
+    """Block (thread-side) for a snapshot whose request went out at or
+    after wall-clock `after`, nudging the stream to start one now.
+    Returns None when the stream stops or `timeout` passes first."""
+    deadline = time.monotonic() + timeout
+    with _snap_cond:
+        while True:
+            snap = _snap_latest
+            if snap is not None and snap["req_ts"] >= after:
+                return snap
+            if _snap_stop.is_set() or not snapshot_poller_running():
+                return None
+            _snap_wake.set()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            _snap_cond.wait(min(remaining, 0.5))
+
+
+def _snapshot_positions(snap: dict, account: str) -> dict[str, int]:
+    """One account's positions from a snapshot, in query_nt_positions'
+    shape (alias → signed qty)."""
+    return {p["instrument"]: p["qty"] for p in snap.get("positions") or []
+            if p["account"] == account and p["qty"]}
+
+
+def _position_qty(positions: dict[str, int], instrument: str) -> int:
+    """Signed quantity held on `instrument`, whatever alias NinjaTrader
+    chose to report it under.
+
+    Orders name the contract the OIF way ("MNQ 12-26"); the state dump
+    prefers "MNQ DEC26". Six days of the live log show every fill
+    confirmation arriving through the balance-delta path and none through
+    the position delta — this exact mismatch — so the lookup folds both
+    spellings onto the OIF form before comparing."""
+    if instrument in positions:
+        return positions[instrument]
+    want = _nt_contract_aliases(instrument)[:1]
+    if not want:
+        return 0
+    for alias, qty in positions.items():
+        if _nt_contract_aliases(alias)[:1] == want:
+            return qty
+    return 0
+
+
+def _stream_snapshot(max_age: float, wait: float, what: str) -> dict | None:
+    """The stream's freshest snapshot for a periodic reader: one requested
+    within `max_age`, waiting up to `wait` for it, else the newest there
+    is (logged with its age). None only when the stream is not running.
+
+    A reader NEVER opens a dump of its own while the stream runs: a
+    NinjaTrader too slow to finish one dump is the one case where a second
+    stream is exactly wrong — the harness reproduced 4 concurrent dumps
+    and 18 cut-off reads from that fallback before it was removed."""
+    if not snapshot_poller_running():
+        return None
+    snap = snapshot_after(time.time() - max_age, wait)
+    if snap is None:
+        snap = _snap_latest
+        if snap is None:
+            # Running, but no dump has landed yet — start-up under a slow
+            # NinjaTrader. An empty read, exactly what a failed query gave
+            # before; the harness caught the alternative (a direct query)
+            # opening three extra streams against a NinjaTrader that was
+            # already too slow to finish its first.
+            logger.warning(f"{what}  the stream has no dump yet — reading nothing")
+            return _empty_snapshot()
+        logger.warning(f"{what}  no snapshot younger than {max_age + wait:.0f}s "
+                       f"— reading one {time.time() - snap['req_ts']:.1f}s old")
+    return snap
+
+
+def _empty_snapshot() -> dict:
+    now = time.time()
+    return {"ok": False, "partial": False, "accounts": {}, "positions": [],
+            "working": {}, "open_orders": {}, "ts": now, "req_ts": now}
+
+
+def _positions_now(account: str, max_age: float) -> dict[str, int]:
+    """One account's positions: from the shared stream when it is running,
+    else one direct ATI query — the pre-stream path, which the tests
+    drive."""
+    snap = _stream_snapshot(max_age, max_age, "POSITIONS")
+    if snap is not None:
+        return _snapshot_positions(snap, account)
+    return query_nt_positions(account, nt_port)
+
+
+def _accounts_now(max_age: float) -> list[dict]:
+    """Every account's CashValue, in query_nt_accounts' shape, from the
+    shared stream when it is running, else one direct ATI query."""
+    snap = _stream_snapshot(max_age, max_age, "BALANCES")
+    if snap is not None:
+        return [{"name": name, "cash": info["cash"]}
+                for name, info in snap["accounts"].items()
+                if isinstance(info.get("cash"), (int, float))]
+    return query_nt_accounts(nt_port)
+
+
+def _pre_position(account: str, instrument: str) -> int:
+    """The leader's position before an entry write, for fill confirmation.
+
+    Never costs the order a dump: with the stream running, the newest
+    snapshot is already in hand and, having been requested before the
+    write, is pre-fill by construction — the same reading the old blocking
+    query returned 0.3–4 s later. Without the stream, one direct query as
+    before; any failure reads as 0, as it always did."""
+    if snapshot_poller_running():
+        # A partial dump can simply lack the position; the newest COMPLETE
+        # read is the baseline while it is recent, so a cut-off dump under
+        # congestion cannot mint a false "FILLED" from a 0 it never held.
+        snap = _snap_latest_ok
+        if snap is None or time.time() - snap["req_ts"] > 5.0:
+            snap = _snap_latest
+        if snap is None:
+            return 0
+        age = time.time() - snap["req_ts"]
+        if age > 5.0:
+            logger.warning(f"PRE-POSITION  newest snapshot is {age:.1f}s old "
+                           f"(NinjaTrader slow?) — confirming {instrument} on "
+                           f"{account} against it anyway")
+        return _position_qty(_snapshot_positions(snap, account), instrument)
+    try:
+        return _position_qty(query_nt_positions(account, nt_port), instrument)
+    except Exception:
+        return 0
+
+
+FLATTEN_SNAPSHOT_MAX_AGE = 5.0   # a flatten acts on a snapshot at most this old …
+FLATTEN_SNAPSHOT_WAIT = 2.0      # … waiting this long for a newer one before using the newest anyway
+
+
+def _flatten_snapshot() -> dict | None:
+    """The state a flatten works from — which orders to cancel by id and
+    which instruments to close by file.
+
+    From the shared stream: a snapshot requested within
+    FLATTEN_SNAPSHOT_MAX_AGE, waiting up to FLATTEN_SNAPSHOT_WAIT for one;
+    past that the newest available, logged with its age, because the
+    closes matter more than a perfect inventory (the bridge's Flatten()
+    needs no inventory at all, CLOSEPOSITION cancels the instrument's
+    working orders itself, and session_contracts backstops the file path).
+    None without the stream, and the callers query directly as before."""
+    return _stream_snapshot(FLATTEN_SNAPSHOT_MAX_AGE, FLATTEN_SNAPSHOT_WAIT, "FLATTEN")
 
 
 # ---------- Futures instrument catalog ----------
@@ -7321,8 +7668,12 @@ def _next_ati_filename(prefix: str) -> str:
     with _ati_seq_lock:
         _ati_write_seq += 1
         seq = _ati_write_seq
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    ms = int((time.time() % 1) * 1000)
+        # One clock read for both fields: read separately, a write that
+        # straddled a second boundary could name itself ..._120000_000
+        # after ..._120000_998 and sort before the file written before it.
+        now = time.time()
+    ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
+    ms = int((now % 1) * 1000)
     return f"{prefix}_{ts}_{ms:03d}_{seq:04d}.txt"
 
 
@@ -7505,25 +7856,47 @@ def _bridge_roundtrip(cmd: dict, timeout: float = 2.0) -> dict | None:
         # bytes — not that the AddOn authenticated us, parsed the command,
         # or executed it. Callers treat a reply as "this is done" and skip
         # their fallback, so it must mean the AddOn said so.
+        #
+        # The ack is NOT the first line back. The AddOn answers every new
+        # connection with its state snapshot before its command reader even
+        # starts (HandleNewClient writes the snapshot, then spawns
+        # ClientReadLoop), and keeps pushing state on account events; the
+        # ack is the first line carrying an "ack" key. Reading one line and
+        # calling it the ack made every flatten log "REFUSED by AddOn" with
+        # a state line as the refusal (live log, 2026-09-17 12:38) while
+        # the AddOn had in fact flattened — so the file fallback fired
+        # every time and the native path was never confirmed.
         buf = b""
-        while b"\n" not in buf and len(buf) < 65536:
-            chunk = s.recv(4096)
-            if not chunk:
+        deadline = time.monotonic() + timeout
+        skipped = 0
+        while time.monotonic() < deadline:
+            s.settimeout(max(0.05, deadline - time.monotonic()))
+            try:
+                chunk = s.recv(65536)
+            except socket.timeout:
                 break
+            if not chunk:
+                break                          # AddOn closed without an ack
             buf += chunk
-        line = buf.split(b"\n", 1)[0].decode("utf-8", errors="ignore").strip()
-        if not line:
-            logger.warning(f"bridge cmd UNCONFIRMED (no ack): {cmd}")
-            return None
-        try:
-            ack = json.loads(line)
-        except (ValueError, json.JSONDecodeError):
-            logger.warning(f"bridge cmd UNCONFIRMED (bad ack {line[:80]!r}): {cmd}")
-            return None
-        if not isinstance(ack, dict):
-            logger.warning(f"bridge cmd UNCONFIRMED (bad ack {line[:80]!r}): {cmd}")
-            return None
-        return ack
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                line = raw.decode("utf-8", errors="ignore").strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (ValueError, json.JSONDecodeError):
+                    logger.warning(f"bridge cmd  unparseable line {line[:80]!r} "
+                                   f"while waiting for the ack: {cmd}")
+                    continue
+                if isinstance(obj, dict) and "ack" in obj:
+                    return obj
+                skipped += 1                   # a state push, not the answer
+            if len(buf) > 1_000_000:
+                break
+        logger.warning(f"bridge cmd UNCONFIRMED (no ack; {skipped} state line(s) "
+                       f"read): {cmd}")
+        return None
     except OSError as exc:
         logger.warning(f"bridge cmd failed: {cmd} · {exc}")
         return None
@@ -7620,8 +7993,12 @@ def fire_cancel_order(order_id: str):
         _dash_set_alert(Fore.RED + f"  ✖  Cancel write error: {exc}" + Style.RESET_ALL)
 
 
-def fire_cancel_account_orders(account: str) -> int:
+def fire_cancel_account_orders(account: str, snap: dict | None = None) -> int:
     """Cancel every open order on ONE account, by order ID.
+
+    `snap` is a state dump already in hand (close_account_positions reads
+    the open-order ids and the position inventory from ONE dump — they
+    used to be two requests for the same bytes); without it, one query.
 
     Replaces the old CANCELALLORDERS file: per the NT8 OIF docs that
     command "will cancel all active orders across all accounts and broker
@@ -7635,7 +8012,10 @@ def fire_cancel_account_orders(account: str) -> int:
     degrades per-instrument rather than nuking every account.
     """
     try:
-        order_ids = query_nt_open_orders(account, nt_port)
+        if snap is not None:
+            order_ids = list((snap.get("open_orders") or {}).get(account, []))
+        else:
+            order_ids = query_nt_open_orders(account, nt_port)
     except Exception as e:
         logger.error(f"cancel_account_orders {account}  query error: {e}")
         return 0
@@ -7661,10 +8041,16 @@ def close_account_positions(account: str) -> list[str]:
     if not account:
         return []
 
+    # One state read serves both the cancel-by-id sweep and the inventory
+    # below — the same dump used to be requested twice, back to back, and
+    # through the shared stream it is usually already in hand (see
+    # _flatten_snapshot). None without the stream: each step queries.
+    snap = _flatten_snapshot()
+
     # Cancel this account's working orders first so a pending entry can't
     # refill after we close. Scoped by order ID — never CANCELALLORDERS,
     # which NT applies globally across all accounts and connections.
-    fire_cancel_account_orders(account)
+    fire_cancel_account_orders(account, snap)
     # Those cancels also void any opening writes still registered as
     # in-flight — a phantom row here would keep re-triggering closes —
     # and a whole-account flatten voids every strategy attribution too.
@@ -7676,7 +8062,8 @@ def close_account_positions(account: str) -> list[str]:
     # Capture what WAS open so the caller sees the same "Closed: ..."
     # list regardless of which path executed the flatten.
     try:
-        positions = query_nt_positions(account, nt_port)
+        positions = (_snapshot_positions(snap, account) if snap is not None
+                     else query_nt_positions(account, nt_port))
         for instrument, qty in positions.items():
             if qty != 0 and instrument:
                 closed.add(instrument)
@@ -7845,12 +8232,10 @@ async def submit_manual_trade(side, instrument, qty, order_type: str = "market",
     leader_plan = next((p for p in plans if p["account"] == active_account), None)
     pre_pos = 0
     if leader_plan and not leader_plan["deferred"]:
-        try:
-            pre_positions = await asyncio.to_thread(
-                query_nt_positions, active_account, nt_port)
-            pre_pos = pre_positions.get(leader_plan["instrument"], 0)
-        except Exception:
-            pre_pos = 0
+        # From the shared stream: the write below no longer waits on a
+        # NinjaTrader dump of its own (0.3–4 s live, on every click).
+        pre_pos = await asyncio.to_thread(
+            _pre_position, active_account, leader_plan["instrument"])
     written = await execute_plans(plans, sig_id)
     scheduled = [p["account"] for p in plans if p["deferred"]]
     if not written and not scheduled:
@@ -7956,7 +8341,7 @@ def check_pending_confirms():
     if not _pending_confirms or not active_account:
         return
 
-    positions = query_nt_positions(active_account, nt_port)
+    positions = _positions_now(active_account, BALANCE_POLL_INTERVAL)
     cur_balance = session_current_balances.get(active_account)
     now = time.time()
     still_pending = []
@@ -7967,7 +8352,7 @@ def check_pending_confirms():
             instrument = entry["instrument"]
             pre_pos = entry["pre_pos"]
             pre_balance = entry.get("pre_balance")
-            cur_pos = positions.get(instrument, 0)
+            cur_pos = _position_qty(positions, instrument)
 
             pos_changed = cur_pos != pre_pos
             balance_changed = (
@@ -8260,7 +8645,7 @@ async def balance_monitor():
             # account's entry in session_current_balances (equity, not
             # cash) so mid-trade unrealized P&L reaches the stop/target
             # check. Other accounts always get ATI's CashValue.
-            all_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
+            all_accounts = await asyncio.to_thread(_accounts_now, BALANCE_POLL_INTERVAL)
             for a in all_accounts:
                 if (live_bridge_enabled and _live_bridge_connected
                         and a["name"] == active_account):
@@ -9171,8 +9556,44 @@ async def _web_toggle_pause(pause: bool) -> tuple[bool, str]:
     return True, "resumed"
 
 
-FLATTEN_VERIFY_DELAY = 1.5   # seconds to let NinjaTrader fill the closes
+# A flatten is WATCHED, not slept through. Success is answered the moment
+# a post-close witness shows nothing open — the live bridge book on its
+# next push, or the first complete state dump requested after the closes.
+# Failure is not rushed: at least FLATTEN_VERIFY_TRIES post-close reads
+# AND (FLATTEN_VERIFY_TRIES + 1) × FLATTEN_VERIFY_DELAY seconds of
+# watching before "incomplete", because a fill can take a few seconds
+# (2026-09-17: still open at +2 s, flat by +4 s). Without the stream
+# (tests, terminal tools) direct dumps are spaced FLATTEN_VERIFY_DELAY
+# apart, as before.
+FLATTEN_VERIFY_DELAY = 1.5
 FLATTEN_VERIFY_TRIES = 3
+FLATTEN_VERIFY_MAX_S = 30.0     # cap on watching when NinjaTrader is slow or silent
+BRIDGE_VERIFY_MARGIN_S = 0.25   # a book line is post-close only if RECEIVED this long after the closes
+# How long one wait for a stream dump may take: the dump in flight when
+# the wait begins (up to one cap) plus the qualifying one after it, so a
+# slow-but-answering NinjaTrader still yields proof.
+VERIFY_SNAPSHOT_WAIT = 2 * SNAPSHOT_TIMEOUT + SNAPSHOT_INTERVAL + 1.0
+# The web budget for a flatten: the whole watch at its worst, then some.
+# A button that waits this long under a congested NinjaTrader is showing
+# the truth; one that times out and cancels the verification mid-flight
+# would hide it.
+FLATTEN_WEB_TIMEOUT = FLATTEN_VERIFY_MAX_S + 15.0
+
+
+async def _snapshot_requested_after(after: float, timeout: float) -> dict | None:
+    """A state dump whose request went out at or after wall-clock `after`.
+
+    Through the shared stream when it runs — the next dump it takes, so a
+    verification adds no second stream to NinjaTrader's ATI — else one
+    direct dump once `after` has passed: the pre-stream path, which the
+    tests drive through nt_snapshot. Exceptions propagate; each verifier
+    logs its own. None means no dump arrived within `timeout`."""
+    wait = after - time.time()
+    if wait > 0:
+        await asyncio.sleep(wait)
+    if snapshot_poller_running():
+        return await asyncio.to_thread(snapshot_after, after, timeout)
+    return await asyncio.to_thread(nt_snapshot, nt_port)
 
 
 async def verify_flat(accounts: list[str]) -> list[dict]:
@@ -9185,30 +9606,99 @@ async def verify_flat(accounts: list[str]) -> list[dict]:
     "prohibited even if the overlap is brief or unintentional" and "cannot
     be appealed". So the close is confirmed, not assumed.
     """
-    remaining: list[dict] = []
-    confirmed = False
-    for attempt in range(FLATTEN_VERIFY_TRIES):
-        await asyncio.sleep(FLATTEN_VERIFY_DELAY)
-        try:
-            snap = await asyncio.to_thread(nt_snapshot, nt_port)
-        except Exception as exc:
-            logger.error(f"FLATTEN VERIFY  snapshot failed: {exc}")
-            continue          # unknown is NOT flat — burn a retry instead
-        if not snap.get("ok"):
-            # A truncated dump parses cleanly and simply comes back short,
-            # so "positions vanished" is indistinguishable from "flat".
-            logger.warning("FLATTEN VERIFY  incomplete dump — cannot confirm")
-            continue
-        remaining = [p for p in snap["positions"] if p["account"] in accounts]
-        confirmed = True
-        if not remaining:
-            return []
-        logger.info(f"FLATTEN VERIFY  attempt {attempt + 1}: still open {remaining}")
+    # Minimum watch before "incomplete": (tries + 1) delays, no shorter
+    # than the old sleep-then-check cadence's last look (~5.4 s live).
+    gone, remaining, confirmed = await _watch_closed(
+        lambda positions: [p for p in positions if p["account"] in accounts],
+        lambda since: _bridge_book_shows_flat(accounts, since),
+        FLATTEN_VERIFY_TRIES, (FLATTEN_VERIFY_TRIES + 1) * FLATTEN_VERIFY_DELAY,
+        "FLATTEN VERIFY")
+    if gone:
+        return []
     if not confirmed:
         logger.warning("FLATTEN VERIFY  never got a complete dump")
         return [{"account": ", ".join(accounts), "instrument": "UNVERIFIED",
                  "qty": 0, "avg_price": None}]
     return remaining
+
+
+async def _watch_closed(open_in, book_flat, tries: int, min_s: float,
+                        label: str) -> tuple[bool, list[dict], bool]:
+    """Watch NinjaTrader after closes were written until nothing that
+    `open_in(positions)` reports is left. Returns (gone, remaining,
+    confirmed); `confirmed` is False when no complete dump ever arrived,
+    and an unverifiable state is NOT flat.
+
+    Two post-close witnesses, either one enough for success:
+      · the live bridge book — NinjaTrader's own Account.Positions, pushed
+        by the AddOn on every position event. A line RECEIVED at least
+        BRIDGE_VERIFY_MARGIN_S after the closes went out that shows
+        nothing open is proof: the same negative the prop fast path
+        already trusts the book for (_bridge_book_snapshot), under the
+        same trust rules (bridge streaming, book fresh, account present
+        with a believable balance).
+      · complete ATI state dumps REQUESTED after the closes, taken one
+        after another by the shared stream. The first showing nothing open
+        is proof; one still showing a position only means keep watching —
+        never "sleep a fixed 1.5 s and look again".
+    Failure is not rushed: at least `tries` post-close reads and `min_s`
+    of watching, capped by FLATTEN_VERIFY_MAX_S. A read that fails or
+    comes back incomplete still counts against `tries`, as it always did,
+    so a NinjaTrader that never answers cleanly cannot hold the watch
+    open past the cap."""
+    since = time.time()
+    remaining: list[dict] = []
+    confirmed = False
+    attempts = 0
+    # Without the stream every read is a direct dump, so they are spaced
+    # FLATTEN_VERIFY_DELAY apart as before; the stream paces itself.
+    spacing = 0.0 if snapshot_poller_running() else FLATTEN_VERIFY_DELAY
+    mark = since + spacing         # the next dump must have been requested after this
+    while True:
+        elapsed = time.time() - since
+        if elapsed >= FLATTEN_VERIFY_MAX_S:
+            logger.warning(f"{label}  watched {elapsed:.0f}s — giving up")
+            break
+        if attempts >= tries and elapsed >= min_s:
+            break
+        if book_flat(since):
+            logger.info(f"{label}  bridge book shows nothing open — confirmed")
+            return True, [], True
+        # The next post-mark dump, checking the book between short waits so
+        # its push is not missed while a slow dump is still in flight.
+        snap = None
+        failed = False
+        budget = time.monotonic() + VERIFY_SNAPSHOT_WAIT
+        while snap is None and time.monotonic() < budget:
+            if book_flat(since):
+                logger.info(f"{label}  bridge book shows nothing open — confirmed")
+                return True, [], True
+            try:
+                snap = await _snapshot_requested_after(mark, 0.25)
+            except Exception as exc:
+                logger.error(f"{label}  snapshot failed: {exc}")
+                failed = True
+                break
+            if time.time() - since >= FLATTEN_VERIFY_MAX_S:
+                break
+        attempts += 1
+        if snap is None:
+            if not failed:
+                logger.warning(f"{label}  no state dump arrived — cannot confirm")
+            mark = time.time() + spacing
+            continue
+        mark = (snap.get("ts") or time.time()) + spacing
+        if not snap.get("ok"):
+            # A truncated dump parses cleanly and simply comes back short,
+            # so "positions vanished" is indistinguishable from "flat".
+            logger.warning(f"{label}  incomplete dump — cannot confirm")
+            continue
+        confirmed = True
+        remaining = open_in(snap["positions"])
+        if not remaining:
+            return True, [], True
+        logger.info(f"{label}  read {attempts}: still open {remaining}")
+    return False, remaining, confirmed
 
 
 async def _confirm_flat(accounts: list[str], closed: list[str]) -> tuple[bool, str]:
@@ -9220,7 +9710,7 @@ async def _confirm_flat(accounts: list[str], closed: list[str]) -> tuple[bool, s
     not both report success.
     """
     still = await verify_flat(accounts)
-    _live_cache["data"] = None
+    _live_invalidate()
     if still:
         detail = ", ".join(
             p["instrument"] if p["instrument"] == "UNVERIFIED"
@@ -9481,6 +9971,7 @@ async def _web_close_position(account, instrument) -> tuple[bool, str]:
     if acct not in target_accounts():
         return False, f"{acct} is not a managed account"
     await asyncio.to_thread(fire_close_position, acct, instr)
+    _live_invalidate(fresh=True)
     _dash_set_alert(Fore.RED + f"  ⛔  CLOSE {instr} on {acct} (web)" + Style.RESET_ALL)
     return True, f"close sent — {instr} on {acct}"
 
@@ -9538,11 +10029,20 @@ async def _web_set_favorites(raw) -> tuple[bool, str]:
     return True, f"{len(favs[:12])} favourite(s) saved"
 
 
-_live_cache: dict = {"ts": 0.0, "data": None}
+_live_cache: dict = {"ts": 0.0, "seq": None, "data": None}
 LIVE_ZERO_FREEZE_S = 180        # how long zeroed AccountItems freeze the live view
 _live_zeroed_since: float | None = None   # wall-clock start of the current zeroed run
 _live_lock = threading.Lock()
-LIVE_CACHE_TTL = 1.0   # seconds; several browser tabs share one ATI round-trip
+LIVE_CACHE_TTL = 1.0   # seconds; several browser tabs share one ATI round-trip (no-stream path)
+
+
+def _live_invalidate(fresh: bool = False):
+    """Drop the derived dashboard view so the next poll rebuilds it (a role
+    or profile changed), and with `fresh` also start the stream's next
+    dump now (positions just changed: a close or reversal was written)."""
+    _live_cache["data"] = None
+    if fresh:
+        _snapshot_nudge()
 
 
 def web_live(force: bool = False) -> dict:
@@ -9555,16 +10055,33 @@ def web_live(force: bool = False) -> dict:
     configured names.
     """
     with _live_lock:
-        fresh = _live_cache["data"] is not None and (
-            time.time() - _live_cache["ts"] < LIVE_CACHE_TTL)
-        if fresh and not force:
-            return _live_cache["data"]
-        try:
-            snap = nt_snapshot(nt_port)
-        except Exception as exc:
-            logger.error(f"WEB LIVE  snapshot failed: {exc}")
-            snap = {"ok": False, "accounts": {}, "positions": [],
-                    "working": {}, "ts": time.time()}
+        if snapshot_poller_running():
+            # Served from the shared stream: this request never waits on
+            # NinjaTrader. The rows are rebuilt only when a new dump has
+            # landed (or a role/profile edit dropped them) — otherwise the
+            # last build is returned as is.
+            snap = _snap_latest
+            if snap is None:
+                snap = snapshot_after(0.0, SNAPSHOT_FIRST_WAIT)   # first poll after start
+            if snap is None:
+                snap = {"ok": False, "accounts": {}, "positions": [],
+                        "working": {}, "ts": time.time(), "seq": None}
+            elif (not force and _live_cache["data"] is not None
+                    and _live_cache["seq"] == snap.get("seq")):
+                return _live_cache["data"]
+        else:
+            # No stream (terminal tools, the test suite): poll directly,
+            # throttled so several tabs still share one round-trip.
+            fresh = _live_cache["data"] is not None and (
+                time.time() - _live_cache["ts"] < LIVE_CACHE_TTL)
+            if fresh and not force:
+                return _live_cache["data"]
+            try:
+                snap = nt_snapshot(nt_port)
+            except Exception as exc:
+                logger.error(f"WEB LIVE  snapshot failed: {exc}")
+                snap = {"ok": False, "accounts": {}, "positions": [],
+                        "working": {}, "ts": time.time()}
         # A truncated or failed dump must not be rendered as "these accounts
         # and positions are gone" — that is what made rows blink. Same for a
         # dump that answers with AccountItems zeroed out: that is NT with its
@@ -9592,7 +10109,7 @@ def web_live(force: bool = False) -> dict:
         if (not snap.get("ok") or zeroed) and _live_cache.get("last_good"):
             stale = dict(_live_cache["last_good"])
             stale["stale"] = True
-            _live_cache.update(ts=time.time(), data=stale)
+            _live_cache.update(ts=time.time(), seq=snap.get("seq"), data=stale)
             return stale
 
         managed = target_accounts()
@@ -9631,7 +10148,8 @@ def web_live(force: bool = False) -> dict:
         data = {"ok": snap["ok"], "accounts": rows, "stale": False,
                 "positions": snap["positions"], "ts": snap["ts"],
                 "totals": _live_totals(rows)}
-        _live_cache.update(ts=time.time(), data=data, last_good=data)
+        _live_cache.update(ts=time.time(), seq=snap.get("seq"), data=data,
+                           last_good=data)
         return data
 
 
@@ -10658,12 +11176,11 @@ def _pnl_observe(live: dict, now: float | None = None,
                 # for its own commission while later ones quietly wore a
                 # `late` flag instead.
                 cands = [k for k, _ in _pnl_staged_pending(name, shape, ts)]
-                if not prev["shape"]:
-                    cands += [o["key"] for o in opens
-                              if (_pnl_open_meta.get(o["key"]) or {})
-                              .get("staged_ts") is not None]
+                cands += [o["key"] for o in opens
+                          if (_pnl_open_meta.get(o["key"]) or {})
+                          .get("staged_ts") is not None]
                 if (dreal is not None and dreal <= -0.005
-                        and not prev["shape"] and len(cands) == 1):
+                        and len(cands) == 1):
                     # NinjaTrader books an entry's commission into
                     # RealizedPnL as the order fills, routinely a poll or
                     # more before the position reaches the snapshot. Read
@@ -10676,13 +11193,26 @@ def _pnl_observe(live: dict, now: float | None = None,
                     # row for its own commission. It belongs to the
                     # position about to open, so it waits there.
                     #
-                    # Only while flat, with exactly one entry pending, and
+                    # Exactly one dispatched entry to answer for it, and
                     # only for money LEAVING: an entry costs, it never
-                    # pays, so realized moving up while flat is P&L and
-                    # belongs to the late path however recently an order
-                    # went out. With a position still on, even a debit is
-                    # ambiguous, and a confident wrong answer there is
-                    # worse than an honest `late`.
+                    # pays, so realized moving up here is P&L and belongs
+                    # to the late path however recently an order went out.
+                    # NOT "only while flat": a second market still held is
+                    # no explanation for the debit — nothing closed on it
+                    # (a partial exit changes its shape and lands in the
+                    # closes branch above) and its ATM moving a stop or
+                    # target never touches realized — and gating on the
+                    # book being flat before the entry is what put the
+                    # 2026-09-24 11:25 row in the log: a Gooping NQ entry
+                    # filled on Sim101 while GC-ExhaustM was still held,
+                    # and its $2.18 became an 'unobserved fill' (with an
+                    # earlier close on the account it would have gone
+                    # `late` onto that row instead). Multi-strategy mode
+                    # overlaps markets as a matter of course, so that was
+                    # the common case, not the edge. What stays ambiguous
+                    # — a loss settling late from an earlier close while a
+                    # new entry is pending — is the same ambiguity accepted
+                    # while flat, and either way the day still adds up.
                     meta = _pnl_open_meta.get(cands[0])
                     if meta is not None:
                         meta["cost"] = round(
@@ -10892,7 +11422,7 @@ async def _web_set_sizing(account, mode, value) -> tuple[bool, str]:
             # single-contract signal to zero and the leg is skipped.
             note = "  ⚠  below ×0.5 a 1-contract signal sizes to 0 and is skipped"
     save_account_profiles()
-    _live_cache["data"] = None
+    _live_invalidate()
     label = "copy" if mode == "copy" else (
         f"×{rule['qty_value']:g}" if mode == "multiple" else f"fixed {int(rule['qty_value'])}")
     logger.info(f"WEB SIZING  {acct} -> {label}")
@@ -10939,7 +11469,7 @@ async def _web_reverse_position(account, instrument) -> tuple[bool, str]:
     if err:
         return False, f"could not build reversal: {err}"
     written = await asyncio.to_thread(write_signal_to_file, signal)
-    _live_cache["data"] = None
+    _live_invalidate(fresh=True)
     if not written:
         return False, "order file write failed — check the output directory"
     logger.info(f"WEB REVERSE  {acct}  {instr}  {action} {abs(pos['qty'])}")
@@ -10967,7 +11497,7 @@ async def _web_flatten_account(account) -> tuple[bool, str]:
     if acct not in target_accounts():
         return False, f"{acct} is not a managed account"
     closed = await asyncio.to_thread(close_account_positions, acct)
-    _live_cache["data"] = None
+    _live_invalidate(fresh=True)
     logger.info(f"WEB FLATTEN  account={acct}  contracts={closed}")
     _dash_set_alert(Fore.RED + f"  ⛔  FLATTEN {acct} (web)" + Style.RESET_ALL)
     # Same contract as FLATTEN ALL: never answer the button from the
@@ -11021,7 +11551,7 @@ async def _web_set_role(account, role) -> tuple[bool, str]:
     cfg["follower_accounts"] = follower_accounts
     cfg["roundrobin_accounts"] = roundrobin_accounts
     save_config(cfg)
-    _live_cache["data"] = None
+    _live_invalidate()
     refresh_terminal()
     logger.info(f"WEB ROLE  {acct} -> {role}  leader={active_account} "
                 f"followers={follower_accounts} rr={roundrobin_accounts}")
@@ -11038,6 +11568,20 @@ def refresh_terminal():
     """
     refresh_header_status()
     refresh_controls()
+
+
+async def _web_shielded(coro):
+    """Run `coro` so that a web timeout cannot cancel it mid-flight.
+
+    A flatten writes its closes and then PROVES them against NinjaTrader;
+    if the browser's request times out first, the proof must still finish
+    and raise its verdict (the sticky FLATTEN INCOMPLETE alert) — a
+    verification cancelled halfway is a silent failure. The inner task is
+    tracked with the deferred legs so shutdown still cancels it."""
+    task = asyncio.ensure_future(coro)
+    _leg_tasks.add(task)
+    task.add_done_callback(_leg_tasks.discard)
+    return await asyncio.shield(task)
 
 
 def _web_run(coro, timeout: float = 20.0):
@@ -11089,6 +11633,11 @@ def _web_allowed_hosts() -> set[str]:
 class _WebHandler(http.server.BaseHTTPRequestHandler):
     server_version = "SocketTrader"
     sys_version = ""
+    # Keep-alive: the page polls twice a second and every click is a
+    # POST; under HTTP/1.0 each one paid a fresh TCP connection and a
+    # fresh handler thread. Every response carries Content-Length (see
+    # _reply), which is what HTTP/1.1 needs to reuse the connection.
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, *args):  # keep the TUI clean
         pass
@@ -11183,15 +11732,21 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        # The refusals below answer before the body is read; on a kept-alive
+        # connection those bytes would be parsed as the next request, so a
+        # refused request also closes its connection.
         if not self._host_ok():
+            self.close_connection = True
             self._json({"ok": False, "message": "forbidden host"}, 403)
             return
         if not self._origin_ok() or not self._token_ok():
             logger.warning(f"WEB POST {path}  rejected — bad origin or token")
+            self.close_connection = True
             self._json({"ok": False, "message": "forbidden"}, 403)
             return
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if ctype != "application/json":
+            self.close_connection = True
             self._json({"ok": False, "message": "content-type must be application/json"}, 415)
             return
         try:
@@ -11213,13 +11768,14 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
             elif path == "/api/pause":
                 ok, msg = _web_run(_web_toggle_pause(data.get("paused", True)))
             elif path == "/api/close_all":
-                ok, msg = _web_run(_web_close_all(), timeout=30.0)
+                ok, msg = _web_run(_web_shielded(_web_close_all()),
+                                   timeout=FLATTEN_WEB_TIMEOUT)
             elif path == "/api/close_position":
                 ok, msg = _web_run(_web_close_position(
                     data.get("account"), data.get("instrument")), timeout=30.0)
             elif path == "/api/flatten_account":
-                ok, msg = _web_run(_web_flatten_account(data.get("account")),
-                                   timeout=30.0)
+                ok, msg = _web_run(_web_shielded(_web_flatten_account(data.get("account"))),
+                                   timeout=FLATTEN_WEB_TIMEOUT)
             elif path == "/api/role":
                 ok, msg = _web_run(_web_set_role(data.get("account"),
                                                  data.get("role")))
@@ -11263,6 +11819,17 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
             self._json({"ok": bool(ok), "message": msg})
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except TimeoutError:
+            # The action was dispatched; only the wait for its answer ran
+            # out. Say that, not "error": a flatten keeps verifying and
+            # reports in the Activity feed.
+            logger.warning(f"WEB POST {path}  still running past its web timeout")
+            try:
+                self._json({"ok": False, "message":
+                            "NinjaTrader has not confirmed in time — the request "
+                            "is still running; watch Activity for the verdict"}, 504)
+            except OSError:
+                pass
         except Exception as exc:
             logger.error(f"WEB POST {path}  {exc}")
             try:
@@ -11481,6 +12048,8 @@ background:#171f2d;border:1px solid var(--cyan);border-radius:9px;padding:10px 1
 display:none;max-width:92vw;z-index:99;box-shadow:var(--shadow);font-size:12.5px}
 #toast.bad{border-color:var(--red);color:#ffb9be}
 #toast.good{border-color:var(--green);color:#a4ecca}
+#toast.warn{border-color:var(--yellow);color:var(--yellow)}
+#toast.info{border-color:var(--cyan);color:var(--cyan)}
 
 /* ---- P&L calendar tab ---- */
 .hide{display:none!important}
@@ -11725,18 +12294,29 @@ function toast(m,kind){const t=$("toast");t.textContent=m;t.className=kind||"";
   t.style.display="block";clearTimeout(t._h);
   t._h=setTimeout(()=>t.style.display="none",5000)}
 
-async function api(path,body){
-  if(busy)return{ok:false};
-  busy=true;
+/* One request at a time — but a second click while one is in flight is
+   refused OUT LOUD: silently dropping it read as a dead button. A request
+   that takes longer than a beat says so (a flatten confirms against
+   NinjaTrader before it answers), and a slow answer shows how long it
+   took, so "sluggish" is at least never "silent". */
+let busyLabel="";
+async function api(path,body,label){
+  if(busy){toast("still working on "+(busyLabel||"the previous request")+"…","warn");
+    return{ok:false}}
+  busy=true;busyLabel=label||path.replace("/api/","").replace(/_/g," ");
+  const t0=performance.now();
+  const slow=setTimeout(()=>toast(busyLabel+" — working… (confirming with NinjaTrader)","info"),600);
   try{
     const r=await fetch(path,{method:"POST",headers:{
       "Content-Type":"application/json","X-ST-Token":TOKEN},body:JSON.stringify(body||{})});
     const j=await r.json();
-    toast(j.message,j.ok?"good":"bad");
-    refresh();refreshLive(true);
+    clearTimeout(slow);
+    const ms=performance.now()-t0;
+    toast(j.message+(ms>1500?"  ("+(ms/1000).toFixed(1)+"s)":""),j.ok?"good":"bad");
+    refresh();liveBurst();
     return j;
-  }catch(e){toast("request failed: "+e,"bad");return{ok:false}}
-  finally{busy=false}
+  }catch(e){clearTimeout(slow);toast("request failed: "+e,"bad");return{ok:false}}
+  finally{busy=false;busyLabel=""}
 }
 async function get(path){
   const r=await fetch(path,{headers:{"X-ST-Token":TOKEN}});
@@ -11780,7 +12360,11 @@ function pickInstrument(code){
   instrument=code;
   renderPicker();renderAlt();renderSelected();note()}
 
+/* The ticket's chips are rebuilt only when what they show changes — the
+   state poll used to tear every one of them down twice a second, which
+   reset hover under the cursor and could swallow the click in flight. */
 function renderSelected(){
+  if(!changed("selected",[instrument,S&&S.favorites]))return;
   const box=$("selected");clear(box);
   if(!instrument){box.appendChild(el("span","none","nothing selected"));return}
   box.appendChild(el("span",null,instrument));
@@ -11795,6 +12379,7 @@ function renderSelected(){
   box.appendChild(star)}
 
 function renderAlt(){
+  if(!changed("alt",[instrument,S&&S.catalog]))return;
   const box=$("altMonths");clear(box);
   if(!instrument||!S)return;
   const root=instrument.split(" ")[0];
@@ -11818,6 +12403,7 @@ function mkPick(code,label,star){
   return b}
 
 function renderFavs(){
+  if(!changed("favs",[S&&S.favorites,instrument]))return;
   const row=$("favRow");clear(row);
   const favs=(S&&S.favorites)||[];
   favs.forEach(c=>row.appendChild(mkPick(c,"★ "+c,true)))}
@@ -11825,9 +12411,10 @@ function renderFavs(){
 function renderPicker(){
   const box=$("instrBox");
   if(document.activeElement&&document.activeElement.closest("#instrBox"))return;
+  const q=$("instrSearch").value.trim().toLowerCase();
+  if(!changed("picker",[S&&S.catalog,instrument,q]))return;
   clear(box);
   if(!S||!S.catalog)return;
-  const q=$("instrSearch").value.trim().toLowerCase();
   const groups={};
   S.catalog.forEach(p=>{
     const hay=(p.root+" "+p.name+" "+p.micro+" "+p.group).toLowerCase();
@@ -11846,6 +12433,7 @@ function renderPicker(){
     box.appendChild(row)})}
 
 function renderQty(){
+  if(!changed("qtychips",qty()))return;
   const q=$("qtyChips");clear(q);
   [1,2,3,5,10].forEach(n=>{
     const b=el("div","pick"+(qty()===n?" on":""),String(n));
@@ -11952,9 +12540,35 @@ function renderTiles(){
     b.appendChild(el("span",null,T.locked.join(", ")+" — session stop or target hit."));
     w.appendChild(b)}}
 
+/* Numbers change on every fill; the buttons in the row must not. The
+   table is rebuilt only when its SHAPE changes — which accounts, their
+   roles, which markets each holds and on which side, sync state — and
+   cash, P&L, working-order counts and position sizes are written into
+   the existing cells, so a Flat or role button never disappears under
+   the cursor mid-click. */
+const acctCells={};
+function acctStructure(){
+  return [L&&L.ok,S&&S.profiles,(L&&L.accounts||[]).map(a=>[a.name,a.role,a.managed,
+    a.stop,a.profile,a.sync,a.sync_detail,
+    a.positions.map(p=>p.instrument+(p.qty>0?"+":"-"))])]}
+function posText(p){return (p.qty>0?"+":"")+p.qty+" "+p.instrument+
+  (p.avg_price?" @"+fmt(p.avg_price):"")}
+function numCls(v){return "num "+(v==null?"dim":v>=0?"pos":"neg")}
+/* Write only what differs: assigning an unchanged textContent still
+   replaces the text node, which is a DOM mutation per cell per poll. */
+function setText(n,v,cls){if(n.textContent!==v)n.textContent=v;
+  if(cls!=null&&n.className!==cls)n.className=cls}
+function updateAccountNumbers(){
+  (L&&L.accounts||[]).forEach(a=>{const c=acctCells[a.name];if(!c)return;
+    setText(c.cash,fmt(a.cash));
+    setText(c.realized,signed(a.realized),numCls(a.realized));
+    setText(c.session,signed(a.session_pnl),numCls(a.session_pnl));
+    setText(c.work,String(a.working||"—"),"num"+(a.working?"":" dim"));
+    a.positions.forEach((p,i)=>{if(c.pos[i])setText(c.pos[i],posText(p))})})}
 function renderAccounts(){
   if(sizeEditOpen)return;                 // never yank an open inline editor
-  if(!changed("accounts",[L&&L.ok,L&&L.accounts,S&&S.profiles]))return;
+  if(!changed("accounts",acctStructure())){updateAccountNumbers();return}
+  for(const k in acctCells)delete acctCells[k];
   const w=$("acctWrap");clear(w);
   if(!L){w.appendChild(el("div","empty","connecting to NinjaTrader…"));return}
   if(!L.ok){w.appendChild(el("div","empty",
@@ -11994,22 +12608,20 @@ function renderAccounts(){
       if(a.sync_detail)sy.title=a.sync_detail}
     tr.appendChild(sy);
 
-    tr.appendChild(td("num",fmt(a.cash)));
-    tr.appendChild(td("num "+(a.realized==null?"dim":a.realized>=0?"pos":"neg"),
-      signed(a.realized)));
-    tr.appendChild(td("num "+(a.session_pnl==null?"dim":a.session_pnl>=0?"pos":"neg"),
-      signed(a.session_pnl)));
+    const cells={pos:[]};acctCells[a.name]=cells;
+    tr.appendChild(cells.cash=td("num",fmt(a.cash)));
+    tr.appendChild(cells.realized=td(numCls(a.realized),signed(a.realized)));
+    tr.appendChild(cells.session=td(numCls(a.session_pnl),signed(a.session_pnl)));
 
     const pt=el("td");
     if(a.positions.length){
       a.positions.forEach(p=>{
-        pt.appendChild(el("div",p.qty>0?"pos":"neg",
-          (p.qty>0?"+":"")+p.qty+" "+p.instrument+
-          (p.avg_price?" @"+fmt(p.avg_price):"")))})}
+        const d=el("div",p.qty>0?"pos":"neg",posText(p));
+        cells.pos.push(d);pt.appendChild(d)})}
     else pt.appendChild(el("span","dim","flat"));
     tr.appendChild(pt);
 
-    tr.appendChild(td("num"+(a.working?"":" dim"),a.working||"—"));
+    tr.appendChild(cells.work=td("num"+(a.working?"":" dim"),a.working||"—"));
 
     const at=el("td");at.style.textAlign="right";
     if(a.stop)at.appendChild(el("span","tag bad",a.stop.toUpperCase()));
@@ -12019,10 +12631,18 @@ function renderAccounts(){
     tb.appendChild(tr)});
   t.appendChild(tb);w.appendChild(t)}
 
+/* Same split as the account grid: the Rev/Close buttons survive a size
+   or average-price change; only a new or closed position rebuilds. */
+const posCells=[];
 function renderPositions(){
-  if(!changed("positions",L&&L.positions))return;
-  const w=$("posWrap");clear(w);
   const list=(L&&L.positions)||[];
+  if(!changed("positions",[L&&L.ok,list.map(p=>p.account+"|"+p.instrument+"|"+(p.qty>0?"L":"S"))])){
+    list.forEach((p,i)=>{const c=posCells[i];if(!c)return;
+      setText(c.qty,String(Math.abs(p.qty)));
+      setText(c.avg,p.avg_price?fmt(p.avg_price):"—")});
+    return}
+  posCells.length=0;
+  const w=$("posWrap");clear(w);
   $("posHint").textContent=list.length?(list.length+" open"):"";
   if(!list.length){w.appendChild(el("div","empty","flat across all accounts"));return}
   const t=el("table"),h=el("thead"),hr=el("tr");
@@ -12031,12 +12651,12 @@ function renderPositions(){
   h.appendChild(hr);t.appendChild(h);
   const tb=el("tbody");
   list.forEach(p=>{
-    const tr=el("tr");
+    const tr=el("tr"),c={};posCells.push(c);
     tr.appendChild(td(null,p.account));
     tr.appendChild(td(null,p.instrument));
     tr.appendChild(td(p.qty>0?"pos":"neg",p.qty>0?"LONG":"SHORT"));
-    tr.appendChild(td("num",Math.abs(p.qty)));
-    tr.appendChild(td("num",p.avg_price?fmt(p.avg_price):"—"));
+    tr.appendChild(c.qty=td("num",Math.abs(p.qty)));
+    tr.appendChild(c.avg=td("num",p.avg_price?fmt(p.avg_price):"—"));
     const act=el("td");act.style.textAlign="right";
     const grp=el("div","btnrow");grp.style.justifyContent="flex-end";
     grp.appendChild(btn("Rev","tiny",()=>{
@@ -13036,6 +13656,7 @@ function renderFeed(){
 function renderAtm(){
   const sel=$("tAtm");
   if(document.activeElement===sel)return;
+  if(!changed("atm",[S.atm_available,S.atm_strategy]))return;
   const cur=sel.value||S.atm_strategy;clear(sel);
   const opts=(S.atm_available||[]).slice();
   if(S.atm_strategy&&!opts.includes(S.atm_strategy))opts.unshift(S.atm_strategy);
@@ -13047,22 +13668,41 @@ function render(){if(!S)return;
   if(!modalOpen){renderFavs();renderPicker();renderSelected();renderAlt();renderQty()}
   note()}
 
+/* Polls never queue behind a slow one: a tick that finds the previous
+   request still in flight is skipped, so a NinjaTrader stall cannot pile
+   up requests that then all land at once. */
+let stateInFlight=false,liveInFlight=false,burstUntil=0;
 async function refresh(){
+  if(stateInFlight)return;
+  stateInFlight=true;
   try{S=await get("/api/state");
     if(!instrument&&S.last_manual&&S.last_manual.instrument)
       instrument=S.last_manual.instrument;
     render()}
-  catch(e){const st=$("chState");st.textContent="app offline";st.className="chip bad"}}
+  catch(e){const st=$("chState");st.textContent="app offline";st.className="chip bad"}
+  finally{stateInFlight=false}}
 
-async function refreshLive(force){
+async function refreshLive(){
+  if(liveInFlight)return;
+  liveInFlight=true;
   try{L=await get("/api/live");
     // Outside the panel guards: the tables only redraw when their data
     // changes, but this timestamp must keep ticking so a frozen table is
     // visibly "unchanged" rather than "stopped".
-    $("liveHint").textContent="updated "+new Date(L.ts*1000).toLocaleTimeString();
+    $("liveHint").textContent="updated "+new Date(L.ts*1000).toLocaleTimeString()+
+      (L.stale?" · stale":"");
     if(!modalOpen){renderTiles();renderAccounts();renderPositions()}
     if(S)renderChips()}
-  catch(e){$("liveHint").textContent="NinjaTrader link lost"}}
+  catch(e){$("liveHint").textContent="NinjaTrader link lost"}
+  finally{liveInFlight=false}}
+
+/* After a click NinjaTrader's state is about to change: poll the live
+   view every 400ms for a few seconds so the fill or close shows the
+   moment the app sees it, instead of on the next 2s tick. The live read
+   is served from the app's shared snapshot stream, so this costs
+   NinjaTrader nothing. */
+function liveBurst(){burstUntil=performance.now()+6000;refreshLive()}
+setInterval(()=>{if(performance.now()<burstUntil)refreshLive()},400);
 
 /* ---- wiring ---- */
 $("sideB").onclick=()=>setSide("long");
@@ -13151,6 +13791,9 @@ async def main():
     if cfg.get("output_directory"):
         output_directory = cfg["output_directory"]
 
+    # One NinjaTrader state stream for everything that reads it — started
+    # before the web UI so its first poll has a dump to answer with.
+    start_snapshot_poller()
     web_url = start_web_ui(asyncio.get_running_loop(), cfg)
     if web_url:
         print(Fore.CYAN + f"  🌐  Web UI  →  {web_url}" + Style.RESET_ALL)
@@ -13210,6 +13853,7 @@ async def main():
             break
 
     stop_web_ui()
+    stop_snapshot_poller()
 
 
 def print_exit_summary():

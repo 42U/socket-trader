@@ -6,13 +6,13 @@
 
 [![VoidOrigin](https://img.shields.io/badge/VOIDORIGIN-voidorigin.com-0a0a0a?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiIHN0cm9rZT0iI2ZmNmIzNSIgc3Ryb2tlLXdpZHRoPSIyIi8+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iNCIgZmlsbD0iI2ZmNmIzNSIvPjwvc3ZnPg==&logoColor=ff6b35&labelColor=0a0a0a)](https://voidorigin.com)
 
-[![Version](https://img.shields.io/badge/v0.17.1-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
+[![Version](https://img.shields.io/badge/v0.18.0-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
 [![GitHub Stars](https://img.shields.io/github/stars/42U/socket-trader?style=for-the-badge&logo=github&color=gold)](https://github.com/42U/socket-trader)
 [![License: MIT](https://img.shields.io/github/license/42U/socket-trader?style=for-the-badge&logo=opensourceinitiative&color=blue)](https://opensource.org/licenses/MIT)
 [![CI](https://img.shields.io/github/actions/workflow/status/42U/socket-trader/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![NinjaTrader](https://img.shields.io/badge/NinjaTrader-8-ff6b00?style=for-the-badge)](https://ninjatrader.com)
-[![Tests](https://img.shields.io/badge/Tests-700_passing-brightgreen?style=for-the-badge&logo=pytest&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/Tests-864_passing-brightgreen?style=for-the-badge&logo=pytest&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
 
 **One WebSocket signal in — verified NinjaTrader orders out, across every account you run.**
 
@@ -536,7 +536,7 @@ It is a **trading companion**, not a replacement for the terminal: it does two j
 | **Activity** | The same signal and alert feed shown in the terminal dashboard |
 | **P&L tab** | The trading calendar — month stats, equity curve, heat-mapped days, and a full per-day breakdown (see below) |
 
-**The account grid is real, live NinjaTrader data.** NinjaTrader answers `ACCOUNTS`, `POSITIONS` and `ORDERS` with the same full state dump, so the app takes one ATI round-trip every two seconds and parses it into accounts, positions and working orders (cached briefly so several browser tabs share a single poll) rather than querying per account.
+**The account grid is real, live NinjaTrader data.** NinjaTrader answers `ACCOUNTS`, `POSITIONS` and `ORDERS` with the same full state dump, so the app keeps **one snapshot stream**: a single background reader takes that dump about once a second, never two at once, and everything that needs NinjaTrader's state — the dashboard, the balance monitor, fill confirmation, flattens and their verification — reads from it. A browser poll or a click never waits on a dump of its own: an order file is written the moment you submit, and a flatten cancels and closes from the snapshot already in hand. The *proof* that an account is flat is watched for, not slept through: the button answers on the first post-close witness — the AddOn's next position push when the live bridge is on (sub-second), or the first complete state dump requested after the closes — and a close that has not landed is watched for several seconds before it is called incomplete. On a busy morning that dump can run to 50–70 KB and take seconds to arrive, which is exactly when five overlapping readers used to make it slower still.
 
 **The instrument picker never depends on history.** Contract months are computed per product family — quarterly (Mar/Jun/Sep/Dec) for equity index, rates and FX; every month for energy; Feb/Apr/Jun/Aug/Dec for gold; Mar/May/Jul/Sep/Dec for silver and copper — and rendered as `ROOT MM-YY` (e.g. `NQ 09-26`), the form the OIF signals use. Anything unusual can still be typed.
 
@@ -569,7 +569,7 @@ NinjaTrader's built-in TCP AT Interface only publishes state transitions (open /
 
 If you want session limits to react **during** an open trade, install the optional `SocketTraderBridge` NinjaScript AddOn. It runs inside NinjaTrader and publishes live `cash`, `realized`, `unrealized`, `equity`, and per-position `last` price / P&L over a TCP socket on every tick.
 
-With prop accounts under management the same stream doubles as the **live position book**: every line is a full dump of all accounts and open positions, so when a signal arrives the client already knows whether any prop account holds anything. A fresh book that shows nothing to close lets the prop entry skip its pre-entry ATI snapshot and fire immediately (see [Prop Firm Mode](#prop-firm-mode)).
+With prop accounts under management the same stream doubles as the **live position book**: every line is a full dump of all accounts and open positions, so when a signal arrives the client already knows whether any prop account holds anything. A fresh book that shows nothing to close lets the prop entry skip its pre-entry ATI snapshot and fire immediately (see [Prop Firm Mode](#prop-firm-mode)). The same book is the fastest **proof of a flatten**: the AddOn pushes a line on every position event, so a flatten from the web UI or a session stop is confirmed the moment the post-close push shows the account holding nothing, instead of waiting on the next ATI state dump.
 
 **Install:**
 

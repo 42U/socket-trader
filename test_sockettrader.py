@@ -122,7 +122,9 @@ def reset_session_state():
     st._bridge_book = None
     st._inflight_opens.clear()
     st._strategy_ledger.clear()
+    st.stop_snapshot_poller()     # no shared stream leaks between tests
     yield
+    st.stop_snapshot_poller()
     st.expected_contract = _REAL_EXPECTED_CONTRACT
     st.active_account = None
     st.follower_accounts = []
@@ -3654,7 +3656,7 @@ class TestSessionContractsScoping:
         markets that account never traded."""
         st.active_account = "A"
         st.session_contracts.update({"NQ 09-26", "ES 09-26", "GC 12-26"})
-        monkeypatch.setattr(st, "fire_cancel_account_orders", lambda a: None)
+        monkeypatch.setattr(st, "fire_cancel_account_orders", lambda a, snap=None: None)
         monkeypatch.setattr(st, "bridge_send_command", lambda *a, **k: False)
         monkeypatch.setattr(st, "query_nt_positions",
                             lambda a, p=36973: {"NQ 09-26": -1})
@@ -3667,7 +3669,7 @@ class TestSessionContractsScoping:
             self, tmp_output_dir, monkeypatch):
         st.active_account = "A"
         st.session_contracts.update({"MNQ 09-26"})
-        monkeypatch.setattr(st, "fire_cancel_account_orders", lambda a: None)
+        monkeypatch.setattr(st, "fire_cancel_account_orders", lambda a, snap=None: None)
         monkeypatch.setattr(st, "bridge_send_command", lambda *a, **k: False)
         monkeypatch.setattr(st, "query_nt_positions",
                             lambda a, p=36973: {"NQ 09-26": -1})
@@ -3778,7 +3780,7 @@ class TestReviewRegressions:
         st.active_account = "A"
         monkeypatch.setattr(st, "live_bridge_enabled", True)
         monkeypatch.setattr(st, "bridge_send_command", lambda *a, **k: False)
-        monkeypatch.setattr(st, "fire_cancel_account_orders", lambda a: None)
+        monkeypatch.setattr(st, "fire_cancel_account_orders", lambda a, snap=None: None)
         monkeypatch.setattr(st, "query_nt_positions",
                             lambda a, p=36973: {"NQ 09-26": -2})
         with patch.object(st, "output_directory", str(tmp_output_dir)):
@@ -3787,6 +3789,42 @@ class TestReviewRegressions:
         files = list(tmp_output_dir.glob("oifclose_*.txt"))
         assert files, "no CLOSEPOSITION file written on the fallback path"
         assert "CLOSEPOSITION" in files[0].read_text()
+
+
+class TestBridgeAck:
+    """The AddOn writes its state snapshot to every new connection before
+    it reads the command, and pushes more state on account events; the
+    ack is the first line with an "ack" key. Reading one line and calling
+    it the ack logged every flatten as REFUSED (live log 2026-09-17)."""
+
+    def _wire(self, monkeypatch, chunks):
+        class Sock:
+            def __init__(self): self.chunks = list(chunks)
+            def settimeout(self, *_): pass
+            def connect(self, *_): pass
+            def sendall(self, b): pass
+            def shutdown(self, *_): pass
+            def recv(self, *_): return self.chunks.pop(0) if self.chunks else b""
+            def close(self): pass
+        monkeypatch.setattr(st.socket, "socket", lambda *a, **k: Sock())
+        monkeypatch.setattr(st, "live_bridge_enabled", True)
+        monkeypatch.setattr(st, "_live_bridge_connected", True)
+        monkeypatch.setattr(st, "_nt_host", lambda p: "127.0.0.1")
+
+    def test_ack_is_found_past_the_state_push(self, monkeypatch):
+        self._wire(monkeypatch, [
+            b'{"t":1.0,"accounts":[{"name":"A","cash":1,"positions":[]}]}\n',
+            b'{"t":1.1,"accounts":[]}\n{"ack":true,"msg":"flattened A"}\n'])
+        assert st.bridge_send_command({"cmd": "flatten", "account": "A"}) is True
+
+    def test_refusal_is_still_a_refusal(self, monkeypatch):
+        self._wire(monkeypatch, [b'{"t":1.0,"accounts":[]}\n',
+                                 b'{"ack":false,"msg":"account not found: Z"}\n'])
+        assert st.bridge_send_command({"cmd": "flatten", "account": "Z"}) is False
+
+    def test_state_pushes_without_an_ack_are_unconfirmed(self, monkeypatch):
+        self._wire(monkeypatch, [b'{"t":1.0,"accounts":[]}\n', b'{"t":1.1,"accounts":[]}\n'])
+        assert st._bridge_roundtrip({"cmd": "flatten", "account": "A"}, timeout=0.5) is None
 
 
 class TestBridgeAuth:
@@ -5675,7 +5713,7 @@ class TestStrategyLedger:
 
     def test_close_account_positions_clears_ledger(self, monkeypatch):
         st._ledger_note_entry("A1", "NQ 09-26", "BUY", 1, ("a", ""), "s1")
-        monkeypatch.setattr(st, "fire_cancel_account_orders", lambda a: 0)
+        monkeypatch.setattr(st, "fire_cancel_account_orders", lambda a, snap=None: 0)
         monkeypatch.setattr(st, "query_nt_positions", lambda a, p: {})
         with patch.object(st, "output_directory", ""):
             st.close_account_positions("A1")
@@ -6665,17 +6703,86 @@ class TestPnlEntryCommission:
         assert t[0]["pnl"] == 27.33         # 28.27 gross less its own 0.94
         assert not t[0].get("late")
 
-    def test_a_debit_with_a_position_already_on_still_goes_to_the_late_path(self):
-        # Book not flat at the previous poll: realized moving without a
-        # close is the genuinely ambiguous case, and must not be claimed
-        # as some pending entry's cost.
+    def test_a_debit_while_another_market_is_held_is_the_pending_entrys_cost(self):
+        # Holding MES, an MNQ entry goes out and realized moves by one
+        # commission before the position shows. Nothing closed on MES (a
+        # partial exit would change its shape), so the only dispatched
+        # explanation is the pending entry — the same call as while flat.
+        # Gating this on "flat before" is what minted the 2026-09-24
+        # unobserved fill: a Gooping NQ entry filled while GC-ExhaustM was
+        # still held on the same account.
         self.quiet(1_000.0, 0.0, 100.0, n=4)
         pos = [_ppos("MES 12-26", -1)]
         self.obs(_plive(_prow(self.A, 1_000.0, pos, realized=0.0)), 108.0)
         st._pnl_note_open(self.A, "MNQ 12-26", ("", "Gooping"), now=110.0)
         self.obs(_plive(_prow(self.A, 999.06, pos, realized=-0.94)), 110.0)
         meta = st._pnl_open_meta.get((self.A, "MNQ")) or {}
-        assert not meta.get("cost")         # not parked on the pending entry
+        assert meta.get("cost") == -0.94    # parked on the pending entry
+        assert self.trades() == []          # no phantom, nothing billed late
+
+    def test_entry_while_another_market_is_held_carries_its_own_commission(self):
+        # 2026-09-24 on Sim101, to the cent: a GC-ExhaustM long taken
+        # flat, a Gooping NQ long filled while GC was still held (its
+        # $2.18 entry commission booked in the poll that showed the
+        # position), the NQ stop, then the GC stop. The record used to
+        # mint an 'unobserved fill' row for the $2.18 and leave the NQ row
+        # short by it.
+        self.quiet(30_000.0, 0.0, 100.0, n=5)
+        st._pnl_note_open(self.A, "GC 12-26", ("", "GC-ExhaustM"), now=105.0)
+        gc = _ppos("GC 12-26", 1, 4_284.9)
+        for i in range(4):
+            self.obs(_plive(_prow(self.A, 29_997.60, [gc], realized=-2.40)),
+                     106.0 + i)
+        st._pnl_note_open(self.A, "NQ 12-26", ("", "Gooping"), now=120.0)
+        nq = _ppos("NQ 12-26", 1, 30_553.75)
+        for i in range(4):
+            self.obs(_plive(_prow(self.A, 29_995.42, [gc, nq], realized=-4.58)),
+                     121.0 + i)
+        for i in range(4):      # NQ stop: 50 ticks against, exit commission booked
+            self.obs(_plive(_prow(self.A, 29_743.24, [gc], realized=-256.76)),
+                     130.0 + i)
+        for i in range(6):      # GC stop: 23 ticks against
+            self.obs(_plive(_prow(self.A, 29_510.84, realized=-489.16)),
+                     140.0 + i)
+        t = self.trades()
+        assert [(x["symbol"], x["pnl"]) for x in t] == [("NQ", -254.36),
+                                                        ("GC", -234.80)]
+        assert not any(x.get("unseen") or x.get("late") for x in t)
+        assert round(sum(x["pnl"] for x in t), 2) == round(29_510.84 - 30_000.0, 2)
+
+    def test_an_entry_taken_while_holding_does_not_bill_the_previous_trade(self):
+        # The quieter form of the same defect: with an earlier close on
+        # the account, the next entry's commission was handed to that row
+        # as `late` instead of to the trade that paid it.
+        self.quiet(30_000.0, 0.0, 100.0, n=5)
+        st._pnl_note_open(self.A, "NQ 12-26", ("", "Gooping"), now=105.0)
+        nq = _ppos("NQ 12-26", 1, 30_000.0)
+        for i in range(4):
+            self.obs(_plive(_prow(self.A, 29_997.82, [nq], realized=-2.18)),
+                     106.0 + i)
+        for i in range(4):      # +100 gross round trip
+            self.obs(_plive(_prow(self.A, 30_095.64, realized=95.64)), 110.0 + i)
+        st._pnl_note_open(self.A, "GC 12-26", ("", "GC-ExhaustM"), now=120.0)
+        gc = _ppos("GC 12-26", 1, 4_284.9)
+        for i in range(4):
+            self.obs(_plive(_prow(self.A, 30_093.24, [gc], realized=93.24)),
+                     121.0 + i)
+        st._pnl_note_open(self.A, "NQ 12-26", ("", "Gooping"), now=130.0)
+        for i in range(4):
+            self.obs(_plive(_prow(self.A, 30_091.06, [gc, nq], realized=91.06)),
+                     131.0 + i)
+        for i in range(4):      # NQ: +50 gross
+            self.obs(_plive(_prow(self.A, 30_138.88, [gc], realized=138.88)),
+                     140.0 + i)
+        for i in range(6):      # GC: 23 ticks against
+            self.obs(_plive(_prow(self.A, 29_906.48, realized=-93.52)),
+                     150.0 + i)
+        t = self.trades()
+        assert [(x["symbol"], x["pnl"]) for x in t] == [("NQ", 95.64),
+                                                        ("NQ", 45.64),
+                                                        ("GC", -234.80)]
+        assert not any(x.get("unseen") or x.get("late") for x in t)
+        assert round(sum(x["pnl"] for x in t), 2) == round(29_906.48 - 30_000.0, 2)
 
     def test_a_second_entry_does_not_backdate_its_cost_onto_the_last_trade(self):
         self.quiet(586.14, 0.0, 100.0, n=5)
@@ -7401,3 +7508,504 @@ class TestWebPnl(_WebClient):
     def test_page_carries_the_pnl_tab(self, web):
         html = self._get(web + "/").read().decode()
         assert 'id="viewPnl"' in html and "/api/pnl" in html
+
+
+# ── Shared NinjaTrader snapshot stream ─────────────────────────────────
+# One daemon thread takes state dumps back to back and every reader —
+# dashboard, balance monitor, fill confirmation, flattens and their
+# verification — works from it. The live log showed why: four or five
+# overlapping 40–70 KB dumps a second during the busiest hours, cut at
+# the 3 s wall 169 times in six days, and a web click that waited for a
+# dump of its own before its order file was written.
+
+import http.client
+import socketserver
+
+
+class _FakeAti:
+    """A TCP stand-in for NinjaTrader's AT Interface: one state dump per
+    connection, sent in chunks with a pause between them, so the reader's
+    stall/cap behaviour can be driven with real sockets."""
+
+    def __init__(self, dump: bytes, chunk: int = 4096, gap: float = 0.0,
+                 silence_after: int | None = None, silence: float = 5.0):
+        outer = self
+
+        class H(socketserver.StreamRequestHandler):
+            def handle(self):
+                self.rfile.readline()
+                outer.requests += 1
+                for i in range(0, len(dump), chunk):
+                    if silence_after is not None and i // chunk == silence_after:
+                        time.sleep(silence)
+                        return
+                    self.wfile.write(dump[i:i + chunk])
+                    self.wfile.flush()
+                    if gap:
+                        time.sleep(gap)
+
+        self.requests = 0
+        self.server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), H)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _ati_dump(n_fields: int = 400) -> bytes:
+    body = "".join(f"CashValue|Acct{i % 20}\x00{1000 + i}\x00" for i in range(n_fields))
+    return (body + "ATI\x00True\x00").encode()
+
+
+class TestQueryAtiStall:
+    def test_slow_but_progressing_dump_is_read_to_the_end(self, monkeypatch):
+        # ~27 KB in 14 chunks 100 ms apart: ~1.4 s in total — the shape of
+        # a busy NinjaTrader. A 0.6 s wall cuts it; a 4 s cap with a 0.5 s
+        # stall reads it to the marker.
+        srv = _FakeAti(_ati_dump(1200), chunk=2048, gap=0.1)
+        monkeypatch.setattr(st, "nt_host_override", "127.0.0.1")
+        try:
+            cut = st._query_ati("ACCOUNTS", srv.port, timeout=0.6)
+            assert cut and not st.ati_response_complete(cut)
+            full = st._query_ati("ACCOUNTS", srv.port, timeout=4.0, stall=0.5)
+            assert st.ati_response_complete(full)
+        finally:
+            srv.close()
+
+    def test_silence_ends_the_read_long_before_the_cap(self, monkeypatch):
+        srv = _FakeAti(_ati_dump(), chunk=1024, silence_after=2, silence=3.0)
+        monkeypatch.setattr(st, "nt_host_override", "127.0.0.1")
+        try:
+            t0 = time.monotonic()
+            text = st._query_ati("ACCOUNTS", srv.port, timeout=8.0, stall=0.4)
+            elapsed = time.monotonic() - t0
+            assert text and not st.ati_response_complete(text)
+            assert 0.35 < elapsed < 2.0        # gave up on silence, not at 8 s
+        finally:
+            srv.close()
+
+    def test_plain_callers_keep_the_wall_semantics(self, monkeypatch):
+        # No stall given → the wall is the only limit, exactly as before.
+        srv = _FakeAti(_ati_dump(), chunk=1024, gap=0.05)
+        monkeypatch.setattr(st, "nt_host_override", "127.0.0.1")
+        try:
+            assert st.ati_response_complete(st._query_ati("ACCOUNTS", srv.port, timeout=3.0))
+        finally:
+            srv.close()
+
+
+class TestSnapshotParsing:
+    DUMP = (
+        "CashValue|Sim101\x0010\x00"
+        "Orders|Sim101\x00aaa|bbb|ccc\x00"
+        "OrderStatus|aaa\x00Working\x00"
+        "OrderStatus|bbb\x00Filled\x00"
+        "OrderStatus|ccc\x00Accepted\x00"
+        "ATI\x00True\x00"
+    )
+
+    def test_snapshot_carries_open_order_ids_and_request_time(self, monkeypatch):
+        monkeypatch.setattr(st, "_query_ati", lambda *a, **k: self.DUMP)
+        before = time.time()
+        snap = st.nt_snapshot(36973)
+        assert snap["ok"] and snap["open_orders"] == {"Sim101": ["aaa", "ccc"]}
+        assert snap["working"] == {"Sim101": 2}
+        assert before <= snap["req_ts"] <= snap["ts"]
+
+    def test_stream_dumps_never_retry_inline(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(st, "_query_ati",
+                            lambda *a, **k: calls.append(k) or "CashValue|A\x001\x00")
+        st.nt_snapshot(36973, retry=False, stall=2.0)
+        assert len(calls) == 1                 # truncated, and NOT re-requested
+        st.nt_snapshot(36973)
+        assert len(calls) == 3                 # the plain path still retries once
+
+    def test_position_lookup_folds_ninjatrader_aliases(self):
+        # Orders say "MNQ 12-26"; the dump says "MNQ DEC26". Six days of
+        # log: every confirmation came through the balance path, none
+        # through the position delta, because of exactly this.
+        assert st._position_qty({"MNQ DEC26": 2}, "MNQ 12-26") == 2
+        assert st._position_qty({"MNQ 12-26": -1, "MNQ DEC26": 2}, "MNQ 12-26") == -1
+        assert st._position_qty({"ES DEC26": 1}, "MNQ 12-26") == 0
+        assert st._position_qty({}, "MNQ 12-26") == 0
+
+
+def _stream_snap(positions=(), open_orders=None, ok=True, accounts=None):
+    return {"ok": ok, "accounts": accounts if accounts is not None
+            else {"A": {"cash": 50_000.0, "realized": 0.0, "buying_power": 0.0}},
+            "working": {}, "open_orders": open_orders or {}, "ts": time.time(),
+            "positions": [{"account": a, "instrument": i, "qty": q, "avg_price": None}
+                          for a, i, q in positions]}
+
+
+class _Stream:
+    """Runs the real poller thread against a fake nt_snapshot that records
+    which thread asked, how, and when."""
+
+    def __init__(self, monkeypatch, snap_fn=None, delay: float = 0.02):
+        self.calls: list[dict] = []
+        self.snap_fn = snap_fn or (lambda: _stream_snap())
+
+        def fake(port=None, timeout=3.0, retry=True, stall=None):
+            self.calls.append({"thread": threading.current_thread().name,
+                               "retry": retry, "stall": stall, "t": time.time()})
+            time.sleep(delay)
+            return dict(self.snap_fn())
+
+        monkeypatch.setattr(st, "nt_snapshot", fake)
+        monkeypatch.setattr(st, "SNAPSHOT_INTERVAL", 0.15)
+        monkeypatch.setattr(st, "SNAPSHOT_MIN_GAP", 0.01)
+        monkeypatch.setattr(st, "SNAPSHOT_DOWN_BACKOFF", 0.3)
+        st.start_snapshot_poller()
+        assert st.snapshot_after(0.0, 2.0) is not None      # first dump landed
+
+    def request_thread_calls(self):
+        return [c for c in self.calls if c["thread"] != "nt-snapshot"]
+
+
+class TestSnapshotStream:
+    def test_one_thread_takes_every_dump_without_inline_retry(self, monkeypatch):
+        s = _Stream(monkeypatch)
+        time.sleep(0.5)
+        assert s.calls and all(c["thread"] == "nt-snapshot" for c in s.calls)
+        assert all(c["retry"] is False and c["stall"] == st.SNAPSHOT_STALL
+                   for c in s.calls)
+        snap = st.snapshot_cached(1.0)
+        assert snap is not None and snap["seq"] >= 1 and "req_ts" in snap
+
+    def test_snapshot_after_returns_a_dump_requested_after_the_mark(self, monkeypatch):
+        s = _Stream(monkeypatch, delay=0.1)
+        first = st.snapshot_cached(5.0)
+        mark = time.time()
+        t0 = time.monotonic()
+        snap = st.snapshot_after(mark, 3.0)
+        assert snap is not None and snap["req_ts"] >= mark
+        assert snap["seq"] > first["seq"]
+        # nudged: it did not wait out a whole SNAPSHOT_INTERVAL first
+        assert time.monotonic() - t0 < 0.5
+
+    def test_snapshot_cached_honours_age(self, monkeypatch):
+        _Stream(monkeypatch)
+        assert st.snapshot_cached(5.0) is not None
+        assert st.snapshot_cached(0.0) is None
+
+    def test_stream_backs_off_while_ninjatrader_is_down(self, monkeypatch):
+        s = _Stream(monkeypatch, snap_fn=lambda: _stream_snap(ok=False, accounts={}))
+        time.sleep(0.7)
+        gaps = [b["t"] - a["t"] for a, b in zip(s.calls, s.calls[1:])]
+        # gaps[0] is the nudge the constructor's first wait requested
+        assert len(gaps) >= 2 and min(gaps[1:]) >= 0.25   # SNAPSHOT_DOWN_BACKOFF, not INTERVAL
+
+    def test_stop_releases_waiters_and_readers_fall_back(self, monkeypatch):
+        _Stream(monkeypatch)
+        st.stop_snapshot_poller()
+        assert not st.snapshot_poller_running()
+        assert st.snapshot_after(time.time(), 1.0) is None
+        monkeypatch.setattr(st, "query_nt_positions", lambda a, p=36973: {"NQ SEP26": 3})
+        monkeypatch.setattr(st, "query_nt_accounts", lambda p=36973: [{"name": "A", "cash": 1.0}])
+        assert st._positions_now("A", 3.0) == {"NQ SEP26": 3}
+        assert st._accounts_now(3.0) == [{"name": "A", "cash": 1.0}]
+        assert st._pre_position("A", "NQ 09-26") == 3       # alias-folded, direct query
+
+    def test_readers_never_open_a_dump_before_the_first_one_lands(self, monkeypatch):
+        # Start-up under a slow NinjaTrader: the stream is running but has
+        # published nothing. Readers get an empty read — never a stream of
+        # their own (the harness saw three extra concurrent dumps from that).
+        boom = lambda *a, **k: (_ for _ in ()).throw(AssertionError("direct query"))
+        monkeypatch.setattr(st, "query_nt_positions", boom)
+        monkeypatch.setattr(st, "query_nt_accounts", boom)
+        monkeypatch.setattr(st, "query_nt_open_orders", boom)
+
+        def slow(port=None, timeout=3.0, retry=True, stall=None):
+            time.sleep(1.0)
+            return _stream_snap()
+        monkeypatch.setattr(st, "nt_snapshot", slow)
+        st.start_snapshot_poller()
+        assert st._accounts_now(0.2) == []
+        assert st._positions_now("A", 0.2) == {}
+        assert st._pre_position("A", "NQ 09-26") == 0
+        snap = st._flatten_snapshot()          # waits briefly, then reads what there is
+        assert snap is not None and "positions" in snap and "open_orders" in snap
+
+    def test_balance_and_position_readers_use_the_stream(self, monkeypatch):
+        _Stream(monkeypatch, snap_fn=lambda: _stream_snap(
+            positions=[("A", "NQ SEP26", -2), ("B", "GC DEC26", 1)],
+            accounts={"A": {"cash": 100.0}, "B": {"cash": None}}))
+        monkeypatch.setattr(st, "query_nt_positions",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("direct query")))
+        monkeypatch.setattr(st, "query_nt_accounts",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("direct query")))
+        assert st._positions_now("A", 3.0) == {"NQ SEP26": -2}
+        assert st._accounts_now(3.0) == [{"name": "A", "cash": 100.0}]   # None cash skipped
+        assert st._pre_position("A", "NQ 09-26") == -2
+
+
+class TestStreamOrderPath:
+    def _arm(self, monkeypatch):
+        st.active_account = "Sim101"
+        monkeypatch.setattr(st, "atm_strategy", "NQ_Med")
+        monkeypatch.setattr(st, "validate_strategy", lambda n: True)
+        monkeypatch.setattr(st, "is_trade_ready", lambda: True)
+        monkeypatch.setattr(st, "query_nt_positions",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("direct query")))
+
+    def test_manual_order_never_waits_for_a_dump(self, tmp_output_dir, monkeypatch):
+        # NinjaTrader taking 1.5 s per dump used to sit between the click
+        # and the order file; now the write goes out at once and the
+        # confirmation's pre-position comes from the dump already in hand.
+        self._arm(monkeypatch)
+        s = _Stream(monkeypatch, snap_fn=lambda: _stream_snap(
+            positions=[("Sim101", "NQ SEP26", 2)]))
+        s_delay = {"v": 1.5}
+        real = st.nt_snapshot
+
+        def slow(*a, **k):
+            time.sleep(s_delay["v"])
+            return real(*a, **k)
+        monkeypatch.setattr(st, "nt_snapshot", slow)
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            t0 = time.monotonic()
+            ok, msg = asyncio.run(st.submit_manual_trade("long", "NQ 09-26", 1))
+            elapsed = time.monotonic() - t0
+        assert ok is True, msg
+        assert elapsed < 0.5
+        assert len(list(tmp_output_dir.glob("oif_*.txt"))) == 1
+        assert st._pending_confirms[-1]["pre_pos"] == 2         # "NQ SEP26" → "NQ 09-26"
+        assert s.request_thread_calls() == []
+
+    def test_pre_position_prefers_the_newest_complete_dump(self, monkeypatch):
+        # A cut-off dump right after a complete one must not read as "flat".
+        self._arm(monkeypatch)
+        state = {"ok": True}
+        s = _Stream(monkeypatch, snap_fn=lambda: _stream_snap(
+            positions=[("Sim101", "NQ SEP26", 2)] if state["ok"] else [],
+            ok=state["ok"]))
+        state["ok"] = False
+        st.snapshot_after(time.time(), 2.0)               # a partial dump lands
+        assert st._snap_latest["ok"] is False
+        assert st._pre_position("Sim101", "NQ 09-26") == 2
+        assert s.request_thread_calls() == []
+
+    def test_confirmation_by_position_delta_across_aliases(self, monkeypatch):
+        self._arm(monkeypatch)
+        _Stream(monkeypatch, snap_fn=lambda: _stream_snap(
+            positions=[("Sim101", "NQ SEP26", 1)]))
+        st.add_pending_confirm("PLACE;Sim101;NQ 09-26;BUY;1;MARKET;;;DAY;;;NQ_Med;m1",
+                               "m1", "NQ 09-26", "BUY", pre_pos=0)
+        st.check_pending_confirms()
+        assert st._pending_confirms == []
+        assert "FILLED NQ 09-26" in st._alert_text and "pos: 0→1" in st._alert_text
+
+
+class TestStreamFlatten:
+    def _arm(self, monkeypatch):
+        st.active_account = "A"
+        st.follower_accounts = ["B"]
+        monkeypatch.setattr(st, "live_bridge_enabled", False)
+        boom = lambda *a, **k: (_ for _ in ()).throw(AssertionError("direct query"))
+        monkeypatch.setattr(st, "query_nt_positions", boom)
+        monkeypatch.setattr(st, "query_nt_open_orders", boom)
+
+    def test_close_account_uses_one_shared_dump_for_cancels_and_closes(
+            self, tmp_output_dir, monkeypatch):
+        self._arm(monkeypatch)
+        s = _Stream(monkeypatch, snap_fn=lambda: _stream_snap(
+            positions=[("A", "NQ SEP26", -2), ("B", "NQ SEP26", -2)],
+            open_orders={"A": ["o1", "o2"], "B": ["o9"]}))
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            closed = st.close_account_positions("A")
+        assert closed == ["NQ SEP26"]
+        cancels = sorted(p.read_text() for p in tmp_output_dir.glob("oifcancel_*.txt"))
+        assert cancels == ["CANCEL;;;;;;;;;;o1;;", "CANCEL;;;;;;;;;;o2;;"]
+        closes = [p.read_text() for p in tmp_output_dir.glob("oifclose_*.txt")]
+        assert closes and all(c.startswith("CLOSEPOSITION;A;") for c in closes)
+        assert s.request_thread_calls() == []
+
+    def test_close_all_stays_leader_first_on_one_dump(self, tmp_output_dir, monkeypatch):
+        self._arm(monkeypatch)
+        s = _Stream(monkeypatch, delay=0.2, snap_fn=lambda: _stream_snap(
+            positions=[("A", "NQ SEP26", 1), ("B", "NQ SEP26", 1)]))
+        order = []
+        real = st.fire_close_position
+        monkeypatch.setattr(st, "fire_close_position",
+                            lambda acct, c: order.append(acct) or real(acct, c))
+        n_before = len(s.calls)
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            t0 = time.monotonic()
+            closed = st.close_all_open_positions()
+            elapsed = time.monotonic() - t0
+        assert closed == ["NQ SEP26"] and order[0] == "A" and set(order) == {"A", "B"}
+        assert elapsed < 0.5                       # no dump on the flatten path
+        assert len(s.calls) - n_before <= 2        # the stream kept its own pace
+
+    def test_verify_flat_trusts_only_a_dump_requested_after_the_closes(self, monkeypatch):
+        # The dump already in hand still shows the position (it was taken
+        # before the closes). Verification must wait for one requested
+        # after the closes — and answer on the first one that shows flat,
+        # not after a fixed FLATTEN_VERIFY_DELAY.
+        st.active_account = "A"
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_DELAY", 1.0)
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_TRIES", 3)
+        flat_from = {"t": None}
+
+        def state():
+            held = flat_from["t"] is None or time.time() < flat_from["t"]
+            return _stream_snap(positions=[("A", "NQ SEP26", 1)] if held else [])
+        s = _Stream(monkeypatch, snap_fn=state)
+        assert st.snapshot_cached(5.0)["positions"]          # held, pre-close
+        flat_from["t"] = time.time() + 0.1                   # "closes land" shortly
+        t0 = time.monotonic()
+        still = asyncio.run(st.verify_flat(["A"]))
+        elapsed = time.monotonic() - t0
+        assert still == []
+        assert 0.1 <= elapsed < 0.9          # after the fill, well inside the old fixed pause
+        assert s.request_thread_calls() == []
+
+    def test_verify_flat_failure_is_not_rushed(self, monkeypatch):
+        # A position that has not closed yet is watched for at least
+        # TRIES x DELAY (a fill can take seconds) and read at least TRIES
+        # times before it is called incomplete.
+        st.active_account = "A"
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_DELAY", 0.3)
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_TRIES", 3)
+        s = _Stream(monkeypatch, snap_fn=lambda: _stream_snap(positions=[("A", "NQ SEP26", 1)]))
+        n0 = len(s.calls)
+        t0 = time.monotonic()
+        still = asyncio.run(st.verify_flat(["A"]))
+        elapsed = time.monotonic() - t0
+        assert [(p["account"], p["qty"]) for p in still] == [("A", 1)]
+        assert elapsed >= 1.2 and len(s.calls) - n0 >= 3       # (TRIES + 1) x DELAY
+
+    def _book(self, accounts_positions):
+        return {"ts": time.time(), "accounts": {
+            a: {"cash": 50_000.0, "positions": list(pos)} for a, pos in accounts_positions.items()}}
+
+    def test_verify_flat_confirms_from_the_bridge_book_before_any_dump(self, monkeypatch):
+        # The stream keeps showing the position (a slow NinjaTrader dump);
+        # the AddOn's next push after the closes shows the account flat —
+        # that is proof, and it lands well before the first post-close dump.
+        st.active_account = "A"
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_DELAY", 1.0)
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_TRIES", 3)
+        monkeypatch.setattr(st, "live_bridge_enabled", True)
+        monkeypatch.setattr(st, "_live_bridge_connected", True)
+        _Stream(monkeypatch, delay=0.4,
+                snap_fn=lambda: _stream_snap(positions=[("A", "NQ SEP26", 1)]))
+        st._bridge_book = self._book({"A": [("NQ SEP26", 1)]})     # pre-close: held
+
+        def push_flat():
+            time.sleep(st.BRIDGE_VERIFY_MARGIN_S + 0.1)
+            st._bridge_book = self._book({"A": []})
+        threading.Thread(target=push_flat, daemon=True).start()
+        t0 = time.monotonic()
+        still = asyncio.run(st.verify_flat(["A"]))
+        elapsed = time.monotonic() - t0
+        assert still == [] and elapsed < 0.9
+
+    def test_a_book_line_from_before_the_closes_is_not_proof(self, monkeypatch):
+        st.active_account = "A"
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_DELAY", 0.05)
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_TRIES", 2)
+        monkeypatch.setattr(st, "live_bridge_enabled", True)
+        monkeypatch.setattr(st, "_live_bridge_connected", True)
+        _Stream(monkeypatch, snap_fn=lambda: _stream_snap(positions=[("A", "NQ SEP26", 1)]))
+        st._bridge_book = self._book({"A": []})            # flat, but received BEFORE the closes
+        time.sleep(0.05)
+        still = asyncio.run(st.verify_flat(["A"]))
+        assert [(p["account"], p["qty"]) for p in still] == [("A", 1)]
+
+    def test_book_witness_trust_rules(self, monkeypatch):
+        monkeypatch.setattr(st, "live_bridge_enabled", True)
+        monkeypatch.setattr(st, "_live_bridge_connected", True)
+        since = time.time() - 1.0
+        st._bridge_book = self._book({"A": [], "B": [("GC DEC26", 1)]})
+        assert st._bridge_book_shows_flat(["A"], since) is True
+        assert st._bridge_book_shows_flat(["A", "B"], since) is False   # B holds gold
+        assert st._bridge_book_shows_flat(["C"], since) is False        # absent: cannot vouch
+        assert st._bridge_book_shows_cleared({("B", "NQ")}, since) is True
+        assert st._bridge_book_shows_cleared({("B", "GC")}, since) is False
+        assert st._bridge_book_shows_cleared({("C", "GC")}, since) is False
+        st._bridge_book["accounts"]["A"]["cash"] = 0.0
+        st.session_current_balances["A"] = 50_000.0             # a known nonzero balance
+        assert st._bridge_book_shows_flat(["A"], since) is False   # outage-shaped zero
+        monkeypatch.setattr(st, "_live_bridge_connected", False)
+        st._bridge_book = self._book({"A": []})
+        assert st._bridge_book_shows_flat(["A"], since) is False   # not streaming: no witness
+
+    def test_verify_flat_reports_a_survivor_from_the_stream(self, monkeypatch):
+        st.active_account = "A"
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_DELAY", 0.05)
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_TRIES", 2)
+        _Stream(monkeypatch, snap_fn=lambda: _stream_snap(positions=[("A", "NQ SEP26", 1)]))
+        still = asyncio.run(st.verify_flat(["A"]))
+        assert [(p["account"], p["qty"]) for p in still] == [("A", 1)]
+
+    def test_verify_flat_never_confirms_from_incomplete_stream_dumps(self, monkeypatch):
+        st.active_account = "A"
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_DELAY", 0.05)
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_TRIES", 2)
+        _Stream(monkeypatch, snap_fn=lambda: _stream_snap(ok=False))
+        still = asyncio.run(st.verify_flat(["A"]))
+        assert still and still[0]["instrument"] == "UNVERIFIED"
+
+
+class TestStreamDashboard:
+    def test_live_view_is_served_without_a_request_side_dump(self, monkeypatch):
+        st.active_account = "A"
+        s = _Stream(monkeypatch, snap_fn=lambda: _stream_snap(
+            positions=[("A", "NQ SEP26", 1)]))
+        live = st.web_live()
+        assert live["ok"] and live["positions"][0]["instrument"] == "NQ SEP26"
+        assert s.request_thread_calls() == []
+        # Same dump → the same built view, not a rebuild
+        assert st.web_live() is live
+        st._live_invalidate()
+        assert st.web_live() is not live
+        # A new dump → a new view
+        st.snapshot_after(time.time(), 2.0)
+        assert st.web_live()["ts"] >= live["ts"]
+
+    def test_live_view_falls_back_to_a_direct_dump_without_the_stream(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(st, "nt_snapshot",
+                            lambda port=None, timeout=3.0: calls.append(1) or _stream_snap())
+        st._live_invalidate()
+        st.web_live(force=True)
+        assert calls == [1]
+
+
+class TestWebKeepAlive(_WebClient):
+    def test_two_requests_reuse_one_connection(self, web):
+        host, port = web.replace("http://", "").split(":")
+        conn = http.client.HTTPConnection(host, int(port), timeout=5)
+        hdrs = {"X-ST-Token": st._web_token}
+        conn.request("GET", "/api/state", headers=hdrs)
+        r1 = conn.getresponse(); r1.read()
+        sock = conn.sock
+        conn.request("GET", "/api/live", headers=hdrs)
+        r2 = conn.getresponse(); r2.read()
+        assert r1.status == 200 and r2.status == 200
+        assert conn.sock is sock                      # kept alive, not reopened
+        conn.request("POST", "/api/pause", body=json.dumps({"paused": False}),
+                     headers={**hdrs, "Content-Type": "application/json"})
+        r3 = conn.getresponse()
+        assert json.loads(r3.read())["ok"] is True and conn.sock is sock
+        conn.close()
+
+    def test_refused_post_closes_its_connection(self, web):
+        # Refused before the body is read: keeping the connection would
+        # feed those bytes to the parser as the next request.
+        host, port = web.replace("http://", "").split(":")
+        conn = http.client.HTTPConnection(host, int(port), timeout=5)
+        conn.request("POST", "/api/pause", body='{"paused":true}',
+                     headers={"Content-Type": "application/json"})   # no token
+        r = conn.getresponse(); r.read()
+        assert r.status == 403
+        with pytest.raises((http.client.RemoteDisconnected, ConnectionError, OSError)):
+            conn.request("GET", "/api/state", headers={"X-ST-Token": st._web_token})
+            conn.getresponse()
+        conn.close()
