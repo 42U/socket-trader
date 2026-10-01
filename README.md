@@ -6,7 +6,7 @@
 
 [![VoidOrigin](https://img.shields.io/badge/VOIDORIGIN-voidorigin.com-0a0a0a?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiIHN0cm9rZT0iI2ZmNmIzNSIgc3Ryb2tlLXdpZHRoPSIyIi8+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iNCIgZmlsbD0iI2ZmNmIzNSIvPjwvc3ZnPg==&logoColor=ff6b35&labelColor=0a0a0a)](https://voidorigin.com)
 
-[![Version](https://img.shields.io/badge/v0.18.0-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
+[![Version](https://img.shields.io/badge/v0.19.0-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
 [![GitHub Stars](https://img.shields.io/github/stars/42U/socket-trader?style=for-the-badge&logo=github&color=gold)](https://github.com/42U/socket-trader)
 [![License: MIT](https://img.shields.io/github/license/42U/socket-trader?style=for-the-badge&logo=opensourceinitiative&color=blue)](https://opensource.org/licenses/MIT)
 [![CI](https://img.shields.io/github/actions/workflow/status/42U/socket-trader/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
@@ -62,10 +62,10 @@ The sim account is automatically swapped with your real NinjaTrader account name
 | **Global strategy filter** | One map — *"GoldStrat only trades GC, NasdaqStrat only NQ"* — applied to every account before any leg exists; exits are never filtered |
 | **Multi-strategy mode** | Subscribe to **several publisher strategies sharing a market** without them trampling each other: each strategy's close-then-place pair is **scoped to its own position** — a close from a strategy that holds nothing here is skipped, a shared position closes only the sender's contracts, and **same-direction entries stack** (within `max_contracts`); opposite entries still reset the market first |
 | **Front-month roll guard** | A signal naming an **expiring contract month** (broker says *"liquidation only"*) is rolled to the known front before fan-out — synced from NinjaTrader's own rollover schedule via the AddOn, calendar fallback without it; old-month positions still get their closes |
-| **Per-account profiles** | Each account can filter which **symbols it trades**, trade micros or full-size, its own contract count, inverted direction, delayed or staggered entries, its own ATM template, and an optional **AI gate** — scoped per symbol / publisher strategy |
+| **Per-account profiles** | Each account can filter which **symbols it trades**, trade micros or full-size, its own contract count, inverted direction, delayed or staggered entries, its own ATM template, and an optional **AI gate** — scoped per symbol / publisher strategy, and **exportable** to a file or straight onto another account |
 | **Balance outage armor** | A NinjaTrader broker-feed outage that zeroes every account reading is quarantined: last known balances are **held and marked stale** instead of tripping phantom stops or poisoning session baselines |
 | **Live trade monitor** | Optional NinjaTrader AddOn streams live equity (cash + unrealized) so stops and targets trip **mid-trade**, with native `account.Flatten()` for closes — and a live **position book** that lets prop entries skip the close-before-open snapshot when every account is provably flat |
-| **Manual trading** | Press `O` (or use the web UI) to submit your own long/short market/limit order with an ATM template — it fans out through copy trading, round-robin, and profiles exactly like a publisher signal |
+| **Manual trading** | Press `O` (or use the web UI) to submit your own long/short market/limit order with an ATM template — it fans out through copy trading, round-robin, and profiles exactly like a publisher signal, with the ATM template you pick standing in as the strategy name your scoped rules match |
 | **Web UI** | A localhost control panel starts with the app: live dashboard, manual orders, pause/flatten/reconnect, micro toggle, accounts, strategy, limits, and profiles from the browser |
 | **P&L calendar** | A month-at-a-glance trading record in the web UI: green/red heat-mapped days, weekly totals, equity curve, and a per-day drill-down with win rate, profit factor, and **by-symbol / by-strategy / by-account** breakdowns — built entirely from data the app already tracks |
 | **Micro mode** | One toggle converts every signal to its CME micro contract — NQ→MNQ, ES→MES, RTY→M2K, GC→MGC, … |
@@ -368,7 +368,7 @@ Copy trading fans identical signals to every account. **Profiles** let each acco
 └──────────────────────────────────────────────────────────┘
 ```
 
-Each account has a **default rule** plus optional **scoped rules** keyed by symbol and/or the publisher's strategy name — built for multi-strategy, multi-symbol setups (e.g. *invert just `algoNQmed` on this account, trade everything else straight*). The first matching scoped rule overrides the default, so order matters; a rule written for `NQ` automatically covers `MNQ` too; strategies are matched by the exact name the wire sends, case-insensitively. Scoped rules are edited here (`R` on the account's profile screen), in the web UI's account editor (*Scoped rules*, with pickers fed by the strategy names actually seen from your publisher), or in config. A `◆ PROFILES` badge shows in the header while any profile is active.
+Each account has a **default rule** plus optional **scoped rules** keyed by symbol and/or the publisher's strategy name — built for multi-strategy, multi-symbol setups (e.g. *invert just `algoNQmed` on this account, trade everything else straight*). The first matching scoped rule overrides the default, so order matters; a rule written for `NQ` automatically covers `MNQ` too; strategies are matched by the exact name the wire sends, case-insensitively. A manual order (terminal `O` or the web ticket) carries its ATM template as that name, so an account that is entries-off by default but opened up for `NQ-Sides` takes a ticket order placed under the `NQ-Sides` template, with that rule's sizing. Scoped rules are edited here (`R` on the account's profile screen), in the web UI's account editor (*Scoped rules*, with pickers fed by the strategy names actually seen from your publisher), or in config. A `◆ PROFILES` badge shows in the header while any profile is active.
 
 **Symbol filter (`S` on the profile screen).** Before any rules apply, an account can be restricted to the only markets it trades — e.g. `GC` for a gold-only account, `NQ ES` for an index account. Signals for anything else are simply ignored *for that account* (shown as a skipped leg), while every other account trades normally — and the filtered account still participates fully, copy-trade or round-robin, in the markets it does accept. Micro twins count as the same market (`GC` covers `MGC`, `NQ` covers `MNQ`). Some publisher strategies are symbol-specific and some trade several markets; the filter makes an account deaf to the markets you didn't give it, whichever strategy fires the signal. Exits are never filtered — if you tighten a filter while a position is open, its closes still flow.
 
@@ -419,6 +419,30 @@ Profiles persist in `~/.voidorigin_config.json` under `account_profiles` and are
 ```
 
 Accounts without a profile behave exactly as before — identical copy of the leader's signal.
+
+### Export & import
+
+A setup you've proven on one account shouldn't have to be retyped on the next. A profile travels as a small JSON document:
+
+- **Terminal:** `S` → `8` → account → `E` writes it to `~/SocketTrader-profile-<account>.json` (or a path you give). `I` on any account's profile screen replaces that account's profile with a copy of **another account's**, or with an exported **file** — from this machine or another.
+- **Web UI:** open the account's editor → *Export / import*: **EXPORT FILE** downloads the document, **IMPORT FILE** loads one, and the chips copy another account's profile straight over.
+
+An import **replaces the whole profile** (you're asked first when the target already has one); the source is untouched. Risk limits (session target / stop) are per-account money settings, not part of a profile, and never travel with it.
+
+```json
+{
+  "socket_trader_profile": 1,
+  "app_version": "0.19.0",
+  "exported_from": "Sim102",
+  "exported_at": "2026-09-29T14:03:00Z",
+  "profile": {
+    "default": { "size": "micros", "qty_mode": "fixed", "qty_value": 2 },
+    "rules": [ { "strategies": ["algoNQmed"], "enabled": false } ]
+  }
+}
+```
+
+A bare `account_profiles` entry (just the `profile` part) imports too, and every import goes through the same sanitizer as the config file. **AI gates** follow the same rule as everywhere else: the terminal's export and import, and an account-to-account copy, carry them; a file exported or imported through the browser does not, because the web API never handles a gate's endpoint or key env var — the exported file says so, and an import tells you when it dropped one.
 
 ### Global Strategy → Symbol Filter
 

@@ -2303,6 +2303,206 @@ class TestProfilesConfig:
         assert "account_profiles" not in st.load_config()
 
 
+class TestProfileExportImport:
+    """A setup proven on one account moves to another — or to another
+    machine — as a JSON document, through the same sanitizer as the config
+    file, replacing the target's profile whole."""
+
+    GATE = {"provider": "ollama", "model": "llama3.2",
+            "endpoint": "http://127.0.0.1:11434/api/chat", "api_key_env": "",
+            "timeout_ms": 8000, "on_error": "skip", "instructions": "be brief"}
+    PROFILE = {"default": {"size": "micros", "qty_mode": "fixed", "qty_value": 2.0},
+               "rules": [{"symbols": ["NQ"], "direction": "invert"},
+                         {"strategies": ["algoNQmed"], "enabled": False}],
+               "symbols_allowed": ["NQ", "GC"],
+               "prop": True, "prop_firm": "apex", "prop_flat_et": "16:50"}
+
+    def test_export_is_a_self_describing_deep_copy(self):
+        st.account_profiles["A"] = json.loads(json.dumps(self.PROFILE))
+        doc = st.export_profile_data("A")
+        assert doc[st.PROFILE_EXPORT_KEY] == st.PROFILE_EXPORT_FORMAT
+        assert doc["exported_from"] == "A" and doc["app_version"] == st.__version__
+        assert doc["profile"] == self.PROFILE
+        doc["profile"]["rules"].clear()                  # a copy, not the live dict
+        assert len(st.account_profiles["A"]["rules"]) == 2
+
+    def test_import_replaces_the_target_whole(self, tmp_config):
+        st.account_profiles["A"] = json.loads(json.dumps(self.PROFILE))
+        st.account_profiles["B"] = {"symbols_allowed": ["ES"], "default": {"delay_ms": 900}}
+        ok, msg = st.import_profile("B", st.export_profile_data("A"), source="A's profile")
+        assert ok and msg.startswith("B ← A's profile:")
+        assert st.account_profiles["B"] == self.PROFILE   # nothing of the old B survives
+        assert st.account_profiles["A"] == self.PROFILE   # the source is untouched
+        assert st.load_config()["account_profiles"]["B"] == self.PROFILE   # persisted
+
+    def test_import_accepts_a_bare_config_entry(self, tmp_config):
+        ok, _ = st.import_profile("B", {
+            "default": {"qty_mode": "multiple", "qty_value": 0.5},
+            "rules": [{"symbols": "ES, NQ", "delay_ms": 5}]})
+        assert ok
+        assert st.account_profiles["B"]["default"] == {"qty_mode": "multiple", "qty_value": 0.5}
+        assert st.account_profiles["B"]["rules"] == [{"symbols": ["ES", "NQ"], "delay_ms": 5}]
+
+    def test_import_sanitizes_like_the_config_loader(self, tmp_config):
+        ok, _ = st.import_profile("B", {"profile": {
+            "default": {"delay_ms": 10**9, "size": "MICROS", "bogus": 1},
+            "rules": ["junk", {"symbols": ["NQ"], "stagger_entries": 99}],
+            "symbols_allowed": "gc nq"}})
+        assert ok
+        prof = st.account_profiles["B"]
+        assert prof["default"] == {"delay_ms": 600_000, "size": "micros"}
+        assert prof["rules"] == [{"symbols": ["NQ"], "stagger_entries": 10}]
+        assert prof["symbols_allowed"] == ["GC", "NQ"]
+
+    @pytest.mark.parametrize("doc, needle", [
+        ("not an object", "JSON object"),
+        ({"foo": 1}, "no profile settings"),
+        ({"profile": {}}, "nothing usable"),
+        ({"profile": {"default": {"bogus": 1}}}, "nothing usable"),
+        ({"account_profiles": {"Sim102": {}, "Sim101": {}}}, "Sim101, Sim102"),
+        ({st.PROFILE_EXPORT_KEY: 99, "profile": {"default": {"delay_ms": 1}}}, "newer"),
+    ])
+    def test_import_refuses_junk_and_leaves_the_target_alone(self, tmp_config, doc, needle):
+        st.account_profiles["B"] = {"default": {"delay_ms": 7}}
+        ok, msg = st.import_profile("B", doc)
+        assert ok is False and needle in msg
+        assert st.account_profiles["B"] == {"default": {"delay_ms": 7}}
+
+    def test_import_needs_an_account(self, tmp_config):
+        assert st.import_profile("  ", {"default": {"delay_ms": 1}})[0] is False
+
+    def test_copy_carries_the_ai_gate(self, tmp_config):
+        st.account_profiles["A"] = {"default": {"ai": dict(self.GATE)},
+                                    "rules": [{"symbols": ["NQ"], "ai": dict(self.GATE)}]}
+        ok, msg = st.copy_profile("A", "B")
+        assert ok and "AI:ollama" in msg
+        assert st.account_profiles["B"]["default"]["ai"] == self.GATE
+        assert st.account_profiles["B"]["rules"][0]["ai"] == self.GATE
+
+    def test_copy_refuses_self_and_a_source_without_a_profile(self, tmp_config):
+        st.account_profiles["A"] = {"default": {"delay_ms": 1}}
+        assert st.copy_profile("A", "A")[0] is False
+        ok, msg = st.copy_profile("Nobody", "B")
+        assert ok is False and "no profile" in msg
+        assert "B" not in st.account_profiles
+
+    def test_file_round_trip_keeps_the_ai_gate(self, tmp_config, tmp_path):
+        # The terminal path: the file is the operator's own, like the config.
+        st.account_profiles["A"] = json.loads(json.dumps(self.PROFILE))
+        st.account_profiles["A"]["default"]["ai"] = dict(self.GATE)
+        path = tmp_path / "out" / "a.json"
+        path.parent.mkdir()
+        st.write_profile_export("A", path)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        st.account_profiles.clear()
+        ok, _ = st.import_profile("B", data, source=path.name)
+        assert ok
+        expected = json.loads(json.dumps(self.PROFILE))
+        expected["default"]["ai"] = dict(self.GATE)
+        assert st.account_profiles["B"] == expected
+
+    def test_default_export_path_is_filename_safe(self):
+        p = st.profile_export_path("APEX 123/456:PA")
+        assert p.parent == Path.home()
+        assert p.name == "SocketTrader-profile-APEX_123_456_PA.json"
+        assert st.profile_export_path("///").name == "SocketTrader-profile-account.json"
+
+    def test_profile_ai_gates_lists_default_then_scoped(self):
+        prof = {"default": {"ai": {"provider": "openai"}},
+                "rules": [{"symbols": ["NQ"]},
+                          {"symbols": ["ES"], "ai": {"provider": "ollama"}}]}
+        assert [g["provider"] for g in st.profile_ai_gates(prof)] == ["openai", "ollama"]
+        assert st.profile_ai_gates({}) == []
+
+
+class TestProfileTransferPrompts:
+    """The terminal's E / I on the profile screen, driven by scripted
+    answers. Nothing here may touch the real home folder: every file path
+    is answered explicitly or the default is pointed at tmp_path."""
+
+    PROFILE = {"default": {"size": "micros", "qty_mode": "fixed", "qty_value": 2.0},
+               "rules": [{"symbols": ["NQ"], "direction": "invert"}],
+               "symbols_allowed": ["NQ"]}
+
+    def _script(self, monkeypatch, answers):
+        queue = list(answers)
+
+        async def fake_ask(prompt):
+            assert queue, f"unexpected prompt: {prompt}"
+            return queue.pop(0)
+        monkeypatch.setattr(st, "_ask_line", fake_ask)
+        return queue
+
+    def test_export_writes_the_file_and_import_reads_it_back(self, tmp_config, tmp_path, monkeypatch):
+        st.account_profiles["A"] = json.loads(json.dumps(self.PROFILE))
+        path = tmp_path / "a.json"
+        left = self._script(monkeypatch, [f'"{path}"'])       # quoted, as "Copy as path" gives
+        asyncio.run(st._export_profile_prompt("A"))
+        assert not left
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        assert doc["exported_from"] == "A" and doc["profile"] == self.PROFILE
+        # B has no profile, so the import must not ask for confirmation.
+        left = self._script(monkeypatch, [str(path)])
+        asyncio.run(st._import_profile_prompt("B"))
+        assert not left
+        assert st.account_profiles["B"] == self.PROFILE
+        assert st.load_config()["account_profiles"]["B"] == self.PROFILE
+
+    def test_export_default_path_and_overwrite_prompt(self, tmp_config, tmp_path, monkeypatch):
+        st.account_profiles["A"] = json.loads(json.dumps(self.PROFILE))
+        default = tmp_path / "SocketTrader-profile-A.json"
+        monkeypatch.setattr(st, "profile_export_path", lambda acct: default)
+        self._script(monkeypatch, [""])                       # ENTER = default
+        asyncio.run(st._export_profile_prompt("A"))
+        assert json.loads(default.read_text())["exported_from"] == "A"
+        default.write_text("sentinel")
+        self._script(monkeypatch, ["", "n"])                  # exists → declined
+        asyncio.run(st._export_profile_prompt("A"))
+        assert default.read_text() == "sentinel"
+        self._script(monkeypatch, [str(tmp_path), "y"])       # a directory → default name in it
+        asyncio.run(st._export_profile_prompt("A"))
+        assert json.loads(default.read_text())["exported_from"] == "A"
+
+    def test_export_refuses_without_a_profile(self, tmp_config, tmp_path, monkeypatch):
+        self._script(monkeypatch, [])                         # must not prompt at all
+        asyncio.run(st._export_profile_prompt("A"))
+        assert not list(tmp_path.iterdir())
+
+    def test_import_copies_another_account_and_asks_before_replacing(self, tmp_config, monkeypatch):
+        st.account_profiles["A"] = json.loads(json.dumps(self.PROFILE))
+        st.account_profiles["B"] = {"default": {"delay_ms": 7}}
+        self._script(monkeypatch, ["1", "n"])                 # by number, then declined
+        asyncio.run(st._import_profile_prompt("B"))
+        assert st.account_profiles["B"] == {"default": {"delay_ms": 7}}
+        self._script(monkeypatch, ["A", "y"])                 # by name, confirmed
+        asyncio.run(st._import_profile_prompt("B"))
+        assert st.account_profiles["B"] == self.PROFILE
+        assert st.account_profiles["A"] == self.PROFILE
+
+    def test_import_bad_sources_leave_the_target_alone(self, tmp_config, tmp_path, monkeypatch):
+        st.account_profiles["A"] = json.loads(json.dumps(self.PROFILE))
+        st.account_profiles["B"] = {"default": {"delay_ms": 7}}
+        junk = tmp_path / "junk.json"
+        junk.write_text("{not json")
+        for answer in ("", "B", str(tmp_path / "missing.json"), str(junk)):
+            left = self._script(monkeypatch, [answer])
+            asyncio.run(st._import_profile_prompt("B"))
+            assert not left
+            assert st.account_profiles["B"] == {"default": {"delay_ms": 7}}
+
+    def test_import_reports_an_ai_gate_that_came_along(self, tmp_config, monkeypatch, capsys):
+        gate = {"provider": "openai", "model": "gpt-4o-mini",
+                "endpoint": "https://api.openai.com/v1/chat/completions",
+                "api_key_env": "OPENAI_API_KEY", "timeout_ms": 8000,
+                "on_error": "skip", "instructions": ""}
+        st.account_profiles["A"] = {"default": {"ai": dict(gate)}}
+        self._script(monkeypatch, ["A"])
+        asyncio.run(st._import_profile_prompt("B"))
+        assert st.account_profiles["B"]["default"]["ai"] == gate
+        out = capsys.readouterr().out
+        assert "AI gate came along" in out and "$OPENAI_API_KEY" in out
+
+
 class TestPublisherStrategyOf:
     def test_extracts_field_11(self):
         msg = json.dumps({"signal": SIG, "ts": 1})
@@ -2879,6 +3079,37 @@ class TestSubmitManualTrade:
         accts = [f.read_text().split(";")[1] for f in tmp_output_dir.glob("oif_*.txt")]
         assert accts == ["Sim101"]
 
+    def test_atm_template_is_the_strategy_scoped_rules_match(self, tmp_output_dir, monkeypatch):
+        # Entries-off by default, opened up for ONE strategy by a scoped
+        # rule: a ticket order under that ATM is that strategy's entry (the
+        # rule's sizing applies), any other ATM is refused — exactly what a
+        # publisher signal carrying the name in field 11 gets.
+        self._arm(monkeypatch)
+        st.account_profiles["Sim101"] = {
+            "default": {"enabled": False},
+            "rules": [{"strategies": ["nq-sides"], "enabled": True,
+                       "qty_mode": "fixed", "qty_value": 2.0}]}
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            ok, msg = asyncio.run(st.submit_manual_trade("long", "NQ 09-26", 1, atm="NQ-Sides"))
+            assert ok is True, msg
+            files = list(tmp_output_dir.glob("oif_*.txt"))
+            parts = files[0].read_text().split(";")
+            assert len(files) == 1 and parts[1] == "Sim101"
+            assert parts[4] == "2" and parts[11] == "NQ-Sides"
+            ok, msg = asyncio.run(st.submit_manual_trade("long", "NQ 09-26", 1, atm="NQ_Med"))
+            assert ok is False and "entries disabled" in msg
+            assert len(list(tmp_output_dir.glob("oif_*.txt"))) == 1
+
+    def test_global_strategy_filter_sees_ticket_orders(self, tmp_output_dir, monkeypatch):
+        self._arm(monkeypatch)
+        st.strategy_symbols["nq-sides"] = ["NQ"]
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            ok, msg = asyncio.run(st.submit_manual_trade("long", "ES 12-26", 1, atm="NQ-Sides"))
+            assert ok is False and "only trades NQ" in msg
+            assert not list(tmp_output_dir.glob("oif_*.txt"))
+            ok, _ = asyncio.run(st.submit_manual_trade("long", "NQ 09-26", 1, atm="NQ-Sides"))
+            assert ok is True
+
 
 # ── web UI ────────────────────────────────────────────────────────────
 class TestWebState:
@@ -3057,6 +3288,89 @@ class TestWebSecurity(_WebClient):
                                                 "target_mode": "sideways",
                                                 "stop": 50, "stop_mode": "hard"})
         assert resp["ok"] is False
+
+
+class TestWebProfileTransfer(_WebClient):
+    """Export / import / copy from the browser. The wire rule for AI gates
+    holds: a file exported or imported through the web carries none, while
+    an account-to-account copy (server side) keeps the source's gate."""
+
+    GATE = {"provider": "ollama", "model": "llama3.2",
+            "endpoint": "http://127.0.0.1:11434/api/chat", "api_key_env": "",
+            "timeout_ms": 8000, "on_error": "skip", "instructions": ""}
+
+    def test_export_requires_token(self, web):
+        st.account_profiles["A"] = {"default": {"delay_ms": 1}}
+        self._expect_status(
+            lambda: self._get(web + "/api/profile_export?account=A", token=False), 403)
+
+    def test_export_strips_ai_gates_and_says_so(self, web):
+        st.account_profiles["A"] = {"default": {"delay_ms": 1, "ai": dict(self.GATE)},
+                                    "rules": [{"symbols": ["NQ"], "ai": dict(self.GATE)}]}
+        doc = json.loads(self._get(web + "/api/profile_export?account=A").read())
+        assert doc[st.PROFILE_EXPORT_KEY] == st.PROFILE_EXPORT_FORMAT
+        assert doc["exported_from"] == "A"
+        assert doc["profile"] == {"default": {"delay_ms": 1}, "rules": [{"symbols": ["NQ"]}]}
+        assert "11434" not in json.dumps(doc)
+        assert "terminal" in doc["note"]
+
+    def test_export_without_gates_carries_no_note(self, web):
+        st.account_profiles["A"] = {"symbols_allowed": ["GC"]}
+        doc = json.loads(self._get(web + "/api/profile_export?account=A").read())
+        assert doc["profile"] == {"symbols_allowed": ["GC"]} and "note" not in doc
+
+    def test_export_of_nothing_is_a_400(self, web):
+        self._expect_status(lambda: self._get(web + "/api/profile_export?account=Nobody"), 400)
+        self._expect_status(lambda: self._get(web + "/api/profile_export"), 400)
+
+    def test_import_drops_wire_gates_and_the_old_ones(self, web, tmp_config):
+        # B's old default gate must NOT survive an import — an import replaces
+        # the profile; only an edit through _web_set_profiles preserves gates.
+        st.account_profiles["B"] = {"default": {"ai": dict(self.GATE)},
+                                    "symbols_allowed": ["ES"]}
+        resp = self._post(web + "/api/profile_import", {"account": "B", "data": {
+            "profile": {"default": {"qty_mode": "fixed", "qty_value": 3},
+                        "rules": [{"symbols": ["NQ"], "ai": {
+                            "provider": "custom",
+                            "endpoint": "http://attacker.example/x",
+                            "api_key_env": "ANTHROPIC_API_KEY"}}]}}})
+        assert resp["ok"] is True and "not imported" in resp["message"]
+        prof = st.account_profiles["B"]
+        assert prof == {"default": {"qty_mode": "fixed", "qty_value": 3.0},
+                        "rules": [{"symbols": ["NQ"]}]}
+        assert st.load_config()["account_profiles"]["B"] == prof
+
+    def test_import_rejects_junk_and_keeps_the_target(self, web, tmp_config):
+        st.account_profiles["B"] = {"default": {"delay_ms": 7}}
+        for data in ("nope", {"foo": 1}, {"profile": {}}):
+            resp = self._post(web + "/api/profile_import", {"account": "B", "data": data})
+            assert resp["ok"] is False
+        resp = self._post(web + "/api/profile_import", {"data": {"default": {"delay_ms": 1}}})
+        assert resp["ok"] is False and "account" in resp["message"]
+        assert st.account_profiles["B"] == {"default": {"delay_ms": 7}}
+
+    def test_copy_carries_the_source_gate(self, web, tmp_config):
+        st.account_profiles["A"] = {"default": {"delay_ms": 1, "ai": dict(self.GATE)}}
+        resp = self._post(web + "/api/profile_copy", {"account": "B", "source": "A"})
+        assert resp["ok"] is True and resp["message"].startswith("B ← A's profile")
+        assert st.account_profiles["B"] == {"default": {"delay_ms": 1, "ai": self.GATE}}
+        assert st.load_config()["account_profiles"]["B"]["default"]["ai"] == self.GATE
+
+    def test_copy_refuses_a_source_without_a_profile(self, web, tmp_config):
+        resp = self._post(web + "/api/profile_copy", {"account": "B", "source": "Nobody"})
+        assert resp["ok"] is False and "no profile" in resp["message"]
+        assert "B" not in st.account_profiles
+
+    def test_transfers_are_frozen_when_hard_locked(self, web, tmp_config):
+        st.account_profiles["A"] = {"default": {"delay_ms": 1}}
+        st.hard_stopped = True
+        for path, body in (
+                ("/api/profile_import",
+                 {"account": "B", "data": {"default": {"delay_ms": 1}}}),
+                ("/api/profile_copy", {"account": "B", "source": "A"})):
+            resp = self._post(web + path, body)
+            assert resp["ok"] is False and "frozen" in resp["message"]
+        assert "B" not in st.account_profiles
 
 
 class TestHedgeGuard:

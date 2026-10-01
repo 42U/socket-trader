@@ -152,6 +152,10 @@ check("state read requires a token", "_token_ok" in get)
 
 profiles = inspect.getsource(st._web_set_profiles)
 check("web profile writes strip AI gate config", "_strip_ai_config" in profiles)
+check("web profile imports strip AI gate config",
+      "_strip_ai_config" in inspect.getsource(st._web_import_profile))
+check("web profile exports strip AI gate config",
+      "_strip_ai_config" in inspect.getsource(st._web_export_profile))
 
 # ---- 6. the page must stay responsive ------------------------------------
 # These are the behaviours that made the dashboard feel sluggish once:

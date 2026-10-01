@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.18.0"
+__version__ = "0.19.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -1300,6 +1300,117 @@ def save_account_profiles():
         cfg.pop("account_profiles", None)
     save_config(cfg)
     logger.info(f"PROFILES SAVED  accounts={sorted(pruned)}")
+
+
+# ---------- Profile export / import ----------
+# A profile is a self-contained recipe — default rule, scoped rules, symbol
+# filter, prop settings — so a setup proven on one account should move to
+# another account, or to another machine, without being retyped field by
+# field. The export is a small self-describing JSON document; the import
+# takes that document (or a bare entry in the config file's own shape),
+# runs it through the same sanitizer as the config file, and replaces the
+# target's profile whole: an import means "trade like that", not a merge.
+# Risk limits (session target / stop) are per-account money settings, not
+# part of a profile, and never travel with one.
+PROFILE_EXPORT_KEY = "socket_trader_profile"   # envelope marker; its value is the format
+PROFILE_EXPORT_FORMAT = 1
+_PROFILE_KEYS = ("default", "rules", "symbols_allowed", "close_before_open",
+                 "prop", "prop_firm", "prop_flat_et", "prop_cutoff_et")
+
+
+def export_profile_data(account: str) -> dict:
+    """Portable JSON document for one account's profile (a deep copy)."""
+    return {
+        PROFILE_EXPORT_KEY: PROFILE_EXPORT_FORMAT,
+        "app_version": __version__,
+        "exported_from": account,
+        "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "profile": json.loads(json.dumps(account_profiles.get(account) or {})),
+    }
+
+
+def profile_export_path(account: str) -> Path:
+    """Default export file: visible in the home folder, named for the account."""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", account).strip("._") or "account"
+    return Path.home() / f"SocketTrader-profile-{safe}.json"
+
+
+def write_profile_export(account: str, path: Path) -> None:
+    path.write_text(json.dumps(export_profile_data(account), indent=2) + "\n",
+                    encoding="utf-8")
+
+
+def _has_ai_config(raw) -> bool:
+    """True when a profiles payload carries any AI gate config."""
+    if isinstance(raw, dict):
+        return any((k == "ai" and bool(v)) or _has_ai_config(v) for k, v in raw.items())
+    if isinstance(raw, list):
+        return any(_has_ai_config(v) for v in raw)
+    return False
+
+
+def profile_ai_gates(prof: dict) -> list[dict]:
+    """Every AI gate a profile carries — default rule first, then scoped."""
+    gates = []
+    for rule in [prof.get("default", {})] + list(prof.get("rules", [])):
+        if isinstance(rule, dict) and isinstance(rule.get("ai"), dict) and rule["ai"]:
+            gates.append(rule["ai"])
+    return gates
+
+
+def parse_profile_import(data) -> tuple[dict | None, str]:
+    """Pick the profile entry out of an import document.
+
+    Accepts an export envelope ({"profile": {...}}) or a bare profile in
+    the config file's own shape. Returns (raw_profile, error); the raw
+    profile still has to go through load_account_profiles.
+    """
+    if not isinstance(data, dict):
+        return None, "a profile document is a JSON object"
+    if isinstance(data.get("profile"), dict):
+        fmt = data.get(PROFILE_EXPORT_KEY)
+        if isinstance(fmt, int) and not isinstance(fmt, bool) and fmt > PROFILE_EXPORT_FORMAT:
+            return None, (f"profile format {fmt} is newer than this app reads "
+                          f"(format {PROFILE_EXPORT_FORMAT}) — update SocketTrader")
+        return data["profile"], ""
+    if isinstance(data.get("account_profiles"), dict):
+        names = ", ".join(sorted(str(k) for k in data["account_profiles"])) or "none"
+        return None, ("that is a whole config file, not one profile — export the "
+                      f"account's profile instead (it holds profiles for: {names})")
+    if not any(k in data for k in _PROFILE_KEYS):
+        return None, ("no profile settings found — expected an exported profile or "
+                      "an account_profiles entry (default, rules, symbols_allowed, prop…)")
+    return data, ""
+
+
+def import_profile(account: str, data, source: str = "the file") -> tuple[bool, str]:
+    """Replace `account`'s profile with the profile in `data` and persist it.
+
+    `data` is an export document or a bare profile entry, sanitized exactly
+    like the config file. Whatever the account had before is replaced whole.
+    """
+    account = account.strip()
+    if not account:
+        return False, "account required"
+    raw_profile, err = parse_profile_import(data)
+    if err:
+        return False, err
+    cleaned = load_account_profiles({"account_profiles": {account: raw_profile}}).get(account)
+    if not cleaned:
+        return False, "nothing usable in that profile — every setting was empty or unrecognized"
+    account_profiles[account] = cleaned
+    save_account_profiles()
+    logger.info(f"PROFILE IMPORTED  {account} <- {source}")
+    return True, f"{account} ← {source}: {profile_summary(account)}"
+
+
+def copy_profile(source: str, account: str) -> tuple[bool, str]:
+    """Copy one account's profile onto another, AI gate included."""
+    if source == account:
+        return False, "pick a different account to copy from"
+    if not account_profiles.get(source):
+        return False, f"{source} has no profile to copy"
+    return import_profile(account, export_profile_data(source), source=f"{source}'s profile")
 
 
 def _instrument_root(instrument: str) -> str:
@@ -6575,6 +6686,86 @@ async def _edit_scoped_rules(account: str):
             save_account_profiles()
 
 
+async def _export_profile_prompt(account: str):
+    """E on the profile screen: write this profile to a JSON file that I
+    imports onto any account — here or on another machine."""
+    if not account_profiles.get(account):
+        print(Fore.YELLOW + f"  ⚠  {account} has no profile to export — it trades the "
+              "plain copy." + Style.RESET_ALL)
+        return
+    default = profile_export_path(account)
+    raw = (await _ask_line(f"FILE (ENTER = {default})")).strip("\"'")
+    path = Path(raw).expanduser() if raw else default
+    if path.is_dir():
+        path = path / default.name
+    if path.exists():
+        confirm = (await _ask_line(f"{path.name} exists — overwrite? [y/N]")).lower()
+        if confirm != "y":
+            return
+    try:
+        write_profile_export(account, path)
+    except OSError as exc:
+        print(Fore.RED + f"  ✖  Could not write {path}: {exc}" + Style.RESET_ALL)
+        return
+    print(Fore.GREEN + f"  ✔  Exported {account}'s profile to {path}" + Style.RESET_ALL)
+    print(Fore.GREEN + "     I on any account's profile screen imports it — here or on "
+          "another machine." + Style.RESET_ALL)
+    if profile_ai_gates(account_profiles[account]):
+        print(Fore.YELLOW + "  ⚠  The file includes the AI gate (its endpoint and the "
+              "key env var's name — never the key itself)." + Style.RESET_ALL)
+
+
+async def _import_profile_prompt(account: str):
+    """I on the profile screen: replace this profile with a copy of another
+    account's, or with a file written by E — here or on another machine."""
+    sources = [a for a in sorted(account_profiles) if a != account and account_profiles[a]]
+    lines = ["Replace this account's profile with a copy of another",
+             "account's, or with a file exported earlier (E).", ""]
+    for i, name in enumerate(sources, 1):
+        lines.append(f"{i}. {name[:13].ljust(13)} {profile_summary(name)[:38]}")
+    if not sources:
+        lines.append("No other account has a profile to copy.")
+    _prof_box(f"IMPORT — {account}", lines, [
+        "ACCOUNT number or name, or the path of a .json file",
+        "ENTER = back"])
+    raw = (await _ask_line("SOURCE")).strip("\"'")
+    if not raw:
+        return
+    if raw.isdigit() and 1 <= int(raw) <= len(sources):
+        raw = sources[int(raw) - 1]
+    if raw == account:
+        print(Fore.YELLOW + "  ⚠  That is this account." + Style.RESET_ALL)
+        return
+    if raw in sources:
+        data, label = export_profile_data(raw), f"{raw}'s profile"
+    else:
+        path = Path(raw).expanduser()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            print(Fore.RED + f"  ✖  Could not read {path}: {exc}" + Style.RESET_ALL)
+            return
+        except ValueError as exc:
+            print(Fore.RED + f"  ✖  {path.name} is not valid JSON: {exc}" + Style.RESET_ALL)
+            return
+        label = path.name
+    if account_profiles.get(account):
+        confirm = (await _ask_line(
+            f"Replace {account}'s current profile with {label}? [y/N]")).lower()
+        if confirm != "y":
+            return
+    ok, msg = import_profile(account, data, source=label)
+    if not ok:
+        print(Fore.YELLOW + f"  ⚠  {msg}" + Style.RESET_ALL)
+        return
+    print(Fore.GREEN + f"  ✔  {msg}" + Style.RESET_ALL)
+    for gate in profile_ai_gates(account_profiles[account]):
+        where = gate.get("endpoint") or "provider default endpoint"
+        key = f" · key from ${gate['api_key_env']}" if gate.get("api_key_env") else ""
+        print(Fore.YELLOW + f"  ⚠  AI gate came along: {gate.get('provider')} · "
+              f"{gate.get('model') or 'default model'} → {where}{key}" + Style.RESET_ALL)
+
+
 async def _edit_account_profile(account: str):
     while True:
         prof_now = account_profiles.get(account, {})
@@ -6596,6 +6787,8 @@ async def _edit_account_profile(account: str):
             f"P. Prop account   — {prop_label}"[:_PROF_INNER],
             "D. Default rule   — applies to every signal",
             f"R. Scoped rules   — {n_rules} configured (per symbol/strategy)",
+            "E. Export         — this profile to a JSON file",
+            "I. Import         — another account's profile, or a file",
             "X. Reset          — remove this account's profile",
         ], ["ENTER = back"])
         raw = (await _ask_line("OPTION")).lower()
@@ -6672,6 +6865,10 @@ async def _edit_account_profile(account: str):
             save_account_profiles()
         elif raw == "r":
             await _edit_scoped_rules(account)
+        elif raw == "e":
+            await _export_profile_prompt(account)
+        elif raw == "i":
+            await _import_profile_prompt(account)
         elif raw == "x":
             confirm = (await _ask_line(f"Remove profile for {account}? [y/N]")).lower()
             if confirm == "y":
@@ -8222,6 +8419,14 @@ async def submit_manual_trade(side, instrument, qty, order_type: str = "market",
     `source` names the surface that fired it and becomes the trade's label
     on the P&L calendar, so hand-fired trades stay separable by where they
     came from instead of collapsing into one bucket.
+
+    The ATM template is also the order's STRATEGY NAME: a ticket order
+    placed under 'NQ-Sides' is an NQ-Sides entry to every per-account
+    scoped rule and to the global strategy → symbol filter, exactly like a
+    publisher signal carrying that name in field 11. Without it no scoped
+    rule could ever match a manual order, so an account whose default is
+    entries-off refused every ticket order — including one placed under a
+    strategy its rules let through.
     """
     global signal_count
     if hard_stopped:
@@ -8234,7 +8439,9 @@ async def submit_manual_trade(side, instrument, qty, order_type: str = "market",
                                       limit_price, atm)
     if err:
         return False, err
-    plans, skipped = plan_signal_legs(signal, manual=True, source=source)
+    atm_name = signal.split(";")[11]   # validated by build_manual_signal
+    plans, skipped = plan_signal_legs(signal, pub_strategy=atm_name,
+                                      manual=True, source=source)
     if not plans:
         why = ", ".join(f"{a}: {r}" for a, r in skipped[:3]) or "no eligible accounts"
         return False, f"no legs to fire — {why}"
@@ -9957,6 +10164,72 @@ async def _web_set_profiles(raw) -> tuple[bool, str]:
     save_account_profiles()
     refresh_terminal()
     return True, f"profiles saved for {', '.join(sorted(cleaned)) or 'no accounts'}"
+
+
+def _web_export_profile(account) -> tuple[bool, object]:
+    """Export document for the browser to download — AI gates stripped.
+
+    The read path never hands out a gate's endpoint or key env var (see
+    _mask_ai_config), so a browser export cannot carry gates; the file says
+    so, and the terminal export (S → 8 → account → E) carries them.
+    """
+    acct = sanitize_ati(str(account or "").strip())
+    if not acct:
+        return False, "account required"
+    if not account_profiles.get(acct):
+        return False, f"{acct} has no profile to export"
+    doc = export_profile_data(acct)
+    if _has_ai_config(doc["profile"]):
+        doc = _strip_ai_config(doc)
+        doc["note"] = ("AI gates are not exported from the web UI — export from the "
+                       "terminal (S → 8 → account → E) to carry them")
+    return True, doc
+
+
+async def _web_import_profile(account, data) -> tuple[bool, str]:
+    """Replace one account's profile with an exported profile document.
+
+    Like every profile payload arriving over HTTP the document is stripped
+    of AI gates first (see _strip_ai_config). The account's previous
+    profile — old gates included — is replaced whole, which is why this
+    does not route through _web_set_profiles: an import is the one web
+    write where "carry the existing gate across the edit" would be wrong.
+    """
+    if hard_stopped:
+        return False, "session hard-locked — settings are frozen"
+    acct = sanitize_ati(str(account or "").strip())
+    if not acct:
+        return False, "account required"
+    if not isinstance(data, dict):
+        return False, "profile document must be a JSON object"
+    dropped = _has_ai_config(data)
+    ok, msg = import_profile(acct, _strip_ai_config(data), source="the imported file")
+    if ok:
+        refresh_terminal()
+        _live_invalidate()
+        if dropped:
+            msg += "  ⚠  its AI gate was not imported — AI gates are set from the terminal"
+    return ok, msg
+
+
+async def _web_copy_profile(account, source) -> tuple[bool, str]:
+    """Copy another account's profile onto this one, AI gate included.
+
+    The gate never crosses the wire — it is the source account's own,
+    already-validated config entry — so the reason the API refuses gates
+    (a request naming an attacker's endpoint) does not apply here.
+    """
+    if hard_stopped:
+        return False, "session hard-locked — settings are frozen"
+    acct = sanitize_ati(str(account or "").strip())
+    src = sanitize_ati(str(source or "").strip())
+    if not acct or not src:
+        return False, "account and source required"
+    ok, msg = copy_profile(src, acct)
+    if ok:
+        refresh_terminal()
+        _live_invalidate()
+    return ok, msg
 
 
 async def _web_reset_pnl() -> tuple[bool, str]:
@@ -11727,6 +12000,17 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
                                 "message": "month must be YYYY-MM"}, 400)
                     return
                 self._json(_pnl_month(month))
+            elif path == "/api/profile_export":
+                if not self._token_ok():
+                    self._json({"ok": False, "message": "forbidden"}, 403)
+                    return
+                query = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(self.path).query)
+                ok, doc = _web_export_profile((query.get("account") or [""])[0])
+                if not ok:
+                    self._json({"ok": False, "message": doc}, 400)
+                    return
+                self._json(doc)
             else:
                 self._json({"ok": False, "message": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -11825,6 +12109,12 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
                     data.get("stop_mode")))
             elif path == "/api/profiles":
                 ok, msg = _web_run(_web_set_profiles(data.get("profiles")))
+            elif path == "/api/profile_import":
+                ok, msg = _web_run(_web_import_profile(
+                    data.get("account"), data.get("data")))
+            elif path == "/api/profile_copy":
+                ok, msg = _web_run(_web_copy_profile(
+                    data.get("account"), data.get("source")))
             else:
                 self._json({"ok": False, "message": "not found"}, 404)
                 return
@@ -12996,6 +13286,63 @@ function accountModal(a){
       const profiles=JSON.parse(JSON.stringify(S.profiles||{}));
       delete profiles[a.name];
       api("/api/profiles",{profiles:profiles}).then(closeModal)}));
+
+    /* ---- Export / import: a setup proven on one account moves to another
+       — or to another machine — as a JSON file, or straight from another
+       account. S.profiles is masked (no gate endpoints reach the page), so
+       a file exported here carries no AI gates and the server drops any
+       gate in an uploaded one; an account-to-account copy happens server
+       side and keeps the source's gate. Both replace the target whole, so
+       the modal (built from the old profile) closes on success. ---- */
+    const X=fold(P,false);
+    X.title.textContent="Export / import";
+    X.sum.textContent="move this setup to a file or another account";
+    const XB=X.body;
+    const hasProf=Object.keys(prof).length>0;
+    const hasAi=o=>!!o&&typeof o==="object"&&(Array.isArray(o)?o.some(hasAi)
+      :Object.keys(o).some(k=>k==="ai"?!!o[k]:hasAi(o[k])));
+    const fname="SocketTrader-profile-"+a.name.replace(/[^A-Za-z0-9._-]+/g,"_")+".json";
+    XB.appendChild(el("div","sub",
+      "EXPORT writes this profile as a JSON file; IMPORT replaces it with one "+
+      "exported earlier — from any account, on any machine. Risk limits stay put."));
+    const xrow=el("div","btnrow");
+    xrow.appendChild(btn("EXPORT FILE","sm",async()=>{
+      if(!hasProf){toast(a.name+" has no profile to export","warn");return}
+      try{
+        const doc=await get("/api/profile_export?account="+encodeURIComponent(a.name));
+        const u=URL.createObjectURL(new Blob([JSON.stringify(doc,null,2)+"\n"],
+          {type:"application/json"}));
+        const l=el("a");l.href=u;l.download=fname;document.body.appendChild(l);
+        l.click();l.remove();setTimeout(()=>URL.revokeObjectURL(u),2000);
+        toast("exported "+fname+(hasAi(prof)?" — without its AI gate (export from the "+
+          "terminal to carry that)":""),hasAi(prof)?"warn":"good");
+      }catch(e){toast("export failed: "+e,"bad")}}));
+    const fi=el("input");fi.type="file";fi.accept=".json,application/json";
+    fi.style.display="none";XB.appendChild(fi);
+    fi.onchange=async()=>{
+      const f=fi.files&&fi.files[0];fi.value="";if(!f)return;
+      let doc;
+      try{doc=JSON.parse(await f.text())}
+      catch(e){toast(f.name+" is not valid JSON","bad");return}
+      if(hasProf&&!confirm("Replace "+a.name+"'s profile with "+f.name+"?"))return;
+      api("/api/profile_import",{account:a.name,data:doc},"import profile")
+        .then(j=>{if(j.ok)closeModal()})};
+    xrow.appendChild(btn("IMPORT FILE","sm",()=>fi.click()));
+    XB.appendChild(xrow);
+    XB.appendChild(el("label",null,"Or copy another account's profile onto "+a.name));
+    const others=Object.keys(S.profiles||{}).filter(n=>n!==a.name).sort();
+    if(!others.length)XB.appendChild(el("div","sub","No other account has a profile yet."));
+    const cw=el("div","chiplist");
+    others.forEach(n=>{
+      const c=el("div","pick",n);
+      const row=(S.accounts||[]).find(x=>x.name===n);
+      c.title=row?row.profile:"";
+      c.onclick=()=>{
+        if(hasProf&&!confirm("Replace "+a.name+"'s profile with a copy of "+n+"'s?"))return;
+        api("/api/profile_copy",{account:a.name,source:n},"copy profile")
+          .then(j=>{if(j.ok)closeModal()})};
+      cw.appendChild(c)});
+    XB.appendChild(cw);
     m.appendChild(P)})}
 
 function strategyModal(){
