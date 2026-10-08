@@ -96,6 +96,8 @@ def reset_session_state():
     st._stagger_placed.clear()
     st._atm_override_warned.clear()
     st._pending_confirms.clear()
+    st._bracket_guard_seen.clear()
+    st._bracket_fills.clear()
     st.shutdown.clear()
     st.roundrobin_accounts = []
     st._rr_remaining = []
@@ -6460,8 +6462,11 @@ class TestMultiStrategyEndToEnd:
             written = _run_plans(plans)
         assert written == []            # deferred legs report via task
         files = self._files(tmp_output_dir)
-        # full close (both sizes) first, then the entry — in that order
-        assert files[0].startswith("CLOSEPOSITION;Sim101;NQ 06-26")
+        # regime's own strategy cancelled/closed by id (it may not even
+        # have filled yet), the full close (both sizes) behind it, then
+        # the entry — in that order
+        assert files[0] == "CLOSESTRATEGY;Sim101;;;;;;;;;;;sid-reg"
+        assert files[1].startswith("CLOSEPOSITION;Sim101;NQ 06-26")
         assert any(f.startswith("CLOSEPOSITION;Sim101;MNQ 06-26") for f in files)
         assert files[-1] == sell
         # the reset voided regime's attribution; mss owns the market now
@@ -6773,8 +6778,8 @@ class TestPnlObserve:
     def test_web_ui_labels_a_blank_strategy_by_its_open_timestamp(self):
         # The rule lives in the embedded JS; guard both call sites use it.
         js = st.WEB_UI_HTML
-        assert 'return t.strategy||' \
-               '(!t.unseen&&t.opened_ts!=null?"Manual":"")}' in js
+        assert 'return !t.unseen&&t.opened_ts!=null?"Manual":""}' in js
+        assert "if(t.strategy)return t.strategy;" in js    # a name always wins
         assert "breakdown(tr,stratOf)" in js
         assert 'td("dim",stratOf(x)' in js       # trade log goes through it
         assert "t=>t.strategy" not in js      # no unlabelled path left
@@ -7199,18 +7204,22 @@ class TestPnlStagedEntryExpiry:
                  100.0 + st.PNL_STAGED_TTL_S + 60)
         assert ("Sim101", "NQ") in st._pnl_open_meta
 
-    def test_unconfirmed_drops_the_stage_at_once(self):
+    def test_a_confirm_timeout_leaves_the_stage_to_the_ttl(self, monkeypatch):
+        # Oct 8 live log: 13 of 13 "no fill" verdicts were fills NinjaTrader
+        # showed 11-25 s after the write, and every one of those legs lost
+        # its strategy name to the verdict and showed as a chart trade. The
+        # TTL above retires an entry that truly never filled; the confirm
+        # path never touches the stage.
         st._pnl_note_open(self.A, "SIL 12-26", ("", "SI-Squeeze"), now=100.0)
-        assert (self.A, "SIL") in st._pnl_open_meta
-        st._pnl_drop_staged(self.A, "SIL 12-26")
-        assert (self.A, "SIL") not in st._pnl_open_meta
-
-    def test_dropping_a_stage_never_touches_an_observed_position(self):
-        pos = [_ppos("MNQ 12-26", -1, 30_771.25)]
-        st._pnl_note_open(self.A, "MNQ 12-26", ("", "Gooping"), now=100.0)
-        self.obs(_plive(_prow(self.A, 586.14, pos, realized=0.0)), 100.0)
-        st._pnl_drop_staged(self.A, "MNQ 12-26")   # a stale confirm timeout
-        assert (self.A, "MNQ") in st._pnl_open_meta
+        monkeypatch.setattr(st, "_confirm_snapshot", lambda: None)
+        monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {})
+        st.add_pending_confirm(f"PLACE;{self.A};SIL 12-26;SELL;1;MARKET;;;DAY;;;SI-Squeeze;s1",
+                               "s1", "SIL 12-26", "SELL", pre_pos=0, account=self.A)
+        st._pending_confirms[-1]["ts"] -= st.CONFIRM_TIMEOUT + 1
+        st.check_pending_confirms()
+        assert st._pending_confirms == [] and "No fill detected" in st._alert_text
+        assert st._pnl_open_meta[(self.A, "SIL")]["strategies"] == ["SI-Squeeze"]
+        assert not hasattr(st, "_pnl_drop_staged")
 
 
 class TestTradeStatsExcludeUnseen:
@@ -7966,11 +7975,12 @@ class _Stream:
     def __init__(self, monkeypatch, snap_fn=None, delay: float = 0.02):
         self.calls: list[dict] = []
         self.snap_fn = snap_fn or (lambda: _stream_snap())
+        self.delay = delay                      # how long NinjaTrader "takes" per dump
 
         def fake(port=None, timeout=3.0, retry=True, stall=None):
             self.calls.append({"thread": threading.current_thread().name,
                                "retry": retry, "stall": stall, "t": time.time()})
-            time.sleep(delay)
+            time.sleep(self.delay)
             return dict(self.snap_fn())
 
         monkeypatch.setattr(st, "nt_snapshot", fake)
@@ -8121,6 +8131,48 @@ class TestStreamOrderPath:
         assert len(list(tmp_output_dir.glob("oif_*.txt"))) == 1
         assert st._pending_confirms[-1]["pre_pos"] == 2         # "NQ SEP26" → "NQ 09-26"
         assert s.request_thread_calls() == []
+
+    def test_a_slow_ninjatrader_is_asked_less_often_and_routine_readers_stop_nudging(
+            self, monkeypatch):
+        # Oct 8: 145 KB dumps cut off at the cap, asked for back to back all
+        # afternoon, while market fills landed 4-27 s late and ATM stops
+        # were rejected "below the market". The stream is the one load that
+        # is ours: past SNAPSHOT_SLOW_S per dump it waits a multiple of the
+        # dump's own length, and routine readers take what is there.
+        monkeypatch.setattr(st, "SNAPSHOT_SLOW_S", 0.1)
+        s = _Stream(monkeypatch, delay=0.25)
+        time.sleep(1.3)
+        snap = st.snapshot_cached(5.0)
+        assert snap["slow"] is True and snap["took"] >= 0.25
+        # The helper's own first wait nudged the stream, so the dump after
+        # the first one came at once; every one after that is paced.
+        gaps = [b["t"] - a["t"] for a, b in zip(s.calls, s.calls[1:])]
+        assert len(gaps) >= 2
+        assert min(gaps[1:]) >= 0.25 + st.SNAPSHOT_SLOW_FACTOR * 0.25 - 0.08
+        t0 = time.monotonic()
+        got = st._stream_snapshot(0.0, 1.0, "BALANCES")      # a routine reader
+        assert got["seq"] >= snap["seq"]
+        assert time.monotonic() - t0 < 0.1                   # no wait ...
+        assert not st._snap_wake.is_set()                    # ... and no nudge
+        got = st._stream_snapshot(0.0, 3.0, "FLATTEN", urgent=True)   # a flatten still asks
+        assert got is not None and got["seq"] > snap["seq"]
+
+    def test_a_cut_off_dump_counts_as_slow_however_fast_it_came_back(self, monkeypatch):
+        _Stream(monkeypatch, snap_fn=lambda: dict(_stream_snap(), partial=True))
+        assert st.snapshot_cached(5.0)["slow"] is True
+
+    def test_the_stream_returns_to_normal_pace_when_dumps_get_fast(self, monkeypatch, caplog):
+        monkeypatch.setattr(st, "SNAPSHOT_SLOW_S", 0.1)
+        with caplog.at_level(logging.INFO):
+            s = _Stream(monkeypatch, delay=0.25)
+            time.sleep(0.9)
+            assert st.snapshot_cached(5.0)["slow"] is True
+            s.delay = 0.01
+            time.sleep(1.2)
+            assert st.snapshot_cached(5.0)["slow"] is False
+        text = "\n".join(r.message for r in caplog.records)
+        assert "SNAPSHOT STREAM  NinjaTrader is slow: dump took" in text
+        assert "SNAPSHOT STREAM  NinjaTrader recovered" in text
 
     def test_pre_position_prefers_the_newest_complete_dump(self, monkeypatch):
         # A cut-off dump right after a complete one must not read as "flat".
@@ -8534,14 +8586,15 @@ class TestFollowerFillConfirmation:
     def test_follower_timeout_is_reported_on_the_follower(self, monkeypatch):
         self._arm(monkeypatch)
         _Stream(monkeypatch, snap_fn=lambda: _stream_snap(positions=[]))
-        dropped = []
-        monkeypatch.setattr(st, "_pnl_drop_staged", lambda a, i: dropped.append((a, i)))
+        st._pnl_note_open("Sim102", "NQ 09-26", ("", "NQ_Med"), role="follower")
         st.add_pending_confirm(self.SIG, "f1", "NQ 09-26", "BUY", pre_pos=0, account="Sim102")
         st._pending_confirms[-1]["ts"] -= st.CONFIRM_TIMEOUT + 1
         st.check_pending_confirms()
         assert st._pending_confirms == []
-        assert dropped == [("Sim102", "NQ 09-26")]
         assert "No fill detected" in st._alert_text and "[Sim102]" in st._alert_text
+        # The verdict never costs the leg its name — the stage outlives it,
+        # so the fill NinjaTrader shows late is still the strategy's trade.
+        assert st._pnl_open_meta[("Sim102", "NQ")]["strategies"] == ["NQ_Med"]
 
     def test_close_timeout_keeps_the_staged_entry(self, monkeypatch):
         # A publisher close that found nothing to close has no fill to wait
@@ -8549,13 +8602,13 @@ class TestFollowerFillConfirmation:
         # paired with (closes arrive 1–3 s before the next entry).
         self._arm(monkeypatch)
         _Stream(monkeypatch, snap_fn=lambda: _stream_snap(positions=[]))
-        dropped = []
-        monkeypatch.setattr(st, "_pnl_drop_staged", lambda a, i: dropped.append((a, i)))
+        st._pnl_note_open("Sim102", "NQ 09-26", ("", "NQ_Med"))
         st.add_pending_confirm("CLOSEPOSITION;Sim102;NQ 09-26;;;;;;;;;;", None,
                                "NQ 09-26", "", pre_pos=0, account="Sim102")
         st._pending_confirms[-1]["ts"] -= st.CONFIRM_TIMEOUT + 1
         st.check_pending_confirms()
-        assert st._pending_confirms == [] and dropped == []
+        assert st._pending_confirms == []
+        assert st._pnl_open_meta[("Sim102", "NQ")]["strategies"] == ["NQ_Med"]
 
     def test_deferred_follower_registers_its_own_confirm(self, tmp_output_dir, monkeypatch):
         self._arm(monkeypatch)
@@ -8576,6 +8629,360 @@ class TestFollowerFillConfirmation:
         assert st._pre_positions(plans) == {"Sim101": 2, "Sim102": -3}
         assert s.request_thread_calls() == []
         assert st._pre_positions([]) == {}
+
+
+class TestConfirmVerdictEvidence:
+    """A fill is evidence whichever dump shows it. A MISSING fill is only
+    evidence from a complete dump requested after the order had its
+    CONFIRM_TIMEOUT to land. The Oct 8 live log judged 13 legs "no fill"
+    from dumps 9-11 s old, and every one of them filled 11-25 s after the
+    write — each judgement made on a NinjaTrader state older than the
+    order it judged."""
+
+    SIG = "PLACE;Sim101;NQ 09-26;BUY;1;MARKET;;;DAY;;;NQ_Med;f1"
+
+    def _snap(self, req_age, positions=(), ok=True):
+        s = _stream_snap(positions=positions, ok=ok)
+        s["req_ts"] = time.time() - req_age
+        return s
+
+    def _pending(self, age, account="Sim101"):
+        st.add_pending_confirm(self.SIG, "f1", "NQ 09-26", "BUY", pre_pos=0, account=account)
+        st._pending_confirms[-1]["ts"] -= age
+
+    def test_a_dump_requested_before_the_order_landed_cannot_say_no_fill(self, monkeypatch):
+        monkeypatch.setattr(st, "_confirm_snapshot", lambda: self._snap(req_age=12))
+        self._pending(age=10)                   # past the wait by the clock ...
+        st.check_pending_confirms()
+        assert len(st._pending_confirms) == 1   # ... but nothing taken since has spoken
+        assert st._alert_text == ""
+
+    def test_a_complete_dump_taken_after_the_wait_delivers_the_verdict(self, monkeypatch):
+        monkeypatch.setattr(st, "_confirm_snapshot", lambda: self._snap(req_age=0.5))
+        self._pending(age=10)
+        st.check_pending_confirms()
+        assert st._pending_confirms == []
+        assert "No fill detected" in st._alert_text
+
+    def test_a_cut_off_dump_cannot_say_no_fill_but_can_show_one(self, monkeypatch):
+        monkeypatch.setattr(st, "_confirm_snapshot", lambda: self._snap(req_age=0.5, ok=False))
+        self._pending(age=10)
+        st.check_pending_confirms()
+        assert len(st._pending_confirms) == 1 and st._alert_text == ""
+        monkeypatch.setattr(st, "_confirm_snapshot", lambda: self._snap(
+            req_age=0.5, ok=False, positions=[("Sim101", "NQ SEP26", 1)]))
+        st.check_pending_confirms()
+        assert st._pending_confirms == [] and "FILLED" in st._alert_text
+
+    def test_no_usable_dump_by_the_give_up_point_is_unverified_not_missing(
+            self, monkeypatch, caplog):
+        monkeypatch.setattr(st, "_confirm_snapshot", lambda: self._snap(req_age=90))
+        st._pnl_note_open("Sim101", "NQ 09-26", ("", "NQ_Med"))
+        self._pending(age=st.CONFIRM_GIVE_UP_S + 1)
+        with caplog.at_level(logging.WARNING):
+            st.check_pending_confirms()
+        assert st._pending_confirms == []
+        assert "UNVERIFIED" in caplog.text and "UNCONFIRMED" not in caplog.text
+        assert "unverified" in st._alert_text
+        assert st._pnl_open_meta[("Sim101", "NQ")]["strategies"] == ["NQ_Med"]
+
+    def test_the_check_reads_the_newest_dump_without_waiting(self, monkeypatch):
+        # The balance monitor calls this every cycle; waiting on the stream
+        # for a fresher dump held it for the wait on a NinjaTrader too slow
+        # to finish one, every cycle, for nothing the verdict could use.
+        waited = []
+        monkeypatch.setattr(st, "_stream_snapshot", lambda *a, **k: waited.append(a))
+        _Stream(monkeypatch, snap_fn=lambda: _stream_snap(positions=[]))
+        self._pending(age=1)
+        st.check_pending_confirms()
+        assert waited == [] and len(st._pending_confirms) == 1
+
+    def test_without_the_stream_the_direct_query_is_live_evidence(self, monkeypatch):
+        monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {})
+        self._pending(age=10)
+        st.check_pending_confirms()
+        assert st._pending_confirms == [] and "No fill detected" in st._alert_text
+
+
+class TestTradeRowRole:
+    """The leader's leg carries no mark; a follower's row says `copy` and a
+    round-robin pick says `round robin` — beside the publisher's strategy
+    name, which stays the same on every account so a strategy's results
+    add up across the group."""
+
+    D = "2026-10-08"
+
+    def obs(self, live, now):
+        st._pnl_observe(live, now=now, session_date=self.D)
+
+    @staticmethod
+    def _plan(account, rr=False):
+        return {"account": account, "rr_pick": rr,
+                "strat_ident": ("gooping", "Gooping"), "manual": False}
+
+    def test_dispatch_records_each_legs_part_in_the_signal(self):
+        st.active_account = "SimAI"
+        sig = "PLACE;%s;NQ 12-26;BUY;1;MARKET;;;DAY;;;Gooping;ent:1"
+        st._ledger_note_file(self._plan("SimAI"), sig % "SimAI")
+        st._ledger_note_file(self._plan("Sim101"), sig % "Sim101")
+        st._ledger_note_file(self._plan("RR1", rr=True), sig % "RR1")
+        assert "role" not in st._pnl_open_meta[("SimAI", "NQ")]
+        assert st._pnl_open_meta[("Sim101", "NQ")]["role"] == "follower"
+        assert st._pnl_open_meta[("RR1", "NQ")]["role"] == "round-robin"
+        assert all(m["strategies"] == ["Gooping"] for m in st._pnl_open_meta.values())
+
+    def test_the_row_carries_the_part_beside_the_name(self):
+        st._pnl_note_open("SimAI", "NQ 12-26", ("", "Gooping"), now=100.0)
+        st._pnl_note_open("Sim101", "NQ 12-26", ("", "Gooping"), now=100.0, role="follower")
+        pos = [_ppos("NQ 12-26", -1, 31_194.0)]
+        self.obs(_plive(_prow("SimAI", 1_000.0, pos, realized=0.0),
+                        _prow("Sim101", 1_000.0, pos, realized=0.0)), 103.0)
+        self.obs(_plive(_prow("SimAI", 705.64, realized=-294.36),
+                        _prow("Sim101", 705.64, realized=-294.36)), 120.0)
+        rows = {t["account"]: t
+                for t in st._pnl_month(self.D[:7])["days"][self.D]["trades"]}
+        assert rows["SimAI"]["strategy"] == "Gooping" and "role" not in rows["SimAI"]
+        assert rows["Sim101"]["strategy"] == "Gooping"
+        assert rows["Sim101"]["role"] == "follower"
+
+    def test_the_log_shows_the_name_then_the_part_then_manual(self):
+        js = st.WEB_UI_HTML
+        body = js[js.index("function stratOf(t)"):][:220]
+        assert "if(t.strategy)return t.strategy" in body
+        assert "if(t.role)return roleOf(t)" in body
+        assert '"Manual"' in body
+        assert 'ROLE_TAG={"follower":"copy","round-robin":"round robin"}' in js
+        assert 'el("span","tag rtag",roleOf(x))' in js
+
+
+class TestBracketGuard:
+    """NinjaTrader attaches the ATM bracket after the fill; when it is slow
+    the stop is rejected "below the market", the target dies with the OCO
+    group, and the leg runs naked (Oct 8, 13:05 and 14:10). NT logs the
+    rejection the same millisecond; the guard acts on that line."""
+
+    STOP_REJ = ("2026-10-08 14:11:26:643|1|32|Order='a29a1e433da6424aace66f7935e17c36/SimAI' "
+                "Name='Stop1' New state='Rejected' Instrument='NQ DEC26' Action='Buy to cover' "
+                "Limit price=0 Stop price=30909 Quantity=1 Type='Stop Market' Time in force=GTC "
+                "Oco='517117c29aac4ea0a566ea2f38b9027f' Filled=0 Fill price=0 Error='Order rejected' "
+                "Native error='Buy stop or buy stop limit orders can't be placed below the market.'")
+    TGT_REJ = ("2026-10-08 14:11:30:263|1|32|Order='b6e676c2328a4e89b075240b05440fac/SimAI' "
+               "Name='Target1' New state='Rejected' Instrument='NQ DEC26' Action='Buy to cover' "
+               "Limit price=30273 Stop price=0 Quantity=1 Type='Limit' Time in force=GTC "
+               "Oco='517117c29aac4ea0a566ea2f38b9027f' Filled=0 Fill price=0 Error='Order rejected' "
+               "Native error='The OCO ID cannot be reused. Please use a new OCO ID.'")
+    TRAIL = ("2026-10-08 13:20:56:706|1|32|Order='31cd1f6d56124d43bff47d8d722c13aa/SimAI' "
+             "Name='Stop1' New state='Accepted' Instrument='NQ DEC26' Action='Buy to cover' "
+             "Limit price=0 Stop price=30911.5 Quantity=1 Type='Stop Market' Time in force=GTC "
+             "Oco='77fd2fc7c3204c4f9d0c1d4f6a4e1b22' Filled=0 Fill price=0 Error='Order rejected' "
+             "Native error='Stop price can't be changed below the market.'")
+
+    def _arm(self, tmp_output_dir):
+        st.active_account = "SimAI"
+        st.follower_accounts = ["Sim101"]
+        st.output_directory = str(tmp_output_dir)
+        return st._nt_log_stamp(self.STOP_REJ) + 1.0        # "now", a second after the line
+
+    def _closes(self, tmp_output_dir):
+        return sorted(p.read_text() for p in tmp_output_dir.glob("oifclose_*.txt"))
+
+    def test_a_rejected_atm_stop_closes_that_leg_at_market(self, tmp_output_dir, caplog):
+        now = self._arm(tmp_output_dir)
+        with caplog.at_level(logging.WARNING):
+            assert st._bracket_guard_event(self.STOP_REJ, now=now) == "close"
+        closes = self._closes(tmp_output_dir)
+        assert closes and closes[0].startswith("CLOSEPOSITION;SimAI;NQ 12-26;")   # NT's "NQ DEC26", OIF spelling
+        assert "REJECTED the ATM stop" in st._alert_text and "closed at market" in st._alert_text
+        assert ("BRACKET GUARD  account=SimAI  NQ 12-26  NinjaTrader REJECTED the ATM stop "
+                "(Buy stop or buy stop limit orders can't be placed below the market)  action=close"
+                in caplog.text)
+
+    def test_the_target_refused_into_the_same_dead_oco_group_is_not_a_second_action(
+            self, tmp_output_dir):
+        now = self._arm(tmp_output_dir)
+        assert st._bracket_guard_event(self.STOP_REJ, now=now) == "close"
+        n = len(self._closes(tmp_output_dir))
+        assert st._bracket_guard_event(self.TGT_REJ, now=now + 4) is None
+        assert len(self._closes(tmp_output_dir)) == n
+
+    def test_a_target_refused_on_its_own_is_flagged_not_closed(self, tmp_output_dir):
+        now = self._arm(tmp_output_dir)
+        assert st._bracket_guard_event(self.TGT_REJ, now=now + 4) == "alert"
+        assert self._closes(tmp_output_dir) == []
+        assert "no target on this position" in st._alert_text
+
+    def test_a_refused_trail_change_is_not_a_rejected_bracket(self, tmp_output_dir):
+        # The stop is still working at its old price: nothing is exposed.
+        now = self._arm(tmp_output_dir)
+        assert st._bracket_guard_event(self.TRAIL, now=now) is None
+        assert self._closes(tmp_output_dir) == [] and st._alert_text == ""
+
+    def test_policy_alert_only_warns(self, tmp_output_dir):
+        now = self._arm(tmp_output_dir)
+        st.save_config({"bracket_guard": "alert"})
+        assert st._bracket_guard_event(self.STOP_REJ, now=now) == "alert"
+        assert self._closes(tmp_output_dir) == []
+        assert "NO STOP on this position" in st._alert_text
+
+    def test_policy_off_does_nothing(self, tmp_output_dir):
+        now = self._arm(tmp_output_dir)
+        st.save_config({"bracket_guard": "off"})
+        assert st._bracket_guard_event(self.STOP_REJ, now=now) is None
+        assert self._closes(tmp_output_dir) == [] and st._alert_text == ""
+
+    def test_an_account_the_app_does_not_manage_is_only_flagged(self, tmp_output_dir):
+        now = self._arm(tmp_output_dir)
+        line = self.STOP_REJ.replace("/SimAI'", "/1632306'")
+        assert st._bracket_guard_event(line, now=now) == "alert"
+        assert self._closes(tmp_output_dir) == []
+        assert "1632306 NQ 12-26" in st._alert_text
+
+    def test_history_in_the_log_is_not_news(self, tmp_output_dir):
+        now = self._arm(tmp_output_dir)
+        assert st._bracket_guard_event(self.STOP_REJ, now=now + 1000) is None
+        assert self._closes(tmp_output_dir) == []
+
+    # The orphan: SimAI 14:47:54 — the MSSComp long's stop fired on a FLAT
+    # account (its position had been netted away by the MacroZoneB entry)
+    # and opened a short nobody asked for.
+    ORPHAN_FILL = ("2026-10-08 14:47:54:087|1|32|Order='76d3fb593e0a4e80b975f87b79f8f7d0/SimAI' "
+                   "Name='Stop1' New state='Filled' Instrument='NQ DEC26' Action='Sell' Limit price=0 "
+                   "Stop price=30919.25 Quantity=1 Type='Stop Market' Time in force=GTC "
+                   "Oco='ab3e2f9d11c04c0d8f9f0a1b2c3d4e5f' Filled=1 Fill price=30919.25")
+    ORPHAN_ADD = ("2026-10-08 14:47:54:875|1|64|Instrument='NQ DEC26' Account='SimAI' "
+                  "Average price=30919.25 Quantity=1 Market position=Short Operation=Operation_Add")
+    STOP_CLOSES = ("2026-10-08 14:49:25:511|1|64|Instrument='NQ DEC26' Account='SimAI' "
+                   "Average price=0 Quantity=0 Market position=Flat Operation=Remove")
+    ENTRY_FILL = ("2026-10-08 14:47:53:900|1|32|Order='41a76ca4e51e4b05900ef491dc14de9b/SimAI' "
+                  "Name='Entry' New state='Filled' Instrument='NQ DEC26' Action='Sell' Limit price=0 "
+                  "Stop price=0 Quantity=1 Type='Market' Time in force=DAY Oco='' Filled=1 Fill price=30919.25")
+
+    def test_a_bracket_fill_that_opens_a_position_on_a_flat_account_is_closed(
+            self, tmp_output_dir, caplog):
+        self._arm(tmp_output_dir)
+        now = st._nt_log_stamp(self.ORPHAN_ADD) + 1.0
+        assert st._bracket_guard_event(self.ORPHAN_FILL, now=now) is None    # remembered, not acted on
+        with caplog.at_level(logging.WARNING):
+            assert st._bracket_guard_event(self.ORPHAN_ADD, now=now) == "close"
+        closes = self._closes(tmp_output_dir)
+        assert closes and closes[0].startswith("CLOSEPOSITION;SimAI;NQ 12-26;")
+        assert "orphaned ATM Stop1 opened SHORT 1 on a flat account" in st._alert_text
+        assert "closed at market" in st._alert_text
+        assert "action=close" in caplog.text
+
+    def test_a_bracket_fill_that_closes_a_position_is_what_brackets_are_for(self, tmp_output_dir):
+        self._arm(tmp_output_dir)
+        now = st._nt_log_stamp(self.STOP_CLOSES) + 1.0
+        st._bracket_guard_event(self.ORPHAN_FILL.replace("14:47:54:087", "14:49:24:321"), now=now)
+        assert st._bracket_guard_event(self.STOP_CLOSES, now=now) is None
+        assert self._closes(tmp_output_dir) == [] and st._alert_text == ""
+        assert st._bracket_fills == {}                                     # consumed either way
+
+    def test_an_entry_opening_a_position_is_normal(self, tmp_output_dir):
+        self._arm(tmp_output_dir)
+        now = st._nt_log_stamp(self.ORPHAN_ADD) + 1.0
+        st._bracket_guard_event(self.ENTRY_FILL, now=now)
+        assert st._bracket_guard_event(self.ORPHAN_ADD, now=now) is None
+        assert self._closes(tmp_output_dir) == []
+
+    def test_a_position_line_long_after_a_bracket_fill_is_not_its_doing(self, tmp_output_dir):
+        self._arm(tmp_output_dir)
+        late = self.ORPHAN_ADD.replace("14:47:54:875", "14:48:30:000")
+        now = st._nt_log_stamp(late) + 1.0
+        st._bracket_guard_event(self.ORPHAN_FILL, now=now)
+        assert st._bracket_guard_event(late, now=now) is None
+        assert self._closes(tmp_output_dir) == []
+
+    def test_the_tail_reader_joins_at_the_end_follows_appends_and_rolls(self, tmp_path):
+        p = tmp_path / "log.20261008.00000.txt"
+        p.write_text("old line 1\nold line 2\n", encoding="utf-8")
+        tail = st._LogTail()
+        assert tail.read(str(p)) == []                 # history is not replayed
+        with p.open("a", encoding="utf-8") as f:
+            f.write("new line, unfinished")
+        assert tail.read(str(p)) == []                 # waits for the line to end
+        with p.open("a", encoding="utf-8") as f:
+            f.write(" now finished\nanother\n")
+        assert tail.read(str(p)) == ["new line, unfinished now finished", "another"]
+        assert tail.read(str(p)) == []
+        q = tmp_path / "log.20261008.00001.txt"       # NT rolled: everything in it is new
+        q.write_text("rolled 1\n", encoding="utf-8")
+        assert tail.read(str(q)) == ["rolled 1"]
+
+    def test_the_newest_log_is_picked_without_its_duplicate(self, tmp_path):
+        for n in ("log.20261007.00000.txt", "log.20261008.00000.txt",
+                  "log.20261008.00000.en.txt", "log.20261008.00001.txt", "trace.txt"):
+            (tmp_path / n).write_text("", encoding="utf-8")
+        assert st._nt_log_file(str(tmp_path)).endswith("log.20261008.00001.txt")
+
+    def test_the_task_closes_a_leg_from_a_line_ninjatrader_just_wrote(
+            self, tmp_path, monkeypatch):
+        incoming = tmp_path / "incoming"; incoming.mkdir()
+        logdir = tmp_path / "log"; logdir.mkdir()
+        log = logdir / "log.20261008.00000.txt"
+        log.write_text("2026-10-08 09:00:00:000|1|1|boot\n", encoding="utf-8")
+        self._arm(incoming)
+        monkeypatch.setattr(st, "BRACKET_GUARD_POLL_S", 0.05)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S") + ":000"
+        line = stamp + self.STOP_REJ[23:]
+
+        async def go():
+            st.shutdown.clear()
+            task = asyncio.create_task(st.bracket_guard_task())
+            await asyncio.sleep(0.2)                   # joined the log at its end
+            with log.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            for _ in range(40):
+                await asyncio.sleep(0.05)
+                if list(incoming.glob("oifclose_*.txt")):
+                    break
+            st.shutdown.set()
+            await asyncio.wait_for(task, 2)
+        asyncio.run(go())
+        assert self._closes(incoming) and self._closes(incoming)[0].startswith(
+            "CLOSEPOSITION;SimAI;NQ 12-26;")
+
+
+class TestResetCancelsTheStandingEntryFirst:
+    """Oct 8: the standing entry had not filled when the reset's
+    CLOSEPOSITION arrived, NinjaTrader found no position and did nothing
+    (it does not cancel a working entry), both entries then filled and
+    netted to flat, and the orphaned brackets opened positions nobody
+    asked for. CLOSESTRATEGY by the entry's own id cancels it unfilled or
+    closes it filled, bracket included — so it goes first."""
+
+    def test_reset_writes_closestrategy_for_the_standing_entry_before_the_close(
+            self, ms_on, live_book, tmp_output_dir, monkeypatch):
+        st.active_account = "Sim101"
+        monkeypatch.setattr(st, "RESET_SETTLE_S", 0.01)
+        monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {})
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1, ("bread_n_butter", "BnB"), "sid-a")
+        buy = "PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(buy, envelope=ENTRY_ENV)
+            assert plans[0]["reset_first"] is True
+            _run_plans(plans)
+        bodies = [f.read_text() for f in sorted(tmp_output_dir.glob("oif_*.txt"))]
+        assert bodies[0] == "CLOSESTRATEGY;Sim101;;;;;;;;;;;sid-a"
+        assert bodies[1].startswith("CLOSEPOSITION;Sim101;NQ 06-26;")
+        assert bodies[-1].startswith("PLACE;Sim101;NQ 06-26;BUY;1;")
+        assert st._ledger_entries("Sim101", "NQ 06-26") and all(
+            r["sid"] != "sid-a" for r in st._ledger_entries("Sim101", "NQ 06-26"))
+
+    def test_a_standing_position_the_ledger_never_wrote_still_gets_the_close(
+            self, ms_on, live_book, tmp_output_dir, monkeypatch):
+        st.active_account = "Sim101"
+        monkeypatch.setattr(st, "RESET_SETTLE_S", 0.01)
+        monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {})
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))   # adopted / chart
+        buy = "PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(buy, envelope=ENTRY_ENV)
+            _run_plans(plans)
+        bodies = [f.read_text() for f in sorted(tmp_output_dir.glob("oif_*.txt"))]
+        assert not any(b.startswith("CLOSESTRATEGY") for b in bodies)
+        assert bodies[0].startswith("CLOSEPOSITION;Sim101;NQ 06-26;")
 
 
 class TestLiveReconnectPath:
@@ -8657,6 +9064,11 @@ class TestLiveReconnectPath:
         assert "AUTH FAILED" not in text
         assert text.count("DUPLICATE IGNORED") == 1     # first delivery kept, the replay dropped
         assert st._quick_retry_s == st.BACKOFF_START_S  # the refused fast retry lengthened the next one
+        # One outage, reported once, measured from the drop — not a 0 s
+        # "reconnect" at the refused handshake plus a fresh one after it.
+        assert text.count("RECONNECTED") == 1
+        assert "RECONNECTED  downtime=" in text and "RECONNECTED  downtime=0s" not in text
+        assert text.index("SESSION HELD") < text.index("RECONNECTED")
 
     def test_http_403_at_the_handshake_is_an_auth_failure_not_an_endless_retry(
             self, monkeypatch, caplog):

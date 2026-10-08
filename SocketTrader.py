@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.20.1"
+__version__ = "0.20.2"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -647,6 +647,11 @@ def validate_signal(parts: list[str]) -> str | None:
 # After a signal fires, we snapshot positions for that instrument and verify
 # NinjaTrader processed it by checking if the position changed.
 CONFIRM_TIMEOUT = 9  # seconds to wait for position change after signal
+# A leg is only called MISSING by a complete state dump NinjaTrader was
+# asked for at least CONFIRM_TIMEOUT after the order was written. Until one
+# lands the leg stays pending; with none by this many seconds the verdict
+# is "unverified" — which is what it is — never "no fill".
+CONFIRM_GIVE_UP_S = 60
 MAX_PENDING_CONFIRMS = 64  # cap to prevent unbounded growth (one entry per account per signal)
 _pending_confirms: list[dict] = []  # [{signal, ts, pre_pos, instrument, id, action}]
 _confirms_lock = __import__("threading").Lock()
@@ -2682,9 +2687,14 @@ def _ledger_note_file(plan: dict, sig: str):
     if cmd in ("PLACE", "REVERSEPOSITION") and len(parts) >= 13:
         _ledger_note_entry(account, parts[2], parts[3], parts[4], ident,
                            parts[12], reset=(cmd == "REVERSEPOSITION"))
+        # The leg's part in the signal, for the trade log: the leader's
+        # own entry carries no mark, a follower's is a copy of it, and a
+        # round-robin pick is the rotation's one draw.
+        role = ("round-robin" if plan.get("rr_pick")
+                else "" if account == active_account else "follower")
         _pnl_note_open(account, parts[2], ident,
                        manual=bool(plan.get("manual")),
-                       source=plan.get("manual_source") or "")
+                       source=plan.get("manual_source") or "", role=role)
     elif cmd == "CLOSEPOSITION" and len(parts) >= 3 and parts[2]:
         _ledger_clear(account, parts[2])
         _pnl_note_close(account, parts[2])
@@ -2940,6 +2950,14 @@ def _smart_close_decision(account: str, instrument: str,
     _ledger_prune_sids(account, {r["sid"] for r in own}, instrument)
     n = len(own)
     return "scope", files, f"scoped to {n} own entr{'y' if n == 1 else 'ies'}"
+
+
+def _close_strategy_file(account: str, sid: str) -> str:
+    """CLOSESTRATEGY by id: cancels the ATM's entry while it is still
+    unfilled, or closes its position and cancels its bracket once it has
+    filled — the one command that handles an entry on either side of its
+    fill. Written the way the smart close writes it (raw id, as placed)."""
+    return f"CLOSESTRATEGY;{sanitize_ati(account)};;;;;;;;;;;{sid}"
 
 
 def _reset_close_files(account: str, instrument: str) -> list[str]:
@@ -3486,12 +3504,28 @@ async def _run_deferred_leg(plan: dict, sig_id: str | None = None):
             # publisher's reset semantics — full close now, a settle beat
             # for NT to process it (the publisher's own close→place gap is
             # 1–3s), then the normal entry flow.
+            #
+            # The standing entry may not have FILLED yet (Oct 8: NinjaTrader
+            # filling 15–30 s after the write). CLOSEPOSITION then finds no
+            # position and does nothing — it does not cancel the working
+            # entry — so both entries fill, net to flat, and both ATMs stay
+            # alive with brackets that later fire on a flat account and
+            # open positions nobody asked for (SimAI and SimEverything
+            # 14:47, SimEverything 15:07). CLOSESTRATEGY by the entry's own
+            # id cancels an unfilled entry and closes a filled one, bracket
+            # included, so it goes first; the CLOSEPOSITION still covers
+            # anything the ledger never wrote (adopted, chart).
+            sids = list(dict.fromkeys(
+                r["sid"] for r in _ledger_entries(account, plan["instrument"])
+                if r.get("sid")))
+            for sid in sids:
+                write_signal_to_file(_close_strategy_file(account, sid))
             for sig in _reset_close_files(account, plan["instrument"]):
                 write_signal_to_file(sig)
             _ledger_clear(account, plan["instrument"])
             _clear_inflight_opens(account, plan["instrument"])
             logger.info(f"RESET  account={account}  closed {plan['instrument']} "
-                        "before opposite-direction entry")
+                        f"before opposite-direction entry  strategies={sids}")
             if not await _interruptible_sleep(RESET_SETTLE_S, account, manual):
                 logger.info(f"LEG ABORTED  account={account}  during=reset settle")
                 return
@@ -4951,6 +4985,18 @@ SNAPSHOT_MIN_GAP = 0.25        # breathing room after a slow dump before the nex
 SNAPSHOT_TIMEOUT = 10.0        # wall-clock cap on one dump …
 SNAPSHOT_STALL = 2.0           # … and the silence that ends one early (see _query_ati)
 SNAPSHOT_DOWN_BACKOFF = 2.0    # NinjaTrader unreachable: how long before asking again
+# A NinjaTrader that needs seconds to answer one dump is one that is also
+# late filling orders and placing ATM brackets: Oct 8 the dumps ran to
+# 145 KB and were cut off at the cap all afternoon, market fills landed
+# 4–27 s late, and three stops were rejected "below the market" — the
+# positions ran naked. Past this many seconds per dump (or a dump cut
+# off) the stream waits SNAPSHOT_SLOW_FACTOR times the dump's own length
+# before asking again, capped, and routine readers take the newest dump
+# instead of nudging for a fresher one: the one load here that is ours to
+# shed. A flatten still nudges.
+SNAPSHOT_SLOW_S = 3.0
+SNAPSHOT_SLOW_FACTOR = 2.0
+SNAPSHOT_SLOW_MAX_PAUSE_S = 30.0
 SNAPSHOT_FIRST_WAIT = 3.0      # the first dashboard poll waits this long for a first dump
 
 _snap_cond = threading.Condition()
@@ -4985,6 +5031,7 @@ def _snapshot_publish(snap: dict):
 def _snapshot_poller_loop(stop: threading.Event, wake: threading.Event):
     """One generation of the stream. `stop` and `wake` are THIS thread's
     own events (see start_snapshot_poller), so a stop is final for it."""
+    was_slow = False
     while not stop.is_set():
         req = time.time()
         try:
@@ -4995,14 +5042,31 @@ def _snapshot_poller_loop(stop: threading.Event, wake: threading.Event):
             snap = {"ok": False, "accounts": {}, "positions": [], "working": {},
                     "open_orders": {}, "ts": time.time(), "partial": False}
         snap["req_ts"] = req
+        done = time.time()
+        took = done - req
+        down = not snap.get("accounts") and not snap.get("ok")
+        slow = not down and (took >= SNAPSHOT_SLOW_S or bool(snap.get("partial")))
+        snap["took"] = took
+        snap["slow"] = slow
         if stop.is_set():
             break                 # stopped mid-dump: never publish over a reset
         _snapshot_publish(snap)
-        done = time.time()
-        if not snap.get("accounts") and not snap.get("ok"):
+        if down:
             pause = SNAPSHOT_DOWN_BACKOFF      # nothing came back — NT is down
+        elif slow:
+            pause = min(SNAPSHOT_SLOW_MAX_PAUSE_S,
+                        max(SNAPSHOT_SLOW_S, SNAPSHOT_SLOW_FACTOR * took))
         else:
             pause = max(req + SNAPSHOT_INTERVAL - done, SNAPSHOT_MIN_GAP)
+        if slow != was_slow:
+            if slow:
+                logger.warning(f"SNAPSHOT STREAM  NinjaTrader is slow: dump took {took:.1f}s"
+                               f"{' and was cut off' if snap.get('partial') else ''} — "
+                               f"backing off to one dump every ~{took + pause:.0f}s")
+            else:
+                logger.info(f"SNAPSHOT STREAM  NinjaTrader recovered: dump took "
+                            f"{took:.1f}s — normal pace")
+            was_slow = slow
         if wake.wait(pause):
             wake.clear()
 
@@ -5099,7 +5163,8 @@ def _position_qty(positions: dict[str, int], instrument: str) -> int:
     return 0
 
 
-def _stream_snapshot(max_age: float, wait: float, what: str) -> dict | None:
+def _stream_snapshot(max_age: float, wait: float, what: str,
+                     urgent: bool = False) -> dict | None:
     """The stream's freshest snapshot for a periodic reader: one requested
     within `max_age`, waiting up to `wait` for it, else the newest there
     is (logged with its age). None only when the stream is not running.
@@ -5107,9 +5172,17 @@ def _stream_snapshot(max_age: float, wait: float, what: str) -> dict | None:
     A reader NEVER opens a dump of its own while the stream runs: a
     NinjaTrader too slow to finish one dump is the one case where a second
     stream is exactly wrong — the harness reproduced 4 concurrent dumps
-    and 18 cut-off reads from that fallback before it was removed."""
+    and 18 cut-off reads from that fallback before it was removed.
+
+    While NinjaTrader is slow (SNAPSHOT_SLOW_S) a routine reader takes the
+    newest dump as it is: waiting here nudges the stream for a fresher
+    one, and that nudge is the load slowing NinjaTrader's fills. An
+    `urgent` reader — a flatten — still gets the nudge and the wait."""
     if not snapshot_poller_running():
         return None
+    latest = _snap_latest
+    if latest is not None and latest.get("slow") and not urgent:
+        return latest
     snap = snapshot_after(time.time() - max_age, wait)
     if snap is None:
         snap = _snap_latest
@@ -5231,7 +5304,8 @@ def _flatten_snapshot() -> dict | None:
     needs no inventory at all, CLOSEPOSITION cancels the instrument's
     working orders itself, and session_contracts backstops the file path).
     None without the stream, and the callers query directly as before."""
-    return _stream_snapshot(FLATTEN_SNAPSHOT_MAX_AGE, FLATTEN_SNAPSHOT_WAIT, "FLATTEN")
+    return _stream_snapshot(FLATTEN_SNAPSHOT_MAX_AGE, FLATTEN_SNAPSHOT_WAIT, "FLATTEN",
+                            urgent=True)
 
 
 # ---------- Futures instrument catalog ----------
@@ -8339,6 +8413,216 @@ def fire_cancel_account_orders(account: str, snap: dict | None = None) -> int:
     return len(order_ids)
 
 
+# ---------- Bracket guard ----------
+# NinjaTrader attaches an ATM's stop and target only after the entry fills.
+# When it is slow, price can pass the stop level before the bracket is even
+# submitted: the stop is rejected ("can't be placed below the market"), the
+# target is then refused into the same, now-dead OCO group, and the position
+# runs with no exit at all (Oct 8: 13:05 on SimEverything, 14:10 on SimAI,
+# Sim101 and SimEverything — up to 26 minutes naked each). NinjaTrader writes
+# that rejection to its own log the same millisecond, so the guard tails the
+# log and acts on it. A rejected STOP means price is already through the
+# level the stop would have fired at, so the leg is closed at market — what
+# the stop would have done — and flagged; a rejected target alone is flagged.
+BRACKET_GUARD_POLL_S = 1.0
+BRACKET_GUARD_MAX_AGE_S = 120.0     # a line older than this is history, not news
+BRACKET_GUARD_KEY = "bracket_guard" # config: "close" (default) | "alert" | "off"
+_NT_REJECT_RE = re.compile(
+    r"\|1\|32\|Order='(?P<oid>[0-9a-f]+)/(?P<acct>[^']+)' Name='(?P<name>[^']+)' "
+    r"New state='Rejected' Instrument='(?P<instr>[^']+)' Action='(?P<action>[^']+)'")
+_NT_OCO_RE = re.compile(r"Oco='([^']*)'")
+_NT_NATIVE_ERR_RE = re.compile(r"Native error='(.*)'\s*$")   # last field; the text itself has apostrophes ("can't")
+_bracket_guard_seen: dict[str, float] = {}   # OCO group (or order id) -> when it was handled
+# A bracket order that FILLS should close or trim a position. Two opposite
+# entries that netted to flat leave both ATMs alive, and the first bracket
+# to fire then opens a position on a flat account instead — NT logs the
+# fill, then the position line with Operation_Add. Nobody's trade: closed.
+_NT_BRACKET_FILL_RE = re.compile(
+    r"\|1\|32\|Order='(?P<oid>[0-9a-f]+)/(?P<acct>[^']+)' Name='(?P<name>(?:Stop|Target)\d*)' "
+    r"New state='Filled' Instrument='(?P<instr>[^']+)'")
+_NT_POSITION_RE = re.compile(
+    r"\|1\|64\|Instrument='(?P<instr>[^']+)' Account='(?P<acct>[^']+)' Average price=[0-9.]+ "
+    r"Quantity=(?P<qty>\d+) Market position=(?P<mp>\w+) Operation=(?P<op>\w+)")
+BRACKET_GUARD_FILL_WINDOW_S = 5.0   # the position line that explains a bracket fill comes this soon after
+_bracket_fills: dict[tuple[str, str], tuple[float, str, str]] = {}   # (acct, NT name) -> (stamp, order id, name)
+
+
+def _nt_log_dir() -> str | None:
+    """NinjaTrader's log folder: beside the incoming folder orders go to."""
+    if not output_directory:
+        return None
+    d = os.path.join(os.path.dirname(os.path.normpath(output_directory)), "log")
+    return d if os.path.isdir(d) else None
+
+
+def _nt_log_file(log_dir: str) -> str | None:
+    """The newest NinjaTrader log. NT keeps `log.<date>.<roll>.txt` and an
+    identical `.en.txt` beside it; one copy is enough, and the lexically
+    greatest name is the latest date and roll."""
+    try:
+        names = [n for n in os.listdir(log_dir)
+                 if n.startswith("log.") and n.endswith(".txt") and ".en." not in n]
+    except OSError:
+        return None
+    return os.path.join(log_dir, max(names)) if names else None
+
+
+def _nt_log_stamp(line: str) -> float | None:
+    """Wall-clock seconds of an NT log line's leading local timestamp."""
+    try:
+        return time.mktime(time.strptime(line[:19], "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return None
+
+
+class _LogTail:
+    """Incremental reader of an append-only log: whole new lines since the
+    last call. The first file is joined at its END (history is not news);
+    a later file — NT rolled or a new day — is read from its start."""
+
+    def __init__(self):
+        self.path: str | None = None
+        self.offset = 0
+        self.buf = b""
+
+    def read(self, path: str | None) -> list[str]:
+        if not path:
+            return []
+        if path != self.path:
+            first = self.path is None
+            self.path, self.buf = path, b""
+            try:
+                self.offset = os.path.getsize(path) if first else 0
+            except OSError:
+                self.offset = 0
+            if first:
+                return []
+        try:
+            size = os.path.getsize(path)
+            if size < self.offset:            # rewritten underneath us: start over
+                self.offset, self.buf = 0, b""
+            if size == self.offset:
+                return []
+            with open(path, "rb") as f:
+                f.seek(self.offset)
+                chunk = f.read(size - self.offset)
+        except OSError:
+            return []
+        self.offset += len(chunk)
+        lines = (self.buf + chunk).split(b"\n")
+        self.buf = lines.pop()                 # an unfinished line waits for its end
+        return [ln.decode("utf-8", "replace").rstrip("\r") for ln in lines]
+
+
+def _bracket_guard_policy() -> str:
+    return str(load_config().get(BRACKET_GUARD_KEY, "close") or "close").lower()
+
+
+def _bracket_guard_act(acct: str, instrument: str, key: str, reason: str,
+                       exposure: str, now: float, close: bool) -> str | None:
+    """Close the leg (a managed account, policy "close") or flag it — once
+    per `key` (an OCO group or an order id)."""
+    if key in _bracket_guard_seen:
+        return None
+    _bracket_guard_seen[key] = now
+    if len(_bracket_guard_seen) > 256:
+        _bracket_guard_seen.pop(min(_bracket_guard_seen, key=_bracket_guard_seen.get), None)
+    if close and acct in target_accounts():
+        fire_close_position(acct, instrument)
+        _pnl_note_close(acct, instrument)
+        _dash_set_alert(
+            Fore.RED + Style.BRIGHT +
+            f"  ⛔  {acct} {instrument}: {reason} — leg closed at market" + Style.RESET_ALL,
+            sticky=True)
+        logger.warning(f"BRACKET GUARD  account={acct}  {instrument}  {reason}  action=close")
+        return "close"
+    _dash_set_alert(
+        Fore.RED + Style.BRIGHT +
+        f"  ⛔  {acct} {instrument}: {reason} — {exposure}" + Style.RESET_ALL, sticky=True)
+    logger.warning(f"BRACKET GUARD  account={acct}  {instrument}  {reason}  action=alert")
+    return "alert"
+
+
+def _bracket_guard_event(line: str, now: float | None = None) -> str | None:
+    """Act on one NT log line: a rejected ATM bracket order, or a bracket
+    fill that OPENED a position.
+
+    Returns what was done — "close", "alert" — or None. The stop's
+    rejection handles a leg; the target's refusal into the same OCO group
+    two seconds later is the same event and not a second action. A
+    bracket fill is remembered until the next position line for that
+    account and contract says what it did: Remove or Update closed or
+    trimmed a position, as a bracket should; Operation_Add opened one."""
+    now = time.time() if now is None else now
+    m = _NT_REJECT_RE.search(line)
+    if m:
+        stamp = _nt_log_stamp(line)
+        if stamp is not None and now - stamp > BRACKET_GUARD_MAX_AGE_S:
+            return None
+        policy = _bracket_guard_policy()
+        if policy == "off":
+            return None
+        oco = _NT_OCO_RE.search(line)
+        key = (oco.group(1) if oco and oco.group(1) else m["oid"])
+        instrument = (_nt_contract_aliases(m["instr"]) or [m["instr"]])[0]
+        err = _NT_NATIVE_ERR_RE.search(line)
+        why = (err.group(1) if err else "rejected").rstrip(".")
+        is_stop = m["name"].lower().startswith("stop")
+        return _bracket_guard_act(
+            m["acct"], instrument, key, now=now,
+            reason=f"NinjaTrader REJECTED the ATM {'stop' if is_stop else 'target'} ({why})",
+            exposure="NO STOP on this position" if is_stop else "no target on this position",
+            close=is_stop and policy == "close")
+    f = _NT_BRACKET_FILL_RE.search(line)
+    if f:
+        _bracket_fills[(f["acct"], f["instr"])] = (_nt_log_stamp(line) or now, f["oid"], f["name"])
+        return None
+    p = _NT_POSITION_RE.search(line)
+    if p:
+        fill = _bracket_fills.pop((p["acct"], p["instr"]), None)
+        if fill is None or p["op"] != "Operation_Add":
+            return None
+        stamp = _nt_log_stamp(line) or now
+        if stamp - fill[0] > BRACKET_GUARD_FILL_WINDOW_S or now - stamp > BRACKET_GUARD_MAX_AGE_S:
+            return None
+        policy = _bracket_guard_policy()
+        if policy == "off":
+            return None
+        instrument = (_nt_contract_aliases(p["instr"]) or [p["instr"]])[0]
+        return _bracket_guard_act(
+            p["acct"], instrument, fill[1], now=now,
+            reason=f"an orphaned ATM {fill[2]} opened {p['mp'].upper()} {p['qty']} on a flat account",
+            exposure="this position is nobody's trade",
+            close=policy == "close")
+    return None
+
+async def bracket_guard_task():
+    """Tail NinjaTrader's log for rejected ATM bracket orders.
+
+    Reads only what NT appended since the last look, off the event loop;
+    a quiet second costs one stat. Idle until an output directory names
+    the NinjaTrader folder."""
+    tail = _LogTail()
+    path = None
+    polls = 0
+    while not shutdown.is_set():
+        try:
+            await asyncio.sleep(BRACKET_GUARD_POLL_S)
+        except asyncio.CancelledError:
+            return
+        try:
+            if path is None or polls % 15 == 0:
+                log_dir = _nt_log_dir()
+                path = _nt_log_file(log_dir) if log_dir else None
+            polls += 1
+            if not path:
+                continue
+            for line in await asyncio.to_thread(tail.read, path):
+                _bracket_guard_event(line)
+        except Exception as exc:
+            logger.error(f"BRACKET GUARD  {exc}")
+
+
 def close_account_positions(account: str) -> list[str]:
     """Close every open position on one account.
 
@@ -8655,6 +8939,17 @@ def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, a
         })
 
 
+def _confirm_snapshot() -> dict | None:
+    """The newest dump the stream has, without waiting for a fresher one.
+
+    The verdict below compares each dump's request time with each order's
+    write time, so an old dump defers instead of misleading — and the
+    balance monitor, which calls this every cycle, is not held for the
+    wait _stream_snapshot would spend on a NinjaTrader too slow to finish
+    a dump. None without the stream: the caller then queries directly."""
+    return _snap_latest if snapshot_poller_running() else None
+
+
 def check_pending_confirms():
     """Check pending legs for a fill via position or balance change — on the
     account each leg was written to, not only the leader (31 follower-only
@@ -8664,14 +8959,26 @@ def check_pending_confirms():
     stay open; cash-balance delta catches fast round-trips where the ATM
     stop/target closes the fill before any poll sees the open position.
     One snapshot read serves every account in the batch.
+
+    A fill is evidence whichever dump shows it. A MISSING fill is not: a
+    dump requested before NinjaTrader had the order says nothing about it,
+    and a cut-off dump can simply lack the position. Live log, Oct 8: 13 of
+    13 "no fill" verdicts were fills that showed 11–25 s after the write,
+    each judged from a dump 9–11 s old. So the no-fill verdict waits for a
+    complete dump requested CONFIRM_TIMEOUT after the write, and gives up
+    as UNVERIFIED — never UNCONFIRMED — when none comes in time.
     """
     if not _pending_confirms:
         return
 
-    snap = _stream_snapshot(BALANCE_POLL_INTERVAL, BALANCE_POLL_INTERVAL, "POSITIONS")
+    snap = _confirm_snapshot()
     positions_by_account: dict[str, dict[str, int]] = {}
     multi = len(target_accounts()) > 1
     now = time.time()
+    # A direct query is live and whole; a dump speaks for the moment it was
+    # requested, and only a complete one can vouch for an absence.
+    seen_ts = now if snap is None else snap["req_ts"]
+    whole = snap is None or bool(snap.get("ok"))
     still_pending = []
 
     with _confirms_lock:
@@ -8712,30 +9019,44 @@ def check_pending_confirms():
                             f"elapsed={elapsed:.1f}s")
                 continue  # drop from pending
 
-            if elapsed >= CONFIRM_TIMEOUT:
-                # Timed out — no position delta and no balance delta
+            if elapsed < CONFIRM_TIMEOUT:
+                still_pending.append(entry)
+                continue
+
+            if not (whole and seen_ts - entry["ts"] >= CONFIRM_TIMEOUT):
+                # Past the wait by the clock, but nothing NinjaTrader was
+                # asked for since the order has had its say yet.
+                if elapsed < CONFIRM_GIVE_UP_S:
+                    still_pending.append(entry)
+                    continue
                 _dash_set_alert(
                     Fore.YELLOW + Style.DIM +
-                    f"  ⚠  {label}No fill detected for {instrument} after {CONFIRM_TIMEOUT}s "
-                    f"(ID: {entry['id']})" + Style.RESET_ALL)
-                logger.warning(f"UNCONFIRMED  id={entry['id']}  account={acct}  {instrument}  "
-                               f"{entry['action']}  pos unchanged at {pre_pos}, "
-                               f"balance unchanged  elapsed={elapsed:.1f}s")
-                # No position and no money moved, so there is nothing for
-                # the P&L record to wait on. Left staged, this dead entry
-                # keeps its slot and can hand its market and strategy to an
-                # unrelated amount hours later. A close that found nothing
-                # to close has no stage of its own — and must not release
-                # the stage of the entry it was paired with.
-                if entry.get("entry", True):
-                    _pnl_drop_staged(acct, instrument)
+                    f"  ⚠  {label}Fill unverified for {instrument} — no complete "
+                    f"NinjaTrader snapshot since the order ({elapsed:.0f}s)" +
+                    Style.RESET_ALL)
+                logger.warning(f"UNVERIFIED  id={entry['id']}  account={acct}  {instrument}  "
+                               f"{entry['action']}  no complete snapshot taken after "
+                               f"the order  elapsed={elapsed:.1f}s")
                 continue  # drop from pending
 
-            still_pending.append(entry)
+            # A complete dump taken after the wait shows no position delta
+            # and no balance delta.
+            _dash_set_alert(
+                Fore.YELLOW + Style.DIM +
+                f"  ⚠  {label}No fill detected for {instrument} after {CONFIRM_TIMEOUT}s "
+                f"(ID: {entry['id']})" + Style.RESET_ALL)
+            logger.warning(f"UNCONFIRMED  id={entry['id']}  account={acct}  {instrument}  "
+                           f"{entry['action']}  pos unchanged at {pre_pos}, "
+                           f"balance unchanged  elapsed={elapsed:.1f}s")
+            # The P&L stage is left alone. PNL_STAGED_TTL_S already retires
+            # an entry that never becomes a position, handing its parked
+            # cost back; dropping it here, on a verdict NinjaTrader's pacing
+            # can still overturn, is how every follower leg of Oct 8 lost
+            # its strategy name and showed in the trade log as a chart trade.
+            continue  # drop from pending
 
         _pending_confirms.clear()
         _pending_confirms.extend(still_pending)
-
 
 _TRIP_STATE = {
     ("stop", "hard"):   ("hard_stop",   Fore.RED,   "⛔", "HARD STOP", "Limit", "⇧X=EXIT"),
@@ -9373,9 +9694,7 @@ async def listen(token: str):
 
                 # How we got here: first boot, or recovery from an outage.
                 was_reconnect = ever_connected
-                outage_secs = int(time.time() - conn_lost_at) if conn_lost_at is not None else None
                 ever_connected = True
-                conn_lost_at = None
                 note_connection_up()
                 note_connected()  # arm the id-less replay guard window
 
@@ -9422,15 +9741,14 @@ async def listen(token: str):
                     _dash_set_alert(
                         Fore.YELLOW + f"  ⚠  Setup incomplete: {', '.join(missing)}" + Style.RESET_ALL,
                         sticky=True)
-                elif was_reconnect:
-                    down = f"  ·  down {fmt_wait(outage_secs)}" if outage_secs else ""
-                    _dash_set_alert(
-                        Fore.GREEN + f"  ✔  Reconnected{down}" + Style.RESET_ALL,
-                        kind=ALERT_CONN)
-                    logger.info(f"RECONNECTED  downtime={outage_secs or 0}s")
-                else:
+                elif not was_reconnect:
                     # Clean first connect: drop any lingering connection alert
                     _dash_clear_alert(kind=ALERT_CONN)
+                # A reconnect is announced once the server speaks (receive
+                # loop below), not at the handshake: a held session accepts
+                # the handshake and closes 1008 a moment later, and the live
+                # log booked each such attempt as a 3 s outage followed by a
+                # fresh 60 s one instead of the single 64 s outage it was.
                 reconnect_event.clear()
 
                 while not shutdown.is_set():
@@ -9449,6 +9767,18 @@ async def listen(token: str):
                     _flush_replay_guard()   # mirror dedup memory before blocking
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=1)
+                        if conn_lost_at is not None:
+                            # The server spoke: the outage that began at the
+                            # drop is over, whatever handshakes it refused
+                            # in between.
+                            outage_secs = int(time.time() - conn_lost_at)
+                            conn_lost_at = None
+                            if not missing:
+                                down = f"  ·  down {fmt_wait(outage_secs)}" if outage_secs else ""
+                                _dash_set_alert(
+                                    Fore.GREEN + f"  ✔  Reconnected{down}" + Style.RESET_ALL,
+                                    kind=ALERT_CONN)
+                            logger.info(f"RECONNECTED  downtime={outage_secs}s")
                         raw_signal, server_ts, sig_id, reject_reason = extract_signal_string(
                             msg, active_account, atm_strategy, follow_publisher_strategy, micro_mode)
                         if raw_signal:
@@ -11026,7 +11356,7 @@ def _pnl_save(force: bool = False):
 
 def _pnl_note_open(account: str, instrument: str, ident: tuple[str, str],
                    manual: bool = False, source: str = "",
-                   now: float | None = None):
+                   now: float | None = None, role: str = ""):
     """Stage strategy attribution for an entry the write path just fired.
 
     Called from _ledger_note_file, i.e. inside the dispatch path — it must
@@ -11044,7 +11374,12 @@ def _pnl_note_open(account: str, instrument: str, ident: tuple[str, str],
     calendar separates a click in the web UI from one in the terminal.
     Neither can be confused with a trade taken straight off a NinjaTrader
     chart: that one never reaches this function at all, and is recognised
-    downstream by having no staged label despite an observed open."""
+    downstream by having no staged label despite an observed open.
+
+    `role` is the leg's part in the signal — "follower" for a copy of the
+    leader's entry, "round-robin" for the rotation's one draw — kept on
+    the position so its trade row can say so beside the strategy name.
+    The leader's own legs carry none."""
     try:
         root = _alias_root(instrument).upper()
         if not account or not root:
@@ -11063,6 +11398,8 @@ def _pnl_note_open(account: str, instrument: str, ident: tuple[str, str],
             meta["staged_ts"] = time.time() if now is None else now
         if label and label not in meta["strategies"]:
             meta["strategies"].append(label)
+        if role:
+            meta["role"] = role
     except Exception as exc:      # bookkeeping must never block dispatch
         logger.error(f"PNL HISTORY  note_open failed: {exc}")
 
@@ -11186,35 +11523,6 @@ def _pnl_expire_staged(account: str, shape: dict[str, int], date: str,
     return changed
 
 
-def _pnl_drop_staged(account: str, instrument: str) -> None:
-    """Forget an entry the confirm path just declared dead.
-
-    check_pending_confirms already knows an order produced no position and
-    no balance move; without telling the record, that dead entry keeps its
-    place in _pnl_open_meta and can later lend its market and strategy to
-    an unrelated amount.
-
-    Two things have to hold before anything is dropped. It must have come
-    from dispatch — a position adopted at startup carries no staged_ts and
-    is real however little is known about it. And the last snapshot must
-    not show a position on that root: an order rejected on top of an
-    existing position times out exactly the same way, and dropping there
-    would take the live trade's entry price, open time and parked cost
-    with it."""
-    try:
-        key = (account, _alias_root(instrument).upper())
-        meta = _pnl_open_meta.get(key)
-        if meta is None or meta.get("ts") is not None:
-            return
-        if meta.get("staged_ts") is None:
-            return
-        if key[1] in ((_pnl_prev.get(account) or {}).get("shape") or {}):
-            return
-        _pnl_open_meta.pop(key, None)
-    except Exception as exc:      # bookkeeping must never block the poll
-        logger.error(f"PNL HISTORY  drop_staged failed: {exc}")
-
-
 def _pnl_shape(row: dict) -> dict[str, int]:
     """Signed contracts per root one live account row currently holds."""
     shape: dict[str, int] = {}
@@ -11328,7 +11636,7 @@ def _pnl_unseen_row(account: str, amount: float, date: str,
     # biggest win.
     pending = _pnl_staged_pending(account, shape, ts) if not shape else []
     key, meta = pending[0] if len(pending) == 1 else (None, {})
-    trades.append({
+    row = {
         "ts": round(ts, 3),
         "account": account,
         "symbol": key[1] if key else "",
@@ -11340,7 +11648,10 @@ def _pnl_unseen_row(account: str, amount: float, date: str,
         "pnl": round(amount, 2),
         "approx": True,
         "unseen": True,
-    })
+    }
+    if meta.get("role"):
+        row["role"] = meta["role"]
+    trades.append(row)
     logger.warning(
         f"PNL HISTORY  {account} {date}: ${amount:+,.2f} of realized P&L from "
         "a fill no poll observed — recorded as an unseen trade so the day "
@@ -11644,6 +11955,7 @@ def _pnl_observe(live: dict, now: float | None = None,
                         "opened_ts": meta.get("ts"),
                         "entry": meta.get("avg"),
                         "strategy": " + ".join(meta.get("strategies") or []),
+                        "role": meta.get("role") or "",
                         "cost": share,
                     })
                 if opened:
@@ -11655,9 +11967,12 @@ def _pnl_observe(live: dict, now: float | None = None,
                         # poll never saw — is a fresh trade; only the label
                         # staged by the write that opened it survives.
                         staged = meta["strategies"][-1:]
+                        part = meta.get("role")
                         meta.clear()
                         meta.update({"strategies": staged, "ts": None,
                                      "avg": None, "cost": 0.0})
+                        if part:
+                            meta["role"] = part
                     if not q0 or flipped or relegged or meta.get("ts") is None:
                         meta["ts"] = ts
                     meta["avg"] = _pnl_avg_price(row, root) or meta.get("avg")
@@ -11784,6 +12099,8 @@ def _pnl_observe(live: dict, now: float | None = None,
                     "pnl": round(pnl, 2),
                     "approx": len(closes) > 1,
                 })
+                if c["role"]:
+                    fresh[-1]["role"] = c["role"]
                 trades.append(fresh[-1])
                 _pnl_dirty = True
             if fresh:
@@ -12517,6 +12834,7 @@ tr.unmanaged td{opacity:.5}
 .pos{color:var(--green)}.neg{color:var(--red)}.dim{color:var(--dim)}
 .num{text-align:right;font-variant-numeric:tabular-nums}
 .tag{font-size:9.5px;padding:2px 6px;border-radius:4px;border:1px solid var(--edge2);color:var(--dim)}
+.rtag{margin-left:6px;white-space:nowrap}
 .tag.lead{color:var(--cyan);border-color:#245c6f;background:#0d2a33}
 .tag.fol{color:var(--violet);border-color:#443c76;background:#1a1730}
 .tag.rr{color:var(--yellow);border-color:#6a5522;background:#2a2211}
@@ -13802,9 +14120,17 @@ function bbar(v,max){const w=el("div","bbar");w.appendChild(el("em"));
    the position open anyway means it came straight off a NinjaTrader
    chart, so it is Manual. Blank with no open timestamp is different: that
    is a position adopted at restart, whose label is lost rather than
-   absent, and calling it Manual would be a guess. */
+   absent, and calling it Manual would be a guess.
+   Dispatch also records the leg's part in the signal: a follower's copy
+   of the leader's entry, or the one round-robin draw. The strategy stays
+   the publisher's name on every account, so a strategy adds up across
+   the group, and the tag beside it says which leg this row was. */
+const ROLE_TAG={"follower":"copy","round-robin":"round robin"};
+function roleOf(t){return t.role?(ROLE_TAG[t.role]||t.role):""}
 function stratOf(t){
-  return t.strategy||(!t.unseen&&t.opened_ts!=null?"Manual":"")}
+  if(t.strategy)return t.strategy;
+  if(t.role)return roleOf(t);
+  return !t.unseen&&t.opened_ts!=null?"Manual":""}
 
 /* ---- account filter ----
    P.acct null means every managed account. Every number the page shows is
@@ -14156,8 +14482,9 @@ function renderDayPanel(day,date){
     r.appendChild(td(x.unseen?"dim":x.side==="LONG"?"pos":"neg",
       x.unseen?"—":x.side));
     r.appendChild(td("num"+(x.unseen?" dim":""),x.unseen?"—":x.qty));
-    r.appendChild(td("dim",stratOf(x)
-      ||(x.unseen?"unobserved fill":"unattributed")));
+    const sc=td("dim",stratOf(x)||(x.unseen?"unobserved fill":"unattributed"));
+    if(x.strategy&&x.role)sc.appendChild(el("span","tag rtag",roleOf(x)));
+    r.appendChild(sc);
     r.appendChild(td("num dim",x.entry!=null?fmt(x.entry):"—"));
     r.appendChild(td("num dim",
       !x.unseen&&x.opened_ts!=null?held(x.ts-x.opened_ts):"—"));
@@ -14396,6 +14723,7 @@ async def main():
             asyncio.create_task(balance_monitor()),
             asyncio.create_task(live_bridge_task()),
             asyncio.create_task(pnl_tracker_task()),
+            asyncio.create_task(bracket_guard_task()),
         ]
 
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
