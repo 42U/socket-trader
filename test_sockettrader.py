@@ -104,6 +104,7 @@ def reset_session_state():
     st._last_connect_mono = None
     st._replay_dirty = False
     st._replay_save_last = 0.0
+    st._quick_retry_s = st.QUICK_RETRY_S
     st._web_events.clear()
     st._session_state = "ready"
     st._state_before_conn = "ready"
@@ -8370,6 +8371,36 @@ class TestRetryWait:
         assert st.retry_wait(5.0, 60) == (60, False)       # died young: flapping server
         assert st.retry_wait(None, 120) == (120, False)    # never linked: handshake failed
 
+    def test_fast_retry_grows_when_the_server_refuses_it_and_never_shrinks(self):
+        assert st.note_fast_retry_refused() == 10
+        assert st.retry_wait(120.0, 60) == (10, True)
+        assert [st.note_fast_retry_refused() for _ in range(3)] == [24, 52, 60]
+        assert st.retry_wait(120.0, 60) == (60, False)     # grown to the schedule: no fast retry
+        assert st.note_fast_retry_refused() == 60
+
+    def test_learned_fast_retry_persists_and_restores(self):
+        st.save_config({"account": "Sim101"})
+        assert st.note_fast_retry_refused() == 10
+        cfg = st.load_config()
+        assert cfg["fast_retry_s"] == 10 and cfg["account"] == "Sim101"   # other keys kept
+        st._quick_retry_s = st.QUICK_RETRY_S
+        st._restore_fast_retry(cfg)
+        assert st._quick_retry_s == 10
+        st._restore_fast_retry({"fast_retry_s": 999})
+        assert st._quick_retry_s == st.BACKOFF_START_S                     # clamped to the schedule
+        st._restore_fast_retry({"fast_retry_s": "junk"})
+        assert st._quick_retry_s == st.QUICK_RETRY_S
+
+    def test_1008_after_a_fast_retry_is_a_held_session_not_a_bad_token(self):
+        # 2026-10-08 01:47:02 and 09:01:39: handshake accepted, 1008 three
+        # seconds after an unclean drop, the user logged out twice.
+        assert st.classify_connection_failure(None, 1008, after_quick_retry=True) == "session_held"
+        assert st.classify_connection_failure(None, 1008, after_quick_retry=False) == "auth_failed"
+        assert st.classify_connection_failure(403, None, after_quick_retry=True) == "auth_failed"
+        assert st.classify_connection_failure(401, 1008, after_quick_retry=True) == "auth_failed"
+        assert st.classify_connection_failure(None, 1006, after_quick_retry=True) == "retry"
+        assert st.classify_connection_failure(None, None, False) == "retry"
+
 
 class TestReplayGuardPersistence:
     CLOSE = "CLOSEPOSITION;Sim101;NQ 12-26;;;;;;;;;;"
@@ -8512,6 +8543,20 @@ class TestFollowerFillConfirmation:
         assert dropped == [("Sim102", "NQ 09-26")]
         assert "No fill detected" in st._alert_text and "[Sim102]" in st._alert_text
 
+    def test_close_timeout_keeps_the_staged_entry(self, monkeypatch):
+        # A publisher close that found nothing to close has no fill to wait
+        # for — and must not release the P&L stage of the entry it was
+        # paired with (closes arrive 1–3 s before the next entry).
+        self._arm(monkeypatch)
+        _Stream(monkeypatch, snap_fn=lambda: _stream_snap(positions=[]))
+        dropped = []
+        monkeypatch.setattr(st, "_pnl_drop_staged", lambda a, i: dropped.append((a, i)))
+        st.add_pending_confirm("CLOSEPOSITION;Sim102;NQ 09-26;;;;;;;;;;", None,
+                               "NQ 09-26", "", pre_pos=0, account="Sim102")
+        st._pending_confirms[-1]["ts"] -= st.CONFIRM_TIMEOUT + 1
+        st.check_pending_confirms()
+        assert st._pending_confirms == [] and dropped == []
+
     def test_deferred_follower_registers_its_own_confirm(self, tmp_output_dir, monkeypatch):
         self._arm(monkeypatch)
         monkeypatch.setattr(st, "_pre_position",
@@ -8531,3 +8576,117 @@ class TestFollowerFillConfirmation:
         assert st._pre_positions(plans) == {"Sim101": 2, "Sim102": -3}
         assert s.request_thread_calls() == []
         assert st._pre_positions([]) == {}
+
+
+class TestLiveReconnectPath:
+    """The real listen() loop against a real websocket server, driven through
+    the failures the live log recorded on 2026-10-08: an unclean drop, a 1008
+    on the fast retry that follows, the server's replay on reconnect, and an
+    HTTP rejection at the handshake."""
+
+    SIGNAL = ("PLACE;X;NQ 12-26;BUY;1;MARKET;;;DAY;;;NQ-Sides;"
+              "ent:nq_sides:Nasdaq:2026-10-08T10:00:00-04:00")
+
+    def _arm(self, monkeypatch):
+        import websockets as _ws
+        st.active_account = "Sim101"
+
+        async def no_boot():
+            pass
+        monkeypatch.setattr(st, "boot_sequence", no_boot)
+        monkeypatch.setattr(st, "query_nt_accounts", lambda *a, **k: [])
+        monkeypatch.setattr(st, "QUICK_RETRY_MIN_UPTIME_S", 0)   # any link that came up counts as healthy
+        monkeypatch.setattr(st, "BACKOFF_START_S", 1)            # the schedule's first step, shrunk
+        monkeypatch.setattr(st, "_quick_retry_s", 0)             # fast retry: at once
+        return _ws
+
+    def _run(self, ws_mod, handler, process_request=None, until=None, timeout=15.0):
+        """Serve `handler`; run listen("t") until `until(state)` holds, listen
+        returns, or `timeout` passes; then shut the loop down. Returns
+        (listen's result, state)."""
+        state = {"connections": 0}
+
+        async def go():
+            async def h(ws):
+                state["connections"] += 1
+                await handler(ws, state["connections"], state)
+
+            async with ws_mod.serve(h, "127.0.0.1", 0, process_request=process_request) as server:
+                port = server.sockets[0].getsockname()[1]
+                st.save_config({"ws_host": f"ws://127.0.0.1:{port}/ws", "token": "t",
+                                "account": "Sim101"})
+                task = asyncio.create_task(st.listen("t"))
+                deadline = time.monotonic() + timeout
+                while (not task.done() and time.monotonic() < deadline
+                       and not (until and until(state))):
+                    await asyncio.sleep(0.05)
+                if not task.done():
+                    st.shutdown.set()
+                    return await asyncio.wait_for(task, 10)
+                return task.result()
+        return asyncio.run(go()), state
+
+    def test_unclean_drop_then_refused_fast_retry_keeps_the_session_and_dedups_the_replay(
+            self, monkeypatch, caplog):
+        ws_mod = self._arm(monkeypatch)
+        envelope = json.dumps({"type": "signal", "signal": self.SIGNAL,
+                               "ts": int(time.time() * 1000)})
+
+        async def handler(ws, n, state):
+            if n == 1:                      # healthy link, then the TCP connection just dies
+                await ws.send(envelope)
+                await asyncio.sleep(0.2)
+                ws.transport.abort()
+                return
+            if n == 2:                      # the fast retry: handshake accepted, session refused
+                await ws.close(1008, "session already active")
+                return
+            await ws.send(envelope)         # back for real — and the server replays its last signal
+            state["replayed"] = True
+            await ws.wait_closed()
+
+        with caplog.at_level(logging.INFO):
+            result, state = self._run(
+                ws_mod, handler,
+                until=lambda s: s.get("replayed") and any(
+                    "DUPLICATE IGNORED" in r.message for r in caplog.records))
+        text = "\n".join(r.message for r in caplog.records)
+        assert result == "shutdown", text              # never "auth_failed": the user stays logged in
+        assert state["connections"] == 3
+        assert "SESSION HELD  ws_code=1008  reason='session already active'" in text
+        assert "AUTH FAILED" not in text
+        assert text.count("DUPLICATE IGNORED") == 1     # first delivery kept, the replay dropped
+        assert st._quick_retry_s == st.BACKOFF_START_S  # the refused fast retry lengthened the next one
+
+    def test_http_403_at_the_handshake_is_an_auth_failure_not_an_endless_retry(
+            self, monkeypatch, caplog):
+        # websockets >= 11 carries the status on e.response; the old check
+        # read e.status_code / e.status and saw None, so a rejected token
+        # would have retried on the schedule forever.
+        ws_mod = self._arm(monkeypatch)
+
+        def reject(connection, request):
+            return connection.respond(403, "Forbidden\n")
+
+        async def handler(ws, n, state):
+            pass
+
+        t0 = time.monotonic()
+        with caplog.at_level(logging.INFO):
+            result, state = self._run(ws_mod, handler, process_request=reject, timeout=8)
+        assert result == "auth_failed"
+        assert time.monotonic() - t0 < 5
+        assert state["connections"] == 0
+        assert "AUTH FAILED  http=403" in "\n".join(r.message for r in caplog.records)
+
+    def test_1008_on_an_ordinary_attempt_is_still_a_bad_token(self, monkeypatch, caplog):
+        ws_mod = self._arm(monkeypatch)
+
+        async def handler(ws, n, state):
+            await ws.close(1008, "invalid token")
+
+        with caplog.at_level(logging.INFO):
+            result, state = self._run(ws_mod, handler, timeout=8)
+        assert result == "auth_failed" and state["connections"] == 1
+        assert "AUTH FAILED  ws_code=1008  reason='invalid token'" in "\n".join(
+            r.message for r in caplog.records)

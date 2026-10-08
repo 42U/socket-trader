@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.20.0"
+__version__ = "0.20.1"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -8638,6 +8638,7 @@ def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, a
     it was written to (the leader when `account` is omitted)."""
     acct = account or active_account
     pre_balance = session_current_balances.get(acct) if acct else None
+    cmd = signal_text.split(";", 1)[0].strip().upper()
     with _confirms_lock:
         if len(_pending_confirms) >= MAX_PENDING_CONFIRMS:
             _pending_confirms.pop(0)  # drop oldest
@@ -8645,6 +8646,7 @@ def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, a
             "signal": signal_text,
             "id": sig_id,
             "account": acct,
+            "entry": cmd in ("PLACE", "REVERSEPOSITION"),
             "instrument": instrument,
             "action": action,
             "ts": time.time(),
@@ -8722,8 +8724,11 @@ def check_pending_confirms():
                 # No position and no money moved, so there is nothing for
                 # the P&L record to wait on. Left staged, this dead entry
                 # keeps its slot and can hand its market and strategy to an
-                # unrelated amount hours later.
-                _pnl_drop_staged(acct, instrument)
+                # unrelated amount hours later. A close that found nothing
+                # to close has no stage of its own — and must not release
+                # the stage of the entry it was paired with.
+                if entry.get("entry", True):
+                    _pnl_drop_staged(acct, instrument)
                 continue  # drop from pending
 
             still_pending.append(entry)
@@ -9249,24 +9254,72 @@ async def prompt_limits():
 
 # ---------- WebSocket listener with reconnection ----------
 MAX_BACKOFF = 1800  # 30 minutes in seconds
+BACKOFF_START_S = 60  # first step of the Fibonacci schedule (1m, 1m, 2m, 3m, 5m, …)
 
 
-QUICK_RETRY_S = 3              # first retry after an established link drops …
+QUICK_RETRY_S = 3              # first fast retry after an established link drops …
 QUICK_RETRY_MIN_UPTIME_S = 30  # … provided the link had lived this long
+_quick_retry_s = QUICK_RETRY_S  # current fast-retry wait; grows when the server refuses one
+FAST_RETRY_KEY = "fast_retry_s"  # config key holding the learned wait across restarts
 
 
-def retry_wait(uptime_s: float | None, fib_curr: int) -> tuple[int, bool]:
-    """(seconds until the next connect attempt, whether it is a quick retry).
+def retry_wait(uptime_s: float | None, fib_curr: int,
+               quick_s: int | None = None) -> tuple[int, bool]:
+    """(seconds until the next connect attempt, whether it is a fast retry).
 
     A link that dropped after running at least QUICK_RETRY_MIN_UPTIME_S is
-    retried in QUICK_RETRY_S: every such drop in the live log ("no close
-    frame received", keepalive timeouts, proxy restarts) reconnected on the
-    first try, yet each cost the full minute the backoff starts at — 48
-    drops on 2026-10-06 alone. A failed attempt, or a link that died young,
-    keeps the Fibonacci schedule so a down server is never hammered."""
-    if uptime_s is not None and uptime_s >= QUICK_RETRY_MIN_UPTIME_S:
-        return QUICK_RETRY_S, True
+    retried in `quick_s` (the adaptive _quick_retry_s by default): every
+    such drop in the live log ("no close frame received", keepalive
+    timeouts, proxy restarts) reconnected on the first try, yet each cost
+    the full minute the backoff starts at — 48 drops on 2026-10-06 alone.
+    A failed attempt, or a link that died young, keeps the Fibonacci
+    schedule so a down server is never hammered; so does a fast-retry wait
+    that has grown to the schedule's own first step."""
+    quick_s = _quick_retry_s if quick_s is None else quick_s
+    if (uptime_s is not None and uptime_s >= QUICK_RETRY_MIN_UPTIME_S
+            and quick_s < fib_curr):
+        return quick_s, True
     return fib_curr, False
+
+
+def note_fast_retry_refused() -> int:
+    """The server closed a fast retry's session with 1008 while it still
+    held the one that dropped. Open the next fast retry later — 3 → 10 →
+    24 → 52 → 60 s, where the schedule takes over — and never shrink it: a
+    server that holds sessions keeps holding them. Returns the new wait."""
+    global _quick_retry_s
+    _quick_retry_s = min(_quick_retry_s * 2 + 4, BACKOFF_START_S)
+    cfg = load_config()
+    if cfg or not CONFIG_FILE.exists():     # never replace an unreadable config
+        cfg[FAST_RETRY_KEY] = _quick_retry_s
+        save_config(cfg)                    # learned once, not once per restart
+    return _quick_retry_s
+
+
+def _restore_fast_retry(cfg: dict):
+    """Reload the learned fast-retry wait at boot, clamped to the range the
+    ladder itself can reach (QUICK_RETRY_S … BACKOFF_START_S)."""
+    global _quick_retry_s
+    try:
+        v = int(cfg.get(FAST_RETRY_KEY, QUICK_RETRY_S))
+    except (TypeError, ValueError):
+        v = QUICK_RETRY_S
+    _quick_retry_s = min(max(v, QUICK_RETRY_S), BACKOFF_START_S)
+
+
+def classify_connection_failure(http_status, ws_code, after_quick_retry: bool) -> str:
+    """How listen() reads a failed attempt. "auth_failed": HTTP 401/403, or
+    close 1008 on an ordinary attempt — the token is bad, re-prompt for it.
+    "session_held": close 1008 right after a fast retry — the handshake
+    passed with the token that worked seconds ago, so the server refused
+    the session it still holds, not the token (2026-10-08 01:47:02 and
+    09:01:39, both 3 s after "no close frame received", both logged the
+    user out as an invalid token). Anything else: "retry"."""
+    if http_status is not None and int(http_status) in (401, 403):
+        return "auth_failed"
+    if ws_code == 1008:
+        return "session_held" if after_quick_retry else "auth_failed"
+    return "retry"
 
 
 def fib_backoff(prev: int, curr: int) -> tuple[int, int]:
@@ -9284,14 +9337,16 @@ def fmt_wait(seconds: int) -> str:
 
 async def listen(token: str):
     global signal_count
-    fib_prev, fib_curr = 60, 60  # Start at 1m, 1m → 2m → 3m → 5m → ...
+    fib_prev, fib_curr = BACKOFF_START_S, BACKOFF_START_S  # Start at 1m, 1m → 2m → 3m → 5m → ...
     ever_connected = False       # distinguishes first boot from a reconnect
     conn_lost_at = None          # when the current outage began
+    quick_retry = False          # the wait before the next attempt is a fast retry
 
     await boot_sequence()
 
     while not shutdown.is_set():
         manual_reconnect = False
+        after_quick_retry = quick_retry   # this attempt follows a fast retry
         linked_at = None               # when this attempt's link came up (None: never)
         wait_s, quick_retry = fib_curr, False   # next retry wait, set per failure below
         hb_reason = "CONNECTION LOST"  # heartbeat-row label while waiting to retry
@@ -9314,7 +9369,7 @@ async def listen(token: str):
                 linked_at = time.time()
                 connect_latency = int((time.time() - connect_start) * 1000)
                 baseline_latency = None  # First signal sets the baseline
-                fib_prev, fib_curr = 60, 60  # Reset on successful connection
+                fib_prev, fib_curr = BACKOFF_START_S, BACKOFF_START_S  # Reset on successful connection
 
                 # How we got here: first boot, or recovery from an outage.
                 was_reconnect = ever_connected
@@ -9382,7 +9437,7 @@ async def listen(token: str):
                     # Check for manual reconnect request
                     if reconnect_event.is_set():
                         reconnect_event.clear()
-                        fib_prev, fib_curr = 60, 60  # Reset backoff on manual reconnect
+                        fib_prev, fib_curr = BACKOFF_START_S, BACKOFF_START_S  # Reset backoff on manual reconnect
                         manual_reconnect = True
                         conn_lost_at = time.time()
                         set_session_state("reconnecting")
@@ -9553,23 +9608,31 @@ async def listen(token: str):
                 conn_lost_at = time.time()
 
             # Check for HTTP status rejection (old and new websockets lib)
-            http_status = getattr(e, "status_code", None) or getattr(e, "status", None)
+            http_status = (getattr(e, "status_code", None) or getattr(e, "status", None)
+                           or getattr(getattr(e, "response", None), "status_code", None))
 
-            # Check for websocket close code 1008 (policy violation = bad token)
-            ws_code = getattr(e, "code", None) or getattr(e, "rcvd", None)
-            if ws_code is not None and not isinstance(ws_code, int):
-                # newer websockets lib: rcvd is a Close frame
-                ws_code = getattr(ws_code, "code", None)
-
-            if http_status is not None and int(http_status) in (401, 403):
-                _dash_set_alert(Fore.RED + f"  ⛔  AUTH FAILED (HTTP {http_status})" + Style.RESET_ALL,
-                                sticky=True)
-                logger.warning(f"AUTH FAILED  http={http_status}")
-                return "auth_failed"
-            elif ws_code == 1008:
-                _dash_set_alert(Fore.RED + "  ⛔  AUTH FAILED (invalid token)" + Style.RESET_ALL,
-                                sticky=True)
-                logger.warning("AUTH FAILED  ws_code=1008")
+            # The close code and reason the SERVER sent, if any: on websockets
+            # ≥ 10 they live on the received Close frame (e.rcvd — None when
+            # the TCP connection just died, or when we sent the close); the
+            # e.code / e.reason shortcuts are deprecated since 13.1 and will
+            # go, which would turn every 1008 into an endless retry. Older
+            # libraries only have the shortcuts.
+            if hasattr(e, "rcvd"):
+                ws_code = getattr(e.rcvd, "code", None)
+                close_reason = getattr(e.rcvd, "reason", None) or ""
+            else:
+                ws_code = getattr(e, "code", None)
+                close_reason = getattr(e, "reason", None) or ""
+            verdict = classify_connection_failure(http_status, ws_code, after_quick_retry)
+            if verdict == "auth_failed":
+                if http_status is not None:
+                    _dash_set_alert(Fore.RED + f"  ⛔  AUTH FAILED (HTTP {http_status})" + Style.RESET_ALL,
+                                    sticky=True)
+                    logger.warning(f"AUTH FAILED  http={http_status}")
+                else:
+                    _dash_set_alert(Fore.RED + "  ⛔  AUTH FAILED (invalid token)" + Style.RESET_ALL,
+                                    sticky=True)
+                    logger.warning(f"AUTH FAILED  ws_code=1008  reason={close_reason!r}")
                 return "auth_failed"
             elif shutdown.is_set():
                 break
@@ -9579,23 +9642,41 @@ async def listen(token: str):
             # drop itself is recorded as a timestamped event on the alert row.
             note_connection_down()
             _flush_replay_guard(force=True)
-            wait_s, quick_retry = retry_wait(
-                None if linked_at is None else time.time() - linked_at, fib_curr)
-            if http_status is not None:
-                hb_reason = f"CONNECTION ERROR (HTTP {http_status})"
-                logger.warning(f"CONNECTION ERROR  http={http_status}  retry={fmt_wait(wait_s)}")
-            else:
-                err = (str(e).strip() or type(e).__name__)[:60]
+            if verdict == "session_held":
+                # Not a token problem: the server still holds the session that
+                # dropped seconds ago and refused a second one. Wait the
+                # schedule out and open the next fast retry later.
+                next_quick = note_fast_retry_refused()
+                wait_s, quick_retry = fib_curr, False
+                hb_reason = "SESSION STILL OPEN ON SERVER"
                 _dash_set_alert(
-                    Fore.RED + f"  ⛔  Connection lost: {err}" + Style.RESET_ALL,
-                    kind=ALERT_CONN)
-                logger.warning(f"CONNECTION LOST  error={e}  retry={fmt_wait(wait_s)}")
+                    Fore.YELLOW + f"  ⚠  Server still holds the dropped session — "
+                    f"retrying in {fmt_wait(wait_s)}; fast retries now wait {next_quick}s"
+                    + Style.RESET_ALL, kind=ALERT_CONN)
+                logger.warning(f"SESSION HELD  ws_code=1008  reason={close_reason!r}  "
+                               f"fast retry refused  retry={fmt_wait(wait_s)}  "
+                               f"next_fast_retry={next_quick}s")
+            else:
+                wait_s, quick_retry = retry_wait(
+                    None if linked_at is None else time.time() - linked_at, fib_curr)
+                if http_status is not None:
+                    hb_reason = f"CONNECTION ERROR (HTTP {http_status})"
+                    logger.warning(f"CONNECTION ERROR  http={http_status}  retry={fmt_wait(wait_s)}")
+                else:
+                    err = (str(e).strip() or type(e).__name__)[:60]
+                    _dash_set_alert(
+                        Fore.RED + f"  ⛔  Connection lost: {err}" + Style.RESET_ALL,
+                        kind=ALERT_CONN)
+                    logger.warning(f"CONNECTION LOST  error={e}  retry={fmt_wait(wait_s)}")
 
         if shutdown.is_set():
             break
 
-        # Manual reconnect: brief 3s pause then reconnect (skip fib backoff)
+        # Manual reconnect: brief 3s pause then reconnect (skip fib backoff).
+        # It is a fast reconnect too: a 1008 on the attempt that follows is
+        # the server still holding this session, not a bad token.
         if manual_reconnect:
+            quick_retry = True
             await asyncio.sleep(3)
             continue
 
@@ -9609,7 +9690,7 @@ async def listen(token: str):
                 return "shutdown"
             if reconnect_event.is_set():
                 reconnect_event.clear()
-                fib_prev, fib_curr = 60, 60
+                fib_prev, fib_curr = BACKOFF_START_S, BACKOFF_START_S
                 _dash_set_alert(
                     Fore.YELLOW + "  🔄  Manual reconnect — resetting backoff." + Style.RESET_ALL,
                     kind=ALERT_CONN)
@@ -14274,6 +14355,9 @@ async def main():
     if _recent_signal_ids or _recent_fired:
         logger.info(f"REPLAY GUARD RESTORED  ids={len(_recent_signal_ids)}  "
                     f"fired={len(_recent_fired)}")
+    _restore_fast_retry(cfg)
+    if _quick_retry_s != QUICK_RETRY_S:
+        logger.info(f"FAST RETRY RESTORED  wait={_quick_retry_s}s")
     load_front_months(cfg)
     if front_months:
         logger.info(f"FRONT MONTHS LOADED  {len(front_months)} roots "

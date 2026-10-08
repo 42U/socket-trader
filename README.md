@@ -6,7 +6,7 @@
 
 [![VoidOrigin](https://img.shields.io/badge/VOIDORIGIN-voidorigin.com-0a0a0a?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiIHN0cm9rZT0iI2ZmNmIzNSIgc3Ryb2tlLXdpZHRoPSIyIi8+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iNCIgZmlsbD0iI2ZmNmIzNSIvPjwvc3ZnPg==&logoColor=ff6b35&labelColor=0a0a0a)](https://voidorigin.com)
 
-[![Version](https://img.shields.io/badge/v0.20.0-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
+[![Version](https://img.shields.io/badge/v0.20.1-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
 [![GitHub Stars](https://img.shields.io/github/stars/42U/socket-trader?style=for-the-badge&logo=github&color=gold)](https://github.com/42U/socket-trader)
 [![License: MIT](https://img.shields.io/github/license/42U/socket-trader?style=for-the-badge&logo=opensourceinitiative&color=blue)](https://opensource.org/licenses/MIT)
 [![CI](https://img.shields.io/github/actions/workflow/status/42U/socket-trader/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
@@ -73,8 +73,8 @@ The sim account is automatically swapped with your real NinjaTrader account name
 | **Auto-detect directory** | Finds NinjaTrader 8 `incoming/` folder on Windows automatically |
 | **Multi-server support** | Save and switch between multiple signal servers |
 | **Persistent config** | Server, token, account, limits, and directory saved to `~/.voidorigin_config.json` |
-| **Smart reconnect** | A healthy link that drops is retried in 3 s; failed attempts back off 1 &rarr; 1 &rarr; 2 &rarr; 3 &rarr; 5 &rarr; 8 &rarr; ... &rarr; 30 min max |
-| **Auth handling** | Invalid token triggers re-prompt instead of infinite retry |
+| **Smart reconnect** | A healthy link that drops is retried fast — 3 s, lengthening toward 60 s if the server still holds the dropped session — and failed attempts back off 1 &rarr; 1 &rarr; 2 &rarr; 3 &rarr; 5 &rarr; 8 &rarr; ... &rarr; 30 min max |
+| **Auth handling** | Invalid token triggers re-prompt instead of infinite retry; a 1008 that follows a fast retry means the server still holds the dropped session, so the app waits the schedule out instead of logging you out |
 | **Latency monitoring** | Color-coded signal delivery time relative to baseline |
 | **Risk management** | Per-account target and stop with independent soft/hard modes |
 | **Live balances** | Press `B` for real-time account balances and session P&L |
@@ -432,7 +432,7 @@ An import **replaces the whole profile** (you're asked first when the target alr
 ```json
 {
   "socket_trader_profile": 1,
-  "app_version": "0.20.0",
+  "app_version": "0.20.1",
   "exported_from": "Sim102",
   "exported_at": "2026-09-29T14:03:00Z",
   "profile": {
