@@ -6,7 +6,7 @@
 
 [![VoidOrigin](https://img.shields.io/badge/VOIDORIGIN-voidorigin.com-0a0a0a?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiIHN0cm9rZT0iI2ZmNmIzNSIgc3Ryb2tlLXdpZHRoPSIyIi8+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iNCIgZmlsbD0iI2ZmNmIzNSIvPjwvc3ZnPg==&logoColor=ff6b35&labelColor=0a0a0a)](https://voidorigin.com)
 
-[![Version](https://img.shields.io/badge/v0.19.0-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
+[![Version](https://img.shields.io/badge/v0.20.0-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
 [![GitHub Stars](https://img.shields.io/github/stars/42U/socket-trader?style=for-the-badge&logo=github&color=gold)](https://github.com/42U/socket-trader)
 [![License: MIT](https://img.shields.io/github/license/42U/socket-trader?style=for-the-badge&logo=opensourceinitiative&color=blue)](https://opensource.org/licenses/MIT)
 [![CI](https://img.shields.io/github/actions/workflow/status/42U/socket-trader/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
@@ -73,15 +73,15 @@ The sim account is automatically swapped with your real NinjaTrader account name
 | **Auto-detect directory** | Finds NinjaTrader 8 `incoming/` folder on Windows automatically |
 | **Multi-server support** | Save and switch between multiple signal servers |
 | **Persistent config** | Server, token, account, limits, and directory saved to `~/.voidorigin_config.json` |
-| **Smart reconnect** | Fibonacci backoff: 1 &rarr; 1 &rarr; 2 &rarr; 3 &rarr; 5 &rarr; 8 &rarr; ... &rarr; 30 min max |
+| **Smart reconnect** | A healthy link that drops is retried in 3 s; failed attempts back off 1 &rarr; 1 &rarr; 2 &rarr; 3 &rarr; 5 &rarr; 8 &rarr; ... &rarr; 30 min max |
 | **Auth handling** | Invalid token triggers re-prompt instead of infinite retry |
 | **Latency monitoring** | Color-coded signal delivery time relative to baseline |
 | **Risk management** | Per-account target and stop with independent soft/hard modes |
 | **Live balances** | Press `B` for real-time account balances and session P&L |
-| **Signal confirmation** | Verifies trade execution via ATI position tracking per instrument |
+| **Signal confirmation** | Verifies the fill on every account that traded — followers included — from the shared NinjaTrader state stream |
 | **Trade readiness gate** | Blocks signals when account, directory, or strategy is missing |
-| **Duplicate detection** | Prevents the same signal from firing twice |
-| **Replay protection** | Signals the server re-delivers after a reconnect are blocked — including id-less commands like `CLOSEPOSITION` that plain id-dedup can't catch |
+| **Duplicate detection** | Prevents the same signal from firing twice — the memory is mirrored to disk, so a restart inside the server's replay window cannot re-fire the last entry |
+| **Replay protection** | Signals the server re-delivers after a reconnect are blocked — including id-less commands like `CLOSEPOSITION` that plain id-dedup can't catch — and the memory survives a restart |
 | **Input validation** | Field length, count, and format checks on all incoming signals |
 | **Atomic config writes** | Crash-safe config persistence via temp file + rename |
 | **Log rotation** | 5 MB per log file, 3 backups kept automatically |
@@ -252,7 +252,7 @@ Press `S` &rarr; `3` to open the account selector:
   ROUND-ROBIN pool (numbers/names, 'all', ENTER=none) ▸ 3 4
 ```
 
-- **Leader** — the primary account; drives the status-bar P&L display and fill confirmation. Always copy-traded.
+- **Leader** — the primary account; drives the status-bar P&L display. Always copy-traded.
 - **Followers** — enter the account numbers (or names), the word `all` for every other account, or press `ENTER` for none (single-account mode, the classic behavior).
 - **Round-robin pool** — accounts that *rotate* instead of copying — see [Round-Robin Mode](#round-robin-mode). An account can be a follower **or** in the pool, never both (conflicts stay followers).
 - Each account receives its **own** order-instruction file with only the account field swapped — instrument, action, quantity, strategy, and signal ID are identical across all accounts.
@@ -309,7 +309,7 @@ How the pool handles each command:
 
 Notes:
 
-- **Copy or round-robin, never both** — the picker keeps a conflicted account as a follower and tells you. The leader is always copy-traded (it anchors P&L display and fill confirmation).
+- **Copy or round-robin, never both** — the picker keeps a conflicted account as a follower and tells you. The leader is always copy-traded (it anchors the P&L display).
 - **Per-account [profiles](#per-account-profiles) and [risk limits](#risk-management) still apply.** A pool account's turn goes through its own profile (size, qty, AI gate, …); if its profile skips the entry, that turn is consumed — the trade is not re-routed. An account locked by its session stop/target is passed over and forfeits its turn until the pool reshuffles.
 - **Symbol filters re-route instead.** A pool account whose [symbol filter](#per-account-profiles) excludes the signal's market is never drawn for it — the entry goes to the next eligible pool account, and the filtered account **keeps its turn** for a market it does trade. If no pool account trades that market, the rotation simply sits the signal out (copy accounts are unaffected).
 - **The rotation survives restarts** within the same futures session (saved with session state); changing the pool membership starts a fresh round.
@@ -432,7 +432,7 @@ An import **replaces the whole profile** (you're asked first when the target alr
 ```json
 {
   "socket_trader_profile": 1,
-  "app_version": "0.19.0",
+  "app_version": "0.20.0",
   "exported_from": "Sim102",
   "exported_at": "2026-09-29T14:03:00Z",
   "profile": {

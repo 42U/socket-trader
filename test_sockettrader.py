@@ -102,6 +102,8 @@ def reset_session_state():
     st._rr_last = None
     st._recent_fired.clear()
     st._last_connect_mono = None
+    st._replay_dirty = False
+    st._replay_save_last = 0.0
     st._web_events.clear()
     st._session_state = "ready"
     st._state_before_conn = "ready"
@@ -8355,3 +8357,177 @@ class TestWebKeepAlive(_WebClient):
             conn.request("GET", "/api/state", headers={"X-ST-Token": st._web_token})
             conn.getresponse()
         conn.close()
+
+
+class TestRetryWait:
+    def test_healthy_link_drop_retries_in_seconds(self):
+        # Every established-link drop in the live log reconnected on the
+        # first try; each used to cost the minute the schedule starts at.
+        assert st.retry_wait(120.0, 60) == (st.QUICK_RETRY_S, True)
+        assert st.QUICK_RETRY_S < 60
+
+    def test_young_link_or_failed_attempt_keeps_the_schedule(self):
+        assert st.retry_wait(5.0, 60) == (60, False)       # died young: flapping server
+        assert st.retry_wait(None, 120) == (120, False)    # never linked: handshake failed
+
+
+class TestReplayGuardPersistence:
+    CLOSE = "CLOSEPOSITION;Sim101;NQ 12-26;;;;;;;;;;"
+    ENTRY_ID = "ent:nq_gooping:Nasdaq:2026-09-24T14:10:00-04:00"
+
+    def test_restart_inside_the_replay_window_still_drops_the_replay(self):
+        # 2026-09-24 14:12:35: the id died with the old process and the
+        # server's replay-on-connect re-fired a filled entry. Mirror, then
+        # simulate the restart (memories empty), then reload.
+        st._note_signal_id(self.ENTRY_ID)
+        st._note_fired_signal(self.CLOSE)
+        assert st._replay_dirty is True
+        st._flush_replay_guard()
+        assert st._replay_dirty is False
+        st._recent_signal_ids.clear()
+        st._recent_fired.clear()
+        st._last_connect_mono = None
+        st._restore_replay_guard()
+        assert self.ENTRY_ID in st._recent_signal_ids
+        st.note_connected()
+        assert st._is_idless_replay(self.CLOSE) is True
+
+    def test_stale_fired_rows_are_not_restored(self):
+        fresh = "CLOSEPOSITION;Sim101;ES 12-26;;;;;;;;;;"
+        st.save_config({st.REPLAY_STATE_KEY: {
+            "ids": ["a", "b"],
+            "fired": [[self.CLOSE, time.time() - (st.REPLAY_LOOKBACK_S + 5)],
+                      [fresh, time.time() - 10]]}})
+        st._restore_replay_guard()
+        assert list(st._recent_signal_ids) == ["a", "b"]
+        assert self.CLOSE not in st._recent_fired
+        assert fresh in st._recent_fired
+
+    def test_malformed_rows_are_skipped(self):
+        st.save_config({st.REPLAY_STATE_KEY: {
+            "ids": [None, "", "ok"],
+            "fired": [["x"], "junk", [self.CLOSE, "nan?"]]}})
+        st._restore_replay_guard()
+        assert list(st._recent_signal_ids) == ["ok"]
+        assert st._recent_fired == {}
+
+    def test_flush_writes_once_per_change_and_never_when_clean(self, monkeypatch):
+        writes = []
+        monkeypatch.setattr(st, "save_config", lambda cfg: writes.append(cfg))
+        st._flush_replay_guard()
+        assert writes == []
+        st._note_signal_id("x1")
+        st._note_fired_signal(self.CLOSE)      # two changes …
+        st._flush_replay_guard()               # … one write
+        assert len(writes) == 1
+        assert writes[0][st.REPLAY_STATE_KEY]["ids"] == ["x1"]
+        assert writes[0][st.REPLAY_STATE_KEY]["fired"][0][0] == self.CLOSE
+        st._flush_replay_guard()
+        assert len(writes) == 1
+
+    def test_flush_is_throttled_to_one_write_a_second_unless_forced(self, monkeypatch):
+        writes = []
+        monkeypatch.setattr(st, "save_config", lambda cfg: writes.append(cfg))
+        st._note_signal_id("x1")
+        st._flush_replay_guard()
+        st._note_signal_id("x2")
+        st._flush_replay_guard()                 # inside the gap: stays dirty, no write
+        assert len(writes) == 1 and st._replay_dirty is True
+        st._flush_replay_guard(force=True)       # a connection drop writes at once
+        assert len(writes) == 2 and st._replay_dirty is False
+        assert writes[1][st.REPLAY_STATE_KEY]["ids"] == ["x1", "x2"]
+
+    def test_mirror_keeps_other_config_keys(self):
+        st.save_config({"account": "Sim101"})
+        st._note_signal_id("x1")
+        st._flush_replay_guard()
+        cfg = st.load_config()
+        assert cfg["account"] == "Sim101"
+        assert cfg[st.REPLAY_STATE_KEY]["ids"] == ["x1"]
+
+    def test_unreadable_config_is_never_overwritten(self):
+        st.CONFIG_FILE.write_text("{not json", encoding="utf-8")
+        st._note_signal_id("x1")
+        st._flush_replay_guard()
+        assert st.CONFIG_FILE.read_text(encoding="utf-8") == "{not json"
+
+
+class TestFollowerFillConfirmation:
+    SIG = "PLACE;Sim101;NQ 09-26;BUY;1;MARKET;;;DAY;;;NQ_Med;f1"
+
+    def _arm(self, monkeypatch):
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        monkeypatch.setattr(st, "atm_strategy", "NQ_Med")
+        monkeypatch.setattr(st, "validate_strategy", lambda n: True)
+        monkeypatch.setattr(st, "is_trade_ready", lambda: True)
+        monkeypatch.setattr(st, "query_nt_positions",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("direct query")))
+
+    def test_follower_only_order_registers_the_followers_fill_check(
+            self, tmp_output_dir, monkeypatch):
+        # The live log's 31 silent dispatches: leader skipped by its
+        # profile, followers wrote, nobody looked for the fill.
+        self._arm(monkeypatch)
+        st.account_profiles["Sim101"] = {"default": {"enabled": False}}
+        _Stream(monkeypatch, snap_fn=lambda: _stream_snap(
+            positions=[("Sim102", "NQ SEP26", 3)]))
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            ok, msg = asyncio.run(st.submit_manual_trade("long", "NQ 09-26", 1))
+        assert ok is True, msg
+        assert [(e["account"], e["pre_pos"]) for e in st._pending_confirms] == [("Sim102", 3)]
+
+    def test_every_written_account_gets_its_own_check_from_one_dump(
+            self, tmp_output_dir, monkeypatch):
+        self._arm(monkeypatch)
+        s = _Stream(monkeypatch, snap_fn=lambda: _stream_snap(
+            positions=[("Sim101", "NQ SEP26", 2), ("Sim102", "NQ SEP26", -1)]))
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            ok, msg = asyncio.run(st.submit_manual_trade("long", "NQ 09-26", 1))
+        assert ok is True, msg
+        assert sorted((e["account"], e["pre_pos"]) for e in st._pending_confirms) == [
+            ("Sim101", 2), ("Sim102", -1)]
+        assert s.request_thread_calls() == []     # no dump of its own, for any account
+
+    def test_check_confirms_each_account_against_its_own_position(self, monkeypatch):
+        self._arm(monkeypatch)
+        _Stream(monkeypatch, snap_fn=lambda: _stream_snap(
+            positions=[("Sim101", "NQ SEP26", 1), ("Sim102", "NQ SEP26", 1)]))
+        st.add_pending_confirm(self.SIG, "f1", "NQ 09-26", "BUY", pre_pos=0)   # leader: filled
+        st.add_pending_confirm(self.SIG, "f1", "NQ 09-26", "BUY", pre_pos=1,
+                               account="Sim102")                                # follower: unchanged
+        st.check_pending_confirms()
+        assert [e["account"] for e in st._pending_confirms] == ["Sim102"]
+        assert "FILLED NQ 09-26" in st._alert_text and "pos: 0→1" in st._alert_text
+
+    def test_follower_timeout_is_reported_on_the_follower(self, monkeypatch):
+        self._arm(monkeypatch)
+        _Stream(monkeypatch, snap_fn=lambda: _stream_snap(positions=[]))
+        dropped = []
+        monkeypatch.setattr(st, "_pnl_drop_staged", lambda a, i: dropped.append((a, i)))
+        st.add_pending_confirm(self.SIG, "f1", "NQ 09-26", "BUY", pre_pos=0, account="Sim102")
+        st._pending_confirms[-1]["ts"] -= st.CONFIRM_TIMEOUT + 1
+        st.check_pending_confirms()
+        assert st._pending_confirms == []
+        assert dropped == [("Sim102", "NQ 09-26")]
+        assert "No fill detected" in st._alert_text and "[Sim102]" in st._alert_text
+
+    def test_deferred_follower_registers_its_own_confirm(self, tmp_output_dir, monkeypatch):
+        self._arm(monkeypatch)
+        monkeypatch.setattr(st, "_pre_position",
+                            lambda acct, instr: 5 if acct == "Sim102" else 0)
+        st.account_profiles["Sim102"] = {"default": st._coerce_rule(
+            {"stagger_entries": 2, "stagger_interval_ms": 0})}
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(SIG)
+            _run_plans(plans, sig_id="77")
+        assert [(e["account"], e["pre_pos"]) for e in st._pending_confirms] == [("Sim102", 5)]
+
+    def test_pre_positions_reads_every_leg_from_the_dump_in_hand(self, monkeypatch):
+        self._arm(monkeypatch)
+        s = _Stream(monkeypatch, snap_fn=lambda: _stream_snap(
+            positions=[("Sim101", "NQ SEP26", 2), ("Sim102", "NQ SEP26", -3)]))
+        plans, _ = st.plan_signal_legs(self.SIG)
+        assert st._pre_positions(plans) == {"Sim101": 2, "Sim102": -3}
+        assert s.request_thread_calls() == []
+        assert st._pre_positions([]) == {}

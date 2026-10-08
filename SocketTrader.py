@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.19.0"
+__version__ = "0.20.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -647,7 +647,7 @@ def validate_signal(parts: list[str]) -> str | None:
 # After a signal fires, we snapshot positions for that instrument and verify
 # NinjaTrader processed it by checking if the position changed.
 CONFIRM_TIMEOUT = 9  # seconds to wait for position change after signal
-MAX_PENDING_CONFIRMS = 20  # cap to prevent unbounded growth
+MAX_PENDING_CONFIRMS = 64  # cap to prevent unbounded growth (one entry per account per signal)
 _pending_confirms: list[dict] = []  # [{signal, ts, pre_pos, instrument, id, action}]
 _confirms_lock = __import__("threading").Lock()
 
@@ -713,13 +713,19 @@ REPLAY_LOOKBACK_S = 900    # how far back a fired signal can match
 _MAX_FIRED_KEYS = 64
 _recent_fired: dict[str, float] = {}   # canonical signal text -> monotonic ts
 _last_connect_mono: float | None = None
+REPLAY_STATE_KEY = "replay_guard"   # config key mirroring both memories to disk
+_replay_dirty = False                # a memory changed since the last mirror write
+_replay_save_last = 0.0              # monotonic time of the last mirror write
+_REPLAY_SAVE_MIN_GAP_S = 1.0         # a signal flood drives at most one write a second
 
 
 def _note_fired_signal(signal_text: str):
     """Remember a signal we actually dispatched (for the replay guard)."""
+    global _replay_dirty
     _recent_fired[signal_text] = time.monotonic()
     while len(_recent_fired) > _MAX_FIRED_KEYS:
         _recent_fired.pop(next(iter(_recent_fired)))
+    _replay_dirty = True
 
 
 def note_connected():
@@ -737,6 +743,69 @@ def _is_idless_replay(signal_text: str) -> bool:
         return False
     fired_at = _recent_fired.get(signal_text)
     return fired_at is not None and now - fired_at <= REPLAY_LOOKBACK_S
+
+
+# Both memories above are process state, but the server replays its recent
+# signals on EVERY connect — the first one after a restart included. On
+# 2026-09-24 14:12:35 a restart two minutes after a Gooping entry re-fired
+# it one second after CONNECTED (two accounts filled twice): the id had
+# died with the old process. The memories are therefore mirrored into the
+# config file — one write per processed signal, taken right before the
+# receive loop blocks for the next message — and reloaded at boot.
+
+
+def _note_signal_id(sig_id: str):
+    """Remember a signal id we have seen (id dedup) and mark the mirror."""
+    global _replay_dirty
+    _recent_signal_ids.append(sig_id)
+    _replay_dirty = True
+
+
+def _persist_replay_guard():
+    """Mirror both dedup memories to disk in one config write. Fired-text
+    stamps are stored wall-clock (monotonic time dies with the process);
+    rows past REPLAY_LOOKBACK_S can never match again and are left out."""
+    global _replay_dirty, _replay_save_last
+    cfg = load_config()
+    if not cfg and CONFIG_FILE.exists():
+        return      # unreadable config: never replace it with a mirror-only file
+    now_mono, now_wall = time.monotonic(), time.time()
+    cfg[REPLAY_STATE_KEY] = {
+        "ids": list(_recent_signal_ids),
+        "fired": [[text, now_wall - (now_mono - ts)]
+                  for text, ts in _recent_fired.items()
+                  if now_mono - ts <= REPLAY_LOOKBACK_S],
+    }
+    save_config(cfg)
+    _replay_dirty = False
+    _replay_save_last = now_mono
+
+
+def _flush_replay_guard(force: bool = False):
+    """Write the mirror only when something changed (a no-op most ticks)
+    and at most once a second unless forced, so publisher-driven text can
+    never turn the signal path into a disk-write loop. A throttled change
+    is written on the next tick — the receive loop wakes at least once a
+    second — or at once when a connection drop forces it."""
+    if _replay_dirty and (force or time.monotonic() - _replay_save_last
+                          >= _REPLAY_SAVE_MIN_GAP_S):
+        _persist_replay_guard()
+
+
+def _restore_replay_guard(cfg: dict | None = None):
+    """Reload the dedup memories at boot so a restart inside the server's
+    replay window drops the replay exactly as a running process would."""
+    saved = (load_config() if cfg is None else cfg).get(REPLAY_STATE_KEY) or {}
+    _recent_signal_ids.extend(str(i) for i in saved.get("ids") or [] if i)
+    now_mono, now_wall = time.monotonic(), time.time()
+    for row in saved.get("fired") or []:
+        try:
+            text, age = str(row[0]), now_wall - float(row[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if age <= REPLAY_LOOKBACK_S:
+            # A stamp from the future (clock step, sub-ms rounding) is "now".
+            _recent_fired[text] = now_mono - max(age, 0.0)
 
 
 def load_config() -> dict:
@@ -3513,9 +3582,9 @@ async def _write_entry_tranches(plan: dict, tranches: list[int],
             logger.info(f"LEG ABORTED  account={account}  at tranche {i + 1}/{len(tranches)}  reason={reason}")
             break
         sig = _tranche_signal(plan["signal"], tranche_qty, i)
-        leader_first = (i == 0 and account == active_account)
+        first = (i == 0)    # the first tranche carries this account's fill check
         pre_pos = 0
-        if leader_first:
+        if first:
             pre_pos = await asyncio.to_thread(
                 _pre_position, account, plan["instrument"])
         path = write_signal_to_file(sig)
@@ -3533,8 +3602,9 @@ async def _write_entry_tranches(plan: dict, tranches: list[int],
         # exposure/stack math needs it on every account type.
         _note_inflight_open(account, plan["instrument"], plan["action"],
                             tranche_qty)
-        if leader_first:
-            add_pending_confirm(sig, sig_id, plan["instrument"], plan["action"], pre_pos)
+        if first:
+            add_pending_confirm(sig, sig_id, plan["instrument"], plan["action"], pre_pos,
+                                account=account)
     if placed:
         _record_stagger(plan["signal"], account, placed)
         if not quiet:
@@ -5083,8 +5153,24 @@ def _accounts_now(max_age: float) -> list[dict]:
     return query_nt_accounts(nt_port)
 
 
+def _pre_snapshot(what: str) -> dict | None:
+    """The dump an entry's pre-position is read from while the stream runs:
+    the newest COMPLETE one while recent, else the newest at all. A partial
+    dump can simply lack a position, so a cut-off read under congestion
+    must not mint a false "FILLED" from a 0 it never held."""
+    snap = _snap_latest_ok
+    if snap is None or time.time() - snap["req_ts"] > 5.0:
+        snap = _snap_latest
+    if snap is not None:
+        age = time.time() - snap["req_ts"]
+        if age > 5.0:
+            logger.warning(f"PRE-POSITION  newest snapshot is {age:.1f}s old "
+                           f"(NinjaTrader slow?) — confirming {what} against it anyway")
+    return snap
+
+
 def _pre_position(account: str, instrument: str) -> int:
-    """The leader's position before an entry write, for fill confirmation.
+    """One account's position before an entry write, for fill confirmation.
 
     Never costs the order a dump: with the stream running, the newest
     snapshot is already in hand and, having been requested before the
@@ -5092,24 +5178,42 @@ def _pre_position(account: str, instrument: str) -> int:
     query returned 0.3–4 s later. Without the stream, one direct query as
     before; any failure reads as 0, as it always did."""
     if snapshot_poller_running():
-        # A partial dump can simply lack the position; the newest COMPLETE
-        # read is the baseline while it is recent, so a cut-off dump under
-        # congestion cannot mint a false "FILLED" from a 0 it never held.
-        snap = _snap_latest_ok
-        if snap is None or time.time() - snap["req_ts"] > 5.0:
-            snap = _snap_latest
-        if snap is None:
-            return 0
-        age = time.time() - snap["req_ts"]
-        if age > 5.0:
-            logger.warning(f"PRE-POSITION  newest snapshot is {age:.1f}s old "
-                           f"(NinjaTrader slow?) — confirming {instrument} on "
-                           f"{account} against it anyway")
-        return _position_qty(_snapshot_positions(snap, account), instrument)
+        snap = _pre_snapshot(f"{instrument} on {account}")
+        return 0 if snap is None else _position_qty(_snapshot_positions(snap, account), instrument)
     try:
         return _position_qty(query_nt_positions(account, nt_port), instrument)
     except Exception:
         return 0
+
+
+def _pre_positions(plans: list[dict]) -> dict[str, int]:
+    """Pre-write position of every INSTANT leg in `plans`, keyed by account
+    — the input to one fill confirmation per written account. With the
+    stream running every account is read from the same dump already in
+    hand, so ten accounts cost exactly what one did."""
+    legs = [(p["account"], p["instrument"]) for p in plans
+            if not p["deferred"] and not p.get("prop_group")]
+    if not legs:
+        return {}
+    if snapshot_poller_running():
+        snap = _pre_snapshot(f"{legs[0][1]} on {len(legs)} account(s)")
+        if snap is None:
+            return {}
+        return {acct: _position_qty(_snapshot_positions(snap, acct), instr)
+                for acct, instr in legs}
+    return {acct: _pre_position(acct, instr) for acct, instr in legs}
+
+
+def _register_confirms(plans: list[dict], written: list[str], sig_id: str | None,
+                       pre: dict[str, int]):
+    """One fill confirmation per instant leg that was written — on every
+    account, not only the leader. Deferred and prop-wave legs register
+    inside their own tasks when their write lands."""
+    for p in plans:
+        if p["deferred"] or p.get("prop_group") or p["account"] not in written:
+            continue
+        add_pending_confirm(p["signal"], sig_id, p["instrument"], p["action"],
+                            pre.get(p["account"], 0), account=p["account"])
 
 
 FLATTEN_SNAPSHOT_MAX_AGE = 5.0   # a flatten acts on a snapshot at most this old …
@@ -8448,21 +8552,16 @@ async def submit_manual_trade(side, instrument, qty, order_type: str = "market",
     signal_count += 1
     _dash_add_signal(format_signal(signal, signal_count, tag="MANUAL"))
     sig_id = signal.split(";")[-1]
-    leader_plan = next((p for p in plans if p["account"] == active_account), None)
-    pre_pos = 0
-    if leader_plan and not leader_plan["deferred"]:
-        # From the shared stream: the write below no longer waits on a
-        # NinjaTrader dump of its own (0.3–4 s live, on every click).
-        pre_pos = await asyncio.to_thread(
-            _pre_position, active_account, leader_plan["instrument"])
+    # From the shared stream: the write below never waits on a NinjaTrader
+    # dump of its own (0.3–4 s live, on every click) — every account's
+    # pre-position comes from the dump already in hand.
+    pre = await asyncio.to_thread(_pre_positions, plans)
     written = await execute_plans(plans, sig_id)
     scheduled = [p["account"] for p in plans if p["deferred"]]
     if not written and not scheduled:
         return False, "no order file written — check the output directory"
     _note_contract(signal)
-    if leader_plan and not leader_plan["deferred"] and active_account in written:
-        add_pending_confirm(leader_plan["signal"], sig_id,
-                            leader_plan["instrument"], leader_plan["action"], pre_pos)
+    _register_confirms(plans, written, sig_id, pre)
     p = signal.split(";")
     desc = f"MANUAL {p[3]} {p[4]} {p[2]} {p[5]}" + (f" @ {p[6]}" if p[6] else "")
     bits = [f"→ {len(written)} account{'s' if len(written) != 1 else ''}"]
@@ -8533,15 +8632,19 @@ async def manual_trade_menu():
         awaiting_user_input = False
 
 
-def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, action: str, pre_pos: int = 0):
-    """Register a signal for post-trade confirmation via position check."""
-    pre_balance = session_current_balances.get(active_account) if active_account else None
+def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, action: str,
+                        pre_pos: int = 0, account: str | None = None):
+    """Register one written leg for post-trade confirmation on the account
+    it was written to (the leader when `account` is omitted)."""
+    acct = account or active_account
+    pre_balance = session_current_balances.get(acct) if acct else None
     with _confirms_lock:
         if len(_pending_confirms) >= MAX_PENDING_CONFIRMS:
             _pending_confirms.pop(0)  # drop oldest
         _pending_confirms.append({
             "signal": signal_text,
             "id": sig_id,
+            "account": acct,
             "instrument": instrument,
             "action": action,
             "ts": time.time(),
@@ -8551,17 +8654,21 @@ def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, a
 
 
 def check_pending_confirms():
-    """Check pending signals for confirmation via position or balance change.
+    """Check pending legs for a fill via position or balance change — on the
+    account each leg was written to, not only the leader (31 follower-only
+    entries in the live log had no fill check at all).
 
     Called every balance poll cycle. Position delta catches trades that
     stay open; cash-balance delta catches fast round-trips where the ATM
     stop/target closes the fill before any poll sees the open position.
+    One snapshot read serves every account in the batch.
     """
-    if not _pending_confirms or not active_account:
+    if not _pending_confirms:
         return
 
-    positions = _positions_now(active_account, BALANCE_POLL_INTERVAL)
-    cur_balance = session_current_balances.get(active_account)
+    snap = _stream_snapshot(BALANCE_POLL_INTERVAL, BALANCE_POLL_INTERVAL, "POSITIONS")
+    positions_by_account: dict[str, dict[str, int]] = {}
+    multi = len(target_accounts()) > 1
     now = time.time()
     still_pending = []
 
@@ -8569,9 +8676,17 @@ def check_pending_confirms():
         for entry in _pending_confirms:
             elapsed = now - entry["ts"]
             instrument = entry["instrument"]
+            acct = entry.get("account") or active_account or ""
             pre_pos = entry["pre_pos"]
             pre_balance = entry.get("pre_balance")
+            positions = positions_by_account.get(acct)
+            if positions is None:
+                positions = (_snapshot_positions(snap, acct) if snap is not None
+                             else query_nt_positions(acct, nt_port))
+                positions_by_account[acct] = positions
             cur_pos = _position_qty(positions, instrument)
+            cur_balance = session_current_balances.get(acct)
+            label = f"[{acct}] " if multi else ""
 
             pos_changed = cur_pos != pre_pos
             balance_changed = (
@@ -8588,9 +8703,9 @@ def check_pending_confirms():
                     detail = f"round-trip  balance: ${delta:+.2f}"
                 _dash_set_alert(
                     Fore.GREEN +
-                    f"  ✔  FILLED {instrument} {entry['action']}  {detail}" +
+                    f"  ✔  {label}FILLED {instrument} {entry['action']}  {detail}" +
                     Style.RESET_ALL)
-                logger.info(f"CONFIRMED  id={entry['id']}  {instrument}  "
+                logger.info(f"CONFIRMED  id={entry['id']}  account={acct}  {instrument}  "
                             f"{entry['action']}  {detail}  "
                             f"elapsed={elapsed:.1f}s")
                 continue  # drop from pending
@@ -8599,16 +8714,16 @@ def check_pending_confirms():
                 # Timed out — no position delta and no balance delta
                 _dash_set_alert(
                     Fore.YELLOW + Style.DIM +
-                    f"  ⚠  No fill detected for {instrument} after {CONFIRM_TIMEOUT}s "
+                    f"  ⚠  {label}No fill detected for {instrument} after {CONFIRM_TIMEOUT}s "
                     f"(ID: {entry['id']})" + Style.RESET_ALL)
-                logger.warning(f"UNCONFIRMED  id={entry['id']}  {instrument}  "
+                logger.warning(f"UNCONFIRMED  id={entry['id']}  account={acct}  {instrument}  "
                                f"{entry['action']}  pos unchanged at {pre_pos}, "
                                f"balance unchanged  elapsed={elapsed:.1f}s")
                 # No position and no money moved, so there is nothing for
                 # the P&L record to wait on. Left staged, this dead entry
                 # keeps its slot and can hand its market and strategy to an
                 # unrelated amount hours later.
-                _pnl_drop_staged(active_account, instrument)
+                _pnl_drop_staged(acct, instrument)
                 continue  # drop from pending
 
             still_pending.append(entry)
@@ -9136,6 +9251,24 @@ async def prompt_limits():
 MAX_BACKOFF = 1800  # 30 minutes in seconds
 
 
+QUICK_RETRY_S = 3              # first retry after an established link drops …
+QUICK_RETRY_MIN_UPTIME_S = 30  # … provided the link had lived this long
+
+
+def retry_wait(uptime_s: float | None, fib_curr: int) -> tuple[int, bool]:
+    """(seconds until the next connect attempt, whether it is a quick retry).
+
+    A link that dropped after running at least QUICK_RETRY_MIN_UPTIME_S is
+    retried in QUICK_RETRY_S: every such drop in the live log ("no close
+    frame received", keepalive timeouts, proxy restarts) reconnected on the
+    first try, yet each cost the full minute the backoff starts at — 48
+    drops on 2026-10-06 alone. A failed attempt, or a link that died young,
+    keeps the Fibonacci schedule so a down server is never hammered."""
+    if uptime_s is not None and uptime_s >= QUICK_RETRY_MIN_UPTIME_S:
+        return QUICK_RETRY_S, True
+    return fib_curr, False
+
+
 def fib_backoff(prev: int, curr: int) -> tuple[int, int]:
     """Advance fibonacci sequence, clamped between 60s and MAX_BACKOFF."""
     nxt = prev + curr
@@ -9159,6 +9292,8 @@ async def listen(token: str):
 
     while not shutdown.is_set():
         manual_reconnect = False
+        linked_at = None               # when this attempt's link came up (None: never)
+        wait_s, quick_retry = fib_curr, False   # next retry wait, set per failure below
         hb_reason = "CONNECTION LOST"  # heartbeat-row label while waiting to retry
         # Header + heartbeat row reflect the attempt in progress
         note_connection_down(reconnecting=ever_connected)
@@ -9176,6 +9311,7 @@ async def listen(token: str):
             uri = f"{ws_host}?token={token}"
             connect_start = time.time()
             async with websockets.connect(uri) as ws:
+                linked_at = time.time()
                 connect_latency = int((time.time() - connect_start) * 1000)
                 baseline_latency = None  # First signal sets the baseline
                 fib_prev, fib_curr = 60, 60  # Reset on successful connection
@@ -9255,6 +9391,7 @@ async def listen(token: str):
                             kind=ALERT_CONN)
                         break
 
+                    _flush_replay_guard()   # mirror dedup memory before blocking
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=1)
                         raw_signal, server_ts, sig_id, reject_reason = extract_signal_string(
@@ -9289,7 +9426,7 @@ async def listen(token: str):
                                 logger.info(f"DUPLICATE IGNORED  id={sig_id}  signal={raw_signal}")
                                 continue
                             if sig_id:
-                                _recent_signal_ids.append(sig_id)
+                                _note_signal_id(sig_id)
 
                             # Id-less replay guard: after a reconnect the server
                             # re-delivers recent signals; commands without a
@@ -9346,20 +9483,18 @@ async def listen(token: str):
                                 logger.info(f"SIGNAL #{signal_count} (ALL LEGS SKIPPED)  {skipped_legs}  {raw_signal}")
                                 continue
 
-                            # Snapshot the LEADER's position BEFORE writing so
-                            # fast fills don't make pre/post look identical.
-                            # Uses the leader's TRANSFORMED instrument — its
-                            # profile may size it differently. Deferred leader
-                            # legs snapshot inside their own task instead.
+                            # Snapshot every instant leg's position BEFORE
+                            # writing so fast fills don't make pre/post look
+                            # identical — from the dump already in hand, so
+                            # the order never waits on a NinjaTrader query.
+                            # Each account's TRANSFORMED instrument is used
+                            # (its profile may resize it); deferred legs
+                            # snapshot inside their own task instead.
                             leader_plan = next(
                                 (p for p in plans if p["account"] == active_account), None)
-                            pre_pos = 0
-                            if leader_plan and not leader_plan["deferred"]:
-                                pre_positions = await asyncio.to_thread(
-                                    query_nt_positions, active_account, nt_port)
-                                pre_pos = pre_positions.get(leader_plan["instrument"], 0)
+                            pre = await asyncio.to_thread(_pre_positions, plans)
                             # Re-check state after the await — balance_monitor could
-                            # have fired a soft/hard stop while we were querying NT.
+                            # have fired a soft/hard stop while we were away.
                             # Without this, a signal in-flight during a stop can race
                             # the close and open a new position right after flatten.
                             if paused or not tradeable_accounts():
@@ -9374,13 +9509,9 @@ async def listen(token: str):
                                 logger.warning(f"SIGNAL #{signal_count} (NO WRITE)  {raw_signal}")
                                 continue
                             _note_fired_signal(raw_signal)  # replay-guard memory
-                            # Register fill confirmation on the leader if its leg
-                            # fired now (deferred leader legs register in-task).
-                            if (leader_plan and not leader_plan["deferred"]
-                                    and active_account in written):
-                                add_pending_confirm(
-                                    leader_plan["signal"], sig_id,
-                                    leader_plan["instrument"], leader_plan["action"], pre_pos)
+                            # One fill confirmation per leg written now, on
+                            # its own account (deferred legs register in-task).
+                            _register_confirms(plans, written, sig_id, pre)
                             total_legs = len(written) + len(scheduled)
                             note_bits = []
                             if total_legs > 1:
@@ -9447,15 +9578,18 @@ async def listen(token: str):
             # and heartbeat row (live countdown in the wait loop below); the
             # drop itself is recorded as a timestamped event on the alert row.
             note_connection_down()
+            _flush_replay_guard(force=True)
+            wait_s, quick_retry = retry_wait(
+                None if linked_at is None else time.time() - linked_at, fib_curr)
             if http_status is not None:
                 hb_reason = f"CONNECTION ERROR (HTTP {http_status})"
-                logger.warning(f"CONNECTION ERROR  http={http_status}  retry={fmt_wait(fib_curr)}")
+                logger.warning(f"CONNECTION ERROR  http={http_status}  retry={fmt_wait(wait_s)}")
             else:
                 err = (str(e).strip() or type(e).__name__)[:60]
                 _dash_set_alert(
                     Fore.RED + f"  ⛔  Connection lost: {err}" + Style.RESET_ALL,
                     kind=ALERT_CONN)
-                logger.warning(f"CONNECTION LOST  error={e}  retry={fmt_wait(fib_curr)}")
+                logger.warning(f"CONNECTION LOST  error={e}  retry={fmt_wait(wait_s)}")
 
         if shutdown.is_set():
             break
@@ -9465,9 +9599,10 @@ async def listen(token: str):
             await asyncio.sleep(3)
             continue
 
-        # Fibonacci backoff wait (interruptible by shutdown or manual
-        # reconnect) with a live countdown on the heartbeat row.
-        wait_end = time.time() + fib_curr
+        # Backoff wait (interruptible by shutdown or manual reconnect) with a
+        # live countdown on the heartbeat row: seconds after a healthy link
+        # dropped, the Fibonacci schedule otherwise (see retry_wait).
+        wait_end = time.time() + wait_s
         last_countdown = None
         while time.time() < wait_end:
             if shutdown.is_set():
@@ -9486,7 +9621,10 @@ async def listen(token: str):
                     Fore.RED + f"  ⛔  {hb_reason}  ·  retry in {fmt_wait(remaining)}" + Style.RESET_ALL)
             await asyncio.sleep(0.5)
 
-        fib_prev, fib_curr = fib_backoff(fib_prev, fib_curr)
+        if not quick_retry:
+            # Only failed attempts climb the schedule; a quick retry after a
+            # healthy link leaves it at 1m for the attempt that follows.
+            fib_prev, fib_curr = fib_backoff(fib_prev, fib_curr)
 
     return "shutdown"
 
@@ -14132,6 +14270,10 @@ async def main():
     account_profiles.update(load_account_profiles(cfg))
     if account_profiles:
         logger.info(f"PROFILES LOADED  accounts={sorted(account_profiles)}")
+    _restore_replay_guard(cfg)
+    if _recent_signal_ids or _recent_fired:
+        logger.info(f"REPLAY GUARD RESTORED  ids={len(_recent_signal_ids)}  "
+                    f"fired={len(_recent_fired)}")
     load_front_months(cfg)
     if front_months:
         logger.info(f"FRONT MONTHS LOADED  {len(front_months)} roots "
