@@ -7313,6 +7313,187 @@ class TestPnlLegBoundary:
         assert (self.A, "MNQ") not in st._pnl_open_meta
 
 
+class TestPnlFarSideLabel:
+    """A reset before an opposite entry closes one position and opens
+    another on the same root. 2026-10-08 21:15 on SimEverything: the
+    XRetest short was staged while the MSSComp long still showed, the
+    long's close was seen at 21:15:11 and took the root's whole record
+    with it, and the short seen eight seconds later had no name — a copy
+    trade shown as "Manual". The far side's label waits for the far side."""
+
+    D, A = "2026-10-01", "SimEverything"
+    LONG = [_ppos("NQ 12-26", 1, 30_985.0)]
+    SHORT = [_ppos("NQ 12-26", -1, 30_985.25)]
+
+    def obs(self, cash, realized, now, positions=()):
+        st._pnl_observe(_plive(_prow(self.A, cash, positions, realized=realized)),
+                        now=now, session_date=self.D)
+
+    def trades(self):
+        return (st._pnl_days(self.D[:7]).get(self.D) or {}).get("trades", [])
+
+    def stage(self, name, action, now, role="follower"):
+        st._pnl_note_open(self.A, "NQ 12-26", ("", name), now=now, role=role,
+                          action=action)
+
+    def _long_on_the_books(self):
+        self.stage("NQ-MSSComp", "BUY", 100.0)
+        self.obs(10_000.0, 0.0, 100.0)
+        self.obs(10_000.0, 0.0, 110.0, self.LONG)
+        assert st._pnl_open_meta[(self.A, "NQ")]["side"] == 1
+
+    def test_the_label_survives_a_close_seen_a_poll_before_the_fill(self):
+        self._long_on_the_books()
+        # The reset and the opposite entry, both written between polls.
+        st._pnl_note_close(self.A, "NQ 12-26", now=120.0)
+        self.stage("NQ-XRetest", "SELL", 121.0)
+        self.obs(9_996.0, -4.0, 130.0)                 # the long is gone
+        self.obs(9_996.0, -4.0, 138.0, self.SHORT)     # the short shows a poll later
+        self.obs(9_500.0, -500.0, 200.0)               # and closes
+        t = self.trades()
+        assert [x["strategy"] for x in t] == ["NQ-MSSComp", "NQ-XRetest"]
+        assert [x["side"] for x in t] == ["LONG", "SHORT"]
+        assert t[1]["role"] == "follower" and t[1]["opened_ts"] == 138.0
+        assert [x["pnl"] for x in t] == [-4.0, -496.0]
+
+    def test_direction_alone_tells_the_far_side_apart(self):
+        # No close flag (a publisher exit outside the plan path): an entry
+        # going the other way from the side on the books is enough.
+        self._long_on_the_books()
+        self.stage("NQ-XRetest", "SELL", 121.0)
+        meta = st._pnl_open_meta[(self.A, "NQ")]
+        assert meta["strategies"] == ["NQ-MSSComp"]
+        assert meta["next"]["strategies"] == ["NQ-XRetest"]
+        assert meta["next"]["sides"] == {"NQ-XRetest": -1}
+
+    def test_a_same_poll_flip_takes_the_far_side_label(self):
+        self._long_on_the_books()
+        self.stage("NQ-XRetest", "SELL", 121.0)
+        self.obs(9_996.0, -4.0, 130.0, self.SHORT)     # +1 → -1 inside one poll
+        self.obs(9_500.0, -500.0, 200.0)
+        t = self.trades()
+        assert [x["strategy"] for x in t] == ["NQ-MSSComp", "NQ-XRetest"]
+        assert t[1]["opened_ts"] == 130.0 and t[1]["role"] == "follower"
+
+    def test_a_same_side_add_still_stacks(self):
+        self._long_on_the_books()
+        self.stage("Gooping", "BUY", 121.0)
+        meta = st._pnl_open_meta[(self.A, "NQ")]
+        assert meta["strategies"] == ["NQ-MSSComp", "Gooping"] and "next" not in meta
+
+    def test_a_far_side_entry_that_never_fills_ages_out(self):
+        self._long_on_the_books()
+        self.stage("NQ-XRetest", "SELL", 121.0)
+        self.obs(9_996.0, -4.0, 121.0 + st.PNL_STAGED_TTL_S + 5)   # the long leaves, much later
+        assert [x["strategy"] for x in self.trades()] == ["NQ-MSSComp"]
+        assert (self.A, "NQ") not in st._pnl_open_meta             # nothing is waited on
+
+    def test_a_close_flag_waits_for_the_transition(self):
+        # Close fired and a same-side re-entry staged; at the next poll
+        # neither has filled yet (NinjaTrader filling late). Nothing may
+        # be cut, and the flag must still be there for the poll that sees
+        # both legs land inside one interval.
+        self._long_on_the_books()
+        st._pnl_note_close(self.A, "NQ 12-26", now=120.0)
+        self.stage("Gooping", "BUY", 121.0)
+        self.obs(10_000.0, 0.0, 125.0, self.LONG)
+        assert self.trades() == []
+        assert st._pnl_open_meta[(self.A, "NQ")]["close_fired"] == 120.0
+        self.obs(9_996.0, -4.0, 135.0, self.LONG)      # -4 round trip, same shape
+        self.obs(9_500.0, -500.0, 200.0)
+        t = self.trades()
+        assert [x["strategy"] for x in t] == ["NQ-MSSComp", "Gooping"]
+        assert t[1]["opened_ts"] == 135.0
+        assert "close_fired" not in st._pnl_open_meta.get((self.A, "NQ"), {})
+
+    def test_a_pending_label_on_the_wrong_side_does_not_name_the_fill(self):
+        # Two opposite entries staged while flat — the reset cancelled the
+        # buy before it filled — and a short shows up: it is the sell's.
+        self.stage("NQ-MSSComp", "BUY", 100.0)
+        self.stage("NQ-MacroZoneB", "SELL", 102.0)
+        self.obs(10_000.0, 0.0, 100.0)
+        self.obs(10_000.0, 0.0, 110.0, self.SHORT)
+        self.obs(9_500.0, -500.0, 200.0)
+        assert [x["strategy"] for x in self.trades()] == ["NQ-MacroZoneB"]
+
+    def test_labels_without_a_side_are_never_dropped(self):
+        st._pnl_note_open(self.A, "NQ 12-26", ("", "NQ-MSSComp"), now=100.0)   # no action given
+        self.obs(10_000.0, 0.0, 100.0)
+        self.obs(10_000.0, 0.0, 110.0, self.SHORT)
+        self.obs(9_500.0, -500.0, 200.0)
+        assert [x["strategy"] for x in self.trades()] == ["NQ-MSSComp"]
+
+    def test_the_ledger_hook_hands_the_recorder_the_side(self):
+        st.active_account = "SimAI"
+        st._pnl_open_meta[("Sim101", "NQ")] = {"strategies": ["NQ-MSSComp"], "ts": 1.0,
+                                               "avg": None, "cost": 0.0, "side": 1}
+        st._ledger_note_file({"account": "Sim101", "strat_ident": ("nq_xretest", "NQ-XRetest")},
+                             "PLACE;Sim101;NQ 12-26;SELL;1;MARKET;;;DAY;;;NQ-XRetest;sid-x")
+        meta = st._pnl_open_meta[("Sim101", "NQ")]
+        assert meta["strategies"] == ["NQ-MSSComp"]
+        assert meta["next"]["strategies"] == ["NQ-XRetest"]
+        assert meta["next"]["role"] == "follower"
+        assert meta["next"]["sides"] == {"NQ-XRetest": -1}
+
+
+class TestPnlCorrectionsOnLoad:
+    """The live month is written back from memory, so a row fixed on disk
+    would only be overwritten. Corrections go in a sidecar the recorder
+    applies once when it loads the month."""
+
+    MONTH, DAY = "2026-10", "2026-10-08"
+
+    def _shard(self, *rows):
+        st.PNL_DIR.mkdir(parents=True, exist_ok=True)
+        (st.PNL_DIR / f"{self.MONTH}.json").write_text(json.dumps(
+            {"v": 2, "days": {self.DAY: {"accounts": {}, "trades": list(rows)}}}), encoding="utf-8")
+
+    def _row(self, account, ts, strategy=""):
+        return {"ts": ts, "account": account, "symbol": "NQ", "side": "LONG", "qty": 1,
+                "strategy": strategy, "entry": 1.0, "opened_ts": ts - 16, "pnl": 1.0, "approx": False}
+
+    def test_rows_are_relabelled_once_and_the_file_is_consumed(self, caplog):
+        self._shard(self._row("Sim101", 1759932043.123), self._row("SimEverything", 1759932043.123),
+                    self._row("SimAI", 1759932100.5, "Manual-ish"))
+        (st.PNL_DIR / st.PNL_CORRECTIONS_FILE).write_text(json.dumps({"v": 1, "rows": [
+            {"day": self.DAY, "ts": 1759932043.123, "account": "Sim101",
+             "strategy": "Gooping", "role": "follower"},
+            {"day": self.DAY, "ts": 1759932100.5, "account": "SimAI", "strategy": "NQ-MacroZoneB", "role": ""},
+            {"day": self.DAY, "ts": 1.0, "account": "Sim101", "strategy": "x"},            # matches nothing
+            {"day": "2026-11-02", "ts": 5.0, "account": "Sim101", "strategy": "y"},        # another month
+        ]}), encoding="utf-8")
+        with caplog.at_level(logging.INFO):
+            rows = st._pnl_load(self.MONTH)["days"][self.DAY]["trades"]
+        assert rows[0]["strategy"] == "Gooping" and rows[0]["role"] == "follower"
+        assert rows[1]["strategy"] == "" and "role" not in rows[1]        # same ts, other account
+        assert rows[2]["strategy"] == "NQ-MacroZoneB" and "role" not in rows[2]
+        left = json.loads((st.PNL_DIR / st.PNL_CORRECTIONS_FILE).read_text(encoding="utf-8"))
+        assert [c["day"] for c in left["rows"]] == ["2026-11-02"]
+        assert "applied 2 correction(s)" in caplog.text and "1 matched no row" in caplog.text
+        st._pnl_save(force=True)
+        on_disk = json.loads((st.PNL_DIR / f"{self.MONTH}.json").read_text(encoding="utf-8"))
+        assert on_disk["days"][self.DAY]["trades"][0]["strategy"] == "Gooping"
+
+    def test_nothing_left_removes_the_file(self):
+        self._shard(self._row("Sim101", 50.0))
+        (st.PNL_DIR / st.PNL_CORRECTIONS_FILE).write_text(json.dumps({"v": 1, "rows": [
+            {"day": self.DAY, "ts": 50.0, "account": "Sim101", "strategy": "Gooping"}]}), encoding="utf-8")
+        rows = st._pnl_load(self.MONTH)["days"][self.DAY]["trades"]
+        assert rows[0]["strategy"] == "Gooping"
+        assert not (st.PNL_DIR / st.PNL_CORRECTIONS_FILE).exists()
+
+    def test_no_file_and_a_broken_file_change_nothing(self, caplog):
+        self._shard(self._row("Sim101", 50.0))
+        assert st._pnl_load(self.MONTH)["days"][self.DAY]["trades"][0]["strategy"] == ""
+        st._pnl_history = None
+        st._pnl_hot_month = None
+        (st.PNL_DIR / st.PNL_CORRECTIONS_FILE).write_text("{not json", encoding="utf-8")
+        with caplog.at_level(logging.ERROR):
+            assert st._pnl_load(self.MONTH)["days"][self.DAY]["trades"][0]["strategy"] == ""
+        assert "could not be read" in caplog.text
+        assert (st.PNL_DIR / st.PNL_CORRECTIONS_FILE).exists()       # left for the operator
+
+
 class TestPhantomPairsHealOnLoad:
     """The rollover phantoms are fixed at the source, but the rows are
     already written. They cancel, so stripping both leaves every total
@@ -8893,6 +9074,22 @@ class TestBracketGuard:
         assert st._bracket_guard_event(late, now=now) is None
         assert self._closes(tmp_output_dir) == []
 
+    def test_an_orphan_position_is_named_for_what_it_is(self, tmp_output_dir):
+        self._arm(tmp_output_dir)
+        now = st._nt_log_stamp(self.ORPHAN_ADD) + 1.0
+        st._bracket_guard_event(self.ORPHAN_FILL, now=now)
+        st._bracket_guard_event(self.ORPHAN_ADD, now=now)
+        meta = st._pnl_open_meta[("SimAI", "NQ")]
+        assert meta["strategies"] == ["orphan ATM bracket"] and meta["ts"] is None
+        # A root the recorder is already waiting on keeps its own name.
+        st._bracket_fills.clear()
+        st._bracket_guard_seen.clear()
+        st._pnl_open_meta[("SimAI", "NQ")] = {"strategies": ["NQ-MacroZoneB"], "ts": None,
+                                              "avg": None, "cost": 0.0, "staged_ts": now}
+        st._bracket_guard_event(self.ORPHAN_FILL, now=now)
+        st._bracket_guard_event(self.ORPHAN_ADD, now=now)
+        assert st._pnl_open_meta[("SimAI", "NQ")]["strategies"] == ["NQ-MacroZoneB"]
+
     def test_the_tail_reader_joins_at_the_end_follows_appends_and_rolls(self, tmp_path):
         p = tmp_path / "log.20261008.00000.txt"
         p.write_text("old line 1\nold line 2\n", encoding="utf-8")
@@ -8983,6 +9180,136 @@ class TestResetCancelsTheStandingEntryFirst:
         bodies = [f.read_text() for f in sorted(tmp_output_dir.glob("oif_*.txt"))]
         assert not any(b.startswith("CLOSESTRATEGY") for b in bodies)
         assert bodies[0].startswith("CLOSEPOSITION;Sim101;NQ 06-26;")
+
+
+    def test_the_reset_tells_the_recorder_the_position_is_leaving(
+            self, ms_on, live_book, tmp_output_dir, monkeypatch):
+        st.active_account = "Sim101"
+        monkeypatch.setattr(st, "RESET_SETTLE_S", 0.01)
+        monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {})
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1, ("bread_n_butter", "BnB"), "sid-a")
+        # The recorder has seen the short on the books.
+        st._pnl_open_meta[("Sim101", "NQ")] = {"strategies": ["Sides"], "ts": 100.0,
+                                               "avg": 1.0, "cost": 0.0, "side": -1}
+        buy = "PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(buy, envelope=ENTRY_ENV)
+            _run_plans(plans)
+        meta = st._pnl_open_meta[("Sim101", "NQ")]
+        assert isinstance(meta.get("close_fired"), float)
+        assert meta["strategies"] == ["Sides"]               # the leaving position keeps its name
+        nxt = meta["next"]                                   # the entry's label waits for the far side
+        assert len(nxt["strategies"]) == 1 and nxt["strategies"] != ["Sides"]
+        assert nxt["sides"] == {nxt["strategies"][0]: 1}
+
+
+def _acoro_returning(val):
+    """A stand-in async function (any args) that resolves to `val`."""
+    async def _f(*a, **k):
+        return val
+    return _f
+
+
+class TestResetVerifySetting:
+    """reset_verify: before an opposite-direction reset re-enters, optionally
+    wait for PROOF the standing position cleared instead of a blind settle.
+    Settable globally (config / web button) and per account/strategy (rule),
+    defaulting off so it is a pure opt-in on top of the CLOSESTRATEGY-first fix."""
+
+    def test_default_rule_inherits(self):
+        assert st.DEFAULT_RULE["reset_verify"] == "inherit"
+        assert st.resolve_rule("no-such-account")["reset_verify"] == "inherit"
+
+    def test_coerce_keeps_valid_values_and_drops_junk(self):
+        assert st._coerce_rule({"reset_verify": "on"})["reset_verify"] == "on"
+        assert st._coerce_rule({"reset_verify": "OFF"})["reset_verify"] == "off"
+        assert st._coerce_rule({"reset_verify": "inherit"})["reset_verify"] == "inherit"
+        assert "reset_verify" not in st._coerce_rule({"reset_verify": "maybe"})
+        assert "reset_verify" not in st._coerce_rule({"reset_verify": 1})
+        # scoped rules carry it too
+        assert st._coerce_rule({"reset_verify": "on"}, scoped=True)["reset_verify"] == "on"
+
+    def test_global_policy_defaults_off(self, tmp_config):
+        st.save_config({})
+        assert st._reset_verify_policy() == "off"
+
+    def test_global_policy_reads_config_and_floors_junk_to_off(self, tmp_config):
+        st.save_config({"reset_verify": "on"})
+        assert st._reset_verify_policy() == "on"
+        st.save_config({"reset_verify": "off"})
+        assert st._reset_verify_policy() == "off"
+        st.save_config({"reset_verify": "garbage"})
+        assert st._reset_verify_policy() == "off"
+
+    def test_account_default_overrides_the_app_default(self):
+        st.account_profiles["RVAcct"] = {"default": {"reset_verify": "on"}}
+        try:
+            assert st.resolve_rule("RVAcct")["reset_verify"] == "on"
+        finally:
+            st.account_profiles.pop("RVAcct", None)
+
+    def test_scoped_rule_overrides_by_strategy(self):
+        st.account_profiles["RVAcct"] = {
+            "default": {"reset_verify": "off"},
+            "rules": [{"strategies": ["NQ_Med"], "reset_verify": "on"}]}
+        try:
+            assert st.resolve_rule("RVAcct", "NQ 06-26", "NQ_Med")["reset_verify"] == "on"
+            assert st.resolve_rule("RVAcct", "NQ 06-26", "Other")["reset_verify"] == "off"
+        finally:
+            st.account_profiles.pop("RVAcct", None)
+
+    def test_explicit_wins_and_inherit_follows_the_global(self, tmp_config):
+        st.save_config({"reset_verify": "off"})
+        assert st._reset_verify_on({"reset_verify": "on"}) is True        # explicit on
+        assert st._reset_verify_on({"reset_verify": "inherit"}) is False  # follows global off
+        assert st._reset_verify_on({}) is False                           # missing == inherit
+        st.save_config({"reset_verify": "on"})
+        assert st._reset_verify_on({"reset_verify": "off"}) is False      # explicit off
+        assert st._reset_verify_on({"reset_verify": "inherit"}) is True   # follows global on
+
+    def test_on_fires_the_entry_once_flat_is_proven(
+            self, ms_on, live_book, tmp_output_dir, monkeypatch):
+        st.active_account = "Sim101"
+        st.account_profiles["Sim101"] = {"default": {"reset_verify": "on"}}
+        monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {})
+        monkeypatch.setattr(st, "_reset_verify_cleared", _acoro_returning(True))
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1,
+                              ("bread_n_butter", "BnB"), "sid-a")
+        buy = "PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"
+        try:
+            with patch.object(st, "output_directory", str(tmp_output_dir)):
+                plans, _ = st.plan_signal_legs(buy, envelope=ENTRY_ENV)
+                assert plans[0]["reset_first"] is True
+                _run_plans(plans)
+        finally:
+            st.account_profiles.pop("Sim101", None)
+        bodies = [f.read_text() for f in sorted(tmp_output_dir.glob("oif_*.txt"))]
+        assert any(b.startswith("CLOSESTRATEGY;Sim101") for b in bodies)
+        assert any(b.startswith("PLACE;Sim101;NQ 06-26;BUY;1;") for b in bodies)
+
+    def test_on_withholds_the_entry_when_flat_cannot_be_proven(
+            self, ms_on, live_book, tmp_output_dir, monkeypatch):
+        st.active_account = "Sim101"
+        st.account_profiles["Sim101"] = {"default": {"reset_verify": "on"}}
+        monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {})
+        monkeypatch.setattr(st, "_reset_verify_cleared", _acoro_returning(False))
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1,
+                              ("bread_n_butter", "BnB"), "sid-a")
+        buy = "PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"
+        try:
+            with patch.object(st, "output_directory", str(tmp_output_dir)):
+                plans, _ = st.plan_signal_legs(buy, envelope=ENTRY_ENV)
+                _run_plans(plans)
+        finally:
+            st.account_profiles.pop("Sim101", None)
+        bodies = [f.read_text() for f in sorted(tmp_output_dir.glob("oif_*.txt"))]
+        # The closes fired; the opposite entry was withheld — never stacked.
+        assert any(b.startswith("CLOSESTRATEGY;Sim101") for b in bodies)
+        assert any(b.startswith("CLOSEPOSITION;Sim101;NQ 06-26") for b in bodies)
+        assert not any(b.startswith("PLACE;Sim101;NQ 06-26;BUY") for b in bodies)
 
 
 class TestLiveReconnectPath:

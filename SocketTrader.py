@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.20.2"
+__version__ = "0.21.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -1170,6 +1170,9 @@ DEFAULT_RULE = {
     "stagger_interval_ms": 1000,  # pause between tranches
     "atm": "",                  # per-account ATM template ("" = session default)
     "ai": None,                 # AI gate config dict, or None (see AI section)
+    "reset_verify": "inherit",  # inherit (global) | on | off — wait for PROOF the
+                                # standing position cleared before an opposite-
+                                # direction reset entry, instead of a blind settle
 }
 
 RULE_CLAMPS = {
@@ -1268,6 +1271,9 @@ def _coerce_rule(raw: dict, scoped: bool = False) -> dict:
     direction = str(raw.get("direction", "")).strip().lower()
     if direction in ("normal", "invert"):
         out["direction"] = direction
+    reset_verify = str(raw.get("reset_verify", "")).strip().lower()
+    if reset_verify in ("inherit", "on", "off"):
+        out["reset_verify"] = reset_verify
     if "atm" in raw and isinstance(raw["atm"], str):
         out["atm"] = sanitize_ati(raw["atm"].strip())
     if "ai" in raw:
@@ -2594,6 +2600,24 @@ _MAX_LEDGER_KEYS = 256
 _MAX_LEDGER_ENTRIES = 12      # per (account, root) — publisher strategies are few
 RESET_SETTLE_S = 1.5          # close→entry gap when an entry resets a market
                               # itself (the publisher's own pairs run 1–3s)
+RESET_VERIFY_KEY = "reset_verify"   # config: "on" | "off" (default) — the global
+                                    # default for the opposite-direction reset wait
+
+
+def _reset_verify_policy() -> str:
+    """Global default for the opposite-direction reset: 'on' waits for PROOF the
+    standing position cleared before the entry; 'off' (default) keeps the blind
+    RESET_SETTLE_S settle. Per-account/strategy rules override it (resolve_rule)."""
+    return "on" if str(load_config().get(RESET_VERIFY_KEY, "off") or "off").lower() == "on" else "off"
+
+
+def _reset_verify_on(rule: dict) -> bool:
+    """Effective reset-verify decision for a leg: an explicit per-account or
+    per-strategy on|off wins; 'inherit' (the default) defers to the global policy."""
+    rv = str((rule or {}).get("reset_verify", "inherit")).strip().lower()
+    if rv in ("on", "off"):
+        return rv == "on"
+    return _reset_verify_policy() == "on"
 _strategy_ledger: dict[tuple[str, str], list[dict]] = {}  # (account, ROOT) -> rows
 _ledger_lock = threading.Lock()   # entry writes run on the loop, flattens in threads
 
@@ -2694,7 +2718,8 @@ def _ledger_note_file(plan: dict, sig: str):
                 else "" if account == active_account else "follower")
         _pnl_note_open(account, parts[2], ident,
                        manual=bool(plan.get("manual")),
-                       source=plan.get("manual_source") or "", role=role)
+                       source=plan.get("manual_source") or "", role=role,
+                       action=parts[3])
     elif cmd == "CLOSEPOSITION" and len(parts) >= 3 and parts[2]:
         _ledger_clear(account, parts[2])
         _pnl_note_close(account, parts[2])
@@ -3169,6 +3194,24 @@ async def _prop_verify_cleared(to_close: dict[str, list[str]]) -> bool:
     return gone
 
 
+async def _reset_verify_cleared(account: str, instrument: str) -> bool:
+    """Confirm a reset's standing position on (account, root) is actually gone
+    before the opposite-direction entry fires — same proof-not-hope doctrine as
+    _prop_verify_cleared and verify_flat: an unverifiable state is NOT clear.
+    NinjaTrader can fill (and so close) 15–30 s late; firing the opposite entry
+    on the blind settle before the close lands leaves both ATMs alive to orphan a
+    bracket on the netted-flat account. The caller withholds the entry when this
+    cannot confirm, rather than stack an opposite position onto an unproven one."""
+    target = {(account, _alias_root(instrument).upper())}
+    gone, _remaining, _confirmed = await _watch_closed(
+        lambda positions: [p for p in positions
+                           if (p["account"], _alias_root(p["instrument"]).upper()) in target],
+        lambda since: _bridge_book_shows_cleared(target, since),
+        FLATTEN_VERIFY_TRIES, (FLATTEN_VERIFY_TRIES + 1) * FLATTEN_VERIFY_DELAY,
+        "RESET VERIFY")
+    return gone
+
+
 def _prop_withhold(plans: list[dict], why: str):
     """Refuse prop entries loudly: log, sticky alert, round-robin refund."""
     accounts = ", ".join(p["account"] for p in plans)
@@ -3522,11 +3565,37 @@ async def _run_deferred_leg(plan: dict, sig_id: str | None = None):
                 write_signal_to_file(_close_strategy_file(account, sid))
             for sig in _reset_close_files(account, plan["instrument"]):
                 write_signal_to_file(sig)
+            # The recorder must know this position is leaving before the
+            # entry below is staged on the same root (_pnl_note_open).
+            _pnl_note_close(account, plan["instrument"])
             _ledger_clear(account, plan["instrument"])
             _clear_inflight_opens(account, plan["instrument"])
             logger.info(f"RESET  account={account}  closed {plan['instrument']} "
                         f"before opposite-direction entry  strategies={sids}")
-            if not await _interruptible_sleep(RESET_SETTLE_S, account, manual):
+            if _reset_verify_on(rule):
+                # Proof, not a fixed beat (opt-in, global or per account/strategy):
+                # NinjaTrader can fill — and so close — 15–30 s late, and firing
+                # the opposite entry before the close lands leaves both ATMs alive
+                # to orphan a bracket on the netted-flat account. Wait for the
+                # standing position to be PROVEN gone; if it can't be confirmed,
+                # withhold the entry rather than stack an opposite one onto it.
+                if not await _reset_verify_cleared(account, plan["instrument"]):
+                    logger.error(
+                        f"RESET  account={account}  could not confirm "
+                        f"{plan['instrument']} cleared — opposite entry withheld")
+                    _dash_set_alert(
+                        Fore.RED + Style.BRIGHT +
+                        f"  ⛔  RESET — closed {plan['instrument']} on {account} but "
+                        "could not confirm it cleared; opposite entry withheld to "
+                        "avoid stacking. Check NinjaTrader." + Style.RESET_ALL,
+                        sticky=True)
+                    if plan.get("rr_pick"):
+                        _rr_return(account)
+                    return
+                if _leg_blocked(account, manual):
+                    logger.info(f"LEG ABORTED  account={account}  during=reset verify")
+                    return
+            elif not await _interruptible_sleep(RESET_SETTLE_S, account, manual):
                 logger.info(f"LEG ABORTED  account={account}  during=reset settle")
                 return
         delay_s = (rule["delay_ms"]
@@ -6692,7 +6761,7 @@ async def _edit_rule_menu(rule: dict, title: str, scoped: bool):
                   3: ("qty_mode", "qty_value", "max_contracts"),
                   4: ("direction",), 5: ("delay_ms", "delay_jitter_ms"),
                   6: ("stagger_entries", "stagger_interval_ms"),
-                  7: ("atm",), 8: ("ai",)}
+                  7: ("atm",), 8: ("ai",), 9: ("reset_verify",)}
     while True:
         eff = {**DEFAULT_RULE, **{k: v for k, v in rule.items() if k in DEFAULT_RULE}}
 
@@ -6710,6 +6779,9 @@ async def _edit_rule_menu(rule: dict, title: str, scoped: bool):
             f" · cap {eff['max_contracts']}" if eff["max_contracts"] else "")
         ai = eff["ai"]
         ai_label = "off" if not ai else f"{ai['provider']} · {ai['model'] or 'default'}"
+        rv_label = {"on": "on — wait for proof flat",
+                    "off": "off — blind settle",
+                    "inherit": "inherit (global)"}.get(eff["reset_verify"], eff["reset_verify"])
         lines = [
             f"1.{mark('enabled')} Entries       {'on' if eff['enabled'] else 'OFF — exits only'}",
             f"2.{mark('size')} Size          {_SIZE_LABELS[eff['size']]}",
@@ -6719,11 +6791,12 @@ async def _edit_rule_menu(rule: dict, title: str, scoped: bool):
             f"6.{mark('stagger_entries', 'stagger_interval_ms')} Stagger       {stagger_label}",
             f"7.{mark('atm')} ATM override  {eff['atm'] or 'inherit'}",
             f"8.{mark('ai')} AI gate       {ai_label}",
+            f"9.{mark('reset_verify')} Reset verify  {rv_label}",
         ]
         if scoped:
             scope = (f"{', '.join(rule.get('symbols', [])) or 'any symbol'} · "
                      f"{', '.join(rule.get('strategies', [])) or 'any strategy'}")
-            lines.append(f"9.  Scope         {scope[:40]}")
+            lines.append(f"10. Scope         {scope[:40]}")
         _prof_box(title, lines, [
             "* = set here · number = edit · -number = reset field",
             "Exits are never blocked, delayed, or AI-gated.",
@@ -6818,7 +6891,17 @@ async def _edit_rule_menu(rule: dict, title: str, scoped: bool):
                           + Style.RESET_ALL)
         elif n == 8:
             await _edit_ai_gate(rule)
-        elif n == 9 and scoped:
+        elif n == 9:
+            raw_v = (await _ask_line("RESET VERIFY [i]nherit / [o]n / o[f]f")).lower().strip()
+            if raw_v.startswith("i"):
+                rule["reset_verify"] = "inherit"
+            elif raw_v.startswith("o"):
+                rule["reset_verify"] = "on"
+            elif raw_v.startswith("f"):
+                rule["reset_verify"] = "off"
+            elif raw_v:
+                print(Fore.YELLOW + "  ⚠  Unknown — unchanged." + Style.RESET_ALL)
+        elif n == 10 and scoped:
             await _edit_rule_scope(rule)
 
 
@@ -8585,6 +8668,10 @@ def _bracket_guard_event(line: str, now: float | None = None) -> str | None:
         stamp = _nt_log_stamp(line) or now
         if stamp - fill[0] > BRACKET_GUARD_FILL_WINDOW_S or now - stamp > BRACKET_GUARD_MAX_AGE_S:
             return None
+        if (p["acct"], _alias_root(p["instr"]).upper()) not in _pnl_open_meta:
+            # Nobody's trade — and the trade log should say so, instead of
+            # calling the position a chart trade when it shows up.
+            _pnl_note_open(p["acct"], p["instr"], ("", "orphan ATM bracket"))
         policy = _bracket_guard_policy()
         if policy == "off":
             return None
@@ -10267,6 +10354,7 @@ def web_state() -> dict:
         "paused": paused, "hard_stopped": hard_stopped, "soft_stopped": soft_stopped,
         "trade_ready": is_trade_ready(),
         "micro_mode": micro_mode,
+        "reset_verify": _reset_verify_policy(),
         "atm_strategy": atm_strategy,
         "follow_publisher_strategy": follow_publisher_strategy,
         "atm_available": atm_templates,
@@ -10512,6 +10600,19 @@ async def _web_toggle_micro() -> tuple[bool, str]:
     on = toggle_micro_mode()
     refresh_terminal()
     return True, f"micro mode {'ON' if on else 'off'}"
+
+
+async def _web_toggle_reset_verify() -> tuple[bool, str]:
+    if hard_stopped:
+        return False, "session hard-locked — settings are frozen"
+    on = _reset_verify_policy() != "on"      # flip
+    cfg = load_config()
+    cfg[RESET_VERIFY_KEY] = "on" if on else "off"
+    save_config(cfg)
+    refresh_terminal()
+    logger.info(f"RESET VERIFY  global {'ON' if on else 'OFF'}")
+    return True, ("reset verify ON — opposite-direction resets wait for proof flat"
+                  if on else "reset verify off — blind settle")
 
 
 async def _web_set_accounts(leader, followers, robins) -> tuple[bool, str]:
@@ -11176,6 +11277,9 @@ _pnl_last_save = 0.0
 _PNL_SHARD_RE = re.compile(r"^\d{4}-\d\d$")
 
 
+PNL_CORRECTIONS_FILE = "corrections.json"   # in PNL_DIR; applied once, at load
+
+
 def _pnl_shard(month: str) -> Path:
     return PNL_DIR / f"{month}.json"
 
@@ -11283,6 +11387,76 @@ def _pnl_migrate_legacy():
                 f"{len(by_month)} monthly file(s) under {PNL_DIR}")
 
 
+def _pnl_apply_corrections(month: str, days: dict) -> int:
+    """Apply operator corrections to the live month's trade rows, once.
+
+    PNL_DIR/corrections.json holds {"v": 1, "rows": [{"day": "2026-10-08",
+    "ts": <row ts>, "account": "Sim101", "strategy": "Gooping", "role":
+    "follower"}, ...]}. A row is matched by day, account and its exact
+    `ts`; only `strategy` and `role` can be set (an empty role removes
+    it). Corrections for this month are consumed whether or not they
+    matched — a miss is logged — and the rest wait for their month. This
+    is how a row the recorder named wrong gets fixed without stopping the
+    trader: the live month is written back from memory, so an edit to the
+    archive on disk would only be overwritten."""
+    path = PNL_DIR / PNL_CORRECTIONS_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return 0
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.error(f"PNL HISTORY  {PNL_CORRECTIONS_FILE} could not be read "
+                     f"({exc}) — left alone")
+        return 0
+    rows = data.get("rows") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return 0
+    keep: list = []
+    applied = missed = 0
+    for c in rows:
+        day = str((c or {}).get("day") or "") if isinstance(c, dict) else ""
+        if not day.startswith(month + "-"):
+            keep.append(c)
+            continue
+        try:
+            want = float(c.get("ts"))
+        except (TypeError, ValueError):
+            missed += 1
+            continue
+        hits = [t for t in ((days.get(day) or {}).get("trades") or [])
+                if isinstance(t, dict) and t.get("account") == c.get("account")
+                and isinstance(t.get("ts"), (int, float))
+                and abs(t["ts"] - want) < 0.001]
+        if not hits:
+            missed += 1
+            continue
+        for t in hits:
+            if "strategy" in c:
+                t["strategy"] = str(c["strategy"] or "")
+            if "role" in c:
+                if c["role"]:
+                    t["role"] = str(c["role"])
+                else:
+                    t.pop("role", None)
+        applied += 1
+    try:
+        if keep:
+            fd, tmp = tempfile.mkstemp(dir=str(PNL_DIR), prefix=".corr", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"v": 1, "rows": keep}, f)
+            os.replace(tmp, path)
+        else:
+            os.remove(path)
+    except OSError as exc:
+        logger.error(f"PNL HISTORY  {PNL_CORRECTIONS_FILE} could not be updated: {exc}")
+    if applied or missed:
+        logger.info(f"PNL HISTORY  {month}: applied {applied} correction(s) from "
+                    f"{PNL_CORRECTIONS_FILE}"
+                    + (f", {missed} matched no row" if missed else ""))
+    return applied
+
+
 def _pnl_hot(month: str) -> dict:
     """Day records for `month`, loaded as the live month. Caller holds the lock.
 
@@ -11299,8 +11473,10 @@ def _pnl_hot(month: str) -> dict:
     _pnl_migrate_legacy()
     _pnl_hot_month = month
     _pnl_history = {"v": 2, "days": _pnl_read_shard(month)}
-    # _pnl_read_shard heals rollover phantoms on the way in; the live month
-    # is the one that gets written back, so make sure the cleaned copy is.
+    _pnl_apply_corrections(month, _pnl_history["days"])
+    # _pnl_read_shard heals rollover phantoms on the way in and corrections
+    # land here; the live month is the one that gets written back, so make
+    # sure the amended copy is.
     _pnl_dirty = True
     _pnl_cache.pop(month, None)          # the live copy supersedes any cached one
     return _pnl_history["days"]
@@ -11354,9 +11530,75 @@ def _pnl_save(force: bool = False):
     _pnl_write_shard(month, payload)
 
 
+def _pnl_side(action: str) -> int:
+    """+1 for a buy, -1 for a sell, 0 when the OIF action is not known."""
+    a = (action or "").strip().upper()
+    if a in ("BUY", "BUYTOCOVER"):
+        return 1
+    if a in ("SELL", "SELLSHORT"):
+        return -1
+    return 0
+
+
+def _pnl_follows_a_close(meta: dict, action: str, now: float) -> bool:
+    """Does an entry staged now follow the position `meta` describes OUT?
+
+    Yes when dispatch has fired a close on that position and the flag is
+    still inside its window, or when the entry goes the other way from the
+    side the position was last seen holding — a reset before an opposite
+    entry writes both. Either way the position on the books is leaving,
+    and the new label is for its successor, not for it."""
+    fired = meta.get("close_fired")
+    if isinstance(fired, (int, float)) and now - fired <= PNL_STAGED_TTL_S:
+        return True
+    side = _pnl_side(action)
+    held = meta.get("side")
+    return bool(side and held and side != held)
+
+
+def _pnl_next_slot(meta: dict, now: float) -> dict | None:
+    """The label staged for the position that follows `meta`'s, while fresh.
+
+    An entry that never fills must not name a position that opens an hour
+    later, so the slot ages out on the same clock as any staged entry."""
+    nxt = meta.get("next")
+    if not isinstance(nxt, dict):
+        return None
+    staged = nxt.get("staged_ts")
+    if not isinstance(staged, (int, float)) or now - staged > PNL_STAGED_TTL_S:
+        meta.pop("next", None)
+        return None
+    return nxt
+
+
+def _pnl_meta_from_next(nxt: dict) -> dict:
+    """A fresh root record waiting on the entry `nxt` was staged for."""
+    meta = {"strategies": list(nxt.get("strategies") or []), "ts": None,
+            "avg": None, "cost": 0.0, "staged_ts": nxt.get("staged_ts")}
+    if nxt.get("role"):
+        meta["role"] = nxt["role"]
+    if nxt.get("sides"):
+        meta["sides"] = dict(nxt["sides"])
+    return meta
+
+
+def _pnl_keep_labels_on_side(meta: dict, held: int):
+    """Drop staged labels whose entry went the other way from the position
+    that showed up: a reset cancels the entry it found unfilled, and that
+    entry's name must not ride on the fill that followed it. A label with
+    no known side stays, and so do all of them when none agrees — an
+    unexplained position is still better named than blank."""
+    sides = meta.get("sides") or {}
+    names = meta.get("strategies") or []
+    kept = [s for s in names if sides.get(s, held) == held]
+    if kept and len(kept) != len(names):
+        meta["strategies"] = kept
+
+
 def _pnl_note_open(account: str, instrument: str, ident: tuple[str, str],
                    manual: bool = False, source: str = "",
-                   now: float | None = None, role: str = ""):
+                   now: float | None = None, role: str = "",
+                   action: str = ""):
     """Stage strategy attribution for an entry the write path just fired.
 
     Called from _ledger_note_file, i.e. inside the dispatch path — it must
@@ -11379,7 +11621,15 @@ def _pnl_note_open(account: str, instrument: str, ident: tuple[str, str],
     `role` is the leg's part in the signal — "follower" for a copy of the
     leader's entry, "round-robin" for the rotation's one draw — kept on
     the position so its trade row can say so beside the strategy name.
-    The leader's own legs carry none."""
+    The leader's own legs carry none.
+
+    `action` is the OIF side (BUY/SELL). An entry that follows the open
+    position out — a close was fired on it, or this goes the other way —
+    is staged for the NEXT position on the root, never on the one about
+    to leave: on 2026-10-08 21:15 the XRetest short was staged over the
+    MSSComp long on SimEverything, the long was seen closing at 21:15:11
+    and took the root's whole record with it, and the short seen at
+    21:15:20 had no name left — "Manual", for a copy trade."""
     try:
         root = _alias_root(instrument).upper()
         if not account or not root:
@@ -11387,17 +11637,37 @@ def _pnl_note_open(account: str, instrument: str, ident: tuple[str, str],
         label = (ident[1] or "").strip() or (ident[0] or "").strip()
         if not label and manual:
             label = (source or "").strip() or "Manual"
+        stamp = time.time() if now is None else now
+        side = _pnl_side(action)
         meta = _pnl_open_meta.setdefault(
             (account, root), {"strategies": [], "ts": None, "avg": None,
                               "cost": 0.0, "staged_ts": None})
+        if meta.get("ts") is not None and _pnl_follows_a_close(meta, action, stamp):
+            # The position on the books is leaving: this label belongs to
+            # the one that comes next on the root. Kept aside so the
+            # closing row never wears it and the opening row never loses
+            # it when the close is seen a poll before the fill.
+            nxt = _pnl_next_slot(meta, stamp)
+            if nxt is None:
+                nxt = meta["next"] = {"strategies": [], "role": "",
+                                      "staged_ts": stamp}
+            if label and label not in nxt["strategies"]:
+                nxt["strategies"].append(label)
+            if label and side:
+                nxt.setdefault("sides", {})[label] = side
+            if role:
+                nxt["role"] = role
+            return
         if meta.get("ts") is None:
             # Nothing has been observed on this root yet, so this dispatch
             # is what the record is waiting on. Adding to an already-open
             # position must not restart the clock: that position is real
             # and its meta is no longer pending anything.
-            meta["staged_ts"] = time.time() if now is None else now
+            meta["staged_ts"] = stamp
         if label and label not in meta["strategies"]:
             meta["strategies"].append(label)
+        if label and side:
+            meta.setdefault("sides", {})[label] = side
         if role:
             meta["role"] = role
     except Exception as exc:      # bookkeeping must never block dispatch
@@ -11897,6 +12167,7 @@ def _pnl_observe(live: dict, now: float | None = None,
                                        "avg": None, "cost": 0.0})
                     if meta.get("avg") is None:
                         meta["avg"] = _pnl_avg_price(row, root)
+                    meta["side"] = 1 if qty > 0 else -1
                 # Falls through to the session settle-up below: a restart
                 # is one of the ways a fill goes unseen in the first place.
                 if _pnl_settle_session(name, acct_day, cash, shape,
@@ -11918,6 +12189,10 @@ def _pnl_observe(live: dict, now: float | None = None,
             dreal = (realized - pr
                      if realized is not None and isinstance(pr, (int, float))
                      else None)
+            # Money moved this poll: the only evidence a snapshot has that
+            # a leg left and another arrived while the quantity held still.
+            moved = (abs(dreal) >= 0.005 if dreal is not None
+                     else abs(dcash) >= 0.005)
             closes: list[dict] = []
             opens: list[dict] = []
             for root in set(prev["shape"]) | set(shape):
@@ -11928,13 +12203,23 @@ def _pnl_observe(live: dict, now: float | None = None,
                 # A close was dispatched for this root and a position is
                 # still showing. The snapshot cannot tell "never left" from
                 # "left and came straight back the same size" — the two are
-                # the same arithmetic. Dispatch can, and said so, so this
-                # is the far side of a new leg however the quantities line
-                # up. Consumed on read: it describes one transition.
-                fired = (_pnl_open_meta.get(key) or {}).pop("close_fired", None)
+                # the same arithmetic — nor from "the close has not filled
+                # yet" (NinjaTrader fills 4–27 s late on a slow day). So a
+                # re-leg needs all three: the close was fired, the entry
+                # that came back was staged, and money moved. Until a
+                # transition is seen the flag waits; it describes one, and
+                # is consumed by it or ages out unused.
+                meta0 = _pnl_open_meta.get(key) or {}
+                fired = meta0.get("close_fired")
+                if isinstance(fired, (int, float)) and ts - fired > PNL_STAGED_TTL_S:
+                    meta0.pop("close_fired", None)
+                    fired = None
+                staged_next = _pnl_next_slot(meta0, ts) if meta0 else None
                 relegged = bool(q0 and q1 and not flipped
                                 and isinstance(fired, (int, float))
-                                and ts - fired <= PNL_STAGED_TTL_S)
+                                and staged_next is not None and moved)
+                if fired is not None and (q0 != q1 or flipped or relegged):
+                    meta0.pop("close_fired", None)
                 if flipped or relegged:
                     closed, opened = abs(q0), abs(q1)
                 else:
@@ -11964,16 +12249,22 @@ def _pnl_observe(live: dict, now: float | None = None,
                               "cost": 0.0})
                     if flipped or relegged:
                         # The far side of a reversal — or of a close the
-                        # poll never saw — is a fresh trade; only the label
-                        # staged by the write that opened it survives.
-                        staged = meta["strategies"][-1:]
-                        part = meta.get("role")
+                        # poll never saw — is a fresh trade: it takes the
+                        # label staged for the position that follows, or,
+                        # when dispatch gave no side to tell them apart,
+                        # the last label staged on the root.
+                        nxt = _pnl_next_slot(meta, ts)
+                        if nxt is not None:
+                            fresh_meta = _pnl_meta_from_next(nxt)
+                        else:
+                            fresh_meta = {"strategies": meta["strategies"][-1:],
+                                          "ts": None, "avg": None, "cost": 0.0}
+                            if meta.get("role"):
+                                fresh_meta["role"] = meta["role"]
                         meta.clear()
-                        meta.update({"strategies": staged, "ts": None,
-                                     "avg": None, "cost": 0.0})
-                        if part:
-                            meta["role"] = part
+                        meta.update(fresh_meta)
                     if not q0 or flipped or relegged or meta.get("ts") is None:
+                        _pnl_keep_labels_on_side(meta, 1 if q1 > 0 else -1)
                         meta["ts"] = ts
                     meta["avg"] = _pnl_avg_price(row, root) or meta.get("avg")
                     opens.append({"key": key, "qty": opened})
@@ -11982,8 +12273,18 @@ def _pnl_observe(live: dict, now: float | None = None,
                         key, {"strategies": [], "ts": None, "avg": None,
                               "cost": 0.0}
                     )["avg"] = _pnl_avg_price(row, root)
+                if q1 and key in _pnl_open_meta:
+                    # Which way the root is held, so an entry staged the
+                    # other way is known to follow this position out.
+                    _pnl_open_meta[key]["side"] = 1 if q1 > 0 else -1
                 if not q1:
-                    _pnl_open_meta.pop(key, None)
+                    gone = _pnl_open_meta.pop(key, None)
+                    nxt = _pnl_next_slot(gone, ts) if gone else None
+                    if nxt is not None:
+                        # The position left, and an entry dispatched to
+                        # follow it is still pending: its label is what
+                        # the record waits on now.
+                        _pnl_open_meta[key] = _pnl_meta_from_next(nxt)
 
             if not closes:
                 # An entry whose position became visible in THIS poll is
@@ -12624,6 +12925,8 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
                 ok, msg = True, "reconnect requested"
             elif path == "/api/micro":
                 ok, msg = _web_run(_web_toggle_micro())
+            elif path == "/api/reset_verify":
+                ok, msg = _web_run(_web_toggle_reset_verify())
             elif path == "/api/micro_map":
                 ok, msg = _web_run(_web_set_micro_map(data.get("map")))
             elif path == "/api/favorites":
@@ -13036,6 +13339,7 @@ box-shadow:var(--shadow);max-width:280px}
       <div class="btnrow">
         <button class="sm" id="btnReconnect">RECONNECT</button>
         <button class="sm" id="btnMicro">MICROS</button>
+        <button class="sm" id="btnResetVerify">RESET VERIFY</button>
         <button class="sm" id="btnResetPnl">RESET P&amp;L</button>
         <button class="sm ghost" id="btnStrategy">STRATEGY…</button>
       </div>
@@ -13632,6 +13936,9 @@ function accountModal(a){
     at.value=rule.atm||"";P.appendChild(at);
     if(rule.ai)P.appendChild(el("div","sub","AI gate: "+rule.ai.provider+
       " — configure from the terminal"));
+    P.appendChild(el("label",null,"Reset verify (opposite-direction reset)"));
+    const rv=pickGroup(P,[{label:"GLOBAL",value:"inherit"},{label:"ON",value:"on"},
+      {label:"OFF",value:"off"}],rule.reset_verify||"inherit");
 
     /* ---- Scoped rules: per-symbol / per-strategy exceptions. Mirrors the
        terminal's S → 8 → account → R editor; each rule carries only the
@@ -13667,6 +13974,7 @@ function accountModal(a){
       if("delay_ms"in r)b.push("delay "+r.delay_ms+"ms");
       if("stagger_entries"in r)b.push("stagger "+r.stagger_entries);
       if(r.atm!=null)b.push("ATM "+(r.atm||"session"));
+      if(r.reset_verify)b.push("reset verify "+r.reset_verify);
       if(r.ai)b.push("AI:"+(r.ai.provider||"on"));
       return b.join(" · ")||"no overrides yet"}
     function drawRules(openIdx){
@@ -13768,6 +14076,11 @@ function accountModal(a){
         at2.value="atm"in r?r.atm:"__inh";
         at2.onchange=()=>set("atm",at2.value,at2.value==="__inh");
         B.appendChild(at2);
+        B.appendChild(el("label",null,"Reset verify"));
+        pickGroup(B,[{label:"INHERIT",value:"i"},{label:"ON",value:"on"},
+          {label:"OFF",value:"off"}],
+          "reset_verify"in r?r.reset_verify:"i",
+          v=>set("reset_verify",v,v==="i"));
         if(r.ai)B.appendChild(el("div","sub","AI gate: "+(r.ai.provider||"configured")+
           " — configure from the terminal; deleting this rule discards it"));
 
@@ -13803,6 +14116,7 @@ function accountModal(a){
       d.qty_value=parseFloat(qv.value||"1");d.max_contracts=parseInt(cap.value||"0",10);
       d.direction=dir.value;d.delay_ms=parseInt(dl.value||"0",10);
       d.stagger_entries=parseInt(stg.value||"1",10);
+      d.reset_verify=rv.value;
       if(at.value)d.atm=at.value;else delete d.atm;
       e.default=d;
       if(allowed.length)e.symbols_allowed=allowed;else delete e.symbols_allowed;
@@ -14538,6 +14852,9 @@ function renderChips(){
   nt.className="chip "+((L&&L.ok)?"info":"bad");
   const mc=$("chMicro");mc.textContent=S.micro_mode?"MICROS ON":"micros off";
   mc.className="chip "+(S.micro_mode?"info":"");
+  const rvb=$("btnResetVerify");if(rvb){rvb.textContent="RESET VERIFY: "+
+    ((S.reset_verify||"off")==="on"?"ON":"OFF");
+    rvb.className="sm "+((S.reset_verify||"off")==="on"?"on":"")}
   $("chAtm").textContent="ATM "+(S.atm_strategy||"—")+
     (S.follow_publisher_strategy?" · follow":"");
   $("chCount").textContent=S.signal_count+" signals · v"+S.version;
@@ -14625,6 +14942,7 @@ $("btnFlatten").onclick=()=>{if(confirm("Flatten ALL positions on every managed 
   api("/api/close_all",{})};
 $("btnReconnect").onclick=()=>api("/api/reconnect",{});
 $("btnMicro").onclick=()=>api("/api/micro",{});
+$("btnResetVerify").onclick=()=>api("/api/reset_verify",{});
 $("btnResetPnl").onclick=()=>{if(confirm("Reset session P&L and re-snapshot balances?"))
   api("/api/reset_pnl",{})};
 $("btnStrategy").onclick=()=>{if(S)strategyModal()};

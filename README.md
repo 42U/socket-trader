@@ -6,7 +6,7 @@
 
 [![VoidOrigin](https://img.shields.io/badge/VOIDORIGIN-voidorigin.com-0a0a0a?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiIHN0cm9rZT0iI2ZmNmIzNSIgc3Ryb2tlLXdpZHRoPSIyIi8+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iNCIgZmlsbD0iI2ZmNmIzNSIvPjwvc3ZnPg==&logoColor=ff6b35&labelColor=0a0a0a)](https://voidorigin.com)
 
-[![Version](https://img.shields.io/badge/v0.20.2-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
+[![Version](https://img.shields.io/badge/v0.21.0-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
 [![GitHub Stars](https://img.shields.io/github/stars/42U/socket-trader?style=for-the-badge&logo=github&color=gold)](https://github.com/42U/socket-trader)
 [![License: MIT](https://img.shields.io/github/license/42U/socket-trader?style=for-the-badge&logo=opensourceinitiative&color=blue)](https://opensource.org/licenses/MIT)
 [![CI](https://img.shields.io/github/actions/workflow/status/42U/socket-trader/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
@@ -62,7 +62,7 @@ The sim account is automatically swapped with your real NinjaTrader account name
 | **Global strategy filter** | One map — *"GoldStrat only trades GC, NasdaqStrat only NQ"* — applied to every account before any leg exists; exits are never filtered |
 | **Multi-strategy mode** | Subscribe to **several publisher strategies sharing a market** without them trampling each other: each strategy's close-then-place pair is **scoped to its own position** — a close from a strategy that holds nothing here is skipped, a shared position closes only the sender's contracts, and **same-direction entries stack** (within `max_contracts`); opposite entries still reset the market first |
 | **Front-month roll guard** | A signal naming an **expiring contract month** (broker says *"liquidation only"*) is rolled to the known front before fan-out — synced from NinjaTrader's own rollover schedule via the AddOn, calendar fallback without it; old-month positions still get their closes |
-| **Per-account profiles** | Each account can filter which **symbols it trades**, trade micros or full-size, its own contract count, inverted direction, delayed or staggered entries, its own ATM template, and an optional **AI gate** — scoped per symbol / publisher strategy, and **exportable** to a file or straight onto another account |
+| **Per-account profiles** | Each account can filter which **symbols it trades**, trade micros or full-size, its own contract count, inverted direction, delayed or staggered entries, its own ATM template, whether opposite-direction resets **verify flat** before re-entering, and an optional **AI gate** — scoped per symbol / publisher strategy, and **exportable** to a file or straight onto another account |
 | **Balance outage armor** | A NinjaTrader broker-feed outage that zeroes every account reading is quarantined: last known balances are **held and marked stale** instead of tripping phantom stops or poisoning session baselines |
 | **Live trade monitor** | Optional NinjaTrader AddOn streams live equity (cash + unrealized) so stops and targets trip **mid-trade**, with native `account.Flatten()` for closes — and a live **position book** that lets prop entries skip the close-before-open snapshot when every account is provably flat |
 | **Manual trading** | Press `O` (or use the web UI) to submit your own long/short market/limit order with an ATM template — it fans out through copy trading, round-robin, and profiles exactly like a publisher signal, with the ATM template you pick standing in as the strategy name your scoped rules match |
@@ -363,6 +363,7 @@ Copy trading fans identical signals to every account. **Profiles** let each acco
 │  6.* Stagger       3 tranches × 2000ms                   │
 │  7.  ATM override  inherit                               │
 │  8.* AI gate       ollama · llama3.2                     │
+│  9.  Reset verify  inherit (global)                      │
 │  * = set here · number = edit · -number = reset field    │
 │  Exits are never blocked, delayed, or AI-gated.          │
 │  ENTER = done                                            │
@@ -382,6 +383,7 @@ Each account has a **default rule** plus optional **scoped rules** keyed by symb
 | **Entry delay** | Fixed ms + optional random jitter before entries fire |
 | **Stagger** | Split each entry into up to 10 tranches at an interval (5 contracts in 3 tranches → 2/2/1). Tranche order ids get unique `~T2`, `~T3`… suffixes, and publisher exits (`CLOSESTRATEGY` / `CANCEL` / `CHANGE`) are fanned out to every tranche |
 | **ATM override** | A different ATM template for this account — e.g. a micro-sized stop template for a micro account |
+| **Reset verify** | On an opposite-direction reset (closing a standing position to open the other way on the same market), wait for **proof** NinjaTrader actually cleared the old position before the new entry fires, instead of a fixed settle. A late fill then can't leave both ATMs alive to orphan a bracket on a netted-flat account; if the close can't be confirmed, the opposite entry is **withheld** (loud alert) rather than stacked. `inherit` follows the global toggle (default **off**); `on` / `off` set it for this account or scoped rule |
 | **AI gate** | Ask an AI to approve, veto, or shrink each entry (below) |
 
 **Exit priority is absolute.** No profile setting can block, delay, or AI-gate an exit. A `REVERSEPOSITION` a rule won't take as a new entry (disabled scope, inverted limit order, sized to zero) is downgraded to `CLOSEPOSITION` so the old position still closes. Pausing, a session stop, or a hard lock aborts pending delayed/staggered entries before they fire.
@@ -421,6 +423,8 @@ Profiles persist in `~/.voidorigin_config.json` under `account_profiles` and are
 
 Accounts without a profile behave exactly as before — identical copy of the leader's signal.
 
+**Reset verify (global).** The opposite-direction reset wait has a global default too — a **RESET VERIFY** button in the web UI's Session card, or the `"reset_verify": "on" | "off"` key in `~/.voidorigin_config.json`. It ships **off** (the fixed settle); turn it on to make every account wait for proof-of-flat before re-entering, then override per account or per scoped rule (`inherit` follows this global). The primary defence against orphan brackets — cancelling the standing entry with `CLOSESTRATEGY` before the close — is always on; this is the extra belt-and-suspenders wait on top of it.
+
 ### Export & import
 
 A setup you've proven on one account shouldn't have to be retyped on the next. A profile travels as a small JSON document:
@@ -433,7 +437,7 @@ An import **replaces the whole profile** (you're asked first when the target alr
 ```json
 {
   "socket_trader_profile": 1,
-  "app_version": "0.20.2",
+  "app_version": "0.21.0",
   "exported_from": "Sim102",
   "exported_at": "2026-09-29T14:03:00Z",
   "profile": {
@@ -574,6 +578,7 @@ The **P&L** tab in the web UI is a standalone day-by-day trading record — no b
 - **Calendar** — the current month (navigable back through history) as a Mon–Fri grid with a weekly-totals column. Each day is washed green or red with intensity scaled to its P&L, and shows net, trade count and win rate. Days are keyed by **CME session close date**, so Sunday-evening trades land on Monday — the same convention as every session number in the app.
 - **Month statistics** — net P&L, green/red days, day and trade win rates, profit factor, average day, best/worst day, current streak, plus a cumulative **equity curve**.
 - **Day drill-down** — click any day for the full sheet: net P&L, trades, win rate, profit factor, average trade/win/loss, largest win/loss, gross profit/loss, long vs short split, average hold — then **by-symbol, by-strategy and by-account** breakdown tables, an intraday cumulative curve, and the complete trade log (time, account, symbol, side, qty, strategy, entry, hold time, P&L). Follower legs are tagged `copy` and rotation legs `round robin` beside the publisher's strategy name — the name itself is the same on every account, so a strategy's results add up across the group. A row with no strategy at all that was watched opening is `Manual`: a trade taken straight off a NinjaTrader chart.
+- **Corrections** — a row the recorder named wrong can be fixed without stopping the trader: put `{"v": 1, "rows": [{"day": "2026-10-08", "ts": <row ts>, "account": "Sim101", "strategy": "Gooping", "role": "follower"}]}` in `~/.voidorigin_pnl/corrections.json`; it is applied once at the next start and removed.
 
 **How the numbers are measured.** The per-day net is the change in each managed account's realized cash balance over the session — the same source and definition as the Session P&L tile, so commissions are included and the calendar always agrees with what you watched during the day. Trades are the drill-down layer: when a position closes, the account's cash move in that window is attributed to the market that closed, tagged with the strategy that opened it. When several markets close inside one poll window the move is split by contracts closed and the rows are marked `≈`; entry commissions and any other drift show up as their own **fees / unattributed** line instead of being hidden inside trade numbers. The balance-outage quarantine applies here too — a NinjaTrader feed drop can never mint phantom trades or a phantom red day.
 
