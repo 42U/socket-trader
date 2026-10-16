@@ -6453,7 +6453,9 @@ class TestMultiStrategyEndToEnd:
         assert plans == [] and "regime_routed" in skipped[0][1]
 
         sell = "PLACE;Sim101;NQ 06-26;SELL;1;MARKET;;;DAY;;;Mss;sid-mss"
-        with patch.object(st, "RESET_SETTLE_S", 0.01), \
+        st._closes_dispatched.clear(); st._nt_orders.clear()
+        with patch.object(st, "_reset_watch", _acoro_returning((True, [], True))), \
+             patch.object(st, "_flip_mode", lambda *a, **k: ("sequence", "test", 0)), \
              patch.object(st, "output_directory", str(tmp_output_dir)):
             plans, _ = st.plan_signal_legs(
                 sell, envelope={"strategy": "mss_de_composite",
@@ -6463,11 +6465,12 @@ class TestMultiStrategyEndToEnd:
         assert written == []            # deferred legs report via task
         files = self._files(tmp_output_dir)
         # regime's own strategy cancelled/closed by id (it may not even
-        # have filled yet), the full close (both sizes) behind it, then
-        # the entry — in that order
+        # have filled yet), flat PROVEN, then the entry — in that order.
+        # No plain close rides behind the CLOSESTRATEGY any more: NinjaTrader
+        # read that pair inside CLOSESTRATEGY's bracket-cancel window and
+        # closed the position twice (SimAlwaySummer, 2026-10-16 02:50).
         assert files[0] == "CLOSESTRATEGY;Sim101;;;;;;;;;;;sid-reg"
-        assert files[1].startswith("CLOSEPOSITION;Sim101;NQ 06-26")
-        assert any(f.startswith("CLOSEPOSITION;Sim101;MNQ 06-26") for f in files)
+        assert not any(f.startswith("CLOSEPOSITION;Sim101") for f in files)
         assert files[-1] == sell
         # the reset voided regime's attribution; mss owns the market now
         assert [r["sid"] for r in st._ledger_entries("Sim101", "NQ 06-26")] == ["sid-mss"]
@@ -8962,6 +8965,9 @@ class TestBracketGuard:
         st.active_account = "SimAI"
         st.follower_accounts = ["Sim101"]
         st.output_directory = str(tmp_output_dir)
+        st._nt_orders.clear(); st._nt_positions.clear(); st._uncovered_since.clear()
+        st._closes_dispatched.clear(); st._nt_unknown_sids.clear()
+        st._nt_position_seen.clear(); st._nt_flat_seen.clear()
         return st._nt_log_stamp(self.STOP_REJ) + 1.0        # "now", a second after the line
 
     def _closes(self, tmp_output_dir):
@@ -9139,6 +9145,162 @@ class TestBracketGuard:
         assert self._closes(incoming) and self._closes(incoming)[0].startswith(
             "CLOSEPOSITION;SimAI;NQ 12-26;")
 
+    # 2026-10-16 02:50, SimAlwaySummer: the reset's CLOSESTRATEGY and
+    # CLOSEPOSITION each submitted a close; the second one's fill opened a
+    # long on the flat account. Real lines, re-addressed to the leader.
+    CLOSE_FILL = ("2026-10-16 02:50:12:150|1|32|Order='d991650b7deb438296d69f883efd9f3c/SimAI' "
+                  "Name='Close' New state='Filled' Instrument='NQ DEC26' Action='Buy to cover' "
+                  "Limit price=0 Stop price=0 Quantity=1 Type='Market' Time in force=GTC Oco='' "
+                  "Filled=1 Fill price=30156 Error='No error' Native error=''")
+    CLOSE_ADD = ("2026-10-16 02:50:12:893|1|64|Instrument='NQ DEC26' Account='SimAI' "
+                 "Average price=30156 Quantity=1 Market position=Long Operation=Operation_Add")
+    CLOSE_REMOVE = ("2026-10-16 02:50:10:397|1|64|Instrument='NQ DEC26' Account='SimAI' "
+                    "Average price=0 Quantity=0 Market position=Flat Operation=Remove")
+    UNKNOWN_SID = ("2026-10-16 02:50:01:165|3|1|OIF, 'CLOSESTRATEGY;SimAlwaySummer;;;;;;;;;;;"
+                   "ent:nq_gooping:Nasdaq:2026-10-15T14:20:00-04:00~SimAlwaySummer' unknown strategy")
+
+    def test_a_close_that_flattens_is_just_a_close(self, tmp_output_dir):
+        self._arm(tmp_output_dir)
+        st._bracket_fills.clear(); st._bracket_guard_seen.clear()
+        now = st._nt_log_stamp(self.CLOSE_REMOVE) + 1.0
+        first = self.CLOSE_FILL.replace("02:50:12:150", "02:50:08:489")
+        assert st._bracket_guard_event(first, now=now) is None
+        assert st._bracket_guard_event(self.CLOSE_REMOVE, now=now) is None
+        assert self._closes(tmp_output_dir) == [] and st._alert_text == ""
+
+    def test_a_close_that_opens_a_position_is_closed_like_an_orphan(self, tmp_output_dir, caplog):
+        self._arm(tmp_output_dir)
+        st._bracket_fills.clear(); st._bracket_guard_seen.clear()
+        st._pnl_open_meta.pop(("SimAI", "NQ"), None)
+        now = st._nt_log_stamp(self.CLOSE_ADD) + 1.0
+        assert st._bracket_guard_event(self.CLOSE_FILL, now=now) is None
+        with caplog.at_level(logging.WARNING):
+            assert st._bracket_guard_event(self.CLOSE_ADD, now=now) == "close"
+        closes = self._closes(tmp_output_dir)
+        assert closes and closes[0].startswith("CLOSEPOSITION;SimAI;NQ 12-26;")
+        assert "a Close that over-covered opened LONG 1 on a flat account" in caplog.text
+        assert st._pnl_open_meta[("SimAI", "NQ")]["strategies"] == ["orphan close fill"]
+
+    # SimTEST 2026-10-16 09:38:43 REVERSEPOSITION, real lines re-addressed to
+    # the leader: the entry fills first and nets the short flat, the new
+    # ATM's stop goes in, then the Close's fill opens the long.
+    REV_ENTRY_FILL = ("2026-10-16 09:38:47:953|1|32|Order='c3de863a1c2a4b7d9a1e2f3c4d5e6f70/SimAI' "
+                      "Name='Entry' New state='Filled' Instrument='NQ DEC26' Action='Buy' "
+                      "Limit price=0 Stop price=0 Quantity=1 Type='Market' Time in force=DAY Oco='' "
+                      "Filled=1 Fill price=29892.75 Error='No error' Native error=''")
+    REV_FLAT = ("2026-10-16 09:38:48:921|1|64|Instrument='NQ DEC26' Account='SimAI' "
+                "Average price=0 Quantity=0 Market position=Flat Operation=Remove")
+    REV_STOP_SUB = ("2026-10-16 09:38:48:838|1|32|Order='6dba917a15f7423db3963dcc6061d833/SimAI' "
+                    "Name='Stop1' New state='Submitted' Instrument='NQ DEC26' Action='Sell' "
+                    "Limit price=0 Stop price=29792.75 Quantity=1 Type='Stop Market' Time in force=GTC "
+                    "Oco='9e6702e47cce4dd1a28df3b365a73d50' Filled=0 Fill price=0 Error='No error' Native error=''")
+    REV_CLOSE_FILL = ("2026-10-16 09:38:49:848|1|32|Order='e1a85fb6aaaa4bbbbcccc1dddd2eeee3/SimAI' "
+                      "Name='Close' New state='Filled' Instrument='NQ DEC26' Action='Buy to cover' "
+                      "Limit price=0 Stop price=0 Quantity=1 Type='Market' Time in force=GTC Oco='' "
+                      "Filled=1 Fill price=29892.75 Error='No error' Native error=''")
+    REV_LONG_ADD = ("2026-10-16 09:38:50:378|1|64|Instrument='NQ DEC26' Account='SimAI' "
+                    "Average price=29892.75 Quantity=1 Market position=Long Operation=Operation_Add")
+
+    def test_a_reversals_own_result_is_not_an_orphan(self, tmp_output_dir):
+        self._arm(tmp_output_dir)
+        st._bracket_fills.clear(); st._bracket_guard_seen.clear(); st._nt_orders.clear()
+        results = [st._bracket_guard_event(line, now=st._nt_log_stamp(line))
+                   for line in (self.REV_ENTRY_FILL, self.REV_FLAT, self.REV_STOP_SUB,
+                                self.REV_CLOSE_FILL, self.REV_LONG_ADD)]
+        assert results == [None] * 5
+        assert self._closes(tmp_output_dir) == []
+        st._nt_orders.clear()
+
+    def test_a_fill_in_the_same_second_as_the_remove_still_settles(self, tmp_output_dir, monkeypatch):
+        # Stamps carry milliseconds: a Remove at :10.397 and a fill at :10.950
+        # are not the same moment.
+        self._arm(tmp_output_dir)
+        monkeypatch.setattr(st, "_nt_tail_seen", time.time())
+        remove = self.REV_FLAT.replace("09:38:48:921", "09:38:48:397")
+        fill = self.REV_ENTRY_FILL.replace("09:38:47:953", "09:38:48:950")
+        st._bracket_guard_event(remove, now=st._nt_log_stamp(remove))
+        st._bracket_guard_event(fill, now=st._nt_log_stamp(fill))
+        t_fill = st._nt_log_stamp_ms(fill)
+        assert st._nt_entry_in_flight("SimAI", "NQ 12-26", now=t_fill + 0.3) is True
+        st._nt_orders.clear(); st._nt_position_seen.clear(); st._nt_flat_seen.clear()
+
+    def test_a_working_entry_older_than_the_ttl_is_a_lost_line(self, tmp_output_dir, monkeypatch):
+        self._arm(tmp_output_dir)
+        monkeypatch.setattr(st, "_nt_tail_seen", time.time())
+        st._nt_orders[("SimAI", "NQ")] = {"e": ("Entry", "Working", time.time() - st.ENTRY_INFLIGHT_MAX_S - 5, 1, "Buy")}
+        assert st._nt_entry_in_flight("SimAI", "NQ 12-26") is False
+        st._nt_orders[("SimAI", "NQ")] = {"e": ("Entry", "Working", time.time() - 30, 1, "Buy")}
+        assert st._nt_entry_in_flight("SimAI", "NQ 12-26") is True
+        st._nt_orders.clear()
+
+    def test_a_filled_entry_is_in_flight_until_its_position_line_lands(self, tmp_output_dir, monkeypatch):
+        # NT logs the Entry fill 0.35-1 s before the position line; a book
+        # read in that window still shows flat (2026-10-14 06:23:02.868 → 03.865).
+        self._arm(tmp_output_dir)
+        monkeypatch.setattr(st, "_nt_tail_seen", time.time())
+        t_fill = st._nt_log_stamp(self.REV_ENTRY_FILL)
+        st._bracket_guard_event(self.REV_ENTRY_FILL, now=t_fill)
+        assert st._nt_entry_in_flight("SimAI", "NQ 12-26", now=t_fill + 0.5) is True
+        assert st._nt_entry_in_flight("SimAI", "NQ 12-26", now=t_fill + st.ENTRY_SETTLE_S + 1) is False
+        st._bracket_guard_event(self.REV_LONG_ADD, now=st._nt_log_stamp(self.REV_LONG_ADD))
+        assert st._nt_entry_in_flight("SimAI", "NQ 12-26", now=t_fill + 0.5) is False
+        pending = self.REV_ENTRY_FILL.replace("New state='Filled'", "New state='Cancel submitted'")
+        st._bracket_guard_event(pending, now=t_fill + 5)
+        assert st._nt_entry_in_flight("SimAI", "NQ 12-26", now=t_fill + 5) is True   # a cancel request can still fill
+        st._nt_orders.clear(); st._nt_position_seen.clear()
+
+    def test_stop_cover_is_counted_for_the_side_it_exits(self, tmp_output_dir):
+        self._arm(tmp_output_dir)
+        buy_stop = self.REV_STOP_SUB.replace("Action='Sell'", "Action='Buy to cover'")
+        st._bracket_guard_event(buy_stop, now=st._nt_log_stamp(buy_stop))
+        assert st._nt_stop_qty("SimAI", "NQ 12-26", -1) == 1     # exits a short
+        assert st._nt_stop_qty("SimAI", "NQ 12-26", 1) == 0      # no cover for a long
+        assert st._nt_stop_qty("SimAI", "NQ 12-26") == 1
+        st._nt_orders.clear()
+
+    def test_a_reversal_is_recognised_by_its_entry_fill_even_when_the_stop_comes_late(self, tmp_output_dir):
+        # Live brokers may fill the Close before the ATM submits its stop:
+        # the Entry that filled seconds before still marks this a reversal.
+        self._arm(tmp_output_dir)
+        st._bracket_fills.clear(); st._bracket_guard_seen.clear(); st._nt_orders.clear()
+        results = [st._bracket_guard_event(line, now=st._nt_log_stamp(line))
+                   for line in (self.REV_ENTRY_FILL, self.REV_FLAT, self.REV_CLOSE_FILL, self.REV_LONG_ADD)]
+        assert results == [None] * 4 and self._closes(tmp_output_dir) == []
+        st._nt_orders.clear()
+
+    def test_a_working_close_is_evidence_until_it_fills(self, tmp_output_dir, monkeypatch):
+        self._arm(tmp_output_dir)
+        st._bracket_fills.clear(); st._bracket_guard_seen.clear(); st._nt_orders.clear()
+        since = st._nt_log_stamp(self.CLOSE_FILL) - 5.0
+        working = self.CLOSE_FILL.replace("New state='Filled'", "New state='Working'")
+        monkeypatch.setattr(st, "_nt_tail_seen", 0.0)
+        assert st._nt_close_in_flight("SimAI", "NQ 12-26", since) is None     # log not in view
+        monkeypatch.setattr(st, "_nt_tail_seen", time.time())
+        assert st._nt_close_in_flight("SimAI", "NQ 12-26", since) is False
+        assert st._bracket_guard_event(working, now=since + 6.0) is None
+        assert st._nt_close_in_flight("SimAI", "NQ 12-26", since) is True
+        assert st._nt_close_in_flight("SimAI", "NQ 12-26", since + 60.0) is False   # before a later reset
+        assert st._nt_close_in_flight("Sim101", "NQ 12-26", since) is False         # another account
+        assert st._bracket_guard_event(self.CLOSE_FILL, now=since + 6.0) is None
+        assert st._nt_close_in_flight("SimAI", "NQ 12-26", since) is False
+        assert self._closes(tmp_output_dir) == []
+        st._nt_orders.clear()
+
+    def test_ninjatraders_unknown_strategy_answer_is_remembered(self, tmp_output_dir):
+        self._arm(tmp_output_dir)
+        st._nt_unknown_sids.clear()
+        sid = "ent:nq_gooping:Nasdaq:2026-10-15T14:20:00-04:00~SimAlwaySummer"
+        stamp = st._nt_log_stamp(self.UNKNOWN_SID)
+        assert st._bracket_guard_event(self.UNKNOWN_SID, now=stamp + 1.0) is None
+        assert st._nt_unknown_sids[sid] == stamp
+        assert st._nt_reported_unknown([sid], since=stamp - 1.0)
+        assert st._nt_reported_unknown([sid], since=stamp + 1.0)      # NT's clock may run a hair early
+        assert not st._nt_reported_unknown([sid, "other-sid"], since=stamp - 1.0)
+        assert not st._nt_reported_unknown([sid], since=stamp + 10.0)
+        assert not st._nt_reported_unknown([], since=0.0)
+        assert self._closes(tmp_output_dir) == []
+        st._nt_unknown_sids.clear()
+
 
 class TestResetCancelsTheStandingEntryFirst:
     """Oct 8: the standing entry had not filled when the reset's
@@ -9148,10 +9310,15 @@ class TestResetCancelsTheStandingEntryFirst:
     asked for. CLOSESTRATEGY by the entry's own id cancels it unfilled or
     closes it filled, bracket included — so it goes first."""
 
+    @pytest.fixture(autouse=True)
+    def _flat_is_proven(self, monkeypatch):
+        st._closes_dispatched.clear(); st._nt_orders.clear()
+        monkeypatch.setattr(st, "_reset_watch", _acoro_returning((True, [], True)))
+        monkeypatch.setattr(st, "_flip_mode", lambda *a, **k: ("sequence", "test", 0))      # these tests pin the sequenced path
+
     def test_reset_writes_closestrategy_for_the_standing_entry_before_the_close(
             self, ms_on, live_book, tmp_output_dir, monkeypatch):
         st.active_account = "Sim101"
-        monkeypatch.setattr(st, "RESET_SETTLE_S", 0.01)
         monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {})
         st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
         st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1, ("bread_n_butter", "BnB"), "sid-a")
@@ -9162,7 +9329,9 @@ class TestResetCancelsTheStandingEntryFirst:
             _run_plans(plans)
         bodies = [f.read_text() for f in sorted(tmp_output_dir.glob("oif_*.txt"))]
         assert bodies[0] == "CLOSESTRATEGY;Sim101;;;;;;;;;;;sid-a"
-        assert bodies[1].startswith("CLOSEPOSITION;Sim101;NQ 06-26;")
+        # No plain close behind it: flat is proven first, then the entry
+        # (the pair double-closed SimAlwaySummer on 2026-10-16 02:50).
+        assert not any(b.startswith("CLOSEPOSITION;Sim101") for b in bodies)
         assert bodies[-1].startswith("PLACE;Sim101;NQ 06-26;BUY;1;")
         assert st._ledger_entries("Sim101", "NQ 06-26") and all(
             r["sid"] != "sid-a" for r in st._ledger_entries("Sim101", "NQ 06-26"))
@@ -9170,7 +9339,6 @@ class TestResetCancelsTheStandingEntryFirst:
     def test_a_standing_position_the_ledger_never_wrote_still_gets_the_close(
             self, ms_on, live_book, tmp_output_dir, monkeypatch):
         st.active_account = "Sim101"
-        monkeypatch.setattr(st, "RESET_SETTLE_S", 0.01)
         monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {})
         st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))   # adopted / chart
         buy = "PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"
@@ -9185,7 +9353,6 @@ class TestResetCancelsTheStandingEntryFirst:
     def test_the_reset_tells_the_recorder_the_position_is_leaving(
             self, ms_on, live_book, tmp_output_dir, monkeypatch):
         st.active_account = "Sim101"
-        monkeypatch.setattr(st, "RESET_SETTLE_S", 0.01)
         monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {})
         st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
         st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1, ("bread_n_butter", "BnB"), "sid-a")
@@ -9212,10 +9379,12 @@ def _acoro_returning(val):
 
 
 class TestResetVerifySetting:
-    """reset_verify: before an opposite-direction reset re-enters, optionally
-    wait for PROOF the standing position cleared instead of a blind settle.
-    Settable globally (config / web button) and per account/strategy (rule),
-    defaulting off so it is a pure opt-in on top of the CLOSESTRATEGY-first fix."""
+    """reset_verify: an opposite-direction reset closes the standing position
+    and — 'on', the default — writes the entry the moment NinjaTrader PROVES
+    the market flat; 'off' keeps the legacy fixed settle with no proof. The
+    entry is never withheld under either (user's rule, 2026-10-16: close,
+    confirm flat, open). Settable globally (config / web button) and per
+    account/strategy (rule)."""
 
     def test_default_rule_inherits(self):
         assert st.DEFAULT_RULE["reset_verify"] == "inherit"
@@ -9230,17 +9399,17 @@ class TestResetVerifySetting:
         # scoped rules carry it too
         assert st._coerce_rule({"reset_verify": "on"}, scoped=True)["reset_verify"] == "on"
 
-    def test_global_policy_defaults_off(self, tmp_config):
+    def test_global_policy_defaults_on(self, tmp_config):
         st.save_config({})
-        assert st._reset_verify_policy() == "off"
+        assert st._reset_verify_policy() == "on"
 
-    def test_global_policy_reads_config_and_floors_junk_to_off(self, tmp_config):
+    def test_global_policy_reads_config_and_floors_junk_to_on(self, tmp_config):
         st.save_config({"reset_verify": "on"})
         assert st._reset_verify_policy() == "on"
         st.save_config({"reset_verify": "off"})
         assert st._reset_verify_policy() == "off"
         st.save_config({"reset_verify": "garbage"})
-        assert st._reset_verify_policy() == "off"
+        assert st._reset_verify_policy() == "on"
 
     def test_account_default_overrides_the_app_default(self):
         st.account_profiles["RVAcct"] = {"default": {"reset_verify": "on"}}
@@ -9271,9 +9440,11 @@ class TestResetVerifySetting:
     def test_on_fires_the_entry_once_flat_is_proven(
             self, ms_on, live_book, tmp_output_dir, monkeypatch):
         st.active_account = "Sim101"
+        st._closes_dispatched.clear(); st._nt_orders.clear()
+        monkeypatch.setattr(st, "_flip_mode", lambda *a, **k: ("sequence", "test", 0))
         st.account_profiles["Sim101"] = {"default": {"reset_verify": "on"}}
         monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {})
-        monkeypatch.setattr(st, "_reset_verify_cleared", _acoro_returning(True))
+        monkeypatch.setattr(st, "_reset_watch", _acoro_returning((True, [], True)))
         st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
         st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1,
                               ("bread_n_butter", "BnB"), "sid-a")
@@ -9289,12 +9460,25 @@ class TestResetVerifySetting:
         assert any(b.startswith("CLOSESTRATEGY;Sim101") for b in bodies)
         assert any(b.startswith("PLACE;Sim101;NQ 06-26;BUY;1;") for b in bodies)
 
-    def test_on_withholds_the_entry_when_flat_cannot_be_proven(
-            self, ms_on, live_book, tmp_output_dir, monkeypatch):
+    def test_no_entry_without_confirmed_flat(
+            self, ms_on, live_book, tmp_output_dir, monkeypatch, caplog):
+        monkeypatch.setattr(st, "_reset_watch", _acoro_returning((False, [], False)))
+        monkeypatch.setattr(st, "RESET_CLOSE_BUDGET_S", 0.0)
+        with caplog.at_level(logging.ERROR):
+            bodies = self._reset_scene(tmp_output_dir, monkeypatch, "on")
+        # The close fired; no second close onto a silent NinjaTrader; and no
+        # entry either — an opposite order onto an unproven book is how a
+        # netted-flat account ends up with orphan brackets.
+        assert bodies == ["CLOSESTRATEGY;Sim101;;;;;;;;;;;sid-a"]
+        assert "never confirmed flat" in caplog.text and "NOT placed" in caplog.text
+
+    def _reset_scene(self, tmp_output_dir, monkeypatch, policy):
         st.active_account = "Sim101"
-        st.account_profiles["Sim101"] = {"default": {"reset_verify": "on"}}
+        st._closes_dispatched.clear(); st._nt_orders.clear()
+        monkeypatch.setattr(st, "_snap_latest_ok", None)
+        monkeypatch.setattr(st, "_flip_mode", lambda *a, **k: ("sequence", "test", 0))
+        st.account_profiles["Sim101"] = {"default": {"reset_verify": policy}}
         monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {})
-        monkeypatch.setattr(st, "_reset_verify_cleared", _acoro_returning(False))
         st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
         st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1,
                               ("bread_n_butter", "BnB"), "sid-a")
@@ -9302,14 +9486,942 @@ class TestResetVerifySetting:
         try:
             with patch.object(st, "output_directory", str(tmp_output_dir)):
                 plans, _ = st.plan_signal_legs(buy, envelope=ENTRY_ENV)
+                assert plans[0]["reset_first"] is True
                 _run_plans(plans)
         finally:
             st.account_profiles.pop("Sim101", None)
+        return [f.read_text() for f in sorted(tmp_output_dir.glob("oif_*.txt"))]
+
+    def test_off_keeps_the_legacy_fixed_settle_with_no_watch(
+            self, ms_on, live_book, tmp_output_dir, monkeypatch):
+        calls = []
+
+        async def watch(*a, **k):
+            calls.append(a)
+            return True, [], True
+        monkeypatch.setattr(st, "_reset_watch", watch)
+        monkeypatch.setattr(st, "RESET_SETTLE_S", 0.01)
+        bodies = self._reset_scene(tmp_output_dir, monkeypatch, "off")
+        assert calls == []
+        assert bodies[0].startswith("CLOSESTRATEGY;Sim101")
+        assert not any(b.startswith("CLOSEPOSITION;Sim101") for b in bodies)
+        assert bodies[-1].startswith("PLACE;Sim101;NQ 06-26;BUY;1;")
+        # The fill check knows a reset's entry starts from flat: +1 is a
+        # fill, anything larger is an overfill.
+        assert st._pending_confirms[-1]["expect"] == 1
+
+    def test_a_close_still_working_is_waited_for_not_doubled(
+            self, ms_on, live_book, tmp_output_dir, monkeypatch):
+        still = [{"account": "Sim101", "instrument": "NQ SEP26", "qty": -1}]
+        reads = iter([(False, still, True), (False, still, True), (True, [], True)])
+
+        async def watch(*a, **k):
+            return next(reads)
+        monkeypatch.setattr(st, "_reset_watch", watch)
+        monkeypatch.setattr(st, "RESET_ESCALATE_S", 0.0)
+        monkeypatch.setattr(st, "_nt_close_in_flight", lambda *a, **k: True)
+        st._nt_unknown_sids.clear()
+        bodies = self._reset_scene(tmp_output_dir, monkeypatch, "on")
+        # NinjaTrader's log already shows a close working on the root: no
+        # close of our own at all, just the wait, then the entry once flat.
+        assert bodies == ["PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"]
+
+    def test_a_position_still_open_with_no_close_working_gets_the_plain_close(
+            self, ms_on, live_book, tmp_output_dir, monkeypatch, caplog):
+        still = [{"account": "Sim101", "instrument": "NQ SEP26", "qty": -1}]
+        reads = iter([(False, still, True), (True, [], True)])
+
+        async def watch(*a, **k):
+            return next(reads)
+        monkeypatch.setattr(st, "_reset_watch", watch)
+        monkeypatch.setattr(st, "RESET_ESCALATE_S", 0.0)
+        monkeypatch.setattr(st, "_nt_close_in_flight", lambda *a, **k: False)
+        st._nt_unknown_sids.clear()
+        with caplog.at_level(logging.WARNING):
+            bodies = self._reset_scene(tmp_output_dir, monkeypatch, "on")
+        assert bodies[0] == "CLOSESTRATEGY;Sim101;;;;;;;;;;;sid-a"
+        assert bodies[1].startswith("CLOSEPOSITION;Sim101;NQ 06-26")
+        assert any(b.startswith("CLOSEPOSITION;Sim101;MNQ 06-26") for b in bodies)
+        assert bodies[-1].startswith("PLACE;Sim101;NQ 06-26;BUY;1;")
+        assert "no close is working per NinjaTrader's log" in caplog.text
+
+    def test_without_the_log_in_view_there_is_never_a_second_close(
+            self, ms_on, live_book, tmp_output_dir, monkeypatch):
+        still = [{"account": "Sim101", "instrument": "NQ SEP26", "qty": -1}]
+        reads = iter([(False, still, True), (False, still, True), (True, [], True)])
+
+        async def watch(*a, **k):
+            return next(reads)
+        monkeypatch.setattr(st, "_reset_watch", watch)
+        monkeypatch.setattr(st, "RESET_ESCALATE_S", 0.0)
+        monkeypatch.setattr(st, "FLATTEN_VERIFY_MAX_S", 0.0)
+        monkeypatch.setattr(st, "_nt_close_in_flight", lambda *a, **k: None)
+        st._nt_unknown_sids.clear()
+        # Still showing, past every timer, but no log evidence: keep watching.
+        bodies = self._reset_scene(tmp_output_dir, monkeypatch, "on")
+        assert not any(b.startswith("CLOSEPOSITION;Sim101") for b in bodies)
+        assert bodies[-1].startswith("PLACE;Sim101;NQ 06-26;BUY;1;")
+
+    def test_the_plain_close_follows_only_when_ninjatrader_knew_no_id(
+            self, ms_on, live_book, tmp_output_dir, monkeypatch):
+        still = [{"account": "Sim101", "instrument": "NQ SEP26", "qty": -1}]
+        reads = iter([(False, still, True), (True, [], True)])
+
+        async def watch(*a, **k):
+            return next(reads)
+        monkeypatch.setattr(st, "_reset_watch", watch)
+        st._nt_unknown_sids.clear()
+        st._nt_unknown_sids["sid-a"] = time.time()      # NT's log: "unknown strategy"
+        try:
+            bodies = self._reset_scene(tmp_output_dir, monkeypatch, "on")
+        finally:
+            st._nt_unknown_sids.clear()
+        assert bodies[0] == "CLOSESTRATEGY;Sim101;;;;;;;;;;;sid-a"
+        assert bodies[1].startswith("CLOSEPOSITION;Sim101;NQ 06-26")
+        assert any(b.startswith("CLOSEPOSITION;Sim101;MNQ 06-26") for b in bodies)
+        assert bodies[-1].startswith("PLACE;Sim101;NQ 06-26;BUY;1;")
+
+    def test_a_close_already_in_flight_is_waited_for_not_doubled(
+            self, ms_on, live_book, tmp_output_dir, monkeypatch, caplog):
+        monkeypatch.setattr(st, "_reset_watch", _acoro_returning((True, [], True)))
+        with caplog.at_level(logging.INFO):
+            st.active_account = "Sim101"
+            st._closes_dispatched.clear(); st._nt_orders.clear()
+            monkeypatch.setattr(st, "_snap_latest_ok", None)
+            monkeypatch.setattr(st, "_flip_mode", lambda *a, **k: ("sequence", "test", 0))
+            st.account_profiles["Sim101"] = {"default": {"reset_verify": "on"}}
+            monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {})
+            st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+            st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1, ("bread_n_butter", "BnB"), "sid-a")
+            st._note_close_dispatched("Sim101", "NQ", -1)    # the publisher's own close, 1 s ago
+            buy = "PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"
+            try:
+                with patch.object(st, "output_directory", str(tmp_output_dir)):
+                    plans, _ = st.plan_signal_legs(buy, envelope=ENTRY_ENV)
+                    _run_plans(plans)
+            finally:
+                st.account_profiles.pop("Sim101", None)
         bodies = [f.read_text() for f in sorted(tmp_output_dir.glob("oif_*.txt"))]
-        # The closes fired; the opposite entry was withheld — never stacked.
-        assert any(b.startswith("CLOSESTRATEGY;Sim101") for b in bodies)
-        assert any(b.startswith("CLOSEPOSITION;Sim101;NQ 06-26") for b in bodies)
-        assert not any(b.startswith("PLACE;Sim101;NQ 06-26;BUY") for b in bodies)
+        # No close of its own — the one in flight is waited for — then the entry.
+        assert bodies == ["PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"]
+        assert "already has a close in flight" in caplog.text
+
+    def test_flat_on_the_book_is_not_flat_while_an_entry_is_working(
+            self, ms_on, live_book, tmp_output_dir, monkeypatch):
+        working = iter([True, True, False])
+        monkeypatch.setattr(st, "_nt_entry_in_flight", lambda *a, **k: next(working))
+        watches = []
+
+        async def watch(*a, **k):
+            watches.append(1)
+            return True, [], True
+        monkeypatch.setattr(st, "_reset_watch", watch)
+        bodies = self._reset_scene(tmp_output_dir, monkeypatch, "on")
+        assert len(watches) == 3                 # kept watching until the entry resolved
+        assert bodies[0].startswith("CLOSESTRATEGY;Sim101")
+        assert bodies[-1].startswith("PLACE;Sim101;NQ 06-26;BUY;1;")
+
+    def test_a_twin_no_strategy_id_covers_gets_its_own_close_on_the_sequenced_path(
+            self, live_book, tmp_output_dir, monkeypatch):
+        st.active_account = "Sim101"
+        st._closes_dispatched.clear(); st._nt_orders.clear()
+        monkeypatch.setattr(st, "_snap_latest_ok", None)
+        monkeypatch.setattr(st, "_reset_watch", _acoro_returning((True, [], True)))
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1), ("MNQ SEP26", -3)]))
+        st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1, ("bread_n_butter", "BnB"), "sid-a")
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            assert asyncio.run(st._reset_close_standing("Sim101", "NQ 06-26")) is True
+        bodies = [f.read_text() for f in sorted(tmp_output_dir.glob("oif_*.txt"))]
+        assert bodies == ["CLOSESTRATEGY;Sim101;;;;;;;;;;;sid-a",
+                          "CLOSEPOSITION;Sim101;MNQ 06-26;;;;;;;;;;"]      # the twin, which no id covers
+        # The web button's sequenced path leaves the twin alone and does not wait on it.
+        for f in tmp_output_dir.glob("oif_*.txt"):
+            f.unlink()
+        st._closes_dispatched.clear()
+        st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1, ("bread_n_butter", "BnB"), "sid-a")
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            assert asyncio.run(st._reset_close_standing("Sim101", "NQ 06-26", close_twin=False)) is True
+        bodies = [f.read_text() for f in sorted(tmp_output_dir.glob("oif_*.txt"))]
+        assert bodies == ["CLOSESTRATEGY;Sim101;;;;;;;;;;;sid-a"]
+        assert st._reset_roots("NQ 06-26") == {"NQ", "MNQ"} and st._reset_roots("NQ 06-26", twin=False) == {"NQ"}
+        st._closes_dispatched.clear()
+
+    def test_nothing_attributed_means_the_plain_close_then_proof(
+            self, ms_on, live_book, tmp_output_dir, monkeypatch):
+        calls = []
+
+        async def watch(account, instrument, twin=True):
+            calls.append((account, instrument))
+            return True, [], True
+        monkeypatch.setattr(st, "_reset_watch", watch)
+        monkeypatch.setattr(st, "_flip_mode", lambda *a, **k: ("sequence", "test", 0))
+        st.active_account = "Sim101"
+        st._closes_dispatched.clear(); st._nt_orders.clear()
+        monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {})
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))   # chart trade
+        buy = "PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(buy, envelope=ENTRY_ENV)
+            _run_plans(plans)
+        bodies = [f.read_text() for f in sorted(tmp_output_dir.glob("oif_*.txt"))]
+        assert bodies[0].startswith("CLOSEPOSITION;Sim101;NQ 06-26")
+        assert calls == [("Sim101", "NQ 06-26")]
+        assert bodies[-1].startswith("PLACE;Sim101;NQ 06-26;BUY;1;")
+
+
+class TestOverfillVerdict:
+    """2026-10-16 02:50:19: 'CONFIRMED ... pos: -1→2' on a 1-lot BUY after a
+    reset. Any position change read as a fill; three contracts moving on a
+    one-lot order is not a confirmation, it is contracts nobody placed."""
+
+    SIG = "PLACE;SimX;NQ 12-26;BUY;1;MARKET;;;DAY;;;Gooping;s1"
+
+    @pytest.fixture(autouse=True)
+    def _direct_query(self, monkeypatch):
+        st._pending_confirms.clear()
+        monkeypatch.setattr(st, "_confirm_snapshot", lambda: None)
+        yield
+        st._pending_confirms.clear()
+
+    def _verdict(self, monkeypatch, held, expect, caplog):
+        monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {"NQ 12-26": held})
+        kw = {"expect": expect} if expect is not None else {}
+        st.add_pending_confirm(self.SIG, "s1", "NQ 12-26", "BUY", pre_pos=-1,
+                               account="SimX", **kw)
+        with caplog.at_level(logging.INFO):
+            st.check_pending_confirms()
+        assert st._pending_confirms == []
+        return caplog.text
+
+    def test_more_contracts_than_the_entry_placed_is_an_overfill(self, monkeypatch, caplog):
+        text = self._verdict(monkeypatch, held=2, expect=1, caplog=caplog)
+        assert "OVERFILL  id=s1  account=SimX  NQ 12-26  BUY  pos: -1→2  expected +1" in text
+        assert "CONFIRMED" not in text
+        assert "OVERFILL" in st._alert_text
+
+    def test_the_expected_size_is_a_plain_fill(self, monkeypatch, caplog):
+        text = self._verdict(monkeypatch, held=1, expect=1, caplog=caplog)
+        assert "CONFIRMED  id=s1  account=SimX  NQ 12-26  BUY  pos: -1→1" in text
+        assert "OVERFILL" not in text
+
+    def test_two_strategies_stacking_is_not_an_overfill(self, monkeypatch, caplog):
+        monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {"NQ 12-26": 2})
+        st.add_pending_confirm(self.SIG, "s1", "NQ 12-26", "BUY", pre_pos=0,
+                               account="SimX", expect=1, delta=1)
+        st.add_pending_confirm(self.SIG.replace("Gooping;s1", "Sides;s2"), "s2", "NQ 12-26", "BUY",
+                               pre_pos=0, account="SimX", expect=1, delta=1)
+        with caplog.at_level(logging.INFO):
+            st.check_pending_confirms()
+        assert st._pending_confirms == []
+        assert caplog.text.count("CONFIRMED") == 2 and "OVERFILL" not in caplog.text
+
+    def test_a_recent_close_resets_the_base_of_a_plain_entry(self, tmp_output_dir, monkeypatch):
+        # The publisher's CLOSEPOSITION went out 2 s ago; the pre-read still
+        # shows the old +1. A SELL 1 should expect -1 from flat, not 0.
+        st.active_account = "Sim101"
+        st._closes_dispatched.clear()
+        monkeypatch.setattr(st, "_snap_latest_ok", None)
+        monkeypatch.setattr(st, "_live_bridge_connected", False)
+        st._note_close_dispatched("Sim101", "NQ", 1)          # the close targeted the whole +1
+        monkeypatch.setattr(st, "_pre_position", lambda *a, **k: 1)
+        plan = {"account": "Sim101", "rule": st.resolve_rule("Sim101"), "instrument": "NQ 12-26",
+                "action": "SELL", "qty": 1, "manual": False, "manual_source": "", "rr_pick": False,
+                "strat_ident": ("", "Gooping"),
+                "signal": "PLACE;Sim101;NQ 12-26;SELL;1;MARKET;;;DAY;;;Gooping;sid-s"}
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            asyncio.run(st._write_entry_tranches(plan, [1], None))
+        st._closes_dispatched.clear()
+        assert st._pending_confirms[-1]["expect"] == -1 and st._pending_confirms[-1]["delta"] == -1
+
+    def test_a_leg_that_states_no_expectation_keeps_the_old_verdict(self, monkeypatch, caplog):
+        text = self._verdict(monkeypatch, held=2, expect=None, caplog=caplog)
+        assert "CONFIRMED" in text and "OVERFILL" not in text
+
+
+class TestLedgerPruneOnFlat:
+    """2026-10-16 02:50: the reset fired CLOSESTRATEGY for seven ids on
+    SimAlwaySummer/NQ, six of them positions brackets had closed hours
+    before ('unknown strategy', per NinjaTrader). A root the live view shows
+    flat has no live entries; only a write still young enough to be in
+    flight survives."""
+
+    def test_stale_rows_go_and_in_flight_writes_stay(self, monkeypatch):
+        monkeypatch.setattr(st, "_nt_tail_seen", time.time())     # the log is in view, nothing working
+        st._nt_orders.clear()
+        st._ledger_clear("PruneAcct")
+        st._ledger_note_entry("PruneAcct", "NQ 12-26", "SELL", 1, ("gooping", "Gooping"), "old-sid")
+        with st._ledger_lock:
+            st._strategy_ledger[("PruneAcct", "NQ")][0]["ts"] -= st.INFLIGHT_OPEN_TTL_S + 1
+        st._ledger_note_entry("PruneAcct", "NQ 12-26", "BUY", 1, ("gooping", "Gooping"), "fresh-sid")
+        st._ledger_prune_flat("PruneAcct", "NQ")
+        assert [r["sid"] for r in st._ledger_entries("PruneAcct", "NQ 12-26")] == ["fresh-sid"]
+        st._ledger_prune_flat("PruneAcct", "ES")           # a root with no rows is fine
+        st._ledger_clear("PruneAcct")
+
+    def test_rows_stay_while_ninjatrader_still_works_an_entry_on_the_root(self, monkeypatch):
+        st._ledger_clear("PruneAcct")
+        st._ledger_note_entry("PruneAcct", "NQ 12-26", "BUY", 1, ("gooping", "Gooping"), "limit-sid")
+        with st._ledger_lock:
+            st._strategy_ledger[("PruneAcct", "NQ")][0]["ts"] -= st.INFLIGHT_OPEN_TTL_S + 1
+        monkeypatch.setattr(st, "_nt_tail_seen", time.time())
+        st._nt_orders[("PruneAcct", "NQ")] = {"e1": ("Entry", "Working", time.time(), 1, "Buy")}
+        try:
+            st._ledger_prune_flat("PruneAcct", "NQ")
+            assert [r["sid"] for r in st._ledger_entries("PruneAcct", "NQ 12-26")] == ["limit-sid"]
+        finally:
+            st._nt_orders.clear()
+            st._ledger_clear("PruneAcct")
+
+    def test_nothing_is_pruned_while_the_log_is_out_of_view(self, monkeypatch):
+        monkeypatch.setattr(st, "_nt_tail_seen", 0.0)
+        st._ledger_clear("PruneAcct")
+        st._ledger_note_entry("PruneAcct", "NQ 12-26", "SELL", 1, ("gooping", "Gooping"), "old-sid")
+        with st._ledger_lock:
+            st._strategy_ledger[("PruneAcct", "NQ")][0]["ts"] -= st.INFLIGHT_OPEN_TTL_S + 1
+        st._ledger_prune_flat("PruneAcct", "NQ")
+        assert [r["sid"] for r in st._ledger_entries("PruneAcct", "NQ 12-26")] == ["old-sid"]
+        st._ledger_clear("PruneAcct")
+
+    def test_the_live_view_prunes_when_the_root_leaves(self, monkeypatch):
+        monkeypatch.setattr(st, "_nt_tail_seen", time.time())
+        st._nt_orders.clear()
+        st._ledger_clear("PruneAcct")
+        st._pnl_open_meta.pop(("PruneAcct", "NQ"), None)
+        st._ledger_note_entry("PruneAcct", "NQ 12-26", "SELL", 1, ("gooping", "Gooping"), "old-sid")
+        with st._ledger_lock:
+            st._strategy_ledger[("PruneAcct", "NQ")][0]["ts"] -= st.INFLIGHT_OPEN_TTL_S + 1
+        held = _plive(_prow("PruneAcct", 50_000.0, [_ppos("NQ 12-26", -1, 30_000.0)]))
+        flat = _plive(_prow("PruneAcct", 50_000.0, []))
+        for i in range(st.PNL_SETTLE_POLLS + 1):       # until the tracker trusts the view
+            st._pnl_observe(held, now=100.0 + i * 0.1, session_date="2026-10-16")
+        assert st._ledger_entries("PruneAcct", "NQ 12-26")
+        st._pnl_observe(flat, now=130.0, session_date="2026-10-16")
+        assert st._ledger_entries("PruneAcct", "NQ 12-26") == []
+        st._ledger_clear("PruneAcct")
+
+
+class TestFlipMode:
+    """A filled, quiet position flips as ONE REVERSEPOSITION; anything that
+    may still be in flight takes the sequenced close → proof → place."""
+
+    def _quiet(self, monkeypatch):
+        monkeypatch.setattr(st, "_nt_tail_seen", 0.0)          # NT's log not in view
+        st._inflight_opens.clear()
+        st._closes_dispatched.clear(); st._nt_orders.clear()
+
+    def test_a_filled_quiet_position_reverses(self, live_book, monkeypatch):
+        self._quiet(monkeypatch)
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        mode, why, twin = st._flip_mode("Sim101", "NQ 06-26")
+        assert mode == "reverse" and "filled and quiet" in why and twin == 0
+
+    def test_nothing_shown_held_sequences(self, live_book, monkeypatch):
+        self._quiet(monkeypatch)
+        st._bridge_book = _book(("Sim101", 50_000.0, []))
+        st._note_inflight_open("Sim101", "NQ 06-26", "SELL", 1)   # written, not yet shown
+        mode, why, _ = st._flip_mode("Sim101", "NQ 06-26")
+        assert mode == "sequence" and "unfilled" in why
+
+    def test_an_entry_still_working_per_the_log_sequences(self, live_book, monkeypatch):
+        self._quiet(monkeypatch)
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        monkeypatch.setattr(st, "_nt_tail_seen", time.time())
+        st._nt_orders.clear()
+        st._nt_orders[("Sim101", "NQ")] = {"e1": ("Entry", "Working", time.time(), 1, "Sell")}
+        try:
+            mode, why, _ = st._flip_mode("Sim101", "NQ 06-26")
+        finally:
+            st._nt_orders.clear()
+        assert mode == "sequence" and "still working" in why
+
+    def test_more_written_than_shown_sequences_without_the_log(self, live_book, monkeypatch):
+        self._quiet(monkeypatch)
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        st._note_inflight_open("Sim101", "NQ 06-26", "SELL", 2)   # one of these is not on the book
+        mode, why, _ = st._flip_mode("Sim101", "NQ 06-26")
+        assert mode == "sequence" and "more written" in why
+
+    def test_more_written_than_shown_sequences_even_with_the_log_in_view(self, live_book, monkeypatch):
+        # NT logs the Entry ~100 ms after reading the file and the tail polls
+        # once a second: a teammate entry written moments ago is known to the
+        # app before the log shows it.
+        self._quiet(monkeypatch)
+        monkeypatch.setattr(st, "_nt_tail_seen", time.time())
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        st._note_inflight_open("Sim101", "NQ 06-26", "SELL", 2)
+        mode, why, _ = st._flip_mode("Sim101", "NQ 06-26")
+        assert mode == "sequence" and "more written" in why
+
+    def test_a_close_already_in_flight_on_the_root_sequences(self, live_book, monkeypatch):
+        # The publisher's own CLOSEPOSITION went out 2 s ago; the book still
+        # shows the position because NT has not filled the close yet.
+        self._quiet(monkeypatch)
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        st._note_close_dispatched("Sim101", "NQ", -1)
+        mode, why, _ = st._flip_mode("Sim101", "NQ 06-26")
+        assert mode == "sequence" and "close is already in flight" in why
+        st._closes_dispatched.clear()
+        st._closes_dispatched[("Sim101", "NQ")] = (time.time() - st.RESET_CLOSE_PENDING_S - 1, -1, -1, ())
+        assert st._flip_mode("Sim101", "NQ 06-26")[0] == "reverse"
+        assert ("Sim101", "NQ") not in st._closes_dispatched          # expired records are dropped
+
+    def test_a_close_the_book_shows_done_is_not_pending(self, live_book, monkeypatch):
+        # The flip that went out 10 s ago is on the book as the NEW side:
+        # that close is done, and a second flip must not wait on it.
+        self._quiet(monkeypatch)
+        monkeypatch.setattr(st, "_snap_latest_ok", None)
+        st._closes_dispatched[("Sim101", "NQ")] = (time.time() - 10.0, -1, -1, ())   # a REVERSEPOSITION over a short
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", 1)]))             # the long it produced
+        assert st._close_pending("Sim101", "NQ 06-26") is False
+        assert ("Sim101", "NQ") not in st._closes_dispatched
+        assert st._flip_mode("Sim101", "NQ 06-26")[0] == "reverse"
+        # Flat after the close: done too.
+        st._closes_dispatched[("Sim101", "NQ")] = (time.time() - 5.0, -1, -1, ())
+        st._bridge_book = _book(("Sim101", 50_000.0, []))
+        assert st._close_pending("Sim101", "NQ 06-26") is False
+        # Still the same side after the close: pending.
+        st._closes_dispatched[("Sim101", "NQ")] = (time.time() - 5.0, -1, -1, ())
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        assert st._close_pending("Sim101", "NQ 06-26") is True
+        # No trusted read since the close at all: pending.
+        st._bridge_book = None
+        assert st._close_pending("Sim101", "NQ 06-26") is True
+        st._closes_dispatched.clear()
+
+    def test_a_scoped_close_is_done_when_its_own_lot_has_left(self, live_book, monkeypatch):
+        # Two strategies short 1 each; one's close leaves the other's lot.
+        self._quiet(monkeypatch)
+        monkeypatch.setattr(st, "_snap_latest_ok", None)
+        st._closes_dispatched[("Sim101", "NQ")] = (time.time() - 5.0, -2, -1, ("sid-a",))
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -2)]))
+        assert st._close_pending("Sim101", "NQ 06-26") is True        # nothing has left yet
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        assert st._close_pending("Sim101", "NQ 06-26") is False       # its lot is gone
+        st._closes_dispatched.clear()
+
+    def test_a_flat_read_proves_nothing_about_a_close_written_before_the_position_showed(
+            self, live_book, monkeypatch):
+        # A publisher close 0.2 s after a fill: the book still showed flat
+        # when the close went out, and a flat line after it is the same
+        # pre-position flat, not the close landing.
+        self._quiet(monkeypatch)
+        monkeypatch.setattr(st, "_snap_latest_ok", None)
+        st._closes_dispatched[("Sim101", "NQ")] = (time.time() - 1.0, 0, 0, ())
+        st._bridge_book = _book(("Sim101", 50_000.0, []))
+        assert st._close_pending("Sim101", "NQ 06-26") is True
+        st._closes_dispatched.clear()
+
+    def test_silence_never_ends_a_pending_close_but_ninjatraders_unknown_answer_does(
+            self, live_book, monkeypatch):
+        self._quiet(monkeypatch)
+        monkeypatch.setattr(st, "_snap_latest_ok", None)
+        st._bridge_book = None
+        monkeypatch.setattr(st, "_nt_tail_seen", time.time())
+        st._nt_orders.clear(); st._nt_unknown_sids.clear()
+        st._closes_dispatched[("Sim101", "NQ")] = (time.time() - 12.0, -1, -1, ())
+        assert st._close_pending("Sim101", "NQ 06-26") is True        # no Close logged yet: a slow NT, not a dead close
+        st._closes_dispatched[("Sim101", "NQ")] = (time.time() - 12.0, -1, -1, ("sid-x",))
+        assert st._close_pending("Sim101", "NQ 06-26") is True
+        st._nt_unknown_sids["sid-x"] = time.time()                     # NT: "unknown strategy"
+        assert st._close_pending("Sim101", "NQ 06-26") is False
+        st._nt_orders.clear(); st._closes_dispatched.clear(); st._nt_unknown_sids.clear()
+
+    def test_every_close_this_process_writes_is_registered(self, tmp_output_dir):
+        st._closes_dispatched.clear()
+        st._ledger_clear("Sim101")
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            st.write_signal_to_file("CLOSEPOSITION;Sim101;NQ 06-26;;;;;;;;;;")
+            assert ("Sim101", "NQ") in st._closes_dispatched
+            st._closes_dispatched.clear()
+            st.write_signal_to_file("REVERSEPOSITION;Sim101;ES 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-r")
+            assert ("Sim101", "ES") in st._closes_dispatched
+            st._closes_dispatched.clear()
+            st._ledger_note_entry("Sim101", "GC 06-26", "BUY", 1, ("x", "X"), "sid-gc")
+            st.write_signal_to_file("CLOSESTRATEGY;Sim101;;;;;;;;;;;sid-gc")
+            rec = st._closes_dispatched[("Sim101", "GC")]
+            assert rec[2] == 1 and rec[3] == ("sid-gc",)             # that strategy's own lot, its id
+            st._closes_dispatched.clear()
+            st.write_signal_to_file("CLOSESTRATEGY;Sim101;;;;;;;;;;;ent:nq_gooping:Nasdaq:2026-10-16T02:50:00-04:00~Sim101")
+            assert ("Sim101", "NQ") in st._closes_dispatched     # the publisher's id names the root
+            st._closes_dispatched.clear()
+            st.write_signal_to_file("CLOSESTRATEGY;Sim101;;;;;;;;;;;sid-unknown")
+            assert st._closes_dispatched == {}                   # root unknown, nothing held: nothing registered, never "*"
+            st.write_signal_to_file("PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-p")
+            assert st._closes_dispatched == {}
+        st._ledger_clear("Sim101")
+
+    def test_a_twin_is_reported_for_a_separate_close(self, live_book, monkeypatch):
+        self._quiet(monkeypatch)
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1), ("MNQ SEP26", -3)]))
+        mode, _, twin = st._flip_mode("Sim101", "NQ 06-26")
+        assert mode == "reverse" and twin == -3
+
+    def test_flip_signal_swaps_only_the_command(self):
+        assert st._flip_signal("PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b") == \
+            "REVERSEPOSITION;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"
+        assert st._flip_signal("CLOSEPOSITION;Sim101;NQ 06-26;;;;;;;;;;") == \
+            "CLOSEPOSITION;Sim101;NQ 06-26;;;;;;;;;;"
+
+
+class TestReverseFlip:
+    """The reset over a filled position is one REVERSEPOSITION: no close
+    file of its own, nothing for a second close to collide with, and the
+    new ATM's bracket is NinjaTrader's to submit before the new side exists."""
+
+    def _scene(self, tmp_output_dir, monkeypatch, twin=0):
+        st.active_account = "Sim101"
+        st._closes_dispatched.clear(); st._nt_orders.clear()
+        monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {})
+        monkeypatch.setattr(st, "_flip_mode", lambda *a, **k: ("reverse", "test", twin))
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1,
+                              ("bread_n_butter", "BnB"), "sid-a")
+        st._pending_confirms.clear()
+        buy = "PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(buy, envelope=ENTRY_ENV)
+            assert plans[0]["reset_first"] is True
+            _run_plans(plans)
+        return [f.read_text() for f in sorted(tmp_output_dir.glob("oif_*.txt"))]
+
+    def test_one_reversal_and_nothing_else(self, ms_on, live_book, tmp_output_dir, monkeypatch, caplog):
+        with caplog.at_level(logging.INFO):
+            bodies = self._scene(tmp_output_dir, monkeypatch)
+        assert bodies == ["REVERSEPOSITION;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"]
+        assert "flips as REVERSEPOSITION" in caplog.text
+        # The book now belongs to the new strategy, the fill check expects
+        # +1 from flat, and the recorder knows the old position left.
+        assert [r["sid"] for r in st._ledger_entries("Sim101", "NQ 06-26")] == ["sid-b"]
+        assert st._pending_confirms[-1]["expect"] == 1
+        assert st._pending_confirms[-1]["signal"].startswith("REVERSEPOSITION")
+
+    def test_the_flip_is_decided_again_at_write_time(
+            self, ms_on, live_book, tmp_output_dir, monkeypatch, caplog):
+        # "reverse" when the leg started; by the time the write comes a close
+        # has gone out on the root: the sequenced path takes over.
+        st.active_account = "Sim101"
+        st._closes_dispatched.clear(); st._nt_orders.clear()
+        modes = iter([("reverse", "at start", 0), ("sequence", "a close is already in flight on this root", 0)])
+        monkeypatch.setattr(st, "_flip_mode", lambda *a, **k: next(modes))
+        monkeypatch.setattr(st, "_reset_watch", _acoro_returning((True, [], True)))
+        monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {})
+        st._bridge_book = _book(("Sim101", 50_000.0, [("NQ SEP26", -1)]))
+        st._ledger_note_entry("Sim101", "NQ 06-26", "SELL", 1, ("bread_n_butter", "BnB"), "sid-a")
+        buy = "PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"
+        with caplog.at_level(logging.INFO), patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(buy, envelope=ENTRY_ENV)
+            _run_plans(plans)
+        bodies = [f.read_text() for f in sorted(tmp_output_dir.glob("oif_*.txt"))]
+        assert bodies[0] == "CLOSESTRATEGY;Sim101;;;;;;;;;;;sid-a"
+        assert bodies[-1] == "PLACE;Sim101;NQ 06-26;BUY;1;MARKET;;;DAY;;;BnB;sid-b"
+        assert "no longer flips as one command" in caplog.text
+
+    def test_a_twin_the_reverse_cannot_touch_gets_a_plain_close(
+            self, ms_on, live_book, tmp_output_dir, monkeypatch):
+        bodies = self._scene(tmp_output_dir, monkeypatch, twin=-2)
+        assert bodies[0].startswith("CLOSEPOSITION;Sim101;MNQ 06-26")
+        assert bodies[-1].startswith("REVERSEPOSITION;Sim101;NQ 06-26;BUY;1;")
+        assert not any(b.startswith("CLOSEPOSITION;Sim101;NQ 06-26") for b in bodies)
+
+
+class TestNakedWatch:
+    """2026-10-16 02:50:13: SimAlwaySummer long 2 with one Stop1 of 1 — one
+    contract from a second close — and from 03:01:51 long 1 with no stop at
+    all. Every position NinjaTrader shows for BRACKET_ATTACH_S with less
+    Stop quantity working than it holds is closed (policy 'close') when it
+    is a managed account's position on a root this app trades."""
+
+    LONG1_ADD = ("2026-10-16 02:50:12:893|1|64|Instrument='NQ DEC26' Account='SimAI' "
+                 "Average price=30156 Quantity=1 Market position=Long Operation=Operation_Add")
+    LONG2_UPD = ("2026-10-16 02:50:13:652|1|64|Instrument='NQ DEC26' Account='SimAI' "
+                 "Average price=30156 Quantity=2 Market position=Long Operation=Update")
+    STOP1_SUB = ("2026-10-16 02:50:13:653|1|32|Order='3420db989f5e456d883fc4ed8b71d834/SimAI' "
+                 "Name='Stop1' New state='Submitted' Instrument='NQ DEC26' Action='Sell' "
+                 "Limit price=0 Stop price=30145.5 Quantity=1 Type='Stop Market' Time in force=GTC "
+                 "Oco='fac013300ce04bff802b82bc9d6d406d' Filled=0 Fill price=0 Error='No error' Native error=''")
+    STOP1_ACC = STOP1_SUB.replace("02:50:13:653", "02:50:14:224").replace("Submitted", "Accepted")
+    STOP1_FILLED = STOP1_SUB.replace("02:50:13:653", "03:01:50:977").replace("Submitted", "Filled")
+    LONG1_AFTER_STOP = ("2026-10-16 03:01:51:980|1|64|Instrument='NQ DEC26' Account='SimAI' "
+                        "Average price=30156 Quantity=1 Market position=Long Operation=Update")
+    FLAT = ("2026-10-16 02:50:10:397|1|64|Instrument='NQ DEC26' Account='SimAI' "
+            "Average price=0 Quantity=0 Market position=Flat Operation=Remove")
+
+    @pytest.fixture(autouse=True)
+    def _arm(self, tmp_output_dir, monkeypatch):
+        st.active_account = "SimAI"
+        st.follower_accounts = []
+        st.output_directory = str(tmp_output_dir)
+        st._nt_orders.clear(); st._nt_positions.clear(); st._uncovered_since.clear()
+        st._nt_position_seen.clear(); st._nt_flat_seen.clear()
+        st._bracket_fills.clear(); st._bracket_guard_seen.clear()
+        st._closes_dispatched.clear()
+        st._pnl_open_meta.pop(("SimAI", "NQ"), None)
+        st._ledger_clear("SimAI")
+        monkeypatch.setattr(st, "_nt_tail_seen", 0.0)
+        yield
+        st._nt_orders.clear(); st._nt_positions.clear(); st._uncovered_since.clear()
+        st._closes_dispatched.clear()
+        st._pnl_open_meta.pop(("SimAI", "NQ"), None)
+        st._ledger_clear("SimAI")
+
+    CLOSE_SUB = ("2026-10-16 02:50:03:515|1|32|Order='49e8718a33b2493f93db1bb6d1fac217/SimAI' "
+                 "Name='Close' New state='Submitted' Instrument='NQ DEC26' Action='Buy to cover' "
+                 "Limit price=0 Stop price=0 Quantity=1 Type='Market' Time in force=DAY Oco='' "
+                 "Filled=0 Fill price=0 Error='No error' Native error=''")
+
+    def _closes(self, tmp_output_dir):
+        return sorted(p.read_text() for p in tmp_output_dir.glob("oifclose_*.txt"))
+
+    def _ours(self):
+        st._pnl_open_meta[("SimAI", "NQ")] = {"strategies": ["Gooping"], "ts": 1.0,
+                                              "avg": 30156.0, "cost": 0.0}
+
+    def test_one_contract_of_two_without_a_stop_closes_the_leg(self, tmp_output_dir, caplog):
+        self._ours()
+        for line in (self.LONG1_ADD, self.LONG2_UPD, self.STOP1_SUB, self.STOP1_ACC):
+            st._bracket_guard_event(line, now=st._nt_log_stamp(line))
+        t0 = st._nt_log_stamp(self.LONG2_UPD)
+        assert st._naked_watch(now=t0 + 5) == []          # first sight under-protected: the clock starts
+        assert st._naked_watch(now=t0 + 15) == []         # 10 s running: still inside the grace
+        with caplog.at_level(logging.WARNING):
+            assert st._naked_watch(now=t0 + 5 + st.BRACKET_ATTACH_S + 1) == ["close"]
+        assert self._closes(tmp_output_dir)[0].startswith("CLOSEPOSITION;SimAI;NQ 12-26;")
+        assert "LONG 2 has 1 contract of stop working" in caplog.text
+        assert st._naked_watch(now=t0 + 5 + st.BRACKET_ATTACH_S + 2) == []  # once per exposure
+
+    def test_the_contract_left_after_the_stop_fills_is_naked(self, tmp_output_dir):
+        self._ours()
+        for line in (self.LONG2_UPD, self.STOP1_SUB, self.STOP1_ACC,
+                     self.STOP1_FILLED, self.LONG1_AFTER_STOP):
+            st._bracket_guard_event(line, now=st._nt_log_stamp(line))
+        t1 = st._nt_log_stamp(self.LONG1_AFTER_STOP)
+        assert st._naked_watch(now=t1 + 1) == []
+        assert st._naked_watch(now=t1 + 1 + st.BRACKET_ATTACH_S + 1) == ["close"]
+        assert "0 contracts of stop working" in st._alert_text and "leg closed at market" in st._alert_text
+
+    def test_a_bracket_submitted_before_the_position_counts(self, tmp_output_dir):
+        # REVERSEPOSITION: NinjaTrader submits the new Stop1 while the account
+        # is still flat, then the long opens already protected.
+        self._ours()
+        early = self.STOP1_SUB.replace("02:50:13:653", "02:50:11:000")
+        acc = self.STOP1_ACC.replace("02:50:14:224", "02:50:13:500")
+        for line in (early, self.LONG1_ADD, acc):
+            st._bracket_guard_event(line, now=st._nt_log_stamp(line))
+        t0 = st._nt_log_stamp(self.LONG1_ADD)
+        assert st._naked_watch(now=t0 + st.BRACKET_ATTACH_S + 1) == []
+        assert self._closes(tmp_output_dir) == []
+
+    def test_a_position_that_left_is_not_watched(self, tmp_output_dir):
+        self._ours()
+        for line in (self.LONG1_ADD, self.FLAT.replace("02:50:10:397", "02:50:20:000")):
+            st._bracket_guard_event(line, now=st._nt_log_stamp(line))
+        assert st._nt_positions == {}
+        assert st._naked_watch(now=st._nt_log_stamp(self.LONG1_ADD) + 60) == []
+
+    def test_a_root_this_app_does_not_trade_is_flagged_not_closed(self, tmp_output_dir):
+        # No ledger row, no staged label: a chart trade with no ATM. Alert only
+        # — also when the P&L observer has already created an empty label
+        # record for the root it saw (it does so for every held position).
+        st._pnl_open_meta[("SimAI", "NQ")] = {"strategies": [], "ts": None, "avg": None, "cost": 0.0}
+        st._bracket_guard_event(self.LONG1_ADD, now=st._nt_log_stamp(self.LONG1_ADD))
+        t0 = st._nt_log_stamp(self.LONG1_ADD)
+        assert st._naked_watch(now=t0 + 1) == []
+        assert st._naked_watch(now=t0 + 1 + st.BRACKET_ATTACH_S + 1) == ["alert"]
+        assert self._closes(tmp_output_dir) == []
+        assert "NO STOP" in st._alert_text
+
+    def test_policy_alert_never_closes(self, tmp_output_dir, tmp_config):
+        st.save_config({"bracket_guard": "alert"})
+        self._ours()
+        st._bracket_guard_event(self.LONG1_ADD, now=st._nt_log_stamp(self.LONG1_ADD))
+        t0 = st._nt_log_stamp(self.LONG1_ADD)
+        assert st._naked_watch(now=t0 + 1) == []
+        assert st._naked_watch(now=t0 + 1 + st.BRACKET_ATTACH_S + 1) == ["alert"]
+        assert self._closes(tmp_output_dir) == []
+
+    def test_a_bracket_cancelled_for_a_close_is_transit_not_nakedness(self, tmp_output_dir, monkeypatch):
+        # NinjaTrader cancels the bracket 1-3 s BEFORE it submits the close.
+        # A watch that counted from the position's open would fire inside
+        # that window and double the close — the very bug this release fixes.
+        self._ours()
+        monkeypatch.setattr(st, "_nt_tail_seen", time.time())           # log in view
+        t0 = st._nt_log_stamp(self.LONG1_ADD)
+        for line in (self.LONG1_ADD, self.STOP1_SUB, self.STOP1_ACC):
+            st._bracket_guard_event(line, now=st._nt_log_stamp(line))
+        assert st._naked_watch(now=t0 + 120) == []                      # protected for two minutes
+        cancel = self.STOP1_ACC.replace("02:50:14:224", "02:52:13:000").replace("Accepted", "Cancelled")
+        st._bracket_guard_event(cancel, now=st._nt_log_stamp(cancel))
+        tc = st._nt_log_stamp(cancel)
+        assert st._naked_watch(now=tc + 0.9) == []                      # the clock just started
+        close = self.CLOSE_SUB.replace("02:50:03:515", "02:52:14:300")
+        st._bracket_guard_event(close, now=st._nt_log_stamp(close))     # NT's close is working
+        assert st._naked_watch(now=tc + st.BRACKET_ATTACH_S + 5) == []  # in transit: never doubled
+        assert self._closes(tmp_output_dir) == []
+        flat = self.FLAT.replace("02:50:10:397", "02:52:16:000")
+        st._bracket_guard_event(flat, now=st._nt_log_stamp(flat))
+        assert st._nt_positions == {} and st._uncovered_since == {}
+
+    def test_a_close_this_process_just_wrote_holds_the_watch_off(self, tmp_output_dir):
+        self._ours()
+        st._bracket_guard_event(self.LONG1_ADD, now=st._nt_log_stamp(self.LONG1_ADD))
+        st._note_close_dispatched("SimAI", "NQ")
+        t0 = st._nt_log_stamp(self.LONG1_ADD)
+        assert st._naked_watch(now=t0 + 1) == []
+        assert st._naked_watch(now=t0 + 1 + st.BRACKET_ATTACH_S + 1) == []
+        assert self._closes(tmp_output_dir) == []
+
+    def test_finished_orders_are_forgotten_before_a_resting_stop(self):
+        st._nt_orders[("SimAI", "NQ")] = {"stop-old": ("Stop1", "Accepted", 1.0, 1, "Sell")}
+        for i in range(47):
+            st._nt_orders[("SimAI", "NQ")][f"done-{i}"] = ("Entry", "Filled", 10.0 + i, 1, "Buy")
+        st._bracket_guard_event(self.STOP1_SUB.replace("3420db989f5e456d883fc4ed8b71d834", "a" * 32),
+                                now=st._nt_log_stamp(self.STOP1_SUB))
+        book = st._nt_orders[("SimAI", "NQ")]
+        assert "stop-old" in book and len(book) == 48
+
+
+class TestWebReverseButton:
+    """The Rev button goes through the same flip as the publisher reset: the
+    position's own ATM template, a strategy id the ledger can target, and
+    REVERSEPOSITION only when the position is filled and quiet."""
+
+    @pytest.fixture(autouse=True)
+    def _scene(self, tmp_output_dir, monkeypatch):
+        st.active_account = "Sim101"
+        st.follower_accounts = []
+        st.hard_stopped = False
+        st.account_stops.clear()
+        st.output_directory = str(tmp_output_dir)
+        st._pending_confirms.clear()
+        st._ledger_clear("Sim101")
+        st._closes_dispatched.clear(); st._nt_orders.clear()
+        monkeypatch.setattr(st, "web_live", lambda force=False: {
+            "stale": False,
+            "positions": [{"account": "Sim101", "instrument": "NQ 12-26", "qty": 2}]})
+        monkeypatch.setattr(st, "validate_strategy", lambda name: name in ("Gooping", "NQ_Med"))
+        monkeypatch.setattr(st, "query_nt_positions", lambda *a, **k: {"NQ 12-26": 2})
+        st._pnl_open_meta[("Sim101", "NQ")] = {"strategies": ["Gooping"], "ts": 1.0,
+                                               "avg": 1.0, "cost": 0.0, "side": 1}
+        yield
+        st._pnl_open_meta.pop(("Sim101", "NQ"), None)
+        st._ledger_clear("Sim101")
+
+    def _files(self, tmp_output_dir):
+        return [f.read_text() for f in sorted(tmp_output_dir.glob("oif_*.txt"))]
+
+    def _run(self, coro):
+        async def go():
+            result = await coro
+            while st._leg_tasks:
+                await asyncio.gather(*list(st._leg_tasks), return_exceptions=True)
+            return result
+        return asyncio.run(go())
+
+    def test_a_filled_position_reverses_with_its_own_atm_and_an_id(self, tmp_output_dir, monkeypatch):
+        monkeypatch.setattr(st, "_flip_mode", lambda *a, **k: ("reverse", "test", 0))
+        ok, msg = self._run(st._web_reverse_position("Sim101", "NQ 12-26"))
+        assert ok, msg
+        files = self._files(tmp_output_dir)
+        assert len(files) == 1
+        head, _, sid = files[0].rpartition(";")
+        assert head == "REVERSEPOSITION;Sim101;NQ 12-26;SELL;2;MARKET;;;DAY;;;Gooping"
+        assert sid.startswith("rev:") and sid.endswith(":Sim101")
+        assert st._pending_confirms[-1]["expect"] == -2
+        assert [r["sid"] for r in st._ledger_entries("Sim101", "NQ 12-26")] == [sid]
+
+    def test_a_click_on_one_instrument_leaves_the_twin_alone(self, tmp_output_dir, monkeypatch):
+        monkeypatch.setattr(st, "_flip_mode", lambda *a, **k: ("reverse", "test", -3))
+        ok, _ = self._run(st._web_reverse_position("Sim101", "NQ 12-26"))
+        assert ok
+        files = self._files(tmp_output_dir)
+        assert len(files) == 1 and files[0].startswith("REVERSEPOSITION;Sim101;NQ 12-26;")
+
+    def test_the_dumps_contract_spelling_is_written_the_oif_way(self, tmp_output_dir, monkeypatch):
+        monkeypatch.setattr(st, "web_live", lambda force=False: {
+            "stale": False,
+            "positions": [{"account": "Sim101", "instrument": "NQ DEC26", "qty": 1}]})
+        monkeypatch.setattr(st, "_flip_mode", lambda *a, **k: ("reverse", "test", 0))
+        ok, msg = self._run(st._web_reverse_position("Sim101", "NQ DEC26"))
+        assert ok, msg
+        assert self._files(tmp_output_dir)[0].startswith("REVERSEPOSITION;Sim101;NQ 12-26;SELL;1;")
+
+    def test_without_a_template_the_reversal_is_refused(self, tmp_output_dir, monkeypatch):
+        st._pnl_open_meta[("Sim101", "NQ")]["strategies"] = ["chart"]
+        monkeypatch.setattr(st, "atm_strategy", "")
+        ok, msg = self._run(st._web_reverse_position("Sim101", "NQ 12-26"))
+        assert not ok and "no ATM template" in msg
+        assert self._files(tmp_output_dir) == []
+
+    def test_the_session_default_backs_a_label_with_no_template(self, tmp_output_dir, monkeypatch):
+        st._pnl_open_meta[("Sim101", "NQ")]["strategies"] = ["chart"]
+        monkeypatch.setattr(st, "atm_strategy", "NQ_Med")
+        monkeypatch.setattr(st, "_flip_mode", lambda *a, **k: ("reverse", "test", 0))
+        ok, _ = self._run(st._web_reverse_position("Sim101", "NQ 12-26"))
+        assert ok and ";NQ_Med;" in self._files(tmp_output_dir)[0]
+
+    def test_an_entry_in_flight_takes_the_sequenced_path(self, tmp_output_dir, monkeypatch):
+        monkeypatch.setattr(st, "_flip_mode", lambda *a, **k: ("sequence", "test", 0))
+        monkeypatch.setattr(st, "_reset_watch", _acoro_returning((True, [], True)))
+        st._ledger_note_entry("Sim101", "NQ 12-26", "BUY", 2, ("gooping", "Gooping"), "sid-old")
+        ok, _ = self._run(st._web_reverse_position("Sim101", "NQ 12-26"))
+        assert ok
+        files = self._files(tmp_output_dir)
+        assert files[0] == "CLOSESTRATEGY;Sim101;;;;;;;;;;;sid-old"
+        assert files[-1].startswith("PLACE;Sim101;NQ 12-26;SELL;2;MARKET;;;DAY;;;Gooping;rev:")
+
+    def test_no_entry_when_the_sequenced_close_is_never_proven(self, tmp_output_dir, monkeypatch, caplog):
+        monkeypatch.setattr(st, "_flip_mode", lambda *a, **k: ("sequence", "test", 0))
+        monkeypatch.setattr(st, "_reset_watch", _acoro_returning((False, [], False)))
+        monkeypatch.setattr(st, "RESET_CLOSE_BUDGET_S", 0.0)
+        st._ledger_note_entry("Sim101", "NQ 12-26", "BUY", 2, ("gooping", "Gooping"), "sid-old")
+        with caplog.at_level(logging.ERROR):
+            ok, _ = self._run(st._web_reverse_position("Sim101", "NQ 12-26"))
+        assert ok
+        assert self._files(tmp_output_dir) == ["CLOSESTRATEGY;Sim101;;;;;;;;;;;sid-old"]
+        assert "NOT placed" in caplog.text
+
+
+class TestBridgeFirst:
+    """When the AddOn streams, NinjaTrader is read through it: positions,
+    cash, realized P&L and average prices from its own account events, and
+    the full ATI dump — every order of the session, serialised on each
+    request — only every SNAPSHOT_INTERVAL_BRIDGED seconds and on demand."""
+
+    LINE = [{"name": "Sim101", "cash": 50_000.0, "realized": -12.5, "equity": 50_100.0,
+             "positions": [{"inst": "NQ DEC26", "qty": -1, "avg": 30156.0, "last": 30150.0, "pl": 120.0}]},
+            {"name": "SimAI", "cash": 15_000.0, "realized": 0.0, "equity": 15_000.0, "positions": []}]
+
+    @pytest.fixture(autouse=True)
+    def _bridge(self, live_book):
+        prev = st._snap_latest_ok
+        st._bridge_ingest_book(self.LINE)
+        st._snap_latest_ok = {"ok": True, "req_ts": time.time(), "ts": time.time(), "positions": [],
+                              "accounts": {"Sim101": {"cash": 1.0, "realized": 0.0, "buying_power": 99.0}},
+                              "working": {"Sim101": 2}, "open_orders": {"Sim101": ["a", "b"]}}
+        yield
+        st._snap_latest_ok = prev
+
+    def test_the_book_keeps_realized_and_average_prices(self):
+        entry = st._bridge_book["accounts"]["Sim101"]
+        assert entry["realized"] == -12.5 and entry["equity"] == 50_100.0
+        assert entry["positions"] == [("NQ DEC26", -1)] and entry["avg"] == {"NQ DEC26": 30156.0}
+        seq = st._bridge_book["seq"]
+        st._bridge_ingest_book(self.LINE)
+        assert st._bridge_book["seq"] == seq + 1
+
+    def test_a_fresh_book_is_a_snapshot_carrying_the_dumps_orders(self):
+        snap = st._bridge_snapshot()
+        assert snap["ok"] and snap["source"] == "bridge"
+        assert snap["positions"] == [{"account": "Sim101", "instrument": "NQ DEC26", "qty": -1,
+                                      "avg_price": 30156.0}]
+        assert snap["accounts"]["Sim101"] == {"cash": 50_000.0, "realized": -12.5, "buying_power": 99.0}
+        assert snap["accounts"]["SimAI"]["cash"] == 15_000.0
+        assert snap["working"] == {"Sim101": 2} and snap["open_orders"] == {"Sim101": ["a", "b"]}
+        assert snap["req_ts"] == st._bridge_book["ts"]
+
+    def test_a_stale_or_disconnected_bridge_yields_nothing(self, monkeypatch):
+        st._bridge_book["ts"] -= st.BRIDGE_BOOK_FRESH_S + 1
+        assert st._bridge_snapshot() is None
+        st._bridge_ingest_book(self.LINE)
+        assert st._bridge_snapshot() is not None
+        monkeypatch.setattr(st, "_live_bridge_connected", False)
+        assert st._bridge_snapshot() is None
+
+    def test_a_line_missing_an_account_the_dump_knows_is_not_a_snapshot(self):
+        st._snap_latest_ok["accounts"]["Ghost"] = {"cash": 5.0, "realized": 0.0, "buying_power": None}
+        assert st._bridge_snapshot() is None
+        del st._snap_latest_ok["accounts"]["Ghost"]
+        assert st._bridge_snapshot() is not None
+
+    def test_fill_verdicts_read_the_bridge_not_the_ati(self, monkeypatch, caplog):
+        def no_ati(*a, **k):
+            raise AssertionError("the ATI was queried")
+        monkeypatch.setattr(st, "query_nt_positions", no_ati)
+        st._pending_confirms.clear()
+        st.add_pending_confirm("PLACE;Sim101;NQ 12-26;SELL;1;MARKET;;;DAY;;;BnB;s1", "s1", "NQ 12-26",
+                               "SELL", pre_pos=0, account="Sim101", expect=-1, delta=-1)
+        with caplog.at_level(logging.INFO):
+            st.check_pending_confirms()
+        assert st._pending_confirms == []
+        assert "CONFIRMED  id=s1  account=Sim101  NQ 12-26  SELL  pos: 0→-1" in caplog.text
+
+    def test_the_dump_stream_rests_longer_while_the_bridge_streams(self, monkeypatch, tmp_config):
+        st.save_config({})
+        assert st._snapshot_interval() == st.SNAPSHOT_INTERVAL_BRIDGED
+        st.save_config({"snapshot_interval_bridged": 4})
+        assert st._snapshot_interval() == 4.0
+        st.save_config({"snapshot_interval_bridged": "junk"})
+        assert st._snapshot_interval() == st.SNAPSHOT_INTERVAL_BRIDGED
+        st.save_config({"snapshot_interval_bridged": 0.1})
+        assert st._snapshot_interval() == st.SNAPSHOT_INTERVAL        # never faster than the plain pace
+        monkeypatch.setattr(st, "_live_bridge_connected", False)
+        assert st._snapshot_interval() == st.SNAPSHOT_INTERVAL
+
+    def test_the_live_view_is_served_from_the_bridge(self, monkeypatch):
+        monkeypatch.setattr(st, "snapshot_poller_running", lambda: True)
+        st.active_account = "Sim101"
+        st.follower_accounts = []
+        st._live_cache.update(data=None, seq=None, ts=0.0)
+        live = st.web_live(force=True)
+        row = next(r for r in live["accounts"] if r["name"] == "Sim101")
+        assert live["ok"] and row["cash"] == 50_000.0 and row["realized"] == -12.5
+        assert row["working"] == 2
+        assert row["positions"] == [{"account": "Sim101", "instrument": "NQ DEC26", "qty": -1,
+                                     "avg_price": 30156.0}]
+
+    def test_balances_read_the_bridge_without_waiting_on_a_dump(self, monkeypatch):
+        def no_stream(*a, **k):
+            raise AssertionError("the dump stream was consulted")
+        monkeypatch.setattr(st, "_stream_snapshot", no_stream)
+        rows = {r["name"]: r["cash"] for r in st._accounts_now(6.0)}
+        assert rows == {"Sim101": 50_000.0, "SimAI": 15_000.0}
+
+
+class TestLeaderDirectionOnlyWhenTrading:
+    """2026-10-16 09:45: a LONG Bhorgini signal put SimTEST SHORT. SimTEST
+    had no profile, so it inherited the leader's direction — and SimAI's
+    Bhorgini rule said invert while being switched OFF. A rule the leader
+    does not trade carries no direction for anyone else."""
+
+    @pytest.fixture(autouse=True)
+    def _group(self, monkeypatch):
+        st.active_account = "SimAI"
+        st.follower_accounts = ["SimTEST"]
+        monkeypatch.setattr(st, "validate_strategy", lambda name: True)
+        st.account_profiles.pop("SimTEST", None)
+        yield
+        st.account_profiles.pop("SimAI", None)
+        st.account_profiles.pop("SimTEST", None)
+
+    SIG = "PLACE;SimAI;NQ 12-26;BUY;1;MARKET;;;DAY;;;Bhorgini;ent:b"
+
+    def _follower_action(self):
+        plans, _ = st.plan_signal_legs(self.SIG, pub_strategy="Bhorgini",
+                                       envelope={"strategy": "bhorgini", "event": "entry",
+                                                 "event_id": "ent:b"})
+        leg = next(p for p in plans if p["account"] == "SimTEST")
+        return leg["signal"].split(";")[3]
+
+    def test_a_disabled_leader_rule_does_not_steer_a_blank_follower(self):
+        st.account_profiles["SimAI"] = {"default": {"enabled": False},
+                                        "rules": [{"strategies": ["Bhorgini"], "enabled": False,
+                                                   "direction": "invert"}]}
+        assert self._follower_action() == "BUY"
+
+    def test_a_leader_rule_it_trades_still_leads(self, caplog):
+        st.account_profiles["SimAI"] = {"default": {"enabled": False},
+                                        "rules": [{"strategies": ["Bhorgini"], "enabled": True,
+                                                   "direction": "invert"}]}
+        with caplog.at_level(logging.INFO):
+            assert self._follower_action() == "SELL"
+        assert "LEG DIRECTION  account=SimTEST  invert inherited from the leader's rule" in caplog.text
+
+    def test_a_followers_own_direction_wins(self):
+        st.account_profiles["SimAI"] = {"default": {"enabled": False},
+                                        "rules": [{"strategies": ["Bhorgini"], "enabled": True,
+                                                   "direction": "invert"}]}
+        st.account_profiles["SimTEST"] = {"default": {"enabled": True, "direction": "normal"}}
+        assert self._follower_action() == "BUY"
 
 
 class TestLiveReconnectPath:

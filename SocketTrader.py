@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.21.0"
+__version__ = "0.22.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -2162,15 +2162,24 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = "",
     # this, turning invert on for the leader alone would put every follower
     # on the opposite side of it. An account that DOES set its own
     # direction keeps it, and the hedge guard warns about the divergence.
+    # Only a rule the leader actually TRADES carries that weight: a leader
+    # rule switched off is not a view of the market, and its leftover
+    # `invert` must not put a blank follower on the wrong side (SimTEST,
+    # 2026-10-16 09:45: a LONG Bhorgini signal went SHORT because SimAI's
+    # disabled Bhorgini rule still said invert).
     leader_direction = "normal"
     if active_account:
-        leader_direction = resolve_rule(
-            active_account, instrument, pub_strategy)["direction"]
+        leader_rule = resolve_rule(active_account, instrument, pub_strategy)
+        if leader_rule.get("enabled", True):
+            leader_direction = leader_rule["direction"]
 
     for account, canonical, is_rr_pick in legs:
         rule = resolve_rule(account, instrument, pub_strategy)
         if (account != active_account
                 and "direction" not in explicit_rule_keys(account, instrument, pub_strategy)):
+            if leader_direction != "normal" and rule["direction"] != leader_direction:
+                logger.info(f"LEG DIRECTION  account={account}  {leader_direction} "
+                            f"inherited from the leader's rule for {pub_strategy or 'this signal'}")
             rule["direction"] = leader_direction
         final, skip_reason, meta = transform_signal_for_account(canonical, account, rule)
         if final is None:
@@ -2598,17 +2607,27 @@ def _inflight_open_rows() -> list[tuple[str, str, int]]:
 LEDGER_TTL_S = 18 * 3600      # one session; older rows are stale bookkeeping
 _MAX_LEDGER_KEYS = 256
 _MAX_LEDGER_ENTRIES = 12      # per (account, root) — publisher strategies are few
-RESET_SETTLE_S = 1.5          # close→entry gap when an entry resets a market
-                              # itself (the publisher's own pairs run 1–3s)
-RESET_VERIFY_KEY = "reset_verify"   # config: "on" | "off" (default) — the global
-                                    # default for the opposite-direction reset wait
+RESET_SETTLE_S = 1.5          # legacy (reset_verify off): close→entry gap on a
+                              # clock, no proof — the entry can net against a
+                              # close NinjaTrader has not filled yet
+RESET_ESCALATE_S = 20.0       # a position still showing this long after a
+                              # CLOSESTRATEGY, with no close working per NT's
+                              # log, gets the plain close (closes filled 7–11 s
+                              # after the command on the slowest day logged)
+RESET_CLOSE_BUDGET_S = 60.0   # proof budget per reset; past it the entry is
+                              # NOT placed, loudly (_reset_not_placed)
+RESET_VERIFY_KEY = "reset_verify"   # config: "on" (default) | "off" — the global
+                                    # default for the opposite-direction reset
 
 
 def _reset_verify_policy() -> str:
-    """Global default for the opposite-direction reset: 'on' waits for PROOF the
-    standing position cleared before the entry; 'off' (default) keeps the blind
-    RESET_SETTLE_S settle. Per-account/strategy rules override it (resolve_rule)."""
-    return "on" if str(load_config().get(RESET_VERIFY_KEY, "off") or "off").lower() == "on" else "off"
+    """Global default for how an opposite-direction reset paces its entry:
+    'on' (default) writes the entry the moment NinjaTrader PROVES the standing
+    position gone; 'off' keeps the legacy fixed RESET_SETTLE_S settle with no
+    proof. Neither path ever writes the entry while a close may still be
+    working; 'on' never writes it without proof of flat at all.
+    Per-account/strategy rules override it (resolve_rule)."""
+    return "off" if str(load_config().get(RESET_VERIFY_KEY, "on") or "on").lower() == "off" else "on"
 
 
 def _reset_verify_on(rule: dict) -> bool:
@@ -2693,6 +2712,175 @@ def _ledger_prune_sids(account: str, sids: set[str],
                 del _strategy_ledger[key]
 
 
+# ---------- Closes in flight ----------
+# Every close this process writes — a publisher's CLOSEPOSITION fanned out,
+# a scoped CLOSESTRATEGY, a reset, a REVERSEPOSITION, a guard close, a
+# bridge FLATTEN — may still be working for seconds: NinjaTrader cancels the
+# bracket first and only then submits the close. A flip that arrives inside
+# that window must wait for it, never write a second one (2026-10-16 02:50).
+RESET_CLOSE_PENDING_S = 30.0
+_closes_dispatched: dict[tuple[str, str], tuple[float, int | None, int | None, tuple]] = {}
+# (account, ROOT) -> (wall clock, signed qty shown on the root when the close
+# went out, signed qty the close targets, strategy ids it named)
+
+
+def _root_qty(snap: dict | None, account: str, instrument: str) -> int | None:
+    """Signed quantity a snapshot shows on (account, root), 0 for flat, None
+    when the snapshot cannot vouch for the account. `instrument` may be a
+    bare root ("NQ") or any spelling of the contract."""
+    if not snap or account not in (snap.get("accounts") or {}):
+        return None
+    root = _alias_root(instrument).upper()
+    return sum(p["qty"] for p in snap.get("positions") or []
+               if p["account"] == account and _alias_root(p["instrument"]).upper() == root)
+
+
+def _shown_qty(account: str, instrument: str) -> int | None:
+    """What the freshest trusted read shows held on (account, root), or
+    None when no read can vouch for the account right now."""
+    return _root_qty(_bridge_snapshot() or _snap_latest_ok, account, instrument)
+
+
+def _read_since(account: str, instrument: str, since: float) -> int | None:
+    """Signed quantity the newest TRUSTED read taken after `since` shows on
+    (account, root) — 0 for flat — or None when no such read exists yet."""
+    root = _alias_root(instrument).upper()
+    book = _bridge_book_after(since)
+    if book is not None:
+        entry = _book_entry_trusted(book, account)
+        if entry is not None:
+            return sum(q for inst, q in entry["positions"] if _alias_root(inst).upper() == root)
+    snap = _snap_latest_ok
+    if snap and snap.get("req_ts", 0.0) >= since + BRIDGE_VERIFY_MARGIN_S:
+        q = _root_qty(snap, account, instrument)
+        if q is not None:
+            return q
+    if _nt_flat_seen.get((account, root), 0.0) >= since:
+        return 0            # NinjaTrader's own position line said Remove after the close
+    return None
+
+
+def _note_close_dispatched(account: str, root: str | None, shown: int | None = None,
+                           targeted: int | None = None, sids: tuple = ()):
+    """A close went out for (account, root). `shown` is what the book held
+    on the root at that moment, `targeted` the signed quantity the close is
+    meant to remove (the whole position for a plain close or a reversal, one
+    strategy's lot for a scoped CLOSESTRATEGY), `sids` the ids it named."""
+    if not account or not root:
+        return
+    _closes_dispatched[(account, root.upper())] = (time.time(), shown, targeted, tuple(sids))
+    if len(_closes_dispatched) > 512:
+        _closes_dispatched.pop(min(_closes_dispatched, key=lambda k: _closes_dispatched[k][0]), None)
+
+
+def _close_pending(account: str, instrument: str, now: float | None = None) -> bool:
+    """A close may still be working on (account, root): this process wrote
+    one within RESET_CLOSE_PENDING_S that nothing since has PROVEN done, or
+    NinjaTrader's log shows a Close order open there. Proof of done is a
+    trusted read taken after the close that shows the root flat, or on the
+    other side of what was held (a reversal's result), or down by at least
+    what the close targeted (a scoped close landed) — all measured against a
+    position that was actually on the book when the close went out; a flat
+    read says nothing about a close written while the fill's position line
+    had not landed. A CLOSESTRATEGY NinjaTrader answered "unknown strategy"
+    for every id is done too: nothing was ever submitted. Silence never
+    counts: a slow NinjaTrader logs the Close seconds after the file."""
+    now = time.time() if now is None else now
+    root = _alias_root(instrument).upper()
+    rec = _closes_dispatched.get((account, root))
+    if rec is not None:
+        stamp, shown, targeted, sids = rec
+        if now - stamp > RESET_CLOSE_PENDING_S:
+            _closes_dispatched.pop((account, root), None)
+        else:
+            done = False
+            read = _read_since(account, instrument, stamp)
+            if read is not None and shown:
+                if read == 0 or (read > 0) != (shown > 0):
+                    done = True
+                elif targeted and abs(read) <= abs(shown) - abs(targeted):
+                    done = True
+            if not done and sids and _nt_reported_unknown(list(sids), stamp):
+                done = True
+            if done:
+                _closes_dispatched.pop((account, root), None)
+            else:
+                return True
+    return _nt_close_in_flight(account, instrument, now - RESET_CLOSE_PENDING_S) is True
+
+
+_PUBLISHER_ID_ROOT_RE = re.compile(r"^ent:([a-z]{1,4})_", re.I)
+
+
+def _ledger_row_of_sid(account: str, sid: str) -> tuple[str, dict] | None:
+    """(root, row) the ledger attributes a strategy id to, if it still does."""
+    with _ledger_lock:
+        for key, rows in _strategy_ledger.items():
+            if key[0] != account:
+                continue
+            for r in rows:
+                if r.get("sid") == sid:
+                    return key[1], dict(r)
+    return None
+
+
+def _ledger_root_of_sid(account: str, sid: str) -> str | None:
+    hit = _ledger_row_of_sid(account, sid)
+    return hit[0] if hit else None
+
+
+def _note_close_from_signal(signal_text: str):
+    """Register the close a just-written OIF command implies, if any — on
+    the root it targets, never account-wide. A CLOSESTRATEGY's root comes
+    from the ledger (with that strategy's own lot as the target), else from
+    the publisher's id convention (ent:<root>_<strategy>:…); an id neither
+    knows registers nothing — NinjaTrader's log, when in view, still shows
+    the Close it produces."""
+    parts = signal_text.split(";")
+    cmd = parts[0].strip().upper() if parts else ""
+    acct = parts[1].strip() if len(parts) > 1 else ""
+    if not acct:
+        return
+    if cmd in ("CLOSEPOSITION", "REVERSEPOSITION") and len(parts) > 2 and parts[2].strip():
+        inst = parts[2].strip()
+        shown = _shown_qty(acct, inst)
+        _note_close_dispatched(acct, _alias_root(inst).upper(), shown, shown)
+    elif cmd == "CLOSESTRATEGY" and len(parts) > 12 and parts[12].strip():
+        sid = parts[12].strip()
+        hit = _ledger_row_of_sid(acct, sid)
+        if hit is not None:
+            root, row = hit
+            _note_close_dispatched(acct, root, _shown_qty(acct, root),
+                                   row["qty"] * row["side"], (sid,))
+            return
+        m = _PUBLISHER_ID_ROOT_RE.match(sid)
+        if m:
+            root = m.group(1).upper()
+            _note_close_dispatched(acct, root, _shown_qty(acct, root), None, (sid,))
+
+
+def _ledger_prune_flat(account: str, root: str):
+    """A root NinjaTrader shows flat has no live entries on it: drop its
+    rows, keeping only writes young enough to still be in flight (an entry
+    the dump has not shown yet). Brackets close positions without telling
+    the ledger, so without this a reset fires CLOSESTRATEGY for every id
+    since the session began — six "unknown strategy" files ahead of the
+    live one on 2026-10-16 02:50."""
+    key = (account, (root or "").upper())
+    if _nt_entry_in_flight(account, root) is not False:
+        return      # an entry may still be working here (or the log is out of view): rows stay
+    now = time.monotonic()
+    with _ledger_lock:
+        rows = _strategy_ledger.get(key)
+        if not rows:
+            return
+        keep = [r for r in rows if now - r["ts"] <= INFLIGHT_OPEN_TTL_S]
+        if keep:
+            _strategy_ledger[key] = keep
+        else:
+            del _strategy_ledger[key]
+
+
 def _ident_matches(row: dict, ident: tuple[str, str]) -> bool:
     """True when a ledger row belongs to this strategy identity. Publishers
     attribute by envelope slug ("bread_n_butter") or by ATI field-11 name
@@ -2761,6 +2949,7 @@ def _bridge_ingest_book(accts: list):
         if not name:
             continue
         positions: list[tuple[str, int]] = []
+        avgs: dict[str, float] = {}
         # A missing/non-list positions field is UNKNOWN, not flat — the
         # account is dropped so the fast path cannot prove it clear.
         raw_pos = a.get("positions")
@@ -2775,14 +2964,71 @@ def _bridge_ingest_book(accts: list):
                 rows_ok = False
                 break
             positions.append((inst, qty))
+            try:
+                avgs[inst] = float(p.get("avg"))
+            except (TypeError, ValueError):
+                pass
         if not rows_ok:
             continue
-        try:
-            cash = float(a["cash"])
-        except (KeyError, TypeError, ValueError):
-            cash = None
-        book[name] = {"cash": cash, "positions": positions}
-    _bridge_book = {"ts": time.time(), "accounts": book}
+
+        def _num(key):
+            try:
+                v = float(a[key])
+            except (KeyError, TypeError, ValueError):
+                return None
+            return v if math.isfinite(v) else None
+        book[name] = {"cash": _num("cash"), "realized": _num("realized"),
+                      "equity": _num("equity"), "positions": positions, "avg": avgs}
+    global _bridge_seq
+    _bridge_seq += 1
+    _bridge_book = {"ts": time.time(), "accounts": book, "seq": _bridge_seq}
+
+
+_bridge_seq = 0
+
+
+def _bridge_fresh() -> bool:
+    """The AddOn is streaming and its newest line is younger than
+    BRIDGE_BOOK_FRESH_S — the condition for reading NinjaTrader through it."""
+    book = _bridge_book
+    return bool(live_bridge_enabled and _live_bridge_connected and book
+                and time.time() - book["ts"] <= BRIDGE_BOOK_FRESH_S)
+
+
+def _bridge_snapshot() -> dict | None:
+    """The live book in nt_snapshot's shape, for every reader that needs
+    positions and balances: the dashboard, the P&L recorder, fill verdicts,
+    an entry's pre-position read, the balance monitor. Positions, cash,
+    realized P&L and average prices come straight from NinjaTrader's own
+    account events, pushed by the AddOn on every change and every 5 s idle;
+    working-order ids — the one thing the AddOn does not carry — are the
+    newest complete ATI dump's. None unless the bridge is fresh.
+
+    This is what lets the ATI dump stream slow to SNAPSHOT_INTERVAL_BRIDGED:
+    NinjaTrader serialises every order of its session into that dump, so
+    asking for it every second is the load that slowed its fills
+    (2026-10-16: 192 KB dumps hitting the 10 s cap before a restart)."""
+    if not _bridge_fresh():
+        return None
+    book = _bridge_book
+    last = _snap_latest_ok or {}
+    last_accounts = last.get("accounts") or {}
+    if any(name not in book["accounts"] for name in last_accounts):
+        return None     # a line that dropped an account the dump knows cannot stand in for the dump
+    accounts: dict[str, dict] = {}
+    rows: list[dict] = []
+    for name, entry in book["accounts"].items():
+        accounts[name] = {"cash": entry.get("cash"), "realized": entry.get("realized"),
+                          "buying_power": (last_accounts.get(name) or {}).get("buying_power")}
+        avgs = entry.get("avg") or {}
+        for inst, qty in entry["positions"]:
+            rows.append({"account": name, "instrument": inst, "qty": qty,
+                         "avg_price": avgs.get(inst)})
+    return {"ok": True, "source": "bridge", "accounts": accounts, "positions": rows,
+            "working": dict(last.get("working") or {}),
+            "open_orders": dict(last.get("open_orders") or {}),
+            "ts": book["ts"], "req_ts": book["ts"], "seq": ("bridge", book.get("seq")),
+            "partial": False, "took": 0.0, "slow": False}
 
 
 def _bridge_book_snapshot(plans: list[dict] | None = None) -> dict | None:
@@ -2972,6 +3218,9 @@ def _smart_close_decision(account: str, instrument: str,
         return "pass", [], "own entry carries no strategy id to scope by"
     files = [f"CLOSESTRATEGY;{sanitize_ati(account)};;;;;;;;;;;{r['sid']}"
              for r in own]
+    _note_close_dispatched(account, _alias_root(instrument).upper(), held,
+                           sum(r["qty"] * r["side"] for r in own),
+                           tuple(r["sid"] for r in own))
     _ledger_prune_sids(account, {r["sid"] for r in own}, instrument)
     n = len(own)
     return "scope", files, f"scoped to {n} own entr{'y' if n == 1 else 'ies'}"
@@ -3194,22 +3443,207 @@ async def _prop_verify_cleared(to_close: dict[str, list[str]]) -> bool:
     return gone
 
 
-async def _reset_verify_cleared(account: str, instrument: str) -> bool:
-    """Confirm a reset's standing position on (account, root) is actually gone
-    before the opposite-direction entry fires — same proof-not-hope doctrine as
-    _prop_verify_cleared and verify_flat: an unverifiable state is NOT clear.
-    NinjaTrader can fill (and so close) 15–30 s late; firing the opposite entry
-    on the blind settle before the close lands leaves both ATMs alive to orphan a
-    bracket on the netted-flat account. The caller withholds the entry when this
-    cannot confirm, rather than stack an opposite position onto an unproven one."""
-    target = {(account, _alias_root(instrument).upper())}
-    gone, _remaining, _confirmed = await _watch_closed(
+def _reset_roots(instrument: str, twin: bool = True) -> set[str]:
+    """The roots a reset must clear: the entry's own and, when the reset
+    closes it, its micro/full twin — the pair _reset_close_files writes a
+    plain close for."""
+    roots = {_alias_root(instrument).upper()}
+    if twin:
+        alt = _apply_size(instrument,
+                          "full" if instrument != to_full_instrument(instrument)
+                          else "micros")
+        if alt and alt != instrument:
+            roots.add(_alias_root(alt).upper())
+    return roots
+
+
+async def _reset_watch(account: str, instrument: str, twin: bool = True
+                       ) -> tuple[bool, list[dict], bool]:
+    """Watch NinjaTrader after a reset's close went out, until the entry's
+    root (and its twin) is PROVEN gone — same proof-not-hope doctrine as
+    _prop_verify_cleared and verify_flat. Returns _watch_closed's
+    (gone, remaining, confirmed): `confirmed` False means no complete
+    post-close dump ever arrived, and an unverifiable state is NOT flat."""
+    target = {(account, root) for root in _reset_roots(instrument, twin)}
+    return await _watch_closed(
         lambda positions: [p for p in positions
                            if (p["account"], _alias_root(p["instrument"]).upper()) in target],
         lambda since: _bridge_book_shows_cleared(target, since),
         FLATTEN_VERIFY_TRIES, (FLATTEN_VERIFY_TRIES + 1) * FLATTEN_VERIFY_DELAY,
         "RESET VERIFY")
-    return gone
+
+
+def _reset_write_close(account: str, instrument: str, close_twin: bool = True
+                       ) -> tuple[list[str], float]:
+    """Write ONE close for what (account, root) holds and keep the books in
+    step: CLOSESTRATEGY per ledger id when the position is attributed (it
+    cancels an unfilled entry, closes a filled one bracket and all), else
+    the plain CLOSEPOSITION pair. A micro/full twin the book shows, which
+    no strategy id covers, gets its own plain close alongside when
+    `close_twin`. Returns (ids written, wall clock)."""
+    sids = list(dict.fromkeys(
+        r["sid"] for r in _ledger_entries(account, instrument) if r.get("sid")))
+    written = time.time()
+    if sids:
+        for sid in sids:
+            write_signal_to_file(_close_strategy_file(account, sid))
+        exp = _account_root_exposure(account, instrument)
+        if close_twin and exp and exp["twin"]:
+            for sig in _reset_close_files(account, instrument)[1:]:
+                write_signal_to_file(sig)
+        logger.info(f"RESET  account={account}  closing {instrument} before "
+                    f"opposite-direction entry  strategies={sids}")
+    else:
+        for sig in (_reset_close_files(account, instrument) if close_twin
+                    else _reset_close_files(account, instrument)[:1]):
+            write_signal_to_file(sig)
+        logger.info(f"RESET  account={account}  closing {instrument} before "
+                    f"opposite-direction entry  (nothing attributed — plain close)")
+    # The recorder must know this position is leaving before the entry
+    # is staged on the same root (_pnl_note_open).
+    _pnl_note_close(account, instrument)
+    _ledger_clear(account, instrument)
+    _clear_inflight_opens(account, instrument)
+    return sids, written
+
+
+FLIP_INFLIGHT_YOUNG_S = 30.0   # an opening write younger than this may still be unfilled
+
+
+def _flip_mode(account: str, instrument: str) -> tuple[str, str, int]:
+    """How to flip (account, root) for an opposite-direction entry.
+
+    "reverse": one REVERSEPOSITION. NinjaTrader cancels the standing ATM's
+    bracket, submits the new entry and the close together, and submits the
+    new ATM's bracket BEFORE the new position exists (SimTEST 2026-10-16
+    09:34 and 09:38: Stop1 submitted 1.5 s before the long opened; the
+    reversed-away strategy answers "unknown strategy" afterwards, so a late
+    publisher close for it cannot cover against the new side). One command,
+    nothing for a second close to collide with, no proof wait.
+
+    "sequence": CLOSESTRATEGY → proof of flat → PLACE (_reset_close_standing).
+    Needed when the standing entry may still be UNFILLED: a REVERSEPOSITION
+    over a flat book only places the entry, the old one then fills, and the
+    netted-flat account is left with two live ATMs (the Oct 8 orphans).
+
+    Returns (mode, why, twin): `twin` is the signed micro/full-twin quantity
+    the book shows, which a reverse must close separately."""
+    root = _alias_root(instrument).upper()
+    exp = _account_root_exposure(account, instrument)
+    if exp is not None:
+        shown, inflight, twin = exp["shown"], exp["inflight"], exp["twin"]
+    else:
+        shown = _pre_position(account, instrument)
+        inflight = sum(q for a, i, q in _inflight_open_rows()
+                       if a == account and _alias_root(i).upper() == root)
+        twin = 0
+    if _close_pending(account, instrument):
+        return "sequence", "a close is already in flight on this root", twin
+    if not shown:
+        return "sequence", "nothing shown held — the standing entry may be unfilled", twin
+    if _nt_entry_in_flight(account, instrument):
+        return "sequence", "NinjaTrader's log shows an entry still working", twin
+    if abs(inflight) > abs(shown):
+        return "sequence", f"more written ({inflight:+d}) than shown ({shown:+d})", twin
+    return "reverse", f"position {shown:+d} filled and quiet", twin
+
+
+def _flip_signal(signal_text: str) -> str:
+    """The REVERSEPOSITION twin of an entry's PLACE: same fields, NinjaTrader
+    does the close and the open as one."""
+    parts = signal_text.split(";")
+    if parts and parts[0].strip().upper() == "PLACE":
+        parts[0] = "REVERSEPOSITION"
+    return ";".join(parts)
+
+
+def _reset_not_placed(account: str, instrument: str, what: str = "RESET"):
+    """The close went out but NinjaTrader never proved the market flat: say
+    so loudly and place nothing — an opposite order onto an unproven book
+    is how a netted-flat account ends up with orphan brackets."""
+    logger.error(f"{what}  account={account}  {instrument} never confirmed flat "
+                 f"within {RESET_CLOSE_BUDGET_S:.0f}s — entry NOT placed")
+    _dash_set_alert(
+        Fore.RED + Style.BRIGHT +
+        f"  ⛔  {what} — closed {instrument} on {account} but NinjaTrader never "
+        "confirmed it flat; the opposite entry was NOT placed. Check NinjaTrader."
+        + Style.RESET_ALL, sticky=True)
+
+
+async def _reset_close_standing(account: str, instrument: str,
+                                close_twin: bool = True) -> bool:
+    """Close what (account, root) holds before an opposite-direction entry
+    and wait for NinjaTrader to PROVE it flat: one close command, then the
+    watch, then — the caller's job — the entry, the moment flat shows.
+    Returns True once flat is proven, False when RESET_CLOSE_BUDGET_S ran
+    out without proof — and then the caller places NOTHING (_reset_not_placed).
+    A close already in flight on the root (this process wrote one within
+    RESET_CLOSE_PENDING_S, or NinjaTrader's log shows a Close working) is
+    waited for instead of being joined by another.
+
+    Why one command at a time: NinjaTrader's CLOSESTRATEGY is not atomic.
+    It cancels the ATM's bracket first, waits for those cancels to be
+    acknowledged, and only then submits its close — 2.4 s on the live log,
+    2.9 s on the SimTEST repro, with NinjaTrader filling in under a second.
+    v0.20.2 wrote a CLOSEPOSITION right behind it as a fallback; NinjaTrader
+    read that file inside the cancel window, found the position still open
+    (a position's quantity only changes on FILL, and CLOSEPOSITION does not
+    look for a close already working) and submitted a second close. Both
+    filled, and a 1-lot short became a 1-lot naked long under the new entry
+    (SimAlwaySummer, 2026-10-16 02:50:01–02:50:13, pos -1→2; one contract
+    still open with no bracket after the ATM's stop took the other at
+    03:01:50). So the plain close follows a CLOSESTRATEGY only when no close
+    can be in flight: NinjaTrader's log answered "unknown strategy" for
+    every id, or the position is still showing RESET_ESCALATE_S later and
+    NinjaTrader's log — in view — shows no Close order working; with the log
+    out of view there is no evidence and no second close, ever. Flat is not
+    flat while the log shows an Entry still working on the root, either: a
+    cancelled entry can still fill. A CLOSESTRATEGY can also lose to its own entry's fill
+    (Sim101, 2026-10-14 06:23: the cancel was processed at :01.252, the
+    market entry filled at :02.868) — that is the still-showing case, and
+    the plain close takes it out before the entry goes."""
+    if _close_pending(account, instrument):
+        # The publisher's own close, a flatten, a flip seconds ago: a close is
+        # already working here. Writing another is the double close.
+        sids, written, pending = [], time.time(), True
+        logger.info(f"RESET  account={account}  {instrument} already has a close in "
+                    "flight — waiting for flat, writing nothing")
+        _pnl_note_close(account, instrument)
+        _ledger_clear(account, instrument)
+        _clear_inflight_opens(account, instrument)
+    else:
+        sids, written = _reset_write_close(account, instrument, close_twin)
+        pending = False
+    escalated = not sids and not pending   # a plain close already went out: last resort used
+    while True:
+        gone, remaining, confirmed = await _reset_watch(account, instrument, close_twin)
+        if gone and _nt_entry_in_flight(account, instrument):
+            # Flat on the book, but NinjaTrader still has an entry working
+            # on this root; it can fill after the cancel (2026-10-14 06:23).
+            gone = False
+        if gone:
+            return True
+        elapsed = time.time() - written
+        if elapsed >= RESET_CLOSE_BUDGET_S:
+            return False
+        if escalated:
+            continue
+        if sids and _nt_reported_unknown(sids, written):
+            why = "NinjaTrader knew none of those ids"
+        elif confirmed and remaining:
+            if elapsed < RESET_ESCALATE_S:
+                continue
+            if _nt_close_in_flight(account, instrument, written) is not False:
+                continue      # a close IS working, or the log is not in view: no blind second close
+            why = "no close is working per NinjaTrader's log"
+        else:
+            continue                          # silence: nothing to act on yet
+        for sig in (_reset_close_files(account, instrument) if close_twin
+                    else _reset_close_files(account, instrument)[:1]):
+            write_signal_to_file(sig)
+        escalated = True
+        logger.warning(f"RESET  account={account}  {instrument} still open — {why}; "
+                       "plain close written")
 
 
 def _prop_withhold(plans: list[dict], why: str):
@@ -3542,61 +3976,38 @@ async def _run_deferred_leg(plan: dict, sig_id: str | None = None):
     try:
         manual = plan.get("manual", False)
         if plan.get("reset_first"):
-            # Opposite-direction entry over a standing teammate-strategy
-            # position (its own paired close was scoped away): restore the
-            # publisher's reset semantics — full close now, a settle beat
-            # for NT to process it (the publisher's own close→place gap is
-            # 1–3s), then the normal entry flow.
-            #
-            # The standing entry may not have FILLED yet (Oct 8: NinjaTrader
-            # filling 15–30 s after the write). CLOSEPOSITION then finds no
-            # position and does nothing — it does not cancel the working
-            # entry — so both entries fill, net to flat, and both ATMs stay
-            # alive with brackets that later fire on a flat account and
-            # open positions nobody asked for (SimAI and SimEverything
-            # 14:47, SimEverything 15:07). CLOSESTRATEGY by the entry's own
-            # id cancels an unfilled entry and closes a filled one, bracket
-            # included, so it goes first; the CLOSEPOSITION still covers
-            # anything the ledger never wrote (adopted, chart).
-            sids = list(dict.fromkeys(
-                r["sid"] for r in _ledger_entries(account, plan["instrument"])
-                if r.get("sid")))
-            for sid in sids:
-                write_signal_to_file(_close_strategy_file(account, sid))
-            for sig in _reset_close_files(account, plan["instrument"]):
-                write_signal_to_file(sig)
-            # The recorder must know this position is leaving before the
-            # entry below is staged on the same root (_pnl_note_open).
-            _pnl_note_close(account, plan["instrument"])
-            _ledger_clear(account, plan["instrument"])
-            _clear_inflight_opens(account, plan["instrument"])
-            logger.info(f"RESET  account={account}  closed {plan['instrument']} "
-                        f"before opposite-direction entry  strategies={sids}")
-            if _reset_verify_on(rule):
-                # Proof, not a fixed beat (opt-in, global or per account/strategy):
-                # NinjaTrader can fill — and so close — 15–30 s late, and firing
-                # the opposite entry before the close lands leaves both ATMs alive
-                # to orphan a bracket on the netted-flat account. Wait for the
-                # standing position to be PROVEN gone; if it can't be confirmed,
-                # withhold the entry rather than stack an opposite one onto it.
-                if not await _reset_verify_cleared(account, plan["instrument"]):
-                    logger.error(
-                        f"RESET  account={account}  could not confirm "
-                        f"{plan['instrument']} cleared — opposite entry withheld")
-                    _dash_set_alert(
-                        Fore.RED + Style.BRIGHT +
-                        f"  ⛔  RESET — closed {plan['instrument']} on {account} but "
-                        "could not confirm it cleared; opposite entry withheld to "
-                        "avoid stacking. Check NinjaTrader." + Style.RESET_ALL,
-                        sticky=True)
+            # Opposite-direction entry over a standing position (a
+            # teammate strategy's, or one the ledger never wrote): the
+            # publisher's reset semantics — close the market, then open the
+            # other way. A FILLED, quiet position flips as ONE
+            # REVERSEPOSITION (the first tranche below); anything that may
+            # still be in flight takes the sequenced path: one close, PROOF
+            # of flat, then the entry — and no entry at all without that
+            # proof. NinjaTrader is never assumed to keep pace with the
+            # files; that assumption put two closes into one 1-lot short.
+            mode, why, twin = await asyncio.to_thread(_flip_mode, account, plan["instrument"])
+            if mode == "reverse":
+                plan = {**plan, "flip": True, "flip_twin": True}
+                logger.info(f"RESET  account={account}  {plan['instrument']} flips as "
+                            f"REVERSEPOSITION  ({why})")
+            elif _reset_verify_on(rule):
+                logger.info(f"RESET  account={account}  {plan['instrument']} takes the "
+                            f"sequenced close  ({why})")
+                flat = await _reset_close_standing(account, plan["instrument"])
+                if not flat:
+                    _reset_not_placed(account, plan["instrument"])
                     if plan.get("rr_pick"):
                         _rr_return(account)
                     return
-                if _leg_blocked(account, manual):
-                    logger.info(f"LEG ABORTED  account={account}  during=reset verify")
+            else:
+                # Legacy: a fixed settle, no proof. The entry can net against
+                # a close NinjaTrader has not filled yet (Oct 8).
+                _reset_write_close(account, plan["instrument"])
+                if not await _interruptible_sleep(RESET_SETTLE_S, account, manual):
+                    logger.info(f"LEG ABORTED  account={account}  during=reset settle")
                     return
-            elif not await _interruptible_sleep(RESET_SETTLE_S, account, manual):
-                logger.info(f"LEG ABORTED  account={account}  during=reset settle")
+            if _leg_blocked(account, manual):
+                logger.info(f"LEG ABORTED  account={account}  during=reset verify")
                 return
         delay_s = (rule["delay_ms"]
                    + (random.uniform(0, rule["delay_jitter_ms"]) if rule["delay_jitter_ms"] else 0)
@@ -3690,6 +4101,27 @@ async def _write_entry_tranches(plan: dict, tranches: list[int],
         if first:
             pre_pos = await asyncio.to_thread(
                 _pre_position, account, plan["instrument"])
+            if plan.get("flip"):
+                # Decided again HERE, not when the leg started: a delay or
+                # AI gate may have passed, and a close may have gone out.
+                mode, why, _twin = await asyncio.to_thread(
+                    _flip_mode, account, plan["instrument"])
+                if mode == "reverse":
+                    # NinjaTrader closes the standing position and opens
+                    # this one as a single REVERSEPOSITION. The recorder is
+                    # told the old position is leaving first; a micro/full
+                    # twin the reverse cannot touch gets a plain close.
+                    sig = _flip_signal(sig)
+                    _pnl_note_close(account, plan["instrument"])
+                    if plan.get("flip_twin") and _twin:
+                        for close_sig in _reset_close_files(account, plan["instrument"])[1:]:
+                            write_signal_to_file(close_sig)
+                else:
+                    logger.info(f"RESET  account={account}  {plan['instrument']} no longer "
+                                f"flips as one command ({why}) — sequenced close instead")
+                    if not await _reset_close_standing(account, plan["instrument"]):
+                        _reset_not_placed(account, plan["instrument"])
+                        break
         path = write_signal_to_file(sig)
         if not path:
             logger.error(f"LEG WRITE FAIL  account={account}  tranche={i + 1}  signal={sig}")
@@ -3706,8 +4138,19 @@ async def _write_entry_tranches(plan: dict, tranches: list[int],
         _note_inflight_open(account, plan["instrument"], plan["action"],
                             tranche_qty)
         if first:
+            # What the book should show once every tranche fills: a reset
+            # starts from flat whatever the pre-read said (it may predate
+            # the close). More than this is contracts nobody placed.
+            sign = 1 if (plan["action"] or "").strip().upper() == "BUY" else -1
+            # A pre-read that may predate a close in flight says nothing
+            # about where this entry lands: start from flat then.
+            rec = _closes_dispatched.get((account, _alias_root(plan["instrument"]).upper()))
+            whole = (rec is not None and _close_pending(account, plan["instrument"])
+                     and rec[2] in (None, pre_pos))
+            base = 0 if plan.get("reset_first") or whole else pre_pos
             add_pending_confirm(sig, sig_id, plan["instrument"], plan["action"], pre_pos,
-                                account=account)
+                                account=account, expect=base + sign * sum(tranches),
+                                delta=sign * sum(tranches))
     if placed:
         _record_stagger(plan["signal"], account, placed)
         if not quiet:
@@ -5050,6 +5493,8 @@ def nt_snapshot(port: int | None = None, timeout: float = 3.0,
 # on it for correctness — only for speed and for keeping NinjaTrader's
 # ATI down to a single stream.
 SNAPSHOT_INTERVAL = 1.0        # seconds from one request to the next when nobody is waiting
+SNAPSHOT_INTERVAL_BRIDGED = 10.0   # … while the live bridge carries positions and balances;
+                                   # config "snapshot_interval_bridged" overrides
 SNAPSHOT_MIN_GAP = 0.25        # breathing room after a slow dump before the next one
 SNAPSHOT_TIMEOUT = 10.0        # wall-clock cap on one dump …
 SNAPSHOT_STALL = 2.0           # … and the silence that ends one early (see _query_ati)
@@ -5079,6 +5524,20 @@ _snap_wake = threading.Event()        # a reader wants the next dump now
 
 def snapshot_poller_running() -> bool:
     return _snap_thread is not None and _snap_thread.is_alive()
+
+
+def _snapshot_interval() -> float:
+    """How long the stream rests between dumps nobody is waiting for: the
+    bridged interval while the AddOn is streaming fresh state (a nudge —
+    an entry write, a flatten, a proof watch — still starts a dump at
+    once), the plain one otherwise."""
+    if not _bridge_fresh():
+        return SNAPSHOT_INTERVAL
+    try:
+        v = float(load_config().get("snapshot_interval_bridged", SNAPSHOT_INTERVAL_BRIDGED))
+    except (TypeError, ValueError):
+        v = SNAPSHOT_INTERVAL_BRIDGED
+    return max(SNAPSHOT_INTERVAL, v)
 
 
 def _snapshot_nudge():
@@ -5126,7 +5585,7 @@ def _snapshot_poller_loop(stop: threading.Event, wake: threading.Event):
             pause = min(SNAPSHOT_SLOW_MAX_PAUSE_S,
                         max(SNAPSHOT_SLOW_S, SNAPSHOT_SLOW_FACTOR * took))
         else:
-            pause = max(req + SNAPSHOT_INTERVAL - done, SNAPSHOT_MIN_GAP)
+            pause = max(req + _snapshot_interval() - done, SNAPSHOT_MIN_GAP)
         if slow != was_slow:
             if slow:
                 logger.warning(f"SNAPSHOT STREAM  NinjaTrader is slow: dump took {took:.1f}s"
@@ -5287,7 +5746,7 @@ def _positions_now(account: str, max_age: float) -> dict[str, int]:
 def _accounts_now(max_age: float) -> list[dict]:
     """Every account's CashValue, in query_nt_accounts' shape, from the
     shared stream when it is running, else one direct ATI query."""
-    snap = _stream_snapshot(max_age, max_age, "BALANCES")
+    snap = _bridge_snapshot() or _stream_snapshot(max_age, max_age, "BALANCES")
     if snap is not None:
         return [{"name": name, "cash": info["cash"]}
                 for name, info in snap["accounts"].items()
@@ -5300,6 +5759,9 @@ def _pre_snapshot(what: str) -> dict | None:
     the newest COMPLETE one while recent, else the newest at all. A partial
     dump can simply lack a position, so a cut-off read under congestion
     must not mint a false "FILLED" from a 0 it never held."""
+    bridged = _bridge_snapshot()
+    if bridged is not None:
+        return bridged
     snap = _snap_latest_ok
     if snap is None or time.time() - snap["req_ts"] > 5.0:
         snap = _snap_latest
@@ -8161,6 +8623,10 @@ def write_signal_to_file(signal_text: str) -> str | None:
     try:
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(signal_text)
+        try:
+            _note_close_from_signal(signal_text)
+        except Exception as exc:
+            logger.error(f"CLOSE REGISTRY  could not record {signal_text.split(';')[0]}: {exc}")
         return filepath
     except Exception as exc:
         _dash_set_alert(Fore.RED + f"  ✖  File write error: {exc}" + Style.RESET_ALL)
@@ -8405,6 +8871,11 @@ def fire_close_position(account: str, contract: str):
     if not output_directory:
         return
     _ledger_clear(account, contract)   # a targeted flatten voids attribution
+    try:
+        shown = _shown_qty(account, contract)
+        _note_close_dispatched(account, _alias_root(contract).upper(), shown, shown)
+    except Exception as exc:
+        logger.error(f"CLOSE REGISTRY  close of {contract} on {account} not recorded: {exc}")
     aliases = _nt_contract_aliases(contract)
     for alias in aliases:
         cmd = f"CLOSEPOSITION;{sanitize_ati(account)};{sanitize_ati(alias)};;;;;;;;;;"
@@ -8516,18 +8987,123 @@ _NT_REJECT_RE = re.compile(
 _NT_OCO_RE = re.compile(r"Oco='([^']*)'")
 _NT_NATIVE_ERR_RE = re.compile(r"Native error='(.*)'\s*$")   # last field; the text itself has apostrophes ("can't")
 _bracket_guard_seen: dict[str, float] = {}   # OCO group (or order id) -> when it was handled
-# A bracket order that FILLS should close or trim a position. Two opposite
-# entries that netted to flat leave both ATMs alive, and the first bracket
-# to fire then opens a position on a flat account instead — NT logs the
-# fill, then the position line with Operation_Add. Nobody's trade: closed.
+# A bracket order that FILLS should close or trim a position, and so should
+# a Close. Two opposite entries that netted to flat leave both ATMs alive,
+# and the first bracket to fire then opens a position on a flat account
+# instead; two closes against one position (2026-10-16 02:50) do the same
+# the moment the second fills. NT logs the fill, then the position line
+# with Operation_Add. Nobody's trade either way: closed.
 _NT_BRACKET_FILL_RE = re.compile(
-    r"\|1\|32\|Order='(?P<oid>[0-9a-f]+)/(?P<acct>[^']+)' Name='(?P<name>(?:Stop|Target)\d*)' "
+    r"\|1\|32\|Order='(?P<oid>[0-9a-f]+)/(?P<acct>[^']+)' Name='(?P<name>(?:Stop|Target)\d*|Close)' "
     r"New state='Filled' Instrument='(?P<instr>[^']+)'")
+# NinjaTrader answers a CLOSESTRATEGY whose id it does not know with this
+# line and does nothing else. The reset reads it as "no close in flight".
+_NT_UNKNOWN_SID_RE = re.compile(
+    r"\|3\|1\|OIF, 'CLOSESTRATEGY;[^']*;(?P<sid>[^;']+)' unknown strategy")
+_nt_unknown_sids: dict[str, float] = {}   # strategy id -> NT's stamp on that answer
+# Every order line NinjaTrader logs, by account and root: the reset asks
+# whether a Close is still working before it dares a second close, whether
+# an Entry is still working before it dares a REVERSEPOSITION, and the naked
+# watch below asks how much Stop quantity protects each position.
+_NT_ORDER_STATE_RE = re.compile(
+    r"\|1\|32\|Order='(?P<oid>[0-9a-f]+)/(?P<acct>[^']+)' Name='(?P<name>[^']+)' "
+    r"New state='(?P<state>[^']+)' Instrument='(?P<instr>[^']+)' Action='(?P<action>[^']*)' "
+    r"Limit price=[0-9.]+ Stop price=[0-9.]+ Quantity=(?P<qty>\d+)")
+_nt_orders: dict[tuple[str, str], dict[str, tuple[str, str, float, int, str]]] = {}  # (acct, ROOT) -> id -> (name, state, stamp, qty, action)
+_nt_positions: dict[tuple[str, str], tuple[int, float, str]] = {}   # (acct, ROOT) -> (signed qty, stamp, NT instrument)
+_nt_position_seen: dict[tuple[str, str], float] = {}   # (acct, ROOT) -> stamp of the last position line of any kind
+_nt_flat_seen: dict[tuple[str, str], float] = {}       # (acct, ROOT) -> stamp of the last Remove line
+# A request to cancel or change is not a cancel: the 2026-10-14 06:23 entry
+# filled after its cancel was submitted. These still count as in flight.
+_NT_INFLIGHT_STATES = OPEN_ORDER_STATES | {"Cancel submitted", "Change submitted",
+                                           "CancelPending", "ChangePending"}
+ENTRY_SETTLE_S = 3.0          # an Entry fill counts as in flight until its position line lands
+ENTRY_INFLIGHT_MAX_S = 180.0  # a working Entry older than this is a lost line, not a live order
+_nt_tail_seen = 0.0           # when the guard last read NinjaTrader's log
+NT_TAIL_FRESH_S = 5.0         # a tail older than this is not in view
+BRACKET_ATTACH_S = 15.0       # a position older than this with less Stop
+                              # quantity working than it holds is naked
 _NT_POSITION_RE = re.compile(
     r"\|1\|64\|Instrument='(?P<instr>[^']+)' Account='(?P<acct>[^']+)' Average price=[0-9.]+ "
     r"Quantity=(?P<qty>\d+) Market position=(?P<mp>\w+) Operation=(?P<op>\w+)")
 BRACKET_GUARD_FILL_WINDOW_S = 5.0   # the position line that explains a bracket fill comes this soon after
 _bracket_fills: dict[tuple[str, str], tuple[float, str, str]] = {}   # (acct, NT name) -> (stamp, order id, name)
+
+
+def _nt_tail_alive(now: float | None = None) -> bool:
+    """Is NinjaTrader's log being read right now (bracket_guard_task)?"""
+    return (time.time() if now is None else now) - _nt_tail_seen <= NT_TAIL_FRESH_S
+
+
+def _nt_open_orders(account: str, instrument: str, prefix: str,
+                    since: float = 0.0, states: frozenset | set = OPEN_ORDER_STATES
+                    ) -> list[tuple[str, int, str]]:
+    """(name, qty, action) of orders on (account, root) whose name starts
+    with `prefix`, last seen in one of `states` since `since`, per NT's log."""
+    orders = _nt_orders.get((account, _alias_root(instrument).upper())) or {}
+    return [(name, qty, action) for name, state, stamp, qty, action in list(orders.values())
+            if name.startswith(prefix) and state in states and stamp >= since - 2.0]
+
+
+def _nt_close_in_flight(account: str, instrument: str, since: float) -> bool | None:
+    """Per NinjaTrader's own log: True when a Close order on (account, root)
+    was last seen in an open state since `since`; False when the log is in
+    view and shows none; None when the log is not in view (no evidence)."""
+    if not _nt_tail_alive():
+        return None
+    return bool(_nt_open_orders(account, instrument, "Close", since, _NT_INFLIGHT_STATES))
+
+
+def _nt_entry_in_flight(account: str, instrument: str, now: float | None = None) -> bool | None:
+    """Per NinjaTrader's own log: is an Entry order still in flight on
+    (account, root)? Working, or cancel-pending (it can still fill), or
+    FILLED within ENTRY_SETTLE_S with no position line landed since — NT
+    logs the fill 0.35-1 s before the position line, and a book read in
+    that window still shows flat. None when the log is not in view."""
+    if not _nt_tail_alive(now):
+        return None
+    now = time.time() if now is None else now
+    key = (account, _alias_root(instrument).upper())
+    if _nt_open_orders(account, instrument, "Entry", now - ENTRY_INFLIGHT_MAX_S,
+                       states=_NT_INFLIGHT_STATES):
+        return True
+    seen = _nt_position_seen.get(key, 0.0)
+    for name, state, stamp, _qty, _action in list((_nt_orders.get(key) or {}).values()):
+        if name.startswith("Entry") and state == "Filled" and now - stamp <= ENTRY_SETTLE_S \
+                and seen < stamp:
+            return True
+    return False
+
+
+def _nt_entry_filled_within(account: str, instrument: str, before: float, window: float) -> bool:
+    """Did an Entry on (account, root) fill in the `window` seconds before `before`?"""
+    key = (account, _alias_root(instrument).upper())
+    return any(name.startswith("Entry") and state == "Filled" and before - window <= stamp <= before
+               for name, state, stamp, _q, _a in list((_nt_orders.get(key) or {}).values()))
+
+
+def _nt_stop_qty(account: str, instrument: str, side: int = 0) -> int:
+    """Stop quantity NinjaTrader shows working (or resting — a sim stop
+    rests as 'Accepted') on (account, root). With `side` (+1 long, -1
+    short) only stops that would EXIT that side count: a buy stop left
+    from a short is no cover for a long."""
+    total = 0
+    for _name, qty, action in _nt_open_orders(account, instrument, "Stop"):
+        a = action.lower()
+        if side > 0 and not a.startswith("sell"):
+            continue
+        if side < 0 and not a.startswith("buy"):
+            continue
+        total += qty
+    return total
+
+
+def _nt_reported_unknown(sids: list[str], since: float) -> bool:
+    """True when NinjaTrader's log answered "unknown strategy" to EVERY one
+    of these CLOSESTRATEGY ids since `since` (the bracket guard's tail
+    records each such line). No tail running means no such evidence."""
+    cutoff = since - 2.0      # NT stamps with its own clock; a hair early still counts
+    return bool(sids) and all(_nt_unknown_sids.get(sid, 0.0) >= cutoff for sid in sids)
 
 
 def _nt_log_dir() -> str | None:
@@ -8548,6 +9124,17 @@ def _nt_log_file(log_dir: str) -> str | None:
     except OSError:
         return None
     return os.path.join(log_dir, max(names)) if names else None
+
+
+def _nt_log_stamp_ms(line: str) -> float | None:
+    """_nt_log_stamp with the line's milliseconds kept: the order book needs
+    them — an Entry fill and the Remove of the position before it can share
+    one wall-clock second."""
+    base = _nt_log_stamp(line)
+    if base is None:
+        return None
+    ms = line[20:23]
+    return base + (int(ms) / 1000.0 if len(line) > 22 and line[19] == ":" and ms.isdigit() else 0.0)
 
 
 def _nt_log_stamp(line: str) -> float | None:
@@ -8637,6 +9224,22 @@ def _bracket_guard_event(line: str, now: float | None = None) -> str | None:
     account and contract says what it did: Remove or Update closed or
     trimmed a position, as a bracket should; Operation_Add opened one."""
     now = time.time() if now is None else now
+    u = _NT_UNKNOWN_SID_RE.search(line)
+    if u:
+        _nt_unknown_sids[u["sid"]] = _nt_log_stamp(line) or now
+        if len(_nt_unknown_sids) > 256:
+            _nt_unknown_sids.pop(min(_nt_unknown_sids, key=_nt_unknown_sids.get), None)
+        return None
+    o = _NT_ORDER_STATE_RE.search(line)
+    if o:
+        book = _nt_orders.setdefault((o["acct"], _alias_root(o["instr"]).upper()), {})
+        book[o["oid"]] = (o["name"], o["state"], _nt_log_stamp_ms(line) or now, int(o["qty"]), o["action"])
+        if len(book) > 48:
+            # Forget finished orders first: a Stop resting for hours on a
+            # core position is the oldest id, and the one the naked watch needs.
+            done = [k for k, v in book.items() if v[1] not in _NT_INFLIGHT_STATES]
+            book.pop(min(done or list(book), key=lambda k: book[k][2]), None)
+        # no return: a Filled close is also a fill the orphan check below must see
     m = _NT_REJECT_RE.search(line)
     if m:
         stamp = _nt_log_stamp(line)
@@ -8662,26 +9265,99 @@ def _bracket_guard_event(line: str, now: float | None = None) -> str | None:
         return None
     p = _NT_POSITION_RE.search(line)
     if p:
+        pkey = (p["acct"], _alias_root(p["instr"]).upper())
+        pstamp = _nt_log_stamp_ms(line) or now
+        signed = int(p["qty"]) * (1 if p["mp"] == "Long" else -1 if p["mp"] == "Short" else 0)
+        _nt_position_seen[pkey] = pstamp
+        if signed:
+            _nt_positions[pkey] = (signed, pstamp, p["instr"])
+        else:
+            _nt_positions.pop(pkey, None)
+            _uncovered_since.pop(pkey, None)
+            _nt_flat_seen[pkey] = pstamp
         fill = _bracket_fills.pop((p["acct"], p["instr"]), None)
         if fill is None or p["op"] != "Operation_Add":
             return None
         stamp = _nt_log_stamp(line) or now
         if stamp - fill[0] > BRACKET_GUARD_FILL_WINDOW_S or now - stamp > BRACKET_GUARD_MAX_AGE_S:
             return None
+        over_close = fill[2] == "Close"
+        if over_close and (
+                _nt_stop_qty(p["acct"], p["instr"], 1 if p["mp"] == "Long" else -1) >= int(p["qty"])
+                or _nt_entry_filled_within(p["acct"], p["instr"], pstamp, 5.0)):
+            # A REVERSEPOSITION: the entry filled first (1-2 s before) and
+            # netted the account flat, the new ATM's stop went in, and this
+            # Close fill opened the new side (SimTEST 2026-10-16 09:34 and
+            # 09:38). Not an orphan — whichever of the two NT logged first.
+            return None
         if (p["acct"], _alias_root(p["instr"]).upper()) not in _pnl_open_meta:
             # Nobody's trade — and the trade log should say so, instead of
             # calling the position a chart trade when it shows up.
-            _pnl_note_open(p["acct"], p["instr"], ("", "orphan ATM bracket"))
+            _pnl_note_open(p["acct"], p["instr"],
+                           ("", "orphan close fill" if over_close else "orphan ATM bracket"))
         policy = _bracket_guard_policy()
         if policy == "off":
             return None
         instrument = (_nt_contract_aliases(p["instr"]) or [p["instr"]])[0]
+        opened = f"opened {p['mp'].upper()} {p['qty']} on a flat account"
         return _bracket_guard_act(
             p["acct"], instrument, fill[1], now=now,
-            reason=f"an orphaned ATM {fill[2]} opened {p['mp'].upper()} {p['qty']} on a flat account",
+            reason=(f"a Close that over-covered {opened}" if over_close
+                    else f"an orphaned ATM {fill[2]} {opened}"),
             exposure="this position is nobody's trade",
             close=policy == "close")
     return None
+
+_uncovered_since: dict[tuple[str, str], float] = {}   # (acct, ROOT) -> when it was last seen under-protected
+
+
+def _naked_watch(now: float | None = None) -> list[str]:
+    """Every position NinjaTrader has shown under-protected — less Stop
+    quantity working than it holds — for BRACKET_ATTACH_S RUNNING is exposure
+    nobody meant: the long 2 with one Stop1 a second close left behind, the
+    long 1 after that stop filled, a leg whose ATM never attached. The clock
+    starts when the protection goes, not when the position opened, and a
+    position in transit is not naked: NinjaTrader strips the bracket 1-3 s
+    BEFORE it submits any close, and a reversal's new bracket goes in before
+    the new side exists. So a close working on the root, an entry working on
+    it, or a close this process wrote within RESET_CLOSE_PENDING_S holds the
+    watch off. A managed account's position on a root this app trades is
+    closed (policy "close"); anything else is flagged. Returns what was done."""
+    now = time.time() if now is None else now
+    policy = _bracket_guard_policy()
+    if policy == "off":
+        return []
+    done: list[str] = []
+    for (acct, root), (qty, stamp, instr) in list(_nt_positions.items()):
+        key = (acct, root)
+        covered = _nt_stop_qty(acct, instr, 1 if qty > 0 else -1)
+        if covered >= abs(qty):
+            _uncovered_since.pop(key, None)
+            continue
+        since = _uncovered_since.setdefault(key, now)
+        if now - since < BRACKET_ATTACH_S:
+            continue
+        instrument = (_nt_contract_aliases(instr) or [instr])[0]
+        if (_nt_close_in_flight(acct, instrument, since - 2.0)
+                or _nt_entry_in_flight(acct, instrument)
+                or _close_pending(acct, instrument)):
+            continue
+        seen_key = f"naked:{acct}:{root}:{qty}:{int(since)}"
+        if seen_key in _bracket_guard_seen:
+            continue
+        meta = _pnl_open_meta.get(key) or {}
+        ours = bool(_ledger_entries(acct, instrument)) or bool(meta.get("strategies"))
+        side = "LONG" if qty > 0 else "SHORT"
+        act = _bracket_guard_act(
+            acct, instrument, seen_key, now=now,
+            reason=(f"{side} {abs(qty)} has {covered} contract{'s' if covered != 1 else ''} "
+                    f"of stop working after {now - since:.0f}s"),
+            exposure=f"{abs(qty) - covered} contract{'s' if abs(qty) - covered != 1 else ''} with NO STOP",
+            close=policy == "close" and ours)
+        if act:
+            done.append(act)
+    return done
+
 
 async def bracket_guard_task():
     """Tail NinjaTrader's log for rejected ATM bracket orders.
@@ -8689,6 +9365,7 @@ async def bracket_guard_task():
     Reads only what NT appended since the last look, off the event loop;
     a quiet second costs one stat. Idle until an output directory names
     the NinjaTrader folder."""
+    global _nt_tail_seen
     tail = _LogTail()
     path = None
     polls = 0
@@ -8704,8 +9381,15 @@ async def bracket_guard_task():
             polls += 1
             if not path:
                 continue
-            for line in await asyncio.to_thread(tail.read, path):
-                _bracket_guard_event(line)
+            try:
+                for line in await asyncio.to_thread(tail.read, path):
+                    try:
+                        _bracket_guard_event(line)
+                    except Exception as exc:
+                        logger.error(f"BRACKET GUARD  line skipped: {exc}")
+            finally:
+                _nt_tail_seen = time.time()
+            _naked_watch()
         except Exception as exc:
             logger.error(f"BRACKET GUARD  {exc}")
 
@@ -8724,6 +9408,13 @@ def close_account_positions(account: str) -> list[str]:
     """
     if not account:
         return []
+    try:
+        for p in ((_bridge_snapshot() or _snap_latest_ok or {}).get("positions") or []):
+            if p["account"] == account and p["qty"]:
+                _note_close_dispatched(account, _alias_root(p["instrument"]).upper(),
+                                       p["qty"], p["qty"])
+    except Exception as exc:
+        logger.error(f"CLOSE REGISTRY  flatten of {account} not recorded: {exc}")
 
     # One state read serves both the cancel-by-id sweep and the inventory
     # below — the same dump used to be requested twice, back to back, and
@@ -9004,9 +9695,13 @@ async def manual_trade_menu():
 
 
 def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, action: str,
-                        pre_pos: int = 0, account: str | None = None):
+                        pre_pos: int = 0, account: str | None = None,
+                        expect: int | float | None = None,
+                        delta: int | float | None = None):
     """Register one written leg for post-trade confirmation on the account
-    it was written to (the leader when `account` is omitted)."""
+    it was written to (the leader when `account` is omitted). `expect` is the
+    signed position the leg should leave once filled; a book showing MORE
+    than that is an overfill, not a confirmation."""
     acct = account or active_account
     pre_balance = session_current_balances.get(acct) if acct else None
     cmd = signal_text.split(";", 1)[0].strip().upper()
@@ -9023,6 +9718,8 @@ def add_pending_confirm(signal_text: str, sig_id: str | None, instrument: str, a
             "ts": time.time(),
             "pre_pos": pre_pos,
             "pre_balance": pre_balance,
+            "expect": expect,
+            "delta": delta,
         })
 
 
@@ -9034,6 +9731,9 @@ def _confirm_snapshot() -> dict | None:
     balance monitor, which calls this every cycle, is not held for the
     wait _stream_snapshot would spend on a NinjaTrader too slow to finish
     a dump. None without the stream: the caller then queries directly."""
+    bridged = _bridge_snapshot()
+    if bridged is not None:
+        return bridged
     return _snap_latest if snapshot_poller_running() else None
 
 
@@ -9092,6 +9792,32 @@ def check_pending_confirms():
             )
 
             if pos_changed or balance_changed:
+                expect = entry.get("expect")
+                allowed = None
+                if pos_changed and isinstance(expect, (int, float)):
+                    # Other entries of this account on the same root still
+                    # pending explain contracts too: two strategies stacking
+                    # 1 + 1 is not an overfill.
+                    root = _alias_root(instrument).upper()
+                    others = sum(e.get("delta") or 0 for e in _pending_confirms
+                                 if e is not entry and e.get("account") == acct
+                                 and isinstance(e.get("delta"), (int, float))
+                                 and _alias_root(e.get("instrument") or "").upper() == root)
+                    allowed = max(abs(expect), abs(expect + others))
+                if allowed is not None and abs(cur_pos) > allowed:
+                    # More contracts than this entry placed: a reset's two
+                    # closes both filling (2026-10-16 02:50, pos -1→2 on a
+                    # 1-lot buy) looks exactly like a fill to a plain "did
+                    # it change" check. It is not a confirmation.
+                    detail = f"pos: {pre_pos}→{cur_pos}  expected {expect:+g}"
+                    _dash_set_alert(
+                        Fore.RED + Style.BRIGHT +
+                        f"  ⛔  {label}OVERFILL {instrument} {entry['action']}  {detail} — "
+                        "more contracts than this entry placed; check NinjaTrader" +
+                        Style.RESET_ALL, sticky=True)
+                    logger.warning(f"OVERFILL  id={entry['id']}  account={acct}  {instrument}  "
+                                   f"{entry['action']}  {detail}  elapsed={elapsed:.1f}s")
+                    continue  # drop from pending
                 if pos_changed:
                     detail = f"pos: {pre_pos}→{cur_pos}"
                 else:
@@ -10991,11 +11717,14 @@ def web_live(force: bool = False) -> dict:
     """
     with _live_lock:
         if snapshot_poller_running():
-            # Served from the shared stream: this request never waits on
-            # NinjaTrader. The rows are rebuilt only when a new dump has
-            # landed (or a role/profile edit dropped them) — otherwise the
-            # last build is returned as is.
-            snap = _snap_latest
+            # Served from the live bridge while it streams, else from the
+            # shared stream: this request never waits on NinjaTrader. The
+            # rows are rebuilt only when a new line or dump has landed (or
+            # a role/profile edit dropped them) — otherwise the last build
+            # is returned as is.
+            snap = _bridge_snapshot()
+            if snap is None:
+                snap = _snap_latest
             if snap is None:
                 snap = snapshot_after(0.0, SNAPSHOT_FIRST_WAIT)   # first poll after start
             if snap is None:
@@ -11011,8 +11740,10 @@ def web_live(force: bool = False) -> dict:
                 time.time() - _live_cache["ts"] < LIVE_CACHE_TTL)
             if fresh and not force:
                 return _live_cache["data"]
+            snap = _bridge_snapshot()
             try:
-                snap = nt_snapshot(nt_port)
+                if snap is None:
+                    snap = nt_snapshot(nt_port)
             except Exception as exc:
                 logger.error(f"WEB LIVE  snapshot failed: {exc}")
                 snap = {"ok": False, "accounts": {}, "positions": [],
@@ -12278,6 +13009,7 @@ def _pnl_observe(live: dict, now: float | None = None,
                     # other way is known to follow this position out.
                     _pnl_open_meta[key]["side"] = 1 if q1 > 0 else -1
                 if not q1:
+                    _ledger_prune_flat(name, root)
                     gone = _pnl_open_meta.pop(key, None)
                     nxt = _pnl_next_slot(gone, ts) if gone else None
                     if nxt is not None:
@@ -12551,6 +13283,32 @@ async def _web_set_sizing(account, mode, value) -> tuple[bool, str]:
     return True, f"{acct} → {label}{note}"
 
 
+def _root_atm_template(account: str, instrument: str) -> str | None:
+    """The ATM template protecting (account, root) now — the recorder's label
+    for it, resolved to an installed template — else the session default;
+    None when nothing installed matches, so a reversal never goes out bare."""
+    meta = _pnl_open_meta.get((account, _alias_root(instrument).upper())) or {}
+    for name in reversed(meta.get("strategies") or []):
+        tmpl = resolve_publisher_atm(str(name), instrument)
+        if tmpl:
+            return tmpl
+    return atm_strategy if atm_strategy and validate_strategy(atm_strategy) else None
+
+
+async def _sequenced_flip(plan: dict):
+    """A web reversal that cannot be one REVERSEPOSITION: close, prove flat,
+    then place — the entry is not written without that proof."""
+    account, instrument, qty = plan["account"], plan["instrument"], plan["qty"]
+    try:
+        if not await _reset_close_standing(account, instrument, close_twin=False):
+            _reset_not_placed(account, instrument, "WEB REVERSE")
+            return
+        await _write_entry_tranches(plan, [qty], None, quiet=True)
+        _live_invalidate(fresh=True)
+    except Exception as exc:
+        logger.error(f"WEB REVERSE  {account}  error={exc}")
+
+
 async def _web_reverse_position(account, instrument) -> tuple[bool, str]:
     """Reverse one account's position — NinjaTrader's `Rev` action.
 
@@ -12563,6 +13321,9 @@ async def _web_reverse_position(account, instrument) -> tuple[bool, str]:
     instr = sanitize_ati(str(instrument or "").strip())
     if not acct or not instr:
         return False, "account and instrument required"
+    # The live view may name the contract the dump's way ("NQ DEC26"); the
+    # files must name it the OIF way ("NQ 12-26").
+    instr_oif = (_nt_contract_aliases(instr) or [instr])[0]
     if acct not in target_accounts():
         return False, f"{acct} is not a managed account"
     if hard_stopped:
@@ -12581,20 +13342,42 @@ async def _web_reverse_position(account, instrument) -> tuple[bool, str]:
         return False, ("live view is stale — NinjaTrader has not confirmed "
                        "current positions; refusing to size a reversal from it")
     pos = next((p for p in live["positions"]
-                if p["account"] == acct and p["instrument"] == instr), None)
+                if p["account"] == acct and p["instrument"] in (instr, instr_oif)), None)
     if not pos:
         return False, f"no open {instr} position on {acct}"
+    instr = instr_oif
     action = "SELL" if pos["qty"] > 0 else "BUY"
-    signal = (f"REVERSEPOSITION;{acct};{instr};{action};{abs(pos['qty'])};"
-              f"MARKET;;;DAY;;;{sanitize_ati(atm_strategy)};")
+    qty = abs(int(pos["qty"]))
+    atm = _root_atm_template(acct, instr)
+    if not atm:
+        return False, ("no ATM template to protect the reversal — set a session "
+                       "ATM or reverse from NinjaTrader")
+    sid = f"rev:{time.strftime('%H%M%S')}:{acct}"
+    signal = f"PLACE;{acct};{instr};{action};{qty};MARKET;;;DAY;;;{sanitize_ati(atm)};{sid}"
     err = validate_signal(signal.split(";"))
     if err:
         return False, f"could not build reversal: {err}"
-    written = await asyncio.to_thread(write_signal_to_file, signal)
-    _live_invalidate(fresh=True)
-    if not written:
-        return False, "order file write failed — check the output directory"
-    logger.info(f"WEB REVERSE  {acct}  {instr}  {action} {abs(pos['qty'])}")
+    # The same flip the publisher reset uses: NinjaTrader's REVERSEPOSITION
+    # when the position is filled and quiet (its new bracket is submitted
+    # before the new side exists), else close → proof of flat → place, and
+    # no entry without that proof. Never a bare reversal.
+    mode, why, twin = await asyncio.to_thread(_flip_mode, acct, instr)
+    plan = {"account": acct, "rule": resolve_rule(acct, instr, atm), "signal": signal,
+            "instrument": instr, "action": action, "qty": qty, "manual": True,
+            "manual_source": "Web", "rr_pick": False, "strat_ident": ("", atm),
+            # A click on one instrument reverses that instrument only; a
+            # micro/full twin the account also holds is not its business.
+            "reset_first": True, "flip": mode == "reverse", "flip_twin": False}
+    logger.info(f"WEB REVERSE  {acct}  {instr}  {action} {qty}  atm={atm}  mode={mode}  ({why})")
+    if mode == "reverse":
+        placed = await _write_entry_tranches(plan, [qty], None, quiet=True)
+        _live_invalidate(fresh=True)
+        if not placed:
+            return False, "order file write failed — check the output directory"
+    else:
+        task = asyncio.create_task(_sequenced_flip(plan))
+        _leg_tasks.add(task)
+        task.add_done_callback(_leg_tasks.discard)
     _dash_set_alert(Fore.YELLOW + f"  ⇄  REVERSE {instr} on {acct}" + Style.RESET_ALL)
     if is_prop_account(acct):
         # One position at a time: sweep any OTHER market this prop account
