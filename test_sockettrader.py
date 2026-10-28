@@ -11053,3 +11053,43 @@ class TestHiddenAndDisconnectedAccounts:
         assert [p["account"] for p in live["positions"]] == ["Sim101", "AAA-old"]
         assert live["positions"][0]["managed"] is True
         assert live["positions"][1]["managed"] is False
+
+
+    def test_windows_side_imports_wsl_install_once(self, tmp_path, tmp_config,
+                                                   fresh_cfg_cache, monkeypatch):
+        legacy = tmp_path / "wsl_home_trader"; legacy.mkdir()
+        shared = tmp_config.parent
+        monkeypatch.setattr(st, "IS_WSL", False)
+        monkeypatch.setattr(st, "IS_WINDOWS", True)
+        monkeypatch.setattr(st, "DATA_HOME", shared)
+        monkeypatch.setattr(st, "PNL_DIR", shared / ".voidorigin_pnl")
+        calls = {"n": 0}
+
+        def scan():
+            calls["n"] += 1
+            return [legacy]
+        monkeypatch.setattr(st, "_wsl_legacy_homes_from_windows", scan)
+        st.save_config({"account": "Sim101"})                 # Windows config already there
+        (legacy / ".voidorigin_config.json").write_text(json.dumps({"account": "Sim999"}))
+        (legacy / ".voidorigin_pnl").mkdir()
+        (legacy / ".voidorigin_pnl" / "2026-10.json").write_text(json.dumps({"v": 2, "days": {
+            "2026-10-21": {"accounts": {}, "trades": [
+                {"ts": 5.0, "account": "Sim101", "symbol": "NQ", "pnl": 40.0}]}}}))
+        notes = st.migrate_legacy_home()
+        assert any("merged WSL P&L history" in n for n in notes)
+        assert "2026-10-21" in json.loads(st._pnl_shard("2026-10").read_text())["days"]
+        assert st.load_config()["account"] == "Sim101"      # Windows config kept
+        assert st.load_config()[st.WSL_LEGACY_SCAN_KEY]
+        assert list(legacy.glob(".voidorigin_pnl.migrated-*"))
+        # Remembered: the (slow, distro-starting) scan is not repeated.
+        assert st.migrate_legacy_home() == [] and calls["n"] == 1
+
+    def test_wsl_distro_listing_decodes_utf16(self, monkeypatch):
+        class R:
+            returncode = 0
+            stdout = "Ubuntu\r\ndocker-desktop\r\n".encode("utf-16-le")
+        monkeypatch.setattr(st.subprocess, "run", lambda *a, **k: R())
+        assert st._wsl_distros_from_windows() == ["Ubuntu", "docker-desktop"]
+        monkeypatch.setattr(st.subprocess, "run",
+                            lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
+        assert st._wsl_distros_from_windows() == []

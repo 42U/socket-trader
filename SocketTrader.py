@@ -15074,10 +15074,16 @@ const acctCells={};
    shown: it is being traded, so a disconnected one is news, not clutter. */
 let showHiddenAccts=false;
 try{showHiddenAccts=sessionStorage.getItem("st-show-hidden")==="1"}catch(e){}
-function acctFolded(a){return !a.managed&&(a.hidden||(a.status&&a.status!=="Connected"))}
+/* An unmanaged account with no cash, no position and no working order is
+   an empty shell — a closed evaluation NinjaTrader still lists — whatever
+   its connection status says (an AddOn build without the status field
+   reports none). It folds along with the hidden and disconnected ones. */
+function acctEmpty(a){return !(a.positions&&a.positions.length)&&!a.working&&
+  (a.cash==null||Math.abs(a.cash)<0.005)&&(a.realized==null||Math.abs(a.realized)<0.005)}
+function acctFolded(a){return !a.managed&&(a.hidden||(a.status&&a.status!=="Connected")||acctEmpty(a))}
 function acctStructure(){
   return [L&&L.ok,S&&S.profiles,showHiddenAccts,(L&&L.accounts||[]).map(a=>[a.name,a.role,a.managed,
-    a.stop,a.profile,a.sync,a.sync_detail,a.status,a.hidden,
+    a.stop,a.profile,a.sync,a.sync_detail,a.status,a.hidden,acctEmpty(a),
     a.positions.map(p=>p.instrument+(p.qty>0?"+":"-"))])]}
 function posText(p){return (p.qty>0?"+":"")+p.qty+" "+p.instrument+
   (p.avg_price?" @"+fmt(p.avg_price):"")}
@@ -15168,7 +15174,7 @@ function renderAccounts(){
   t.appendChild(tb);w.appendChild(t);
   if(folded.length){
     const fr=el("div","btnrow");fr.style.marginTop="6px";
-    fr.appendChild(btn((showHiddenAccts?"hide ":"show ")+folded.length+" hidden / disconnected account"+
+    fr.appendChild(btn((showHiddenAccts?"hide ":"show ")+folded.length+" hidden / empty / disconnected account"+
       (folded.length===1?"":"s"),"tiny ghost",()=>{showHiddenAccts=!showHiddenAccts;
         try{sessionStorage.setItem("st-show-hidden",showHiddenAccts?"1":"0")}catch(e){}
         renderAccounts();renderPositions()}));
@@ -16512,21 +16518,89 @@ def release_instance_lock() -> None:
         pass
 
 
-def migrate_legacy_home() -> list[str]:
-    """Fold a pre-shared-home WSL install (/home/<you>) into the data home.
+WSL_LEGACY_SCAN_KEY = "wsl_legacy_scanned"   # config: Windows looked inside WSL for old data (once)
 
-    Runs once, before setup(): the shared config, when it exists, is kept
-    as is (the Windows side is the one that was in use) and the WSL copy is
-    set aside; P&L months are MERGED day by day and trade by trade, so the
-    calendar shows both machines' history. The old files are renamed
-    `.migrated`, never deleted — a trading record is not something a
-    migration eats. Returns the lines to show the operator."""
-    legacy = Path.home()
+
+def _wsl_distros_from_windows() -> list[str]:
+    """Installed WSL distributions, as `wsl.exe -l -q` lists them. Its
+    output is UTF-16; an absent WSL answers with an error, i.e. []."""
     try:
-        if not IS_WSL or legacy.resolve() == DATA_HOME.resolve():
-            return []
-    except OSError:
+        result = subprocess.run(["wsl.exe", "-l", "-q"], capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError, ValueError):
         return []
+    if result.returncode != 0:
+        return []
+    raw = result.stdout or b""
+    try:
+        text = raw.decode("utf-16-le") if b"\x00" in raw else raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return []
+    return [ln.strip().lstrip("\ufeff") for ln in text.splitlines() if ln.strip().strip("\x00")]
+
+
+def _wsl_legacy_homes_from_windows() -> list[Path]:
+    r"""Old WSL-side installs reachable from Windows: every
+    \\wsl$\<distro>\home\<user> (and /root) holding a config or P&L
+    folder. Touching \\wsl$ starts a stopped distribution, so the caller
+    does this once and records it."""
+    found: list[Path] = []
+    for distro in _wsl_distros_from_windows():
+        base = Path(f"\\\\wsl$\\{distro}")
+        roots: list[Path] = []
+        try:
+            home = base / "home"
+            if home.is_dir():
+                roots.extend(p for p in home.iterdir() if p.is_dir())
+            roots.append(base / "root")
+        except OSError:
+            continue
+        for r in roots:
+            try:
+                if (r / ".voidorigin_config.json").is_file() or (r / ".voidorigin_pnl").is_dir() \
+                        or (r / ".voidorigin_pnl_history.json").is_file():
+                    found.append(r)
+            except OSError:
+                continue
+    return found
+
+
+def migrate_legacy_home() -> list[str]:
+    """Fold pre-shared-home installs into the data home, once.
+
+    From WSL that is its own /home/<you>; from Windows it is every WSL
+    distribution's /home/<user> reached through the \\wsl$ share (looked at once,
+    then remembered in the config), so whichever side starts first after
+    the upgrade brings the other's history in. The shared config, when it
+    exists, is kept as is (the Windows side is the one that was in use) and
+    the WSL copy is set aside; P&L months are MERGED day by day and trade
+    by trade, so the calendar shows both machines' history. Old files are
+    renamed `.migrated`, never deleted — a trading record is not something
+    a migration eats. Returns the lines to show the operator."""
+    sources: list[Path] = []
+    scanned_wsl = False
+    if IS_WSL:
+        legacy = Path.home()
+        try:
+            if legacy.resolve() != DATA_HOME.resolve():
+                sources.append(legacy)
+        except OSError:
+            pass
+    elif IS_WINDOWS:
+        if not load_config().get(WSL_LEGACY_SCAN_KEY):
+            sources.extend(_wsl_legacy_homes_from_windows())
+            scanned_wsl = True
+    notes: list[str] = []
+    for legacy in sources:
+        notes.extend(_migrate_legacy_from(legacy))
+    if scanned_wsl:
+        cfg = load_config()
+        cfg[WSL_LEGACY_SCAN_KEY] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        save_config(cfg)
+    return notes
+
+
+def _migrate_legacy_from(legacy: Path) -> list[str]:
+    """Fold one old install directory into the data home (see above)."""
     notes: list[str] = []
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
