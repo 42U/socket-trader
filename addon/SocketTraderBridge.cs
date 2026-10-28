@@ -840,6 +840,12 @@ namespace NinjaTrader.NinjaScript.AddOns
             sb.Append("{\"name\":").Append(JsonString(acct.Name ?? ""));
             sb.Append(",\"cash\":").Append(D(cash));
             sb.Append(",\"realized\":").Append(D(realized));
+            // Account.All keeps every account a connection has ever listed
+            // (closed evaluations included), so the dashboard needs to know
+            // which ones are actually up.
+            string status = "";
+            try { status = acct.ConnectionStatus.ToString(); } catch { }
+            sb.Append(",\"status\":").Append(JsonString(status));
 
             double unrealizedSum = 0;
             sb.Append(",\"positions\":[");

@@ -42,7 +42,7 @@ try:
 except ImportError:
     anthropic = None
 
-__version__ = "0.22.0"
+__version__ = "0.23.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -76,8 +76,101 @@ if IS_WINDOWS:
 else:
     init()
 
+# ---------- Data home ----------
+# Every durable file — config (accounts, profiles, limits, session baseline),
+# the P&L calendar archive, the signal log — lives in ONE directory, and it
+# has to be the SAME directory whether SocketTrader is started from Windows
+# Python or from WSL. Before this it was `Path.home()`, which is
+# C:\Users\<you> on Windows and /home/<you> inside WSL: two unrelated
+# installs that never saw each other's profiles or trading days, which is
+# how the calendar came to show a different month in each. The Windows
+# user profile folder is the shared home (NinjaTrader lives there too);
+# from WSL it is reached through the DrvFs mount (/mnt/c/Users/<you>).
+# Native Linux and macOS keep using the Unix home.
+#
+#   SOCKETTRADER_HOME=<dir>   overrides the resolution on any OS.
+DATA_HOME_ENV = "SOCKETTRADER_HOME"
+_data_home_note: str = ""      # how the data home was chosen (shown at startup)
+
+
+def _run_quiet(args: list[str], timeout: float = 8.0) -> str | None:
+    """stdout of a subprocess, trimmed; None on any failure. Used before the
+    logger exists, so it must never raise. Decoded as UTF-8 first and the
+    Windows code pages after — cmd.exe answers in the OEM code page, which
+    matters the moment a user name has an accent in it."""
+    try:
+        result = subprocess.run(args, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if result.returncode != 0:
+        return None
+    raw = result.stdout or b""
+    for enc in ("utf-8", "cp1252", "cp850", "latin-1"):
+        try:
+            out = raw.decode(enc).strip()
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        return None
+    return out or None
+
+
+def _wsl_windows_userprofile() -> Path | None:
+    """The Windows %USERPROFILE% as a WSL path, or None when Windows interop
+    is unavailable (cmd.exe/powershell.exe/wslpath missing or disabled)."""
+    for args in (["cmd.exe", "/c", "echo %USERPROFILE%"],
+                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                  "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+                  "[Environment]::GetFolderPath('UserProfile')"]):
+        out = _run_quiet(args)
+        if not out:
+            continue
+        win = out.splitlines()[-1].strip().strip('"')
+        if not re.match(r"^[A-Za-z]:\\", win):
+            continue
+        unix = _run_quiet(["wslpath", "-u", win])
+        if not unix:
+            # wslpath missing: the default DrvFs layout (/mnt/<drive>/...).
+            unix = "/mnt/" + win[0].lower() + win[2:].replace("\\", "/")
+        try:
+            p = Path(unix)
+            if p.is_dir():
+                return p
+        except OSError:
+            pass
+        # A mis-decoded name (cmd.exe's code page) is not a directory; the
+        # PowerShell attempt answers in UTF-8.
+    return None
+
+
+def resolve_data_home() -> Path:
+    """Pick the directory every durable file lives in (see the note above)."""
+    global _data_home_note
+    override = (os.environ.get(DATA_HOME_ENV) or "").strip()
+    if override:
+        p = Path(override).expanduser()
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            _data_home_note = f"{DATA_HOME_ENV}={p}"
+            return p
+        except OSError as exc:
+            _data_home_note = f"{DATA_HOME_ENV}={p} unusable ({exc}) — using the home folder"
+    if IS_WSL:
+        win_home = _wsl_windows_userprofile()
+        if win_home is not None:
+            _data_home_note = f"shared with Windows ({win_home})"
+            return win_home
+        _data_home_note = ("WSL: could not find the Windows user folder — using the "
+                           "Linux home; settings and P&L history will NOT be shared "
+                           f"with Windows runs (set {DATA_HOME_ENV} to fix)")
+    return Path.home()
+
+
+DATA_HOME = resolve_data_home()
+
 # ---------- Config persistence ----------
-CONFIG_FILE = Path.home() / ".voidorigin_config.json"
+CONFIG_FILE = DATA_HOME / ".voidorigin_config.json"
 
 paused = False
 shutdown = asyncio.Event()
@@ -657,7 +750,7 @@ _pending_confirms: list[dict] = []  # [{signal, ts, pre_pos, instrument, id, act
 _confirms_lock = __import__("threading").Lock()
 
 # ---------- Logging ----------
-LOG_FILE = Path.home() / ".voidorigin_signals.log"
+LOG_FILE = DATA_HOME / ".voidorigin_signals.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024  # 5 MB per file
 LOG_BACKUP_COUNT = 3             # keep 3 rotated copies (.log.1, .log.2, .log.3)
 logger = logging.getLogger("sockettrader")
@@ -813,41 +906,315 @@ def _restore_replay_guard(cfg: dict | None = None):
             _recent_fired[text] = now_mono - max(age, 0.0)
 
 
+# The config file is read by several threads (the web server answering the
+# dashboard's polls, the snapshot poller, the P&L tracker) and written by
+# the asyncio loop (session baseline every ~30 s, the replay guard after
+# every signal, profiles, limits). On Windows a rename over a file that any
+# other handle has open fails with "Access is denied" — Python's open() does
+# not share-for-delete — so every save that landed while another thread was
+# mid-read was dropped on the floor: "Could not save config: ... .tmp",
+# and the caller carried on believing it had saved. That is how a profile
+# edited on Windows looked fine until the next restart. Linux renames over
+# open files freely, which is why WSL never showed it.
+#
+# So: one lock around the file, an in-memory copy that every read is served
+# from (the file is stat()ed — no handle — and re-read only when something
+# else changed it on disk), a rename that retries through a transient
+# Windows lock, and a save that REPORTS failure instead of printing and
+# moving on. A refused save keeps the intended state in memory and is
+# retried by the next save from anyone (config_flush_pending ticks it from
+# the P&L tracker), so the file catches up instead of staying stale.
+_cfg_lock = threading.RLock()
+_cfg_cache: dict | None = None        # last good config, exactly as on disk (or as intended, see below)
+_cfg_cache_path: str = ""             # the CONFIG_FILE the cache belongs to (tests redirect it)
+_cfg_cache_stat: tuple | None = None  # (mtime_ns, size) the cache corresponds to
+_cfg_unsaved = False                  # the cache holds a state the disk refused to take
+_cfg_unreadable = False               # a file exists that could not be parsed, and no cache
+_cfg_last_error = ""                  # last save failure, for the UI
+_cfg_read_error = ""                  # last read failure logged (polls must not spam the log)
+_cfg_disk_fail_count = 0
+_cfg_gen = 0                          # bumped on every save_config; what the disk holds is _cfg_written_gen
+_cfg_written_gen = 0
+_cfg_write_lock = threading.Lock()    # serialises disk writes; held WITHOUT _cfg_lock so readers never wait on I/O
+REPLACE_RETRIES = 10                  # × REPLACE_RETRY_S: how long a rename waits out a transient sharing lock
+REPLACE_RETRY_S = 0.05                #   (0.5 s; a save that still fails is retried every 2 s off the loop thread)
+
+
+def _cfg_stat() -> tuple | None:
+    try:
+        s = os.stat(CONFIG_FILE)
+    except OSError:
+        return None
+    return (s.st_mtime_ns, s.st_size)
+
+
+def _sanitize_cfg(cfg: dict) -> dict:
+    """Self-heal: drop account_limits keys polluted with terminal control
+    characters (arrow-key escapes captured before input stripping), and
+    bring machine-specific values into this OS's form."""
+    limits = cfg.get("account_limits")
+    if isinstance(limits, dict):
+        for key in [k for k in limits if any(ord(c) < 32 for c in k)]:
+            del limits[key]
+    _localize_cfg(cfg)
+    return cfg
+
+
 def load_config() -> dict:
-    """Load saved config from disk, or return empty dict."""
-    if CONFIG_FILE.exists():
+    """The saved config, or an empty dict when there is none.
+
+    Served from memory; the file is re-read only when it changed on disk
+    (an edit by hand, or another process). A file that exists but cannot
+    be read never turns into "{}" for a writer to save back over it: the
+    last good copy is served instead, and if there is none, saves are
+    refused until a read succeeds (see save_config)."""
+    global _cfg_cache, _cfg_cache_path, _cfg_cache_stat, _cfg_unreadable, _cfg_read_error
+    with _cfg_lock:
+        path = str(CONFIG_FILE)
+        current = _cfg_stat()
+        if _cfg_cache is not None and _cfg_cache_path == path:
+            if _cfg_unsaved or current == _cfg_cache_stat:
+                return json.loads(json.dumps(_cfg_cache))
+        if current is None:                       # no file
+            _cfg_cache, _cfg_cache_path, _cfg_cache_stat = {}, path, None
+            _cfg_unreadable = False
+            return {}
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
-        except (json.JSONDecodeError, OSError):
+            if not isinstance(cfg, dict):
+                raise ValueError("config root is not a JSON object")
+        except (ValueError, OSError) as exc:
+            # Logged on change only: this runs on every dashboard poll.
+            if _cfg_cache is not None and _cfg_cache_path == path:
+                msg = f"CONFIG  {CONFIG_FILE} unreadable ({exc}) — serving the last good copy"
+                if msg != _cfg_read_error:
+                    logger.warning(msg)
+                    _cfg_read_error = msg
+                return json.loads(json.dumps(_cfg_cache))
+            msg = (f"CONFIG  {CONFIG_FILE} unreadable ({exc}) — saves are refused "
+                   "until it can be read, so it is not overwritten")
+            if msg != _cfg_read_error:
+                logger.error(msg)
+                _cfg_read_error = msg
+            _cfg_unreadable = True
             return {}
-        # Self-heal: drop account_limits keys polluted with terminal control
-        # characters (arrow-key escapes captured before input stripping).
-        limits = cfg.get("account_limits")
-        if isinstance(limits, dict):
-            for key in [k for k in limits if any(ord(c) < 32 for c in k)]:
-                del limits[key]
-        return cfg
-    return {}
+        if _cfg_read_error:
+            logger.info(f"CONFIG  {CONFIG_FILE} readable again")
+            _cfg_read_error = ""
+        _cfg_unreadable = False
+        _cfg_cache = _sanitize_cfg(cfg)
+        _cfg_cache_path, _cfg_cache_stat = path, current
+        return json.loads(json.dumps(_cfg_cache))
 
 
-def save_config(cfg: dict):
-    """Persist config to disk atomically with restricted permissions."""
+def _replace_file(tmp: str, dst: Path) -> None:
+    """os.replace that waits out a transient Windows sharing lock (another
+    process reading, Defender scanning the new file). The Windows drive
+    seen from WSL (DrvFs) is subject to the same locks, so the retry is
+    not keyed on the OS. Raises on final failure with the temp file
+    removed — on any exit, an interrupt included."""
     try:
-        fd, tmp = tempfile.mkstemp(
-            dir=str(CONFIG_FILE.parent), suffix=".tmp", prefix=".voidorigin_"
-        )
+        for attempt in range(REPLACE_RETRIES):
+            try:
+                os.replace(tmp, dst)
+                return
+            except PermissionError:
+                if attempt + 1 >= REPLACE_RETRIES:
+                    raise
+                time.sleep(REPLACE_RETRY_S)
+    except BaseException:
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=2)
-            if not IS_WINDOWS:
-                os.chmod(tmp, 0o600)
-            os.replace(tmp, CONFIG_FILE)
-        except BaseException:
             os.unlink(tmp)
-            raise
-    except OSError as exc:
-        print(Fore.RED + f"  ✖  Could not save config: {exc}" + Style.RESET_ALL)
+        except OSError:
+            pass
+        raise
+
+
+def _write_atomic(dst: Path, payload: str, prefix: str) -> None:
+    """Write `payload` to `dst` atomically and privately; raises OSError."""
+    fd, tmp = tempfile.mkstemp(dir=str(dst.parent), suffix=".tmp", prefix=prefix)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+        if not IS_WINDOWS:
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass      # DrvFs (the Windows drive seen from WSL) ignores modes
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    _replace_file(tmp, dst)
+
+
+def _save_failed_notice(what: str, exc: Exception) -> None:
+    """Tell the operator a save was refused — on the dashboard's alert line
+    when it is up, on the plain console before that. print() into the
+    pinned layout is what used to scramble the screen."""
+    text = f"  ✖  Could not save {what}: {exc}"
+    try:
+        if _controls_pinned:
+            _dash_set_alert(Fore.RED + text + Style.RESET_ALL, sticky=True)
+            return
+    except Exception:
+        pass
+    print(Fore.RED + text + Style.RESET_ALL)
+
+
+def save_config(cfg: dict) -> bool:
+    """Persist config atomically. Returns True when it is on disk.
+
+    On failure the intended state stays in memory (every later load_config
+    sees it, and the next save from anyone writes it), the failure is
+    logged and shown, and False is returned so the caller can say so."""
+    global _cfg_cache, _cfg_cache_path, _cfg_gen, _cfg_last_error
+    with _cfg_lock:
+        path = str(CONFIG_FILE)
+        if _cfg_unreadable and _cfg_stat() is not None:
+            # Never replace a file we could not read with whatever a caller
+            # built from the "{}" it was handed — that is a config wipe.
+            msg = "existing config file is unreadable — fix or remove it first"
+            if msg != _cfg_last_error:
+                logger.error(f"CONFIG  save refused — {msg}")
+                _save_failed_notice("config", OSError(msg))
+                _cfg_last_error = msg
+            return False
+        _cfg_cache = _sanitize_cfg(json.loads(json.dumps(cfg)))   # same healing as a read
+        _cfg_cache_path = path
+        _cfg_gen += 1
+    return _cfg_write_latest()
+
+
+def _cfg_write_latest() -> bool:
+    """Put the newest in-memory config on disk. True when the disk holds it.
+
+    The write happens outside _cfg_lock, so a reader on the trading path
+    (hedge_guard_mode, get_account_limits) is never parked behind a rename
+    that is waiting out a file lock; _cfg_write_lock serialises writers,
+    and every writer writes the NEWEST state — a save that queued behind
+    another never puts an older copy on disk over a newer one."""
+    global _cfg_cache_stat, _cfg_unsaved, _cfg_unreadable, _cfg_last_error
+    global _cfg_disk_fail_count, _cfg_written_gen
+    with _cfg_write_lock:
+        with _cfg_lock:
+            if _cfg_cache is None:
+                return True
+            if _cfg_gen == _cfg_written_gen and not _cfg_unsaved:
+                return True                      # already on disk
+            gen, path = _cfg_gen, Path(_cfg_cache_path)
+            payload = json.dumps(_cfg_cache, indent=2)
+            if _cfg_unsaved and _cfg_cache_stat is not None and _cfg_stat() != _cfg_cache_stat:
+                # The file changed under us while saves were being refused
+                # (the other OS, or an edit by hand). The in-memory state
+                # is what the operator set in THIS app, so it wins — but
+                # say so, because that edit is about to be replaced.
+                logger.warning(f"CONFIG  {path} was changed by something else while "
+                               "saves were refused — overwriting it with this app's state")
+        try:
+            _write_atomic(path, payload, ".voidorigin_")
+        except OSError as exc:
+            with _cfg_lock:
+                _cfg_unsaved = True
+                _cfg_disk_fail_count += 1
+                msg = str(exc)
+                if msg != _cfg_last_error:
+                    logger.error(f"CONFIG  save failed: {exc} — kept in memory, will retry")
+                    _save_failed_notice("config", exc)
+                _cfg_last_error = msg
+            return False
+        with _cfg_lock:
+            _cfg_written_gen = gen
+            if str(CONFIG_FILE) == str(path):
+                _cfg_cache_stat = _cfg_stat()
+            if _cfg_unsaved:
+                logger.info(f"CONFIG  save recovered after {_cfg_disk_fail_count} refusal(s)")
+            _cfg_unsaved = False
+            _cfg_unreadable = False
+            _cfg_last_error = ""
+            _cfg_disk_fail_count = 0
+            newer = _cfg_gen != gen
+    # A save landed while this one was writing: write again so the disk
+    # ends on the newest state.
+    return _cfg_write_latest() if newer else True
+
+
+def config_flush_pending() -> bool:
+    """Retry a save the disk refused earlier. True when nothing is pending."""
+    with _cfg_lock:
+        pending = _cfg_unsaved and _cfg_cache is not None
+    return _cfg_write_latest() if pending else True
+
+
+def config_save_warning() -> str:
+    """Suffix for a UI message when the last save did not reach disk."""
+    with _cfg_lock:
+        if not _cfg_unsaved:
+            return ""
+        return f"  ⚠  NOT written to disk yet ({_cfg_last_error}) — retrying"
+
+
+# ---------- Machine-specific config values ----------
+# The config is shared between Windows and WSL runs, but two of its values
+# are only meaningful on the OS that wrote them: the NinjaTrader incoming
+# folder (C:\Users\… vs /mnt/c/Users/…) and the explicit NinjaTrader host
+# override (loopback on Windows, the WSL gateway address inside WSL). The
+# folder is translated on load; the host override is remembered together
+# with the OS that set it and ignored elsewhere (auto-detect takes over).
+_WIN_DRIVE_RE = re.compile(r"^([A-Za-z]):[\\/](.*)$")
+_WSL_MNT_RE = re.compile(r"^(?:/mnt)?/([a-zA-Z])(?:/(.*))?$")   # /mnt/c/… or a custom root's /c/…
+
+
+def _wsl_mount_root() -> str:
+    """Where WSL mounts Windows drives — "/mnt" unless the data home says
+    otherwise (a custom automount root shows up in its own path)."""
+    m = re.match(r"^(.*)/[a-zA-Z]/Users/", str(DATA_HOME))
+    return m.group(1) if m else "/mnt"
+
+
+def localize_path(raw) -> str:
+    """A path from the shared config in this OS's form."""
+    if not isinstance(raw, str) or not raw:
+        return raw
+    if IS_WSL:
+        m = _WIN_DRIVE_RE.match(raw)
+        if m:
+            return f"{_wsl_mount_root()}/{m.group(1).lower()}/" + m.group(2).replace("\\", "/")
+    if IS_WINDOWS:
+        m = _WSL_MNT_RE.match(raw)
+        if m:
+            tail = (m.group(2) or "").replace("/", "\\")
+            return f"{m.group(1).upper()}:\\{tail}"
+    return raw
+
+
+def _platform_tag() -> str:
+    return "windows" if IS_WINDOWS else ("wsl" if IS_WSL else "posix")
+
+
+def _localize_cfg(cfg: dict) -> None:
+    out_dir = cfg.get("output_directory")
+    if isinstance(out_dir, str) and out_dir:
+        cfg["output_directory"] = localize_path(out_dir)
+
+
+def effective_nt_host(cfg: dict) -> str:
+    """The explicit NinjaTrader host override, or "" when it was set from
+    the other OS (where it names a different machine) — the stored value
+    itself is left alone so that OS keeps it."""
+    host = str(cfg.get("nt_host", "") or "").strip()
+    host_os = cfg.get("nt_host_os")
+    if host and isinstance(host_os, str) and host_os and host_os != _platform_tag():
+        return ""
+    if host and not host_os and IS_WSL and host.lower() in ("127.0.0.1", "localhost", "::1"):
+        # Untagged (set before the tag existed) loopback: it can only have
+        # meant the Windows side's own NinjaTrader; inside WSL loopback is
+        # the Linux VM, where nothing listens.
+        return ""
+    return host
 
 
 # ---------- Micro contract conversion ----------
@@ -1350,8 +1717,12 @@ def load_account_profiles(cfg: dict) -> dict[str, dict]:
     return out
 
 
-def save_account_profiles():
-    """Prune empty profiles and persist account_profiles to config."""
+def save_account_profiles() -> bool:
+    """Prune empty profiles and persist account_profiles to config.
+
+    Returns True when the file took it. On False the profiles are still
+    live in memory (and in the config cache, so the next successful save
+    of anything carries them) — callers say so rather than claim a save."""
     global account_profiles
     pruned: dict[str, dict] = {}
     for acct, prof in account_profiles.items():
@@ -1378,8 +1749,21 @@ def save_account_profiles():
         cfg["account_profiles"] = pruned
     else:
         cfg.pop("account_profiles", None)
-    save_config(cfg)
-    logger.info(f"PROFILES SAVED  accounts={sorted(pruned)}")
+    ok = save_config(cfg)
+    if ok:
+        logger.info(f"PROFILES SAVED  accounts={sorted(pruned)}")
+    else:
+        logger.error(f"PROFILES NOT SAVED (disk refused)  accounts={sorted(pruned)}")
+    return ok
+
+
+def _save_profiles_tty() -> bool:
+    """save_account_profiles for the terminal editors: says so on refusal."""
+    ok = save_account_profiles()
+    if not ok:
+        print(Fore.RED + f"  ✖  Profile NOT written to disk ({_cfg_last_error}) — it stays "
+              "live in this session and the save is retried automatically." + Style.RESET_ALL)
+    return ok
 
 
 # ---------- Profile export / import ----------
@@ -1412,7 +1796,7 @@ def export_profile_data(account: str) -> dict:
 def profile_export_path(account: str) -> Path:
     """Default export file: visible in the home folder, named for the account."""
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", account).strip("._") or "account"
-    return Path.home() / f"SocketTrader-profile-{safe}.json"
+    return DATA_HOME / f"SocketTrader-profile-{safe}.json"
 
 
 def write_profile_export(account: str, path: Path) -> None:
@@ -1481,7 +1865,7 @@ def import_profile(account: str, data, source: str = "the file") -> tuple[bool, 
     account_profiles[account] = cleaned
     save_account_profiles()
     logger.info(f"PROFILE IMPORTED  {account} <- {source}")
-    return True, f"{account} ← {source}: {profile_summary(account)}"
+    return True, f"{account} ← {source}: {profile_summary(account)}" + config_save_warning()
 
 
 def copy_profile(source: str, account: str) -> tuple[bool, str]:
@@ -2978,7 +3362,11 @@ def _bridge_ingest_book(accts: list):
                 return None
             return v if math.isfinite(v) else None
         book[name] = {"cash": _num("cash"), "realized": _num("realized"),
-                      "equity": _num("equity"), "positions": positions, "avg": avgs}
+                      "equity": _num("equity"), "positions": positions, "avg": avgs,
+                      # The account's connection state as NinjaTrader reports it
+                      # ("Connected", "Disconnected", …); "" from an AddOn build
+                      # that predates the field.
+                      "status": str(a.get("status") or "")}
     global _bridge_seq
     _bridge_seq += 1
     _bridge_book = {"ts": time.time(), "accounts": book, "seq": _bridge_seq}
@@ -3019,7 +3407,8 @@ def _bridge_snapshot() -> dict | None:
     rows: list[dict] = []
     for name, entry in book["accounts"].items():
         accounts[name] = {"cash": entry.get("cash"), "realized": entry.get("realized"),
-                          "buying_power": (last_accounts.get(name) or {}).get("buying_power")}
+                          "buying_power": (last_accounts.get(name) or {}).get("buying_power"),
+                          "status": entry.get("status") or ""}
         avgs = entry.get("avg") or {}
         for inst, qty in entry["positions"]:
             rows.append({"account": name, "instrument": inst, "qty": qty,
@@ -7388,7 +7777,7 @@ async def _edit_scoped_rules(account: str):
         if raw in ("", "q"):
             if not rules:
                 prof.pop("rules", None)
-            save_account_profiles()
+            _save_profiles_tty()
             return
         if raw == "a":
             rule: dict = {}
@@ -7397,16 +7786,16 @@ async def _edit_scoped_rules(account: str):
             if rule:
                 rules.append(rule)
                 print(Fore.GREEN + "  ✔  Rule added." + Style.RESET_ALL)
-            save_account_profiles()
+            _save_profiles_tty()
         elif raw.startswith("d") and raw[1:].strip().isdigit():
             idx = int(raw[1:].strip())
             if 1 <= idx <= len(rules):
                 rules.pop(idx - 1)
                 print(Fore.GREEN + f"  ✔  Rule {idx} deleted." + Style.RESET_ALL)
-            save_account_profiles()
+            _save_profiles_tty()
         elif raw.isdigit() and 1 <= int(raw) <= len(rules):
             await _edit_rule_menu(rules[int(raw) - 1], f"RULE {raw} — {account}", scoped=True)
-            save_account_profiles()
+            _save_profiles_tty()
 
 
 async def _export_profile_prompt(account: str):
@@ -7559,7 +7948,7 @@ async def _edit_account_profile(account: str):
                 print(Fore.GREEN + "     opposite entries across accounts are "
                       f"blocked, and it is flattened at {fh:02d}:{fm:02d} ET."
                       + Style.RESET_ALL)
-            save_account_profiles()
+            _save_profiles_tty()
         elif raw == "s":
             raw_s = await _ask_line(
                 "ALLOWED SYMBOLS e.g. 'GC' or 'NQ ES' (ENTER = all symbols)")
@@ -7580,12 +7969,12 @@ async def _edit_account_profile(account: str):
                 if not prof:
                     account_profiles.pop(account, None)
                 print(Fore.GREEN + f"  ✔  {account} trades all symbols." + Style.RESET_ALL)
-            save_account_profiles()
+            _save_profiles_tty()
         elif raw == "d":
             prof = account_profiles.setdefault(account, {})
             rule = prof.setdefault("default", {})
             await _edit_rule_menu(rule, f"DEFAULT RULE — {account}", scoped=False)
-            save_account_profiles()
+            _save_profiles_tty()
         elif raw == "r":
             await _edit_scoped_rules(account)
         elif raw == "e":
@@ -7596,7 +7985,7 @@ async def _edit_account_profile(account: str):
             confirm = (await _ask_line(f"Remove profile for {account}? [y/N]")).lower()
             if confirm == "y":
                 account_profiles.pop(account, None)
-                save_account_profiles()
+                _save_profiles_tty()
                 print(Fore.GREEN + f"  ✔  {account} back to defaults." + Style.RESET_ALL)
 
 
@@ -8051,7 +8440,11 @@ async def prompt_live_bridge():
         if not raw:
             # Blank input = clear override, revert to auto-detect.
             nt_host_override = ""
-            cfg["nt_host"] = ""
+            if cfg.get("nt_host_os") in (None, "", _platform_tag()):
+                # Ours (or pre-tag): clear it. Set by the other OS: it is
+                # already ignored here, and still theirs over there.
+                cfg["nt_host"] = ""
+                cfg.pop("nt_host_os", None)
             save_config(cfg)
             _dash_set_alert(
                 Fore.CYAN + "  ✔  NT host reverted to auto-detect." +
@@ -8059,6 +8452,7 @@ async def prompt_live_bridge():
         else:
             nt_host_override = raw
             cfg["nt_host"] = raw
+            cfg["nt_host_os"] = _platform_tag()   # only meaningful on this OS
             save_config(cfg)
             # Probe the new host on the live bridge port right away so the
             # alert tells the user whether it actually reaches NT.
@@ -8701,8 +9095,8 @@ def get_account_limits(account: str) -> dict:
     }
 
 
-def set_account_limits(account: str, target: float, target_mode: str, stop: float, stop_mode: str):
-    """Save target/stop for an account to config."""
+def set_account_limits(account: str, target: float, target_mode: str, stop: float, stop_mode: str) -> bool:
+    """Save target/stop for an account to config. True when on disk."""
     cfg = load_config()
     if "account_limits" not in cfg:
         cfg["account_limits"] = {}
@@ -8710,7 +9104,7 @@ def set_account_limits(account: str, target: float, target_mode: str, stop: floa
         "target": target, "target_mode": target_mode,
         "stop": stop, "stop_mode": stop_mode,
     }
-    save_config(cfg)
+    return save_config(cfg)
 
 
 def query_nt_balance(account: str) -> float | None:
@@ -10986,7 +11380,13 @@ def setup() -> tuple[str, dict]:
         changed = True
 
     # 4. Output directory — auto-detected on Windows/WSL, manual otherwise.
-    if not cfg.get("output_directory"):
+    # Re-checked every start, not only when unset: the folder is shared
+    # between OSes in translated form, and a saved path this OS cannot see
+    # would otherwise fail every order file quietly.
+    if not cfg.get("output_directory") or not Path(cfg["output_directory"]).is_dir():
+        if cfg.get("output_directory"):
+            print(Fore.YELLOW + f"  ⚠  Saved NinjaTrader folder not found here: "
+                  f"{cfg['output_directory']}" + Style.RESET_ALL)
         global output_directory
         output_directory = detect_or_ask_directory(cfg)
         if output_directory:
@@ -10997,6 +11397,11 @@ def setup() -> tuple[str, dict]:
         save_config(cfg)
 
     # Display current config
+    if "NOT be shared" in _data_home_note or "unusable" in _data_home_note:
+        print(Fore.YELLOW + f"  ⚠  Data: {DATA_HOME}  — {_data_home_note}" + Style.RESET_ALL)
+    else:
+        print(Fore.GREEN + f"  ✔  Data: {DATA_HOME}"
+              + (f"  ({_data_home_note})" if _data_home_note else "") + Style.RESET_ALL)
     print(Fore.GREEN + f"  ✔  Server: {cfg['ws_host']}" + Style.RESET_ALL)
     print(Fore.GREEN + f"  ✔  Token: {'*' * len(cfg.get('token', ''))}" + Style.RESET_ALL)
     if cfg.get("account"):
@@ -11422,7 +11827,7 @@ async def _web_set_limits(account, target, target_mode, stop, stop_mode) -> tupl
     except (TypeError, ValueError) as exc:
         return False, f"invalid limits: {exc}"
     logger.info(f"WEB LIMITS  {acct}  target={target}/{target_mode}  stop={stop}/{stop_mode}")
-    return True, f"limits saved for {acct}"
+    return True, f"limits saved for {acct}" + config_save_warning()
 
 
 def _strip_ai_config(raw):
@@ -11526,7 +11931,17 @@ def _restore_ai_config(cleaned: dict, previous: dict,
     return cleaned
 
 
-async def _web_set_profiles(raw) -> tuple[bool, str]:
+async def _web_set_profiles(raw, only=None) -> tuple[bool, str]:
+    """Apply a profiles payload from the web editor.
+
+    `only` names the one account the editor was open on: then exactly that
+    account's entry is set (or removed when absent) and every other
+    account keeps its server-side profile, whatever the page believed
+    about them. The page's copy of the map comes from a poll that can be
+    stale or — after a failed /api/state — empty, and before this a save
+    from such a page replaced the whole map and silently wiped every other
+    account's profile. Without `only` the payload is the whole map (older
+    pages, scripts)."""
     if hard_stopped:
         return False, "session hard-locked — settings are frozen"
     if not isinstance(raw, dict):
@@ -11535,11 +11950,25 @@ async def _web_set_profiles(raw) -> tuple[bool, str]:
     hints = _extract_ai_hints(raw)
     cleaned = load_account_profiles({"account_profiles": _strip_ai_config(raw)})
     cleaned = _restore_ai_config(cleaned, previous, hints)
+    if only is not None:
+        acct = sanitize_ati(str(only).strip())
+        if not acct:
+            return False, "account required"
+        merged = previous
+        if acct in cleaned:
+            merged[acct] = cleaned[acct]
+        else:
+            merged.pop(acct, None)
+        cleaned = merged
     account_profiles.clear()
     account_profiles.update(cleaned)
-    save_account_profiles()
+    if save_account_profiles():
+        refresh_terminal()
+        return True, f"profiles saved for {', '.join(sorted(cleaned)) or 'no accounts'}"
     refresh_terminal()
-    return True, f"profiles saved for {', '.join(sorted(cleaned)) or 'no accounts'}"
+    return False, (f"profiles applied for {', '.join(sorted(cleaned)) or 'no accounts'} but "
+                   f"NOT written to disk ({_cfg_last_error}) — they stay live and the save "
+                   "is retried automatically; check the alert line")
 
 
 def _web_export_profile(account) -> tuple[bool, object]:
@@ -11654,7 +12083,7 @@ async def _web_set_micro_map(raw) -> tuple[bool, str]:
     cfg["micro_map"] = overrides
     save_config(cfg)
     micro_map = load_micro_map(cfg)
-    return True, f"{len(overrides)} micro override(s) saved"
+    return True, f"{len(overrides)} micro override(s) saved" + config_save_warning()
 
 
 async def _web_set_strategy_symbols(raw) -> tuple[bool, str]:
@@ -11672,7 +12101,7 @@ async def _web_set_strategy_symbols(raw) -> tuple[bool, str]:
     strategy_symbols.update(cleaned)
     save_strategy_symbols()
     return True, (f"{len(cleaned)} strategy filter(s) saved"
-                  if cleaned else "strategy filters cleared")
+                  if cleaned else "strategy filters cleared") + config_save_warning()
 
 
 async def _web_set_favorites(raw) -> tuple[bool, str]:
@@ -11687,7 +12116,30 @@ async def _web_set_favorites(raw) -> tuple[bool, str]:
     cfg = load_config()
     cfg["web_favorites"] = favs[:12]
     save_config(cfg)
-    return True, f"{len(favs[:12])} favourite(s) saved"
+    return True, f"{len(favs[:12])} favourite(s) saved" + config_save_warning()
+
+
+def hidden_accounts() -> list[str]:
+    """Accounts the operator folded away in the web UI (config
+    "web_hidden_accounts"). Display only — a hidden account that holds a
+    role is still shown and still traded."""
+    raw = load_config().get("web_hidden_accounts")
+    return [str(a) for a in raw if isinstance(a, str) and a] if isinstance(raw, list) else []
+
+
+async def _web_hide_account(account, hidden) -> tuple[bool, str]:
+    acct = sanitize_ati(str(account or "").strip())
+    if not acct:
+        return False, "account required"
+    cfg = load_config()
+    current = [a for a in hidden_accounts() if a != acct]
+    if hidden:
+        current.append(acct)
+    cfg["web_hidden_accounts"] = current[:200]
+    save_config(cfg)
+    _live_invalidate()
+    return True, (f"{acct} hidden — 'show hidden' brings it back" if hidden
+                  else f"{acct} shown again") + config_save_warning()
 
 
 _live_cache: dict = {"ts": 0.0, "seq": None, "data": None}
@@ -11779,6 +12231,7 @@ def web_live(force: bool = False) -> dict:
             return stale
 
         managed = target_accounts()
+        hidden = set(hidden_accounts())
         rows = []
         names = list(snap["accounts"]) or list(managed)
         for name in names:
@@ -11808,11 +12261,22 @@ def web_live(force: bool = False) -> dict:
                 "profile": profile_summary(name),
                 "limits": get_account_limits(name),
                 "positions": [p for p in snap["positions"] if p["account"] == name],
+                # NinjaTrader lists every account its connections have ever
+                # reported — closed evaluations included — so the page can
+                # fold away what is not connected and what the operator hid.
+                "status": str(info.get("status") or ""),
+                "hidden": name in hidden,
             })
         rows.sort(key=lambda r: (not r["managed"], r["name"]))
         _annotate_sync(rows)
+        # Positions in the same order as the grid — the accounts being
+        # traded first — and tagged, so a book with hundreds of stale
+        # accounts cannot push the live ones below the fold.
+        positions = sorted(
+            ({**p, "managed": p["account"] in managed} for p in snap["positions"]),
+            key=lambda p: (p["account"] not in managed, p["account"], p["instrument"]))
         data = {"ok": snap["ok"], "accounts": rows, "stale": False,
-                "positions": snap["positions"], "ts": snap["ts"],
+                "positions": positions, "ts": snap["ts"],
                 "totals": _live_totals(rows)}
         _live_cache.update(ts=time.time(), seq=snap.get("seq"), data=data,
                            last_good=data)
@@ -11966,8 +12430,8 @@ def _live_totals(rows: list[dict]) -> dict:
 #     the history gets.
 #   · A file that cannot be parsed costs one month, not the whole record,
 #     and is never overwritten unless that month is the live one.
-PNL_DIR = Path.home() / ".voidorigin_pnl"
-PNL_HISTORY_FILE = Path.home() / ".voidorigin_pnl_history.json"   # legacy, migrated once
+PNL_DIR = DATA_HOME / ".voidorigin_pnl"
+PNL_HISTORY_FILE = DATA_HOME / ".voidorigin_pnl_history.json"   # legacy, migrated once
 PNL_TRACK_INTERVAL = 2.0        # seconds between live-view observations
 PNL_SAVE_MIN_GAP_S = 10.0       # batch disk writes; data loss window is tiny
 PNL_TRADES_PER_DAY_CAP = 2000   # runaway guard — a real day is nowhere close
@@ -12003,6 +12467,8 @@ _pnl_recent: dict[str, tuple[str, list[dict]]] = {}
 _pnl_stable: dict[str, list] = {}
 _pnl_dirty = False
 _pnl_last_save = 0.0
+_pnl_written_stat: dict[str, tuple | None] = {}   # month -> (mtime_ns, size) as this process last read/wrote it
+_pnl_unflushed: dict[str, dict] = {}              # a left month whose flush was refused -> its days
 
 
 _PNL_SHARD_RE = re.compile(r"^\d{4}-\d\d$")
@@ -12019,12 +12485,15 @@ def _pnl_dir_ready() -> bool:
     """Make sure the archive directory exists and is private. Never raises."""
     try:
         PNL_DIR.mkdir(parents=True, exist_ok=True)
-        if not IS_WINDOWS:
-            os.chmod(PNL_DIR, 0o700)
-        return True
     except OSError as exc:
         logger.error(f"PNL HISTORY  archive directory unusable ({exc})")
         return False
+    if not IS_WINDOWS:
+        try:
+            os.chmod(PNL_DIR, 0o700)
+        except OSError:
+            pass          # DrvFs (the Windows drive seen from WSL) ignores modes
+    return True
 
 
 def _pnl_read_shard(month: str) -> dict:
@@ -12037,11 +12506,13 @@ def _pnl_read_shard(month: str) -> dict:
         with open(_pnl_shard(month), "r", encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
+        _pnl_written_stat[month] = None
         return {}
     except (json.JSONDecodeError, OSError) as exc:
         logger.error(f"PNL HISTORY  {month} could not be read ({exc}) — that "
                      "month shows empty; the file is left alone for recovery")
         return {}
+    _pnl_written_stat[month] = _pnl_shard_stat(month)
     days = data.get("days") if isinstance(data, dict) else None
     if not isinstance(days, dict):
         return {}
@@ -12054,23 +12525,114 @@ def _pnl_read_shard(month: str) -> dict:
     return days
 
 
-def _pnl_write_shard(month: str, payload: str):
-    """Atomically replace one month's file. Never raises."""
+def _pnl_write_shard(month: str, payload: str) -> bool:
+    """Atomically replace one month's file. Never raises; False on failure."""
+    global _pnl_written_stat
     if not _pnl_dir_ready():
-        return
+        return False
     try:
-        fd, tmp = tempfile.mkstemp(dir=str(PNL_DIR), prefix=".pnl", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(payload)
-            if not IS_WINDOWS:
-                os.chmod(tmp, 0o600)
-            os.replace(tmp, _pnl_shard(month))
-        except BaseException:
-            os.unlink(tmp)
-            raise
+        _write_atomic(_pnl_shard(month), payload, ".pnl")
     except OSError as exc:
-        logger.error(f"PNL HISTORY  save failed for {month}: {exc}")
+        logger.error(f"PNL HISTORY  save failed for {month}: {exc} — kept in memory, "
+                     "will retry")
+        return False
+    _pnl_written_stat[month] = _pnl_shard_stat(month)
+    return True
+
+
+def _pnl_shard_stat(month: str) -> tuple | None:
+    try:
+        st_ = os.stat(_pnl_shard(month))
+    except OSError:
+        return None
+    return (st_.st_mtime_ns, st_.st_size)
+
+
+def _pnl_trade_key(t: dict) -> tuple:
+    """Identity of a trade row across copies of the archive. NOT its pnl:
+    a row's pnl is amended in place after it is written (a fill that
+    settles a poll late is added to the row that earned it), so a copy on
+    disk can legitimately carry an older number for the same trade — and
+    keying on it would re-import that stale copy as a second trade."""
+    return (str(t.get("account")), repr(t.get("ts")), str(t.get("symbol") or ""),
+            str(t.get("side") or ""), bool(t.get("unseen")))
+
+
+def _pnl_merge_days(into: dict, other: dict) -> int:
+    """Fold `other`'s day records into `into` without losing either side.
+
+    A day only one side has is copied. A day both have keeps `into`'s
+    per-account baselines (they describe the process that is writing) and
+    gains any account only `other` saw; trade rows are unioned, matched on
+    (account, ts, symbol, pnl), in time order. Returns how many rows or
+    days were added — 0 means `into` already held everything."""
+    added = 0
+    if not isinstance(other, dict):
+        return 0
+    for date, rec in other.items():
+        if not isinstance(date, str) or not isinstance(rec, dict):
+            continue
+        mine = into.get(date)
+        if not isinstance(mine, dict):
+            into[date] = json.loads(json.dumps(rec))
+            added += 1
+            continue
+        if not isinstance(mine.get("accounts"), dict):
+            mine["accounts"] = {}
+        other_accts = rec.get("accounts")
+        for name, acct in (other_accts.items() if isinstance(other_accts, dict) else ()):
+            if name not in mine["accounts"] and isinstance(acct, dict):
+                mine["accounts"][name] = json.loads(json.dumps(acct))
+                added += 1
+        if not isinstance(mine.get("trades"), list):
+            mine["trades"] = []
+        trades = mine["trades"]
+        have = {_pnl_trade_key(t) for t in trades if isinstance(t, dict)}
+        other_trades = rec.get("trades")
+        new_rows = [t for t in (other_trades if isinstance(other_trades, list) else [])
+                    if isinstance(t, dict) and _pnl_trade_key(t) not in have]
+        if new_rows:
+            trades.extend(json.loads(json.dumps(new_rows)))
+            trades.sort(key=lambda t: (t.get("ts") if isinstance(t.get("ts"), (int, float)) else 0))
+            added += len(new_rows)
+    return added
+
+
+def _pnl_shard_readable(month: str) -> bool:
+    """False only when the month's file EXISTS and will not parse — the one
+    state in which writing over it destroys a recoverable record."""
+    try:
+        with open(_pnl_shard(month), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return True
+    except (json.JSONDecodeError, OSError):
+        return False
+    return isinstance(data, dict) and isinstance(data.get("days"), dict)
+
+
+def _pnl_merge_from_disk(month: str, days: dict) -> int:
+    """Before the live month is written back whole: if the file changed
+    since this process last read or wrote it, fold what is there into
+    memory. That is what keeps a second writer — a WSL run left open while
+    the Windows one starts, or the other way round — from erasing a
+    month of the other's trades with its own copy."""
+    if _pnl_shard_stat(month) == _pnl_written_stat.get(month):
+        return 0
+    on_disk = _pnl_read_shard(month)
+    if not on_disk:
+        return 0
+    try:
+        added = _pnl_merge_days(days, on_disk)
+    except Exception as exc:           # a malformed row must never stall the archive
+        logger.error(f"PNL HISTORY  {month}: merge from disk failed ({exc}) — "
+                     "writing this process's copy")
+        return 0
+    if added:
+        logger.warning(f"PNL HISTORY  {month}: merged {added} record(s) another writer "
+                       "put on disk — two SocketTraders may be running against the same "
+                       "data home")
+    return added
 
 
 def _pnl_months() -> list[str]:
@@ -12198,9 +12760,15 @@ def _pnl_hot(month: str) -> dict:
     if _pnl_hot_month == month and _pnl_history is not None:
         return _pnl_history["days"]
     if _pnl_dirty and _pnl_hot_month and _pnl_history is not None:
-        _pnl_write_shard(_pnl_hot_month,
-                         json.dumps({"v": 2, "days": _pnl_history["days"]}))
-        _pnl_dirty = False
+        _pnl_merge_from_disk(_pnl_hot_month, _pnl_history["days"])
+        if _pnl_write_shard(_pnl_hot_month,
+                            json.dumps({"v": 2, "days": _pnl_history["days"]})):
+            _pnl_dirty = False
+        else:
+            # Not lost: the calendar keeps serving it from the cache and
+            # _pnl_save retries the write until it lands.
+            _pnl_cache[_pnl_hot_month] = _pnl_history["days"]
+            _pnl_unflushed[_pnl_hot_month] = _pnl_history["days"]
     _pnl_migrate_legacy()
     _pnl_hot_month = month
     _pnl_history = {"v": 2, "days": _pnl_read_shard(month)}
@@ -12250,15 +12818,28 @@ def _pnl_save(force: bool = False):
     not grow with the depth of the archive."""
     global _pnl_dirty, _pnl_last_save
     with _pnl_lock:
+        for month in list(_pnl_unflushed):
+            days = _pnl_unflushed[month]
+            _pnl_merge_from_disk(month, days)
+            if _pnl_write_shard(month, json.dumps({"v": 2, "days": days})):
+                del _pnl_unflushed[month]
         if _pnl_history is None or not _pnl_dirty or not _pnl_hot_month:
             return
         if not force and time.monotonic() - _pnl_last_save < PNL_SAVE_MIN_GAP_S:
             return
         month = _pnl_hot_month
+        _pnl_merge_from_disk(month, _pnl_history["days"])
         payload = json.dumps({"v": 2, "days": _pnl_history["days"]})
         _pnl_dirty = False
         _pnl_last_save = time.monotonic()
-    _pnl_write_shard(month, payload)
+    if not _pnl_write_shard(month, payload):
+        # The write was refused (a Windows lock, a full or missing drive):
+        # the record is still in memory, so mark it dirty again or the
+        # next save — the one at exit included — would find nothing to do
+        # and the day's last trades would never reach disk.
+        with _pnl_lock:
+            if _pnl_hot_month == month:
+                _pnl_dirty = True
 
 
 def _pnl_side(action: str) -> int:
@@ -13228,6 +13809,15 @@ async def pnl_tracker_task():
                 await asyncio.sleep(PNL_TRACK_INTERVAL)
             except asyncio.CancelledError:
                 return
+            # Housekeeping that rides this 2 s tick, and must keep running
+            # even when the P&L step below is failing: the data-home
+            # heartbeat (a silent one admits a second instance after 45 s)
+            # and a config save the disk refused earlier.
+            try:
+                await asyncio.to_thread(instance_lock_beat)
+                await asyncio.to_thread(config_flush_pending)
+            except Exception as exc:
+                logger.error(f"housekeeping error: {exc}")
             try:
                 live = await asyncio.to_thread(web_live)
                 _pnl_observe(live)
@@ -13280,7 +13870,7 @@ async def _web_set_sizing(account, mode, value) -> tuple[bool, str]:
     label = "copy" if mode == "copy" else (
         f"×{rule['qty_value']:g}" if mode == "multiple" else f"fixed {int(rule['qty_value'])}")
     logger.info(f"WEB SIZING  {acct} -> {label}")
-    return True, f"{acct} → {label}{note}"
+    return True, f"{acct} → {label}{note}" + config_save_warning()
 
 
 def _root_atm_template(account: str, instrument: str) -> str | None:
@@ -13714,6 +14304,9 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
                 ok, msg = _web_run(_web_set_micro_map(data.get("map")))
             elif path == "/api/favorites":
                 ok, msg = _web_run(_web_set_favorites(data.get("favorites")))
+            elif path == "/api/hide_account":
+                ok, msg = _web_run(_web_hide_account(data.get("account"),
+                                                     bool(data.get("hidden", True))))
             elif path == "/api/accounts":
                 ok, msg = _web_run(_web_set_accounts(
                     data.get("leader"), data.get("followers"),
@@ -13730,7 +14323,8 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
                     data.get("target_mode"), data.get("stop"),
                     data.get("stop_mode")))
             elif path == "/api/profiles":
-                ok, msg = _web_run(_web_set_profiles(data.get("profiles")))
+                ok, msg = _web_run(_web_set_profiles(data.get("profiles"),
+                                                     data.get("only")))
             elif path == "/api/profile_import":
                 ok, msg = _web_run(_web_import_profile(
                     data.get("account"), data.get("data")))
@@ -14473,9 +15067,17 @@ function renderTiles(){
    the existing cells, so a Flat or role button never disappears under
    the cursor mid-click. */
 const acctCells={};
+/* NinjaTrader reports every account its connections have ever listed —
+   closed evaluations and accounts on connections that are not up — so an
+   unmanaged account is folded away when NinjaTrader says it is not
+   connected, or when the operator hid it. A managed account is always
+   shown: it is being traded, so a disconnected one is news, not clutter. */
+let showHiddenAccts=false;
+try{showHiddenAccts=sessionStorage.getItem("st-show-hidden")==="1"}catch(e){}
+function acctFolded(a){return !a.managed&&(a.hidden||(a.status&&a.status!=="Connected"))}
 function acctStructure(){
-  return [L&&L.ok,S&&S.profiles,(L&&L.accounts||[]).map(a=>[a.name,a.role,a.managed,
-    a.stop,a.profile,a.sync,a.sync_detail,
+  return [L&&L.ok,S&&S.profiles,showHiddenAccts,(L&&L.accounts||[]).map(a=>[a.name,a.role,a.managed,
+    a.stop,a.profile,a.sync,a.sync_detail,a.status,a.hidden,
     a.positions.map(p=>p.instrument+(p.qty>0?"+":"-"))])]}
 function posText(p){return (p.qty>0?"+":"")+p.qty+" "+p.instrument+
   (p.avg_price?" @"+fmt(p.avg_price):"")}
@@ -14500,7 +15102,9 @@ function renderAccounts(){
   if(!L.ok){w.appendChild(el("div","empty",
     "NinjaTrader ATI not reachable — check NT is running and the ATI port"));return}
   if(!L.accounts.length){w.appendChild(el("div","empty","no accounts reported"));return}
-  $("acctHint").textContent=L.accounts.length+" accounts";
+  const folded=L.accounts.filter(acctFolded),shown=showHiddenAccts?L.accounts:L.accounts.filter(a=>!acctFolded(a));
+  $("acctHint").textContent=shown.length+" account"+(shown.length===1?"":"s")+
+    (folded.length?" · "+folded.length+" hidden":"");
 
   const t=el("table"),h=el("thead"),hr=el("tr");
   [["Account",""],["Role",""],["Size","num"],["Sync",""],["Cash","num"],
@@ -14508,7 +15112,7 @@ function renderAccounts(){
     .forEach(([x,c])=>hr.appendChild(el("th",c,x)));
   h.appendChild(hr);t.appendChild(h);
   const tb=el("tbody");
-  L.accounts.forEach(a=>{
+  shown.forEach(a=>{
     const tr=el("tr",a.managed?"":"unmanaged");
     const nameTd=td(null,a.name);
     nameTd.style.cursor="pointer";
@@ -14551,26 +15155,46 @@ function renderAccounts(){
 
     const at=el("td");at.style.textAlign="right";
     if(a.stop)at.appendChild(el("span","tag bad",a.stop.toUpperCase()));
+    if(a.status&&a.status!=="Connected")at.appendChild(el("span","tag bad",a.status.toUpperCase()));
+    if(!a.managed){
+      const hb=btn(a.hidden?"Unhide":"Hide","tiny ghost",()=>api("/api/hide_account",
+        {account:a.name,hidden:!a.hidden}));
+      hb.title=a.hidden?"show this account in the grid again":"fold this account away (display only)";
+      at.appendChild(hb)}
     at.appendChild(btn("Flat","tiny danger",()=>{
       if(confirm("Flatten "+a.name+"?"))api("/api/flatten_account",{account:a.name})}));
     tr.appendChild(at);
     tb.appendChild(tr)});
-  t.appendChild(tb);w.appendChild(t)}
+  t.appendChild(tb);w.appendChild(t);
+  if(folded.length){
+    const fr=el("div","btnrow");fr.style.marginTop="6px";
+    fr.appendChild(btn((showHiddenAccts?"hide ":"show ")+folded.length+" hidden / disconnected account"+
+      (folded.length===1?"":"s"),"tiny ghost",()=>{showHiddenAccts=!showHiddenAccts;
+        try{sessionStorage.setItem("st-show-hidden",showHiddenAccts?"1":"0")}catch(e){}
+        renderAccounts();renderPositions()}));
+    w.appendChild(fr)}}
 
 /* Same split as the account grid: the Rev/Close buttons survive a size
    or average-price change; only a new or closed position rebuilds. */
 const posCells=[];
 function renderPositions(){
-  const list=(L&&L.positions)||[];
-  if(!changed("positions",[L&&L.ok,list.map(p=>p.account+"|"+p.instrument+"|"+(p.qty>0?"L":"S"))])){
+  /* A position on a folded account (hidden, or not connected per
+     NinjaTrader) folds with it — the "show hidden" toggle brings both back. */
+  const foldedNames=new Set(((L&&L.accounts)||[]).filter(acctFolded).map(a=>a.name));
+  const all=(L&&L.positions)||[];
+  const list=showHiddenAccts?all:all.filter(p=>!foldedNames.has(p.account));
+  const foldedN=all.length-list.length;
+  if(!changed("positions",[L&&L.ok,showHiddenAccts,list.map(p=>p.account+"|"+p.instrument+"|"+(p.qty>0?"L":"S"))])){
     list.forEach((p,i)=>{const c=posCells[i];if(!c)return;
       setText(c.qty,String(Math.abs(p.qty)));
       setText(c.avg,p.avg_price?fmt(p.avg_price):"—")});
     return}
   posCells.length=0;
   const w=$("posWrap");clear(w);
-  $("posHint").textContent=list.length?(list.length+" open"):"";
-  if(!list.length){w.appendChild(el("div","empty","flat across all accounts"));return}
+  $("posHint").textContent=(list.length?(list.length+" open"):"")+
+    (foldedN?(list.length?" · ":"")+foldedN+" on hidden accounts":"");
+  if(!list.length){w.appendChild(el("div","empty",
+    foldedN?"flat on every shown account":"flat across all accounts"));return}
   const t=el("table"),h=el("thead"),hr=el("tr");
   [["Account",""],["Instrument",""],["Side",""],["Qty","num"],["Avg","num"],["",""]]
     .forEach(([x,c])=>hr.appendChild(el("th",c,x)));
@@ -14915,11 +15539,13 @@ function accountModal(a){
         if(pcut.value.trim())e.prop_cutoff_et=pcut.value.trim();else delete e.prop_cutoff_et}
       else{delete e.prop;delete e.prop_firm;delete e.prop_flat_et;delete e.prop_cutoff_et}
       profiles[a.name]=e;
-      api("/api/profiles",{profiles:profiles}).then(closeModal)}));
+      /* only: the server touches this account alone — a stale or empty
+         S.profiles on this page can never wipe the others. */
+      api("/api/profiles",{profiles:profiles,only:a.name}).then(closeModal)}));
     P.appendChild(btn("RESET PROFILE","wide sm danger",()=>{
       const profiles=JSON.parse(JSON.stringify(S.profiles||{}));
       delete profiles[a.name];
-      api("/api/profiles",{profiles:profiles}).then(closeModal)}));
+      api("/api/profiles",{profiles:profiles,only:a.name}).then(closeModal)}));
 
     /* ---- Export / import: a setup proven on one account moves to another
        — or to another machine — as a JSON file, or straight from another
@@ -15747,12 +16373,283 @@ setInterval(refreshLive,2000);
 """
 
 
+# ---------- One data home: instance lock + legacy migration ----------
+# With Windows and WSL runs sharing one data home, the one thing that must
+# never happen is two SocketTraders writing it at once: each holds the live
+# month in memory and writes it back whole, and the config is read-modify-
+# write. The lock file carries a heartbeat (not a PID — a WSL PID means
+# nothing to Windows and vice versa); a holder that stopped beating for
+# INSTANCE_LOCK_STALE_S is a crash, not a peer, and is taken over.
+INSTANCE_LOCK_NAME = ".voidorigin.lock"
+INSTANCE_LOCK_STALE_S = 45.0
+INSTANCE_LOCK_BEAT_S = 10.0
+INSTANCE_LOCK_IGNORE_ENV = "SOCKETTRADER_IGNORE_LOCK"
+_instance_lock_owned = False
+_instance_lock_last_beat = 0.0
+_instance_lock_id = secrets.token_hex(8)
+
+
+def _instance_lock_path() -> Path:
+    return CONFIG_FILE.parent / INSTANCE_LOCK_NAME
+
+
+def _instance_record() -> dict:
+    return {"id": _instance_lock_id, "pid": os.getpid(), "os": _platform_tag(),
+            "host": socket.gethostname(), "version": __version__,
+            "beat": time.time()}
+
+
+def _pid_alive(pid: int) -> bool | None:
+    """Whether a process of THIS OS is running; None when it cannot be told."""
+    try:
+        if IS_WINDOWS:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            handle = k32.OpenProcess(0x1000, False, int(pid))   # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return None
+                return code.value == 259                        # STILL_ACTIVE
+            finally:
+                k32.CloseHandle(handle)
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError, ValueError, AttributeError):
+        return None
+
+
+def instance_lock_holder() -> dict | None:
+    """The live holder of the data home, or None (absent, stale, ours).
+
+    Liveness is the heartbeat's age, taken as the YOUNGER of the stamp
+    inside the file and the file's own mtime: WSL2's clock drifts minutes
+    behind the host after a sleep, and the mtime is set by the filesystem,
+    so a lagging WSL holder still reads as live from Windows. A holder on
+    THIS OS whose pid is gone is dead whatever its stamps say — closing a
+    console window skips the release — so a relaunch is not refused."""
+    path = _instance_lock_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict) or rec.get("id") == _instance_lock_id:
+        return None
+    now = time.time()
+    ages = []
+    try:
+        ages.append(now - float(rec.get("beat")))
+    except (TypeError, ValueError):
+        pass
+    try:
+        ages.append(now - os.stat(path).st_mtime)
+    except OSError:
+        pass
+    if not ages:
+        return None
+    age = max(0.0, min(ages))          # a stamp from the future is "now"
+    if age >= INSTANCE_LOCK_STALE_S:
+        return None
+    if rec.get("os") == _platform_tag() and rec.get("host") == socket.gethostname():
+        try:
+            if _pid_alive(int(rec.get("pid"))) is False:
+                return None
+        except (TypeError, ValueError):
+            pass
+    return rec
+
+
+def acquire_instance_lock() -> tuple[bool, str]:
+    """Claim the data home. (False, why) when another SocketTrader holds it."""
+    global _instance_lock_owned, _instance_lock_last_beat
+    holder = instance_lock_holder()
+    if holder and not os.environ.get(INSTANCE_LOCK_IGNORE_ENV):
+        where = f"{holder.get('os', '?')} pid {holder.get('pid', '?')}"
+        return False, (f"another SocketTrader ({where}) is already running against "
+                       f"{CONFIG_FILE.parent} — close it first (it stops counting as "
+                       f"live {int(INSTANCE_LOCK_STALE_S)} s after it exits or dies). "
+                       f"Set {INSTANCE_LOCK_IGNORE_ENV}=1 to override.")
+    try:
+        _write_atomic(_instance_lock_path(), json.dumps(_instance_record()), ".stlock")
+    except OSError as exc:
+        logger.warning(f"INSTANCE LOCK  could not be written ({exc}) — running unlocked")
+        return True, ""
+    _instance_lock_owned = True
+    _instance_lock_last_beat = time.monotonic()
+    return True, ""
+
+
+def instance_lock_beat(force: bool = False) -> None:
+    """Refresh the heartbeat (cheap no-op between beats)."""
+    global _instance_lock_last_beat
+    if not _instance_lock_owned:
+        return
+    if not force and time.monotonic() - _instance_lock_last_beat < INSTANCE_LOCK_BEAT_S:
+        return
+    try:
+        _write_atomic(_instance_lock_path(), json.dumps(_instance_record()), ".stlock")
+    except OSError as exc:
+        logger.warning(f"INSTANCE LOCK  heartbeat failed ({exc})")
+    _instance_lock_last_beat = time.monotonic()
+
+
+def release_instance_lock() -> None:
+    global _instance_lock_owned
+    if not _instance_lock_owned:
+        return
+    _instance_lock_owned = False
+    try:
+        with open(_instance_lock_path(), "r", encoding="utf-8") as f:
+            rec = json.load(f)
+        if isinstance(rec, dict) and rec.get("id") == _instance_lock_id:
+            os.unlink(_instance_lock_path())
+    except (OSError, ValueError):
+        pass
+
+
+def migrate_legacy_home() -> list[str]:
+    """Fold a pre-shared-home WSL install (/home/<you>) into the data home.
+
+    Runs once, before setup(): the shared config, when it exists, is kept
+    as is (the Windows side is the one that was in use) and the WSL copy is
+    set aside; P&L months are MERGED day by day and trade by trade, so the
+    calendar shows both machines' history. The old files are renamed
+    `.migrated`, never deleted — a trading record is not something a
+    migration eats. Returns the lines to show the operator."""
+    legacy = Path.home()
+    try:
+        if not IS_WSL or legacy.resolve() == DATA_HOME.resolve():
+            return []
+    except OSError:
+        return []
+    notes: list[str] = []
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    old_cfg = legacy / ".voidorigin_config.json"
+    if old_cfg.is_file():
+        set_aside = False
+        if CONFIG_FILE.exists():
+            notes.append(f"kept the shared config at {CONFIG_FILE}; the WSL copy was set aside")
+            set_aside = True
+        else:
+            try:
+                with open(old_cfg, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            except (OSError, ValueError) as exc:
+                notes.append(f"WSL config could not be read ({exc}) — left in place")
+                cfg = None
+            if isinstance(cfg, dict):
+                if save_config(_sanitize_cfg(cfg)):
+                    notes.append(f"moved the WSL config to {CONFIG_FILE}")
+                    set_aside = True
+                else:
+                    notes.append(f"WSL config could NOT be written to {CONFIG_FILE} — "
+                                 "left in place; nothing else was migrated")
+                    return notes
+            elif cfg is not None:
+                notes.append("WSL config is not a JSON object — left in place")
+        if set_aside:
+            # Only once the shared home holds a config: the old file is the
+            # only copy of the token and accounts until then.
+            try:
+                old_cfg.rename(old_cfg.with_name(f"{old_cfg.name}.migrated-{stamp}"))
+            except OSError:
+                pass
+
+    merged_rows = 0
+    months: set[str] = set()
+    skipped: list[str] = []
+
+    def fold(month: str, days: dict):
+        nonlocal merged_rows
+        if not _PNL_SHARD_RE.match(month) or not isinstance(days, dict):
+            return
+        if not _pnl_shard_readable(month):
+            # The shared month exists but will not parse: it is a damaged
+            # record, not an empty one, and merging "into" it would replace
+            # the Windows side's trades with the WSL rows alone.
+            skipped.append(month)
+            return
+        target = _pnl_read_shard(month)
+        added = _pnl_merge_days(target, days)
+        if added or not _pnl_shard(month).exists():
+            if _pnl_write_shard(month, json.dumps({"v": 2, "days": target})):
+                merged_rows += added
+                months.add(month)
+
+    old_dir = legacy / ".voidorigin_pnl"
+    if old_dir.is_dir():
+        for shard in sorted(old_dir.glob("*.json")):
+            if not _PNL_SHARD_RE.match(shard.stem):
+                continue
+            try:
+                with open(shard, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError) as exc:
+                notes.append(f"{shard.name} could not be read ({exc}) — not merged; it "
+                             "moves with the .migrated folder")
+                continue
+            fold(shard.stem, (data or {}).get("days") or {})
+        corr = old_dir / PNL_CORRECTIONS_FILE
+        if corr.is_file() and not (PNL_DIR / PNL_CORRECTIONS_FILE).exists():
+            try:
+                shutil.copy2(corr, PNL_DIR / PNL_CORRECTIONS_FILE)
+            except OSError:
+                pass
+        try:
+            old_dir.rename(old_dir.with_name(f"{old_dir.name}.migrated-{stamp}"))
+        except OSError:
+            pass
+
+    old_hist = legacy / ".voidorigin_pnl_history.json"
+    if old_hist.is_file():
+        try:
+            with open(old_hist, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            by_month: dict[str, dict] = {}
+            for date, rec in ((data or {}).get("days") or {}).items():
+                if isinstance(date, str) and len(date) >= 7:
+                    by_month.setdefault(date[:7], {})[date] = rec
+            for month, days in by_month.items():
+                fold(month, days)
+            old_hist.rename(old_hist.with_name(f"{old_hist.name}.migrated-{stamp}"))
+        except (OSError, ValueError) as exc:
+            notes.append(f"{old_hist.name} could not be migrated ({exc}) — left in place")
+
+    if months:
+        notes.append(f"merged WSL P&L history into {PNL_DIR}: {len(months)} month(s), "
+                     f"{merged_rows} new record(s)")
+    if skipped:
+        notes.append(f"NOT merged — the shared file for {', '.join(sorted(set(skipped)))} is "
+                     f"damaged; repair it, then merge the WSL copy from the .migrated folder")
+    for line in notes:
+        logger.info(f"DATA HOME  {line}")
+    return notes
+
+
 # ---------- Main ----------
 async def main():
     global output_directory, active_account, atm_strategy, follow_publisher_strategy, nt_port
     global follower_accounts, roundrobin_accounts, micro_mode, micro_map, atm_aliases
 
+    # The lock comes first: a WSL launch while the Windows instance is live
+    # must not touch the month that instance holds in memory, not even to
+    # migrate into it.
+    ok, why = acquire_instance_lock()
+    if not ok:
+        print(Fore.RED + f"\n  ✖  {why}\n" + Style.RESET_ALL)
+        logger.error(f"INSTANCE LOCK  refused to start: {why}")
+        return
+    for line in migrate_legacy_home():
+        print(Fore.CYAN + f"  ↻  {line}" + Style.RESET_ALL)
+
     token, cfg = setup()
+    instance_lock_beat(force=True)      # setup() can sit at a prompt longer than the stale window
     active_account = cfg.get("account", "")
     follower_accounts = [a for a in cfg.get("follower_accounts", []) if a and a != active_account]
     roundrobin_accounts = sanitize_roundrobin(
@@ -15799,7 +16696,7 @@ async def main():
         # independently of this config.
         write_bridge_token()
     live_bridge_port = int(cfg.get("live_bridge_port", 36984))
-    nt_host_override = str(cfg.get("nt_host", "") or "").strip()
+    nt_host_override = effective_nt_host(cfg)
 
     if cfg.get("output_directory"):
         output_directory = cfg["output_directory"]
@@ -15868,6 +16765,7 @@ async def main():
 
     stop_web_ui()
     stop_snapshot_poller()
+    release_instance_lock()
 
 
 def print_exit_summary():
@@ -15904,4 +16802,5 @@ if __name__ == "__main__":
         # Restore terminal before printing summary
         if os.name != "nt" and _saved_termios is not None:
             _restore_termios()
+        release_instance_lock()
         print_exit_summary()

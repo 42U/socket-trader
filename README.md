@@ -6,7 +6,7 @@
 
 [![VoidOrigin](https://img.shields.io/badge/VOIDORIGIN-voidorigin.com-0a0a0a?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSI+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iMTAiIHN0cm9rZT0iI2ZmNmIzNSIgc3Ryb2tlLXdpZHRoPSIyIi8+PGNpcmNsZSBjeD0iMTIiIGN5PSIxMiIgcj0iNCIgZmlsbD0iI2ZmNmIzNSIvPjwvc3ZnPg==&logoColor=ff6b35&labelColor=0a0a0a)](https://voidorigin.com)
 
-[![Version](https://img.shields.io/badge/v0.22.0-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
+[![Version](https://img.shields.io/badge/v0.23.0-stable-22c55e?style=for-the-badge)](https://github.com/42U/socket-trader)
 [![GitHub Stars](https://img.shields.io/github/stars/42U/socket-trader?style=for-the-badge&logo=github&color=gold)](https://github.com/42U/socket-trader)
 [![License: MIT](https://img.shields.io/github/license/42U/socket-trader?style=for-the-badge&logo=opensourceinitiative&color=blue)](https://opensource.org/licenses/MIT)
 [![CI](https://img.shields.io/github/actions/workflow/status/42U/socket-trader/ci.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/42U/socket-trader/actions/workflows/ci.yml)
@@ -72,7 +72,7 @@ The sim account is automatically swapped with your real NinjaTrader account name
 | **ATI integration** | Auto-detect accounts, live balances, and position closing via NinjaTrader ATI |
 | **Auto-detect directory** | Finds NinjaTrader 8 `incoming/` folder on Windows automatically |
 | **Multi-server support** | Save and switch between multiple signal servers |
-| **Persistent config** | Server, token, account, limits, and directory saved to `~/.voidorigin_config.json` |
+| **Persistent config** | Server, token, account, limits, profiles and directory saved to `.voidorigin_config.json` in the [data home](#where-your-data-lives) — one folder shared by Windows and WSL runs |
 | **Smart reconnect** | A healthy link that drops is retried fast — 3 s, lengthening toward 60 s if the server still holds the dropped session — and failed attempts back off 1 &rarr; 1 &rarr; 2 &rarr; 3 &rarr; 5 &rarr; 8 &rarr; ... &rarr; 30 min max |
 | **Auth handling** | Invalid token triggers re-prompt instead of infinite retry; a 1008 that follows a fast retry means the server still holds the dropped session, so the app waits the schedule out instead of logging you out |
 | **Latency monitoring** | Color-coded signal delivery time relative to baseline |
@@ -103,7 +103,7 @@ That's it. The installer (no admin rights needed) checks for Python 3.10+ and in
 
 > Windows SmartScreen may show *"Windows protected your PC"* the first time — click **More info → Run anyway**. The `.bat` exists precisely so you never have to touch PowerShell execution policy yourself.
 
-**Re-run the installer any time to update.** Your config (`~/.voidorigin_config.json`) and any templates you've edited are left untouched. CI runs this installer end to end on a clean Windows machine on every push.
+**Re-run the installer any time to update.** Your config (`.voidorigin_config.json` in the [data home](#where-your-data-lives)) and any templates you've edited are left untouched. CI runs this installer end to end on a clean Windows machine on every push.
 
 ### Manual (any OS)
 
@@ -261,7 +261,7 @@ Press `S` &rarr; `3` to open the account selector:
 - **Risk is enforced per account, independently.** Each account has its own [session target/stop](#risk-management); when one account trips its limit, only that account is flattened and locked out for the session — the leader and other followers keep trading. When *every* account has stopped, the session pauses.
 - The status bar shows the leader with a copy-count badge, e.g. `Sim101+2: $28,857.02 (+$247.50)`.
 
-Followers are saved to `~/.voidorigin_config.json` (`follower_accounts`) and restored on the next run. Works identically on Windows, WSL2, macOS, and Linux.
+Followers are saved to `.voidorigin_config.json` (`follower_accounts`) in the [data home](#where-your-data-lives) and restored on the next run — by a Windows run or a WSL run alike, since both read the same file.
 
 ---
 
@@ -404,7 +404,7 @@ Route an account's entries through an AI before they hit NinjaTrader. The model 
 
 ### Config
 
-Profiles persist in `~/.voidorigin_config.json` under `account_profiles` and are fully hand-editable:
+Profiles persist in `.voidorigin_config.json` (in the [data home](#where-your-data-lives)) under `account_profiles` and are fully hand-editable:
 
 ```json
 "account_profiles": {
@@ -423,7 +423,7 @@ Profiles persist in `~/.voidorigin_config.json` under `account_profiles` and are
 
 Accounts without a profile behave exactly as before — identical copy of the leader's signal.
 
-**Reset verify (global).** An opposite-direction entry over a standing position is a flip, and the router picks the flip NinjaTrader can do safely. A **filled, quiet** position (shown on the book, no entry still working on that root per NinjaTrader's log) flips as one `REVERSEPOSITION`: NinjaTrader cancels the old ATM's bracket, submits the close and the new entry together, and submits the new ATM's bracket before the new side exists — measured on SimTEST 2026-10-16, about 7.5 s from the command to a protected position, with the reversed-away strategy gone afterwards so a late publisher close for it is a no-op. Anything that may still be in flight takes the sequenced path: one close (`CLOSESTRATEGY` on the standing entry's own id, or a plain `CLOSEPOSITION` when nothing is attributed), a watch until NinjaTrader shows the market flat, then the entry. Nothing else is written in between — NinjaTrader's `CLOSESTRATEGY` cancels the bracket first and submits its close only after those cancels are acknowledged, and a `CLOSEPOSITION` read inside that window closes the position a second time (that pair turned a 1-lot short into a bracketless long on 2026-10-16). The plain close follows a `CLOSESTRATEGY` only when NinjaTrader's log answered *unknown strategy* for every id, or when the position is still showing after 20 s and the log shows no close working. **No entry goes out without proof of flat**: if NinjaTrader never confirms within the watch budget (about a minute), the entry is not placed and a sticky alert says so. The global default — a **RESET VERIFY** button in the web UI's Session card, or the `"reset_verify": "on" | "off"` key in `~/.voidorigin_config.json` — ships **on**; **off** keeps the legacy fixed 1.5 s settle on the sequenced path. Override per account or per scoped rule (`inherit` follows this global). The web UI's **Rev** button takes the same flip: the position's own ATM template (the session default as fallback, and a refusal rather than a bare reversal), a strategy id the ledger can target later, and the sequenced path when an entry is still working.
+**Reset verify (global).** An opposite-direction entry over a standing position is a flip, and the router picks the flip NinjaTrader can do safely. A **filled, quiet** position (shown on the book, no entry still working on that root per NinjaTrader's log) flips as one `REVERSEPOSITION`: NinjaTrader cancels the old ATM's bracket, submits the close and the new entry together, and submits the new ATM's bracket before the new side exists — measured on SimTEST 2026-10-16, about 7.5 s from the command to a protected position, with the reversed-away strategy gone afterwards so a late publisher close for it is a no-op. Anything that may still be in flight takes the sequenced path: one close (`CLOSESTRATEGY` on the standing entry's own id, or a plain `CLOSEPOSITION` when nothing is attributed), a watch until NinjaTrader shows the market flat, then the entry. Nothing else is written in between — NinjaTrader's `CLOSESTRATEGY` cancels the bracket first and submits its close only after those cancels are acknowledged, and a `CLOSEPOSITION` read inside that window closes the position a second time (that pair turned a 1-lot short into a bracketless long on 2026-10-16). The plain close follows a `CLOSESTRATEGY` only when NinjaTrader's log answered *unknown strategy* for every id, or when the position is still showing after 20 s and the log shows no close working. **No entry goes out without proof of flat**: if NinjaTrader never confirms within the watch budget (about a minute), the entry is not placed and a sticky alert says so. The global default — a **RESET VERIFY** button in the web UI's Session card, or the `"reset_verify": "on" | "off"` key in `.voidorigin_config.json` — ships **on**; **off** keeps the legacy fixed 1.5 s settle on the sequenced path. Override per account or per scoped rule (`inherit` follows this global). The web UI's **Rev** button takes the same flip: the position's own ATM template (the session default as fallback, and a refusal rather than a bare reversal), a strategy id the ledger can target later, and the sequenced path when an entry is still working.
 
 ### Export & import
 
@@ -578,11 +578,11 @@ The **P&L** tab in the web UI is a standalone day-by-day trading record — no b
 - **Calendar** — the current month (navigable back through history) as a Mon–Fri grid with a weekly-totals column. Each day is washed green or red with intensity scaled to its P&L, and shows net, trade count and win rate. Days are keyed by **CME session close date**, so Sunday-evening trades land on Monday — the same convention as every session number in the app.
 - **Month statistics** — net P&L, green/red days, day and trade win rates, profit factor, average day, best/worst day, current streak, plus a cumulative **equity curve**.
 - **Day drill-down** — click any day for the full sheet: net P&L, trades, win rate, profit factor, average trade/win/loss, largest win/loss, gross profit/loss, long vs short split, average hold — then **by-symbol, by-strategy and by-account** breakdown tables, an intraday cumulative curve, and the complete trade log (time, account, symbol, side, qty, strategy, entry, hold time, P&L). Follower legs are tagged `copy` and rotation legs `round robin` beside the publisher's strategy name — the name itself is the same on every account, so a strategy's results add up across the group. A row with no strategy at all that was watched opening is `Manual`: a trade taken straight off a NinjaTrader chart.
-- **Corrections** — a row the recorder named wrong can be fixed without stopping the trader: put `{"v": 1, "rows": [{"day": "2026-10-08", "ts": <row ts>, "account": "Sim101", "strategy": "Gooping", "role": "follower"}]}` in `~/.voidorigin_pnl/corrections.json`; it is applied once at the next start and removed.
+- **Corrections** — a row the recorder named wrong can be fixed without stopping the trader: put `{"v": 1, "rows": [{"day": "2026-10-08", "ts": <row ts>, "account": "Sim101", "strategy": "Gooping", "role": "follower"}]}` in `.voidorigin_pnl/corrections.json` (data home); it is applied once at the next start and removed.
 
 **How the numbers are measured.** The per-day net is the change in each managed account's realized cash balance over the session — the same source and definition as the Session P&L tile, so commissions are included and the calendar always agrees with what you watched during the day. Trades are the drill-down layer: when a position closes, the account's cash move in that window is attributed to the market that closed, tagged with the strategy that opened it. When several markets close inside one poll window the move is split by contracts closed and the rows are marked `≈`; entry commissions and any other drift show up as their own **fees / unattributed** line instead of being hidden inside trade numbers. The balance-outage quarantine applies here too — a NinjaTrader feed drop can never mint phantom trades or a phantom red day.
 
-History is recorded from the moment this version first runs (there is nothing to backfill from), persisted atomically to `~/.voidorigin_pnl_history.json`, kept for ~13 months, and left untouched by **RESET P&L** — the calendar is a record, not a session counter.
+History is recorded from the moment this version first runs (there is nothing to backfill from), persisted atomically one month per file under `.voidorigin_pnl/` in the [data home](#where-your-data-lives), kept indefinitely, and left untouched by **RESET P&L** — the calendar is a record, not a session counter. Windows and WSL runs write the same archive, so the calendar shows every day regardless of which one traded it; a write that lands while another writer changed the file is merged, never overwritten.
 
 ### Web UI security
 
@@ -597,7 +597,7 @@ Requests must be `application/json`; the page is served with a strict CSP and `X
 
 NinjaTrader's built-in TCP AT Interface only publishes state transitions (open / fill / cancel / close). It does **not** push live market prices or live unrealized P&L, so by default SocketTrader's session stop / target limits can only fire *after* a trade closes — NinjaTrader's own ATM template handles per-trade risk.
 
-**NinjaTrader is read through the AddOn while it streams.** Positions, cash, realized P&L and average prices come from NinjaTrader's own account events — pushed on every change and every 5 s idle — and feed the dashboard, the P&L recorder, fill verdicts, an entry's pre-position read, the balance monitor and the proof-of-flat watches. The full ATI state dump (which NinjaTrader builds by serialising **every order of its session** on each request — 192 KB and hitting the 10 s cap on 2026-10-16 before a restart) is then requested only every 10 s (`"snapshot_interval_bridged"` in `~/.voidorigin_config.json`) and on demand — an entry write, a flatten, a cancel-by-id — instead of every second. Without the AddOn, or while its stream is stale, everything falls back to the 1 s dump stream as before. Working-order ids are the one thing the AddOn does not carry, so they always come from the newest complete dump.
+**NinjaTrader is read through the AddOn while it streams.** Positions, cash, realized P&L and average prices come from NinjaTrader's own account events — pushed on every change and every 5 s idle — and feed the dashboard, the P&L recorder, fill verdicts, an entry's pre-position read, the balance monitor and the proof-of-flat watches. The full ATI state dump (which NinjaTrader builds by serialising **every order of its session** on each request — 192 KB and hitting the 10 s cap on 2026-10-16 before a restart) is then requested only every 10 s (`"snapshot_interval_bridged"` in `.voidorigin_config.json`) and on demand — an entry write, a flatten, a cancel-by-id — instead of every second. Without the AddOn, or while its stream is stale, everything falls back to the 1 s dump stream as before. Working-order ids are the one thing the AddOn does not carry, so they always come from the newest complete dump.
 
 If you want session limits to react **during** an open trade, install the optional `SocketTraderBridge` NinjaScript AddOn. It runs inside NinjaTrader and publishes live `cash`, `realized`, `unrealized`, `equity`, and per-position `last` price / P&L over a TCP socket on every tick.
 
@@ -751,9 +751,29 @@ Each signal displays delivery time from server to client. The first signal on ea
 
 ---
 
+## Where your data lives
+
+Everything durable — the config (server, token, accounts, risk limits, profiles, session baseline), the P&L calendar archive (`.voidorigin_pnl/`), the signal log and the default profile-export location — lives in **one data home**, and it is the **same folder whether you start SocketTrader from Windows Python or from WSL**:
+
+| Runtime | Data home |
+|---|---|
+| Windows | `C:\Users\<you>\` (your user profile folder) |
+| WSL | the same folder, through the drive mount: `/mnt/c/Users/<you>/` |
+| Linux / macOS | `~` |
+
+So a profile edited on Windows is there the next morning in WSL, and the calendar is one record no matter which runtime traded the day. The startup banner prints the folder in use (`✔  Data: …`). To put it somewhere else, set `SOCKETTRADER_HOME=<folder>` in the environment before starting. If WSL cannot reach Windows (interop disabled), it falls back to the Linux home and says so in yellow — settings and history are then *not* shared.
+
+**First start after upgrading, in WSL:** the old WSL-side install under `/home/<you>` is folded into the data home once. The Windows config is kept as is (the WSL copy is set aside as `.voidorigin_config.json.migrated-<stamp>`); the WSL P&L months are **merged** into the shared archive day by day and trade by trade, then the old folder is renamed `.voidorigin_pnl.migrated-<stamp>` — nothing is deleted. The banner lists what was merged.
+
+Machine-specific values travel safely: the NinjaTrader `incoming` folder is stored in whichever form the saving OS uses and translated on load (`C:\Users\…` ⇄ `/mnt/c/Users/…`); an explicit `nt_host` override is remembered with the OS that set it and ignored by the other, which auto-detects as usual.
+
+**One SocketTrader at a time.** Two instances writing the same home — say a WSL window left open while a Windows one starts — would overwrite each other's month, so the data home carries a heartbeat lock (`.voidorigin.lock`). A second instance refuses to start and names the holder; an instance that crashed stops counting as live 45 s later. `SOCKETTRADER_IGNORE_LOCK=1` overrides.
+
+**Saves that cannot land are not silent.** On Windows a rename over a file another handle has open fails with *Access is denied*; the config is now served from memory and written under a lock with retries, and if the disk still refuses, the alert line and the web reply say `NOT written to disk … retrying` — the setting stays live, and the next successful save (retried every few seconds) carries it. The P&L archive keeps the month dirty on a failed write for the same reason.
+
 ## Configuration
 
-Settings persist in `~/.voidorigin_config.json`:
+Settings persist in `.voidorigin_config.json` in the [data home](#where-your-data-lives):
 
 ```json
 {

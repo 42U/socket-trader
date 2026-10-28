@@ -183,6 +183,8 @@ def isolate_pnl_history(tmp_path_factory):
     st._pnl_unclassified.clear()
     st._pnl_dirty = False
     st._pnl_last_save = 0.0
+    st._pnl_written_stat.clear()
+    st._pnl_unflushed.clear()
     yield
     st.PNL_HISTORY_FILE = original
     st._pnl_history = None
@@ -10314,7 +10316,8 @@ class TestBridgeFirst:
         assert snap["ok"] and snap["source"] == "bridge"
         assert snap["positions"] == [{"account": "Sim101", "instrument": "NQ DEC26", "qty": -1,
                                       "avg_price": 30156.0}]
-        assert snap["accounts"]["Sim101"] == {"cash": 50_000.0, "realized": -12.5, "buying_power": 99.0}
+        assert snap["accounts"]["Sim101"] == {"cash": 50_000.0, "realized": -12.5, "buying_power": 99.0,
+                                              "status": ""}
         assert snap["accounts"]["SimAI"]["cash"] == 15_000.0
         assert snap["working"] == {"Sim101": 2} and snap["open_orders"] == {"Sim101": ["a", "b"]}
         assert snap["req_ts"] == st._bridge_book["ts"]
@@ -10541,3 +10544,512 @@ class TestLiveReconnectPath:
         assert result == "auth_failed" and state["connections"] == 1
         assert "AUTH FAILED  ws_code=1008  reason='invalid token'" in "\n".join(
             r.message for r in caplog.records)
+
+
+
+# ── One data home shared by Windows and WSL ───────────────────────────
+# Config persistence that survives Windows file locks, a P&L archive that
+# merges instead of overwriting, and the instance lock that keeps two
+# SocketTraders from writing the same home at once.
+
+
+@pytest.fixture
+def fresh_cfg_cache():
+    """Start each config test with an empty in-memory config cache."""
+    st._cfg_cache = None
+    st._cfg_cache_path = ""
+    st._cfg_cache_stat = None
+    st._cfg_unsaved = False
+    st._cfg_unreadable = False
+    st._cfg_last_error = ""
+    st._cfg_read_error = ""
+    st._cfg_disk_fail_count = 0
+    yield
+    st._cfg_cache = None
+    st._cfg_cache_path = ""
+    st._cfg_unsaved = False
+    st._cfg_unreadable = False
+    st._cfg_last_error = ""
+
+
+class TestConfigCache:
+    def test_round_trip_and_reload_on_external_edit(self, tmp_config, fresh_cfg_cache):
+        assert st.save_config({"account": "Sim101"}) is True
+        assert st.load_config()["account"] == "Sim101"
+        # An edit by hand (or by the other OS) is picked up on the next read.
+        time.sleep(0.01)
+        tmp_config.write_text(json.dumps({"account": "Sim202"}), encoding="utf-8")
+        assert st.load_config()["account"] == "Sim202"
+
+    def test_reads_do_not_hand_out_the_cache_itself(self, tmp_config, fresh_cfg_cache):
+        st.save_config({"account_limits": {"Sim101": {"target": 1}}})
+        a = st.load_config()
+        a["account_limits"]["Sim101"]["target"] = 999
+        assert st.load_config()["account_limits"]["Sim101"]["target"] == 1
+
+    def test_refused_write_keeps_state_and_retries(self, tmp_config, fresh_cfg_cache,
+                                                  monkeypatch, caplog):
+        st.save_config({"account": "Sim101", "account_profiles": {"A": {"prop": True}}})
+        real = st._write_atomic
+        calls = {"n": 0}
+
+        def refuse(dst, payload, prefix):
+            calls["n"] += 1
+            raise PermissionError(13, "Access is denied", str(dst) + ".tmp")
+
+        monkeypatch.setattr(st, "_write_atomic", refuse)
+        cfg = st.load_config()
+        cfg["account_profiles"]["B"] = {"symbols_allowed": ["NQ"]}
+        with caplog.at_level(logging.ERROR):
+            assert st.save_config(cfg) is False
+        assert "save failed" in "\n".join(r.message for r in caplog.records)
+        assert st.config_save_warning().startswith("  ⚠  NOT written to disk")
+        # Disk is stale, memory is the truth every reader sees …
+        assert "B" not in json.loads(tmp_config.read_text())["account_profiles"]
+        assert "B" in st.load_config()["account_profiles"]
+        # … and the retry writes the FULL intended state, not the stale file.
+        monkeypatch.setattr(st, "_write_atomic", real)
+        assert st.config_flush_pending() is True
+        on_disk = json.loads(tmp_config.read_text())
+        assert set(on_disk["account_profiles"]) == {"A", "B"}
+        assert st.config_save_warning() == ""
+
+    def test_save_account_profiles_reports_refusal(self, tmp_config, fresh_cfg_cache,
+                                                   monkeypatch):
+        st.account_profiles.clear()
+        st.account_profiles["Sim101"] = {"prop": True}
+        monkeypatch.setattr(st, "_write_atomic",
+                            lambda *a, **k: (_ for _ in ()).throw(PermissionError("denied")))
+        assert st.save_account_profiles() is False
+        # Still live for trading, and the web reply says it did not land.
+        assert st.account_profiles["Sim101"] == {"prop": True}
+        ok, msg = asyncio.run(st._web_set_profiles({"Sim101": {"prop": True}}))
+        assert ok is False and "NOT written to disk" in msg
+        st.account_profiles.clear()
+
+    def test_unreadable_file_is_never_overwritten(self, tmp_config, fresh_cfg_cache, caplog):
+        tmp_config.write_text("{not json", encoding="utf-8")
+        with caplog.at_level(logging.ERROR):
+            assert st.load_config() == {}
+            assert st.save_config({"session": {"id": "x"}}) is False
+        assert tmp_config.read_text() == "{not json"
+        assert "refused" in "\n".join(r.message for r in caplog.records)
+
+    def test_corruption_after_a_good_read_serves_last_good_copy(self, tmp_config,
+                                                                fresh_cfg_cache):
+        st.save_config({"account": "Sim101", "token": "t"})
+        assert st.load_config()["token"] == "t"
+        time.sleep(0.01)
+        tmp_config.write_text("", encoding="utf-8")      # truncated mid-write elsewhere
+        assert st.load_config() == {"account": "Sim101", "token": "t"}
+
+    def test_replace_waits_out_a_windows_lock(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(st, "IS_WINDOWS", True)
+        monkeypatch.setattr(st, "REPLACE_RETRY_S", 0.001)
+        real_replace = os.replace
+        left = {"n": 3}
+
+        def flaky(src, dst):
+            if left["n"]:
+                left["n"] -= 1
+                raise PermissionError(5, "Access is denied")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", flaky)
+        dst = tmp_path / "cfg.json"
+        st._write_atomic(dst, "{}", ".t")
+        assert dst.read_text() == "{}" and left["n"] == 0
+        assert not list(tmp_path.glob(".t*"))          # no temp left behind
+
+    def test_replace_gives_up_and_cleans_tmp(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(st, "IS_WINDOWS", True)
+        monkeypatch.setattr(st, "REPLACE_RETRY_S", 0.001)
+        monkeypatch.setattr(st, "REPLACE_RETRIES", 3)
+        monkeypatch.setattr(os, "replace",
+                            lambda s_, d: (_ for _ in ()).throw(PermissionError(5, "denied")))
+        with pytest.raises(PermissionError):
+            st._write_atomic(tmp_path / "cfg.json", "{}", ".t")
+        assert not list(tmp_path.iterdir())
+
+
+class TestSharedHomePaths:
+    def test_windows_path_localized_in_wsl(self, monkeypatch):
+        monkeypatch.setattr(st, "IS_WSL", True)
+        monkeypatch.setattr(st, "IS_WINDOWS", False)
+        monkeypatch.setattr(st, "DATA_HOME", Path("/mnt/c/Users/trader"))
+        assert (st.localize_path(r"C:\Users\trader\Documents\NinjaTrader 8\incoming")
+                == "/mnt/c/Users/trader/Documents/NinjaTrader 8/incoming")
+        assert st.localize_path("/mnt/c/already/unix") == "/mnt/c/already/unix"
+
+    def test_custom_mount_root_followed(self, monkeypatch):
+        monkeypatch.setattr(st, "IS_WSL", True)
+        monkeypatch.setattr(st, "IS_WINDOWS", False)
+        monkeypatch.setattr(st, "DATA_HOME", Path("/c/Users/trader"))
+        assert st.localize_path(r"D:\NinjaTrader 8\incoming") == "/d/NinjaTrader 8/incoming"
+
+    def test_wsl_path_localized_on_windows(self, monkeypatch):
+        monkeypatch.setattr(st, "IS_WSL", False)
+        monkeypatch.setattr(st, "IS_WINDOWS", True)
+        assert (st.localize_path("/mnt/c/Users/trader/Documents/NinjaTrader 8/incoming")
+                == r"C:\Users\trader\Documents\NinjaTrader 8\incoming")
+        assert st.localize_path(r"C:\x") == r"C:\x"
+
+    def test_config_load_localizes_output_directory(self, tmp_config, fresh_cfg_cache,
+                                                    monkeypatch):
+        tmp_config.write_text(json.dumps(
+            {"output_directory": r"C:\Users\trader\Documents\NinjaTrader 8\incoming"}))
+        monkeypatch.setattr(st, "IS_WSL", True)
+        monkeypatch.setattr(st, "IS_WINDOWS", False)
+        monkeypatch.setattr(st, "DATA_HOME", Path("/mnt/c/Users/trader"))
+        assert st.load_config()["output_directory"].startswith("/mnt/c/Users/trader/")
+
+    def test_nt_host_override_only_on_the_os_that_set_it(self, monkeypatch):
+        monkeypatch.setattr(st, "IS_WSL", True)
+        monkeypatch.setattr(st, "IS_WINDOWS", False)
+        assert st.effective_nt_host({"nt_host": "127.0.0.1", "nt_host_os": "windows"}) == ""
+        assert st.effective_nt_host({"nt_host": "172.20.0.1", "nt_host_os": "wsl"}) == "172.20.0.1"
+        assert st.effective_nt_host({"nt_host": "10.0.0.5"}) == "10.0.0.5"   # pre-tag config
+        # Pre-tag loopback can only have meant the Windows side's own NT.
+        assert st.effective_nt_host({"nt_host": "127.0.0.1"}) == ""
+        monkeypatch.setattr(st, "IS_WSL", False)
+        monkeypatch.setattr(st, "IS_WINDOWS", True)
+        assert st.effective_nt_host({"nt_host": "127.0.0.1"}) == "127.0.0.1"
+
+    def test_custom_root_path_localized_on_windows(self, monkeypatch):
+        monkeypatch.setattr(st, "IS_WSL", False)
+        monkeypatch.setattr(st, "IS_WINDOWS", True)
+        assert st.localize_path("/c/Users/trader/Documents/NinjaTrader 8/incoming") == \
+            r"C:\Users\trader\Documents\NinjaTrader 8\incoming"
+
+
+class TestPnlArchiveSafety:
+    def _day(self, ts, pnl, acct="Sim101"):
+        return {"accounts": {acct: {"start": 1000.0, "last": 1000.0 + pnl}},
+                "trades": [{"ts": ts, "account": acct, "symbol": "NQ", "side": "LONG",
+                            "qty": 1, "pnl": pnl}]}
+
+    def test_merge_days_unions_without_duplicates(self):
+        into = {"2026-10-27": self._day(1.0, 10.0)}
+        other = {"2026-10-27": self._day(1.0, 10.0),         # same row
+                 "2026-10-28": self._day(2.0, -5.0, "Sim202")}
+        other["2026-10-27"]["trades"].append(
+            {"ts": 1.5, "account": "Sim101", "symbol": "ES", "side": "SHORT", "qty": 1, "pnl": 3.0})
+        other["2026-10-27"]["accounts"]["Sim202"] = {"start": 5.0, "last": 6.0}
+        added = st._pnl_merge_days(into, other)
+        assert added == 3                      # one row, one account, one day
+        assert [t["ts"] for t in into["2026-10-27"]["trades"]] == [1.0, 1.5]
+        assert set(into["2026-10-27"]["accounts"]) == {"Sim101", "Sim202"}
+        assert "2026-10-28" in into
+        assert st._pnl_merge_days(into, other) == 0
+
+    def test_amended_row_is_not_duplicated_by_a_merge(self):
+        """A row's pnl is amended in place when a fill settles late; the
+        copy on disk still carries the old number. That is the same trade."""
+        st._pnl_load("2026-10")
+        with st._pnl_lock:
+            st._pnl_history["days"]["2026-10-27"] = self._day(1.0, 0.0)
+            st._pnl_dirty = True
+        st._pnl_save(force=True)
+        # Another writer touches the file (so the next save merges from disk).
+        time.sleep(0.01)
+        other = json.loads(st._pnl_shard("2026-10").read_text())
+        other["days"]["2026-10-28"] = self._day(2.0, 1.0, "Sim202")
+        st._pnl_shard("2026-10").write_text(json.dumps(other), encoding="utf-8")
+        with st._pnl_lock:
+            row = st._pnl_history["days"]["2026-10-27"]["trades"][0]
+            row["pnl"] = -12.5                      # late settle lands on the row
+            st._pnl_dirty = True
+        st._pnl_save(force=True)
+        day = json.loads(st._pnl_shard("2026-10").read_text())["days"]["2026-10-27"]
+        assert [(t["ts"], t["pnl"]) for t in day["trades"]] == [(1.0, -12.5)]
+
+    def test_merge_survives_malformed_records(self):
+        into = {"2026-10-27": {"accounts": None, "trades": None}}
+        other = {"2026-10-27": {"accounts": {"A": {"start": 1}}, "trades": [{"ts": 1.0, "account": "A"}]},
+                 "bad": "not a dict", 7: {}}
+        assert st._pnl_merge_days(into, other) == 2
+        assert into["2026-10-27"]["accounts"] == {"A": {"start": 1}}
+        assert st._pnl_merge_days(into, "garbage") == 0
+
+    def test_failed_write_keeps_the_month_dirty(self, monkeypatch, caplog):
+        st._pnl_load("2026-10")
+        with st._pnl_lock:
+            st._pnl_history["days"]["2026-10-27"] = self._day(1.0, 10.0)
+            st._pnl_dirty = True
+        monkeypatch.setattr(st, "_write_atomic",
+                            lambda *a, **k: (_ for _ in ()).throw(PermissionError("denied")))
+        with caplog.at_level(logging.ERROR):
+            st._pnl_save(force=True)
+        assert st._pnl_dirty is True
+        assert not st._pnl_shard("2026-10").exists()
+        monkeypatch.undo()
+        st._pnl_save(force=True)               # the exit-time save now lands it
+        assert st._pnl_dirty is False
+        assert "2026-10-27" in json.loads(st._pnl_shard("2026-10").read_text())["days"]
+
+    def test_write_merges_what_another_writer_put_on_disk(self):
+        st._pnl_load("2026-10")
+        with st._pnl_lock:
+            st._pnl_history["days"]["2026-10-27"] = self._day(1.0, 10.0)
+            st._pnl_dirty = True
+        st._pnl_save(force=True)
+        # A second SocketTrader (the other OS) wrote its own day into the file.
+        time.sleep(0.01)
+        other = json.loads(st._pnl_shard("2026-10").read_text())
+        other["days"]["2026-10-28"] = self._day(2.0, -4.0, "Sim202")
+        st._pnl_shard("2026-10").write_text(json.dumps(other), encoding="utf-8")
+        with st._pnl_lock:
+            st._pnl_history["days"]["2026-10-29"] = self._day(3.0, 1.0)
+            st._pnl_dirty = True
+        st._pnl_save(force=True)
+        days = json.loads(st._pnl_shard("2026-10").read_text())["days"]
+        assert set(days) == {"2026-10-27", "2026-10-28", "2026-10-29"}
+        assert "2026-10-28" in st._pnl_month("2026-10")["days"]
+
+
+class TestInstanceLock:
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        monkeypatch.delenv(st.INSTANCE_LOCK_IGNORE_ENV, raising=False)
+        st._instance_lock_owned = False
+        yield
+        st.release_instance_lock()
+        st._instance_lock_owned = False
+
+    def test_second_instance_refused_until_stale(self, tmp_config, monkeypatch):
+        ok, why = st.acquire_instance_lock()
+        assert ok and why == ""
+        path = st._instance_lock_path()
+        assert path.exists()
+        # A different process id (another SocketTrader) sees a live holder.
+        monkeypatch.setattr(st, "_instance_lock_id", "other-process")
+        ok, why = st.acquire_instance_lock()
+        assert ok is False and "already running" in why
+        # … unless the holder stopped beating.
+        rec = json.loads(path.read_text())
+        rec["beat"] = time.time() - st.INSTANCE_LOCK_STALE_S - 1
+        path.write_text(json.dumps(rec))
+        old = time.time() - st.INSTANCE_LOCK_STALE_S - 1
+        os.utime(path, (old, old))                 # the file is as old as the stamp says
+        assert st.acquire_instance_lock() == (True, "")
+
+    def test_override_env_and_release(self, tmp_config, monkeypatch):
+        assert st.acquire_instance_lock()[0]
+        monkeypatch.setattr(st, "_instance_lock_id", "other-process")
+        monkeypatch.setenv(st.INSTANCE_LOCK_IGNORE_ENV, "1")
+        assert st.acquire_instance_lock()[0]
+        st.release_instance_lock()
+        assert not st._instance_lock_path().exists()
+
+    def test_dead_pid_on_this_os_is_not_a_holder(self, tmp_config, monkeypatch):
+        st.acquire_instance_lock()
+        monkeypatch.setattr(st, "_instance_lock_id", "other-process")
+        monkeypatch.setattr(st, "_pid_alive", lambda pid: False)
+        assert st.acquire_instance_lock() == (True, "")      # closed-with-X relaunch
+        monkeypatch.setattr(st, "_pid_alive", lambda pid: True)
+        monkeypatch.setattr(st, "_instance_lock_id", "third-process")
+        assert st.acquire_instance_lock()[0] is False
+
+    def test_lagging_clock_holder_still_live_via_mtime(self, tmp_config, monkeypatch):
+        st.acquire_instance_lock()
+        path = st._instance_lock_path()
+        rec = json.loads(path.read_text())
+        rec["beat"] = time.time() - 600          # holder's clock is 10 min behind
+        rec["os"] = "wsl" if st._platform_tag() != "wsl" else "windows"
+        path.write_text(json.dumps(rec))         # mtime = now, as the filesystem sets it
+        monkeypatch.setattr(st, "_instance_lock_id", "other-process")
+        assert st.acquire_instance_lock()[0] is False
+
+    def test_beat_refreshes(self, tmp_config, monkeypatch):
+        st.acquire_instance_lock()
+        first = json.loads(st._instance_lock_path().read_text())["beat"]
+        monkeypatch.setattr(st, "INSTANCE_LOCK_BEAT_S", 0.0)
+        time.sleep(0.01)
+        st.instance_lock_beat()
+        assert json.loads(st._instance_lock_path().read_text())["beat"] > first
+
+
+class TestLegacyHomeMigration:
+    def test_wsl_install_folds_into_shared_home(self, tmp_path, tmp_config,
+                                                fresh_cfg_cache, monkeypatch):
+        legacy = tmp_path / "linuxhome"
+        legacy.mkdir()
+        shared = tmp_config.parent
+        monkeypatch.setattr(st, "IS_WSL", True)
+        monkeypatch.setattr(st, "IS_WINDOWS", False)
+        monkeypatch.setattr(st, "DATA_HOME", shared)
+        monkeypatch.setattr(st, "PNL_DIR", shared / ".voidorigin_pnl")
+        monkeypatch.setattr(st.Path, "home", classmethod(lambda cls: legacy))
+        # The Windows side already has a config and one October day …
+        st.save_config({"account": "Sim101", "account_profiles": {"W": {"prop": True}}})
+        st.PNL_DIR.mkdir()
+        st._pnl_shard("2026-10").write_text(json.dumps({"v": 2, "days": {
+            "2026-10-27": {"accounts": {}, "trades": [
+                {"ts": 10.0, "account": "Sim101", "symbol": "NQ", "pnl": 5.0}]}}}))
+        # … WSL has its own config, two months of history, a legacy single file.
+        (legacy / ".voidorigin_config.json").write_text(json.dumps(
+            {"account": "Sim999", "account_profiles": {"L": {"prop": True}}}))
+        (legacy / ".voidorigin_pnl").mkdir()
+        (legacy / ".voidorigin_pnl" / "2026-10.json").write_text(json.dumps({"v": 2, "days": {
+            "2026-10-27": {"accounts": {}, "trades": [
+                {"ts": 10.0, "account": "Sim101", "symbol": "NQ", "pnl": 5.0},   # dup
+                {"ts": 11.0, "account": "Sim101", "symbol": "ES", "pnl": -2.0}]},
+            "2026-10-20": {"accounts": {}, "trades": [
+                {"ts": 1.0, "account": "Sim101", "symbol": "GC", "pnl": 7.0}]}}}))
+        (legacy / ".voidorigin_pnl" / "2026-09.json").write_text(json.dumps({"v": 2, "days": {
+            "2026-09-30": {"accounts": {}, "trades": [
+                {"ts": 0.5, "account": "Sim101", "symbol": "CL", "pnl": 1.0}]}}}))
+        (legacy / ".voidorigin_pnl_history.json").write_text(json.dumps({"days": {
+            "2026-08-05": {"accounts": {}, "trades": [
+                {"ts": 0.1, "account": "Sim101", "symbol": "NQ", "pnl": 2.0}]}}}))
+
+        notes = st.migrate_legacy_home()
+
+        # Windows config kept whole; WSL copy set aside, never merged in.
+        assert st.load_config()["account"] == "Sim101"
+        assert set(st.load_config()["account_profiles"]) == {"W"}
+        assert not (legacy / ".voidorigin_config.json").exists()
+        assert list(legacy.glob(".voidorigin_config.json.migrated-*"))
+        # History merged: duplicate row dropped, new rows/days/months added.
+        oct_days = json.loads(st._pnl_shard("2026-10").read_text())["days"]
+        assert set(oct_days) == {"2026-10-20", "2026-10-27"}
+        assert [t["ts"] for t in oct_days["2026-10-27"]["trades"]] == [10.0, 11.0]
+        assert st._pnl_shard("2026-09").exists() and st._pnl_shard("2026-08").exists()
+        assert not (legacy / ".voidorigin_pnl").exists()
+        assert list(legacy.glob(".voidorigin_pnl.migrated-*"))
+        assert not (legacy / ".voidorigin_pnl_history.json").exists()
+        assert any("merged WSL P&L history" in n for n in notes)
+        # Second run: nothing left to do.
+        assert st.migrate_legacy_home() == []
+
+    def _wsl(self, monkeypatch, legacy, shared):
+        monkeypatch.setattr(st, "IS_WSL", True)
+        monkeypatch.setattr(st, "IS_WINDOWS", False)
+        monkeypatch.setattr(st, "DATA_HOME", shared)
+        monkeypatch.setattr(st, "PNL_DIR", shared / ".voidorigin_pnl")
+        monkeypatch.setattr(st.Path, "home", classmethod(lambda cls: legacy))
+
+    def test_damaged_shared_month_is_never_overwritten(self, tmp_path, tmp_config,
+                                                       fresh_cfg_cache, monkeypatch):
+        legacy = tmp_path / "linuxhome"; legacy.mkdir()
+        self._wsl(monkeypatch, legacy, tmp_config.parent)
+        st.PNL_DIR.mkdir()
+        st._pnl_shard("2026-09").write_text('{"v": 2, "days": {"2026-09-30": {"acc')   # truncated
+        (legacy / ".voidorigin_pnl").mkdir()
+        (legacy / ".voidorigin_pnl" / "2026-09.json").write_text(json.dumps({"v": 2, "days": {
+            "2026-09-29": {"accounts": {}, "trades": []}}}))
+        notes = st.migrate_legacy_home()
+        assert st._pnl_shard("2026-09").read_text().startswith('{"v": 2, "days": {"2026-09-30": {"acc')
+        assert any("damaged" in n for n in notes)
+
+    def test_wsl_config_kept_when_copy_fails(self, tmp_path, tmp_config, fresh_cfg_cache,
+                                             monkeypatch):
+        legacy = tmp_path / "linuxhome"; legacy.mkdir()
+        self._wsl(monkeypatch, legacy, tmp_config.parent)
+        old = legacy / ".voidorigin_config.json"
+        old.write_text(json.dumps({"token": "t", "account": "Sim101"}))
+        monkeypatch.setattr(st, "_write_atomic",
+                            lambda *a, **k: (_ for _ in ()).throw(PermissionError("denied")))
+        notes = st.migrate_legacy_home()
+        assert old.exists()                        # the only copy of the token stays put
+        assert not tmp_config.exists()
+        assert any("could NOT be written" in n for n in notes)
+        st._cfg_unsaved = False
+
+    def test_noop_when_home_is_the_data_home(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(st, "IS_WSL", True)
+        monkeypatch.setattr(st, "DATA_HOME", tmp_path)
+        monkeypatch.setattr(st.Path, "home", classmethod(lambda cls: tmp_path))
+        assert st.migrate_legacy_home() == []
+
+
+class TestWebProfileSaveScope:
+    """The editor saves one account; the page's copy of the other accounts
+    (a poll that may be stale or empty) must never be written over them."""
+
+    def test_only_touches_the_named_account(self, tmp_config, fresh_cfg_cache):
+        st.account_profiles.clear()
+        st.account_profiles.update({"A": {"prop": True}, "B": {"symbols_allowed": ["NQ"]}})
+        # Page believed there were no profiles at all (S.profiles = {}).
+        ok, msg = asyncio.run(st._web_set_profiles({"C": {"prop": True}}, only="C"))
+        assert ok, msg
+        assert set(st.account_profiles) == {"A", "B", "C"}
+        ok, _ = asyncio.run(st._web_set_profiles({}, only="B"))     # RESET PROFILE on B
+        assert ok and set(st.account_profiles) == {"A", "C"}
+        assert set(st.load_config()["account_profiles"]) == {"A", "C"}
+        st.account_profiles.clear()
+
+    def test_whole_map_without_only_still_replaces(self, tmp_config, fresh_cfg_cache):
+        st.account_profiles.clear()
+        st.account_profiles.update({"A": {"prop": True}})
+        ok, _ = asyncio.run(st._web_set_profiles({"B": {"prop": True}}))
+        assert ok and set(st.account_profiles) == {"B"}
+        st.account_profiles.clear()
+
+
+class TestHiddenAndDisconnectedAccounts:
+    """NinjaTrader lists every account its connections ever reported; the
+    dashboard folds away what is not connected and what the operator hid."""
+
+    def test_bridge_status_reaches_the_snapshot(self, monkeypatch):
+        monkeypatch.setattr(st, "live_bridge_enabled", True)
+        monkeypatch.setattr(st, "_live_bridge_connected", True)
+        monkeypatch.setattr(st, "_snap_latest_ok", None)
+        st._bridge_ingest_book([
+            {"name": "Sim101", "cash": 1000.0, "realized": 0.0, "positions": [],
+             "status": "Connected"},
+            {"name": "OldEval", "cash": 0.0, "realized": 0.0, "positions": [],
+             "status": "Disconnected"},
+            {"name": "Legacy", "cash": 5.0, "realized": 0.0, "positions": []},   # old AddOn
+        ])
+        snap = st._bridge_snapshot()
+        assert snap["accounts"]["Sim101"]["status"] == "Connected"
+        assert snap["accounts"]["OldEval"]["status"] == "Disconnected"
+        assert snap["accounts"]["Legacy"]["status"] == ""
+
+    def test_hide_and_unhide_persist(self, tmp_config, fresh_cfg_cache):
+        ok, msg = asyncio.run(st._web_hide_account("OldEval", True))
+        assert ok and "hidden" in msg
+        assert st.hidden_accounts() == ["OldEval"]
+        assert st.load_config()["web_hidden_accounts"] == ["OldEval"]
+        ok, _ = asyncio.run(st._web_hide_account("OldEval", False))
+        assert ok and st.hidden_accounts() == []
+        ok, _ = asyncio.run(st._web_hide_account("", True))
+        assert ok is False
+
+    def test_live_rows_carry_status_and_hidden(self, tmp_config, fresh_cfg_cache, monkeypatch):
+        asyncio.run(st._web_hide_account("OldEval", True))
+        snap = {"ok": True, "accounts": {
+                    "Sim101": {"cash": 1000.0, "realized": 0.0, "status": "Connected"},
+                    "OldEval": {"cash": 0.0, "realized": 0.0, "status": "Disconnected"}},
+                "positions": [], "working": {}, "open_orders": {}, "ts": time.time(),
+                "req_ts": time.time(), "seq": 1}
+        monkeypatch.setattr(st, "snapshot_poller_running", lambda: False)
+        monkeypatch.setattr(st, "_bridge_snapshot", lambda: None)
+        monkeypatch.setattr(st, "nt_snapshot", lambda *a, **k: snap)
+        monkeypatch.setattr(st, "active_account", "Sim101")
+        st._live_invalidate(fresh=True)
+        live = st.web_live(force=True)
+        rows = {r["name"]: r for r in live["accounts"]}
+        assert rows["Sim101"]["status"] == "Connected" and rows["Sim101"]["hidden"] is False
+        assert rows["OldEval"]["status"] == "Disconnected" and rows["OldEval"]["hidden"] is True
+
+    def test_positions_list_managed_first_and_tagged(self, tmp_config, fresh_cfg_cache,
+                                                     monkeypatch):
+        snap = {"ok": True, "accounts": {
+                    "Sim101": {"cash": 1000.0, "realized": 0.0},
+                    "AAA-old": {"cash": 0.0, "realized": 0.0}},
+                "positions": [
+                    {"account": "AAA-old", "instrument": "ES DEC26", "qty": 1, "avg_price": 1.0},
+                    {"account": "Sim101", "instrument": "NQ DEC26", "qty": -2, "avg_price": 2.0}],
+                "working": {}, "open_orders": {}, "ts": time.time(),
+                "req_ts": time.time(), "seq": 2}
+        monkeypatch.setattr(st, "snapshot_poller_running", lambda: False)
+        monkeypatch.setattr(st, "_bridge_snapshot", lambda: None)
+        monkeypatch.setattr(st, "nt_snapshot", lambda *a, **k: snap)
+        monkeypatch.setattr(st, "active_account", "Sim101")
+        st._live_invalidate(fresh=True)
+        live = st.web_live(force=True)
+        assert [p["account"] for p in live["positions"]] == ["Sim101", "AAA-old"]
+        assert live["positions"][0]["managed"] is True
+        assert live["positions"][1]["managed"] is False
