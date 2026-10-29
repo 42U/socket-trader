@@ -229,21 +229,103 @@ $($py.Exe) $($py.Prefix -join ' ') SocketTrader.py
 pause
 "@ | Set-Content -Path $launcher -Encoding ASCII
 
+# Windows identifies a running app by its AppUserModelID. A shortcut that
+# carries one is how a script-based app gets treated like a real one: the
+# taskbar groups and pins it as SocketTrader (not "Python"), with this
+# icon, and the app stamps the same ID on itself at start-up. The ID is
+# written through the shell link's property store (there is no cmdlet).
+$AppId = 'VoidOrigin.SocketTrader'
+$AppIdSource = @"
+using System;
+using System.Runtime.InteropServices;
+namespace STInstall {
+  [StructLayout(LayoutKind.Sequential, Pack = 4)]
+  public struct PROPERTYKEY { public Guid fmtid; public uint pid;
+    public PROPERTYKEY(Guid g, uint p) { fmtid = g; pid = p; } }
+  [StructLayout(LayoutKind.Explicit)]
+  public struct PROPVARIANT { [FieldOffset(0)] public ushort vt; [FieldOffset(8)] public IntPtr p; }
+  [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  public interface IPropertyStore {
+    int GetCount(out uint c); int GetAt(uint i, out PROPERTYKEY k);
+    int GetValue(ref PROPERTYKEY k, out PROPVARIANT v); int SetValue(ref PROPERTYKEY k, ref PROPVARIANT v);
+    int Commit(); }
+  [ComImport, Guid("0000010b-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  public interface IPersistFile {
+    void GetClassID(out Guid id); [PreserveSig] int IsDirty();
+    void Load([MarshalAs(UnmanagedType.LPWStr)] string f, uint mode);
+    void Save([MarshalAs(UnmanagedType.LPWStr)] string f, [MarshalAs(UnmanagedType.Bool)] bool remember);
+    void SaveCompleted([MarshalAs(UnmanagedType.LPWStr)] string f);
+    void GetCurFile([MarshalAs(UnmanagedType.LPWStr)] out string f); }
+  [ComImport, Guid("00021401-0000-0000-C000-000000000046")] public class ShellLink { }
+  public static class AppId {
+    public static void Set(string lnk, string id) {
+      object o = new ShellLink();
+      var pf = (IPersistFile)o; pf.Load(lnk, 2);
+      var ps = (IPropertyStore)o;
+      var key = new PROPERTYKEY(new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), 5);
+      var pv = new PROPVARIANT(); pv.vt = 31; pv.p = Marshal.StringToCoTaskMemUni(id);
+      try { ps.SetValue(ref key, ref pv); ps.Commit(); pf.Save(lnk, true); }
+      finally { Marshal.FreeCoTaskMem(pv.p); }
+    } } }
+"@
+$appIdReady = $false
+try { Add-Type -TypeDefinition $AppIdSource -ErrorAction Stop; $appIdReady = $true }
+catch { Write-Warn "App ID helper unavailable ($($_.Exception.Message)) - shortcuts still work" }
+
 $shell = New-Object -ComObject WScript.Shell
+$ico = Join-Path $InstallDir 'images\sockettrader.ico'
 foreach ($dir in @([Environment]::GetFolderPath('Desktop'),
                    (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))) {
     if (-not (Test-Path $dir)) { continue }
-    $lnk = $shell.CreateShortcut((Join-Path $dir 'SocketTrader.lnk'))
+    $path = Join-Path $dir 'SocketTrader.lnk'
+    $lnk = $shell.CreateShortcut($path)
     $lnk.TargetPath = $launcher
     $lnk.WorkingDirectory = $InstallDir
     $lnk.Description = 'SocketTrader - NinjaTrader signal gateway'
     # The shortcut's icon is also what the console window and taskbar show
     # when the app is launched through it.
-    $ico = Join-Path $InstallDir 'images\sockettrader.ico'
     if (Test-Path $ico) { $lnk.IconLocation = "$ico,0" }
     $lnk.Save()
+    if ($appIdReady) {
+        try { [STInstall.AppId]::Set($path, $AppId) }
+        catch { Write-Warn "could not stamp the App ID on $path ($($_.Exception.Message))" }
+    }
 }
 Write-Ok 'Desktop and Start Menu shortcuts created'
+
+# Register with Windows the way an installer does, per user (no admin):
+# Settings > Apps shows SocketTrader with its icon, version and an
+# Uninstall button. Uninstall removes the program folder and shortcuts and
+# leaves the data home (config, P&L history) alone — that is a trading
+# record, not program files.
+$uninst = Join-Path $InstallDir 'uninstall.cmd'
+$desktopLnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'SocketTrader.lnk'   # Desktop may be OneDrive-redirected
+@"
+@echo off
+echo Removing SocketTrader program files and shortcuts (your config and P&L history are kept).
+del /q "$desktopLnk" 2>nul
+del /q "%APPDATA%\Microsoft\Windows\Start Menu\Programs\SocketTrader.lnk" 2>nul
+reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\SocketTrader" /f >nul 2>&1
+cd /d "%TEMP%"
+rmdir /s /q "$InstallDir"
+echo Done.
+pause
+"@ | Set-Content -Path $uninst -Encoding ASCII
+try {
+    $ver = Get-LocalVersion $InstallDir
+    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\SocketTrader'
+    New-Item -Path $key -Force | Out-Null
+    Set-ItemProperty -Path $key -Name DisplayName -Value 'SocketTrader'
+    Set-ItemProperty -Path $key -Name DisplayVersion -Value ($(if ($ver) { $ver } else { '0' }))
+    Set-ItemProperty -Path $key -Name Publisher -Value 'VoidOrigin'
+    Set-ItemProperty -Path $key -Name InstallLocation -Value $InstallDir
+    Set-ItemProperty -Path $key -Name DisplayIcon -Value "$ico,0"
+    Set-ItemProperty -Path $key -Name UninstallString -Value "`"$uninst`""
+    Set-ItemProperty -Path $key -Name NoModify -Value 1 -Type DWord
+    Set-ItemProperty -Path $key -Name NoRepair -Value 1 -Type DWord
+    Set-ItemProperty -Path $key -Name InstallDate -Value (Get-Date -Format 'yyyyMMdd')
+    Write-Ok 'Registered in Settings > Apps (with uninstaller)'
+} catch { Write-Warn "could not register with Windows ($($_.Exception.Message))" }
 
 # ---- 6. NinjaTrader ATI check -------------------------------------------
 Write-Step 6 'Checking NinjaTrader Automated Trading Interface'

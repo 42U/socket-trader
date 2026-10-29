@@ -7623,6 +7623,44 @@ def _fx_on_console_close() -> None:
         pass
 
 
+APP_USER_MODEL_ID = "VoidOrigin.SocketTrader"   # must match the installer's shortcut stamp
+
+
+def apply_windows_app_identity() -> None:
+    """Make the console window look like ours on Windows: our title, our
+    icon in the title bar and taskbar, and the App ID the installer puts
+    on the shortcut — so a direct `py SocketTrader.py` is grouped and
+    pinned like the shortcut launch. The console window belongs to the
+    console host, not to this process, so the icon is set on that window
+    with WM_SETICON. Cosmetic: every failure is ignored."""
+    if not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+        except Exception:
+            pass
+        ctypes.windll.kernel32.SetConsoleTitleW(f"SocketTrader {__version__}")
+        ico = SCRIPT_DIR / "images" / "sockettrader.ico"
+        k32, u32 = ctypes.windll.kernel32, ctypes.windll.user32
+        k32.GetConsoleWindow.restype = wt.HWND
+        hwnd = k32.GetConsoleWindow()
+        if not hwnd or not ico.is_file():
+            return
+        u32.LoadImageW.restype = wt.HANDLE
+        u32.LoadImageW.argtypes = [wt.HINSTANCE, wt.LPCWSTR, wt.UINT, ctypes.c_int, ctypes.c_int, wt.UINT]
+        u32.SendMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+        IMAGE_ICON, LR_LOADFROMFILE, WM_SETICON = 1, 0x10, 0x80
+        for which, size in ((1, 32), (0, 16)):          # ICON_BIG, ICON_SMALL
+            hicon = u32.LoadImageW(None, str(ico), IMAGE_ICON, size, size, LR_LOADFROMFILE)
+            if hicon:
+                u32.SendMessageW(hwnd, WM_SETICON, which, hicon)
+    except Exception:
+        pass
+
+
 def install_console_close_handler() -> None:
     """Windows only: react to the console window's X (and logoff/shutdown)."""
     global _fx_ctrl_handler
@@ -17340,6 +17378,7 @@ async def main():
     # The lock comes first: a WSL launch while the Windows instance is live
     # must not touch the month that instance holds in memory, not even to
     # migrate into it.
+    apply_windows_app_identity()
     ok, why = acquire_instance_lock()
     if not ok:
         print(Fore.RED + f"\n  ✖  {why}\n" + Style.RESET_ALL)
