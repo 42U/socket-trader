@@ -103,7 +103,7 @@ That's it. The installer (no admin rights needed) checks for Python 3.10+ and in
 
 > Windows SmartScreen may show *"Windows protected your PC"* the first time — click **More info → Run anyway**. The `.bat` exists precisely so you never have to touch PowerShell execution policy yourself.
 
-**Re-run the installer any time to update.** Your config (`.voidorigin_config.json` in the [data home](#where-your-data-lives)) and any templates you've edited are left untouched. CI runs this installer end to end on a clean Windows machine on every push.
+**Re-run the installer any time to update.** Run from an unpacked zip or a checkout it installs *those* files (and refuses to downgrade an installed copy to an older GitHub release — pass `-FromGitHub` to force a download). Your config (`.voidorigin_config.json` in the [data home](#where-your-data-lives)) and any templates you've edited are left untouched. CI runs this installer end to end on a clean Windows machine on every push.
 
 ### Manual (any OS)
 

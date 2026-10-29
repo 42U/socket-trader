@@ -23,10 +23,19 @@
 
 .PARAMETER InstallDir
     Where to install. Defaults to %LOCALAPPDATA%\SocketTrader.
+
+.PARAMETER FromGitHub
+    Always download the published release, even when this script sits in
+    a checkout that has SocketTrader.py next to it. By default a checkout
+    installs ITSELF: running install.bat from an unpacked zip or a local
+    edit must install those files, not silently replace them with whatever
+    GitHub currently has (which is how a newer local build got rolled back
+    to an older published one).
 #>
 [CmdletBinding()]
 param(
     [switch]$Force,
+    [switch]$FromGitHub,
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'SocketTrader')
 )
 
@@ -114,18 +123,46 @@ if ($py) {
 }
 
 # ---- 2. SocketTrader files ----------------------------------------------
-Write-Step 2 'Downloading SocketTrader'
+function Get-LocalVersion { param($dir)
+    $f = Join-Path $dir 'SocketTrader.py'
+    if (-not (Test-Path $f)) { return $null }
+    $m = Select-String -Path $f -Pattern '^__version__\s*=\s*"([^"]+)"' | Select-Object -First 1
+    if ($m) { return $m.Matches[0].Groups[1].Value } else { return $null }
+}
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$localSrc = if (-not $FromGitHub -and (Test-Path (Join-Path $here 'SocketTrader.py'))) { $here } else { $null }
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-$zip = Join-Path $env:TEMP 'socket-trader.zip'
-$stage = Join-Path $env:TEMP 'socket-trader-stage'
-if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-Invoke-WebRequest -Uri $RepoZip -OutFile $zip -UseBasicParsing
-Expand-Archive -Path $zip -DestinationPath $stage -Force
-$src = Get-ChildItem $stage -Directory | Select-Object -First 1
-Copy-Item (Join-Path $src.FullName '*') $InstallDir -Recurse -Force
-Remove-Item $zip, $stage -Recurse -Force -ErrorAction SilentlyContinue
-Write-Ok "Installed to $InstallDir"
+$installedBefore = Get-LocalVersion $InstallDir
+if ($localSrc -and ((Resolve-Path $localSrc).Path -eq (Resolve-Path $InstallDir).Path)) {
+    Write-Step 2 'SocketTrader files'
+    Write-Ok "Running from the install folder itself (v$installedBefore) - files left as they are"
+} elseif ($localSrc) {
+    Write-Step 2 "Installing SocketTrader from this folder"
+    Write-Info "$localSrc  (v$(Get-LocalVersion $localSrc))"
+    if ($installedBefore) { Write-Info "replacing installed v$installedBefore" }
+    # Everything except caches and the launcher the installer writes itself.
+    Get-ChildItem $localSrc -Force | Where-Object { $_.Name -notin @('__pycache__', 'SocketTrader.cmd', '.git') } |
+        ForEach-Object { Copy-Item $_.FullName (Join-Path $InstallDir $_.Name) -Recurse -Force }
+    Write-Ok "Installed to $InstallDir"
+} else {
+    Write-Step 2 'Downloading SocketTrader'
+    $zip = Join-Path $env:TEMP 'socket-trader.zip'
+    $stage = Join-Path $env:TEMP 'socket-trader-stage'
+    if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $RepoZip -OutFile $zip -UseBasicParsing
+    Expand-Archive -Path $zip -DestinationPath $stage -Force
+    $src = Get-ChildItem $stage -Directory | Select-Object -First 1
+    $downloaded = Get-LocalVersion $src.FullName
+    if ($installedBefore -and $downloaded -and ([version]$downloaded -lt [version]$installedBefore)) {
+        Write-Warn "GitHub has v$downloaded but v$installedBefore is installed - NOT downgrading."
+        Write-Warn "Run install.bat from the folder that holds the newer files, or pass -FromGitHub to force."
+    } else {
+        Copy-Item (Join-Path $src.FullName '*') $InstallDir -Recurse -Force
+        Write-Ok "Installed v$downloaded to $InstallDir"
+    }
+    Remove-Item $zip, $stage -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 # ---- 3. Dependencies -----------------------------------------------------
 Write-Step 3 'Installing Python packages'
