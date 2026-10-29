@@ -360,14 +360,20 @@ $uninst = Join-Path $InstallDir 'uninstall.cmd'
 $desktopLnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'SocketTrader.lnk'   # Desktop may be OneDrive-redirected
 @"
 @echo off
+rem A batch file cannot delete the folder it runs from, so hop to %TEMP% first.
+if /i not "%~dp0"=="%TEMP%\" (
+  copy /y "%~f0" "%TEMP%\sockettrader_uninstall.cmd" >nul
+  start "" /d "%TEMP%" cmd /c "%TEMP%\sockettrader_uninstall.cmd"
+  exit /b
+)
 echo Removing SocketTrader program files and shortcuts (your config and P&L history are kept).
 del /q "$desktopLnk" 2>nul
 del /q "%APPDATA%\Microsoft\Windows\Start Menu\Programs\SocketTrader.lnk" 2>nul
 reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\SocketTrader" /f >nul 2>&1
-cd /d "%TEMP%"
 rmdir /s /q "$InstallDir"
 echo Done.
 pause
+del /q "%~f0"
 "@ | Set-Content -Path $uninst -Encoding ASCII
 try {
     $ver = if ($appMode) { Get-ExeVersion (Join-Path $InstallDir 'SocketTrader.exe') } else { Get-LocalVersion $InstallDir }

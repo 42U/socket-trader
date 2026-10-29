@@ -1108,6 +1108,7 @@ _cfg_unsaved = False                  # the cache holds a state the disk refused
 _cfg_unreadable = False               # a file exists that could not be parsed, and no cache
 _cfg_last_error = ""                  # last save failure, for the UI
 _cfg_read_error = ""                  # last read failure logged (polls must not spam the log)
+_cfg_overwrite_warned: tuple | None = None   # the external edit already warned about (retry runs every 2 s)
 _cfg_disk_fail_count = 0
 _cfg_gen = 0                          # bumped on every save_config; what the disk holds is _cfg_written_gen
 _cfg_written_gen = 0
@@ -1309,7 +1310,7 @@ def _cfg_write_latest() -> bool:
     and every writer writes the NEWEST state — a save that queued behind
     another never puts an older copy on disk over a newer one."""
     global _cfg_cache_stat, _cfg_unsaved, _cfg_unreadable, _cfg_last_error
-    global _cfg_disk_fail_count, _cfg_written_gen
+    global _cfg_disk_fail_count, _cfg_written_gen, _cfg_overwrite_warned
     with _cfg_write_lock:
         with _cfg_lock:
             if _cfg_cache is None:
@@ -1318,13 +1319,16 @@ def _cfg_write_latest() -> bool:
                 return True                      # already on disk
             gen, path = _cfg_gen, Path(_cfg_cache_path)
             payload = json.dumps(_cfg_cache, indent=2)
-            if _cfg_unsaved and _cfg_cache_stat is not None and _cfg_stat() != _cfg_cache_stat:
+            now_stat = _cfg_stat()
+            if (_cfg_unsaved and _cfg_cache_stat is not None and now_stat != _cfg_cache_stat
+                    and now_stat != _cfg_overwrite_warned):
                 # The file changed under us while saves were being refused
                 # (the other OS, or an edit by hand). The in-memory state
                 # is what the operator set in THIS app, so it wins — but
-                # say so, because that edit is about to be replaced.
+                # say so once per such edit, because it is about to be replaced.
                 logger.warning(f"CONFIG  {path} was changed by something else while "
                                "saves were refused — overwriting it with this app's state")
+                _cfg_overwrite_warned = now_stat
         try:
             _write_atomic(path, payload, ".voidorigin_")
         except OSError as exc:
