@@ -7931,7 +7931,7 @@ def _fx_spawn_overlay() -> None:
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def _fx_on_console_close() -> None:
+def _fx_on_console_close(overlay: bool = True) -> None:
     """The console-control callback's work. Order matters: the record first
     (the helper is cosmetic), each step on its own so one failure cannot
     take the others with it. Must finish well inside Windows' ~5 s grace."""
@@ -7949,7 +7949,7 @@ def _fx_on_console_close() -> None:
         except Exception:
             pass
     try:
-        if fx_enabled():
+        if overlay and fx_enabled():
             _fx_spawn_overlay()
     except Exception:
         pass
@@ -8265,6 +8265,25 @@ def update_state() -> dict | None:
             "prerelease": _update_info.get("prerelease", False)}
 
 
+def _hold_window_open(note: str) -> None:
+    """A start-up refusal in the installed app otherwise flashes a console
+    for a frame and vanishes (2026-10-29 11:42 and 12:14: two double-clicks
+    on the shortcut while SocketTrader was running, and nothing to read).
+    When this is its own window, wait for a key; piped or scripted runs
+    return at once."""
+    try:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            return
+        print(Fore.YELLOW + f"  {note}  Press any key…" + Style.RESET_ALL, flush=True)
+        if IS_WINDOWS:
+            import msvcrt
+            msvcrt.getch()
+        else:
+            sys.stdin.readline()
+    except Exception:
+        pass
+
+
 def install_console_close_handler() -> None:
     """Windows only: react to the console window's X (and logoff/shutdown)."""
     global _fx_ctrl_handler
@@ -8279,7 +8298,11 @@ def install_console_close_handler() -> None:
             if event in (0, 1):               # Ctrl+C / Ctrl+Break: Python's own handling
                 return False
             if event in (2, 5, 6):            # CLOSE, LOGOFF, SHUTDOWN
-                _fx_on_console_close()
+                # The record is saved on all three; the switch-off overlay
+                # only when the operator closed the window — at logoff or
+                # shutdown there is no desktop left to draw it on, and a
+                # helper process started then only delays the session end.
+                _fx_on_console_close(overlay=(event == 2))
                 return True
             return False
 
@@ -17866,10 +17889,15 @@ def _pid_alive(pid: int) -> bool | None:
     try:
         if IS_WINDOWS:
             import ctypes
-            k32 = ctypes.windll.kernel32
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
             handle = k32.OpenProcess(0x1000, False, int(pid))   # PROCESS_QUERY_LIMITED_INFORMATION
             if not handle:
-                return False
+                # ERROR_INVALID_PARAMETER (87): no such process. Anything
+                # else — ERROR_ACCESS_DENIED (5) for an elevated or another
+                # user's SocketTrader above all — means it may well be
+                # running, and "cannot tell" must not read as "dead": that
+                # would let a second instance start against the same home.
+                return False if ctypes.get_last_error() == 87 else None
             try:
                 code = ctypes.c_ulong()
                 if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
@@ -18076,9 +18104,10 @@ def _migrate_legacy_from(legacy: Path, adopt_config: bool = True) -> list[str]:
             notes.append(f"kept the shared config at {CONFIG_FILE}; the WSL copy was set aside")
             set_aside = True
         elif not adopt_config:
+            # Not adopted, so not renamed either: an old WSL-side install
+            # that is still started now and then keeps its own config.
             notes.append(f"a WSL config was found at {old_cfg} — NOT adopted (review it by hand; "
                          "the Windows side keeps its own settings)")
-            set_aside = True
         else:
             try:
                 with open(old_cfg, "r", encoding="utf-8") as f:
@@ -18188,6 +18217,7 @@ async def main():
     if not ok:
         print(Fore.RED + f"\n  ✖  {why}\n" + Style.RESET_ALL)
         logger.error(f"INSTANCE LOCK  refused to start: {why}")
+        _hold_window_open("SocketTrader is already running — this window can be closed.")
         return
     notes = migrate_legacy_home()
     fx_matrix_rain()

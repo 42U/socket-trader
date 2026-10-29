@@ -11208,7 +11208,10 @@ class TestLocalSurfaceHardening:
         assert cfg.get(st.WSL_LEGACY_SCAN_KEY)
         assert any("NOT adopted" in n for n in notes)
         assert st._pnl_shard("2026-10").exists()                           # history still merged
-        assert list(legacy.glob(".voidorigin_config.json.migrated-*"))     # set aside, not deleted
+        # Not adopted, so left exactly where it was: an old WSL-side install
+        # that is still started now and then must keep finding its config.
+        assert (legacy / ".voidorigin_config.json").exists()
+        assert not list(legacy.glob(".voidorigin_config.json.migrated-*"))
 
     def test_wsl_own_home_still_moves_its_config(self, tmp_path, tmp_config, fresh_cfg_cache, monkeypatch):
         legacy = tmp_path / "linuxhome"; legacy.mkdir()
@@ -11785,3 +11788,42 @@ class TestUpdater(_WebClient):
         assert body["ok"] is False and "install.bat" in body["message"]
         body = self._post(web + "/api/update", {"action": "bogus"})
         assert body["ok"] is False
+
+
+class TestConsoleCloseHandler:
+    def test_overlay_only_when_the_window_is_closed(self, monkeypatch):
+        spawned = {"n": 0}
+        saved = {"n": 0}
+        monkeypatch.setattr(st, "_fx_spawn_overlay", lambda: spawned.__setitem__("n", spawned["n"] + 1))
+        monkeypatch.setattr(st, "_pnl_save", lambda force=False: saved.__setitem__("n", saved["n"] + 1))
+        monkeypatch.setattr(st, "fx_enabled", lambda: True)
+        monkeypatch.setattr(st, "release_instance_lock", lambda: None)
+        monkeypatch.setattr(st, "config_flush_pending", lambda: True)
+        monkeypatch.setattr(st, "_flush_replay_guard", lambda force=False: None)
+        # Logoff / shutdown: the record is saved, no helper is started.
+        st._fx_closed_once = False
+        st._fx_on_console_close(overlay=False)
+        assert saved["n"] == 1 and spawned["n"] == 0
+        # The window's X: both.
+        st._fx_closed_once = False
+        st._fx_on_console_close(overlay=True)
+        assert saved["n"] == 2 and spawned["n"] == 1
+        # Idempotent: a second callback does nothing.
+        st._fx_on_console_close(overlay=True)
+        assert saved["n"] == 2 and spawned["n"] == 1
+        st._fx_closed_once = False
+
+    def test_pid_alive_access_denied_is_unknown_not_dead(self, monkeypatch):
+        # On Windows OpenProcess fails with ERROR_ACCESS_DENIED for an elevated
+        # or another user's SocketTrader; that must not read as "dead".
+        monkeypatch.setattr(st, "IS_WINDOWS", True)
+        import types
+        calls = {"err": 5}
+        fake_ctypes = types.SimpleNamespace(
+            WinDLL=lambda name, use_last_error=False: types.SimpleNamespace(
+                OpenProcess=lambda *a: 0),
+            get_last_error=lambda: calls["err"])
+        monkeypatch.setitem(st.sys.modules, "ctypes", fake_ctypes)
+        assert st._pid_alive(4242) is None            # access denied → unknown
+        calls["err"] = 87
+        assert st._pid_alive(4242) is False           # invalid parameter → no such process

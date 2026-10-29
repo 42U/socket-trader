@@ -144,7 +144,8 @@ jobs:
             throw "launcher does not invoke SocketTrader.py as expected:`n$cmd"
           }
           $interp = $Matches[1] -split '\s+'
-          & $interp[0] @($interp[1..($interp.Length-1)]) -c `
+          $rest = if ($interp.Length -gt 1) { @($interp[1..($interp.Length-1)]) } else { @() }
+          & $interp[0] @($rest) -c `
             "import sys; sys.path.insert(0, r'$dir'); import SocketTrader; print('imports OK, v' + SocketTrader.__version__)"
           if ($LASTEXITCODE -ne 0) { throw 'app failed to import with the launcher interpreter' }
           Write-Host "installer output verified"

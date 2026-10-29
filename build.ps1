@@ -58,9 +58,12 @@ Step "Building SocketTrader v$version"
 
 # ---- python / venv --------------------------------------------------------
 $py = $null
+# Arguments after the interpreter name. ($c[1..0] is NOT empty in PowerShell:
+# a descending range yields two elements, which fed `python $null python -c …`.)
+function Rest { param($a) if ($a.Count -gt 1) { return @($a[1..($a.Count - 1)]) } else { return @() } }
 foreach ($c in @(@('py', '-3'), @('python'))) {
     try {
-        $out = & $c[0] @($c[1..($c.Count - 1)]) -c 'import sys;print(sys.version_info[0],sys.version_info[1])' 2>$null
+        $out = & $c[0] @(Rest $c) -c 'import sys;print(sys.version_info[0],sys.version_info[1])' 2>$null
         if ($LASTEXITCODE -eq 0 -and $out) {
             $p = $out -split '\s+'
             if ([version]"$($p[0]).$($p[1])" -ge [version]'3.10') { $py = $c; break }
@@ -70,7 +73,7 @@ foreach ($c in @(@('py', '-3'), @('python'))) {
 if (-not $py) { throw 'Python 3.10+ is needed to BUILD (not to run the result). Install it from python.org.' }
 $venv = Join-Path $here '.venv-build'
 if (-not (Test-Path (Join-Path $venv 'Scripts\python.exe'))) {
-    & $py[0] @($py[1..($py.Count - 1)]) -m venv $venv
+    & $py[0] @(Rest $py) -m venv $venv
     if ($LASTEXITCODE -ne 0) { throw 'could not create the build venv' }
 }
 $vpy = Join-Path $venv 'Scripts\python.exe'

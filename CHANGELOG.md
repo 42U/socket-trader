@@ -64,6 +64,15 @@ machine or by the test suite (1083 tests) unless marked otherwise.
   The web and terminal confirms now show the account's current setup, the
   file's setup, its scoped strategies, and where/when the file was exported.
 
+- A second launch while SocketTrader runs printed its refusal and closed the
+  window in the same instant (twice on 2026-10-29); it now waits for a key.
+- Instance lock: a holder whose process cannot be inspected (another user's
+  or an elevated SocketTrader — access denied) counts as live, not dead.
+- The Windows side no longer renames a WSL config it did not adopt.
+- Switch-off overlay only on the window's X, not at logoff/shutdown.
+- `build.ps1` / CI: the plain `python` fallback (no `py` launcher) was
+  broken by a PowerShell descending-range slice.
+
 ### Added (operability, after the 2026-10-29 stale-profile restart)
 - `PROFILE DIGEST` log lines whenever profiles are loaded or saved: per
   account, what it will do and every scoped rule with its scope — a restart
