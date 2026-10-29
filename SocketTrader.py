@@ -2170,8 +2170,14 @@ def _profile_history_snapshot(profiles: dict):
                     return                      # unchanged — no new copy
             except (OSError, ValueError):
                 pass
-        name = datetime.now().strftime("%Y%m%d-%H%M%S.%f")[:-3] + ".json"   # ms: sorts, never collides
-        _write_atomic(hist / name, payload, ".voidorigin_")
+        # Second-resolution stamp plus a sequence, so two saves inside one
+        # tick (Windows clocks tick every 15 ms) get two files that still
+        # sort in save order instead of one overwriting the other.
+        base = datetime.now().strftime("%Y%m%d-%H%M%S")
+        taken = [int(p.stem[len(base) + 1:]) for p in hist.glob(f"{base}-??.json")
+                 if p.stem[len(base) + 1:].isdigit()]
+        n = min(max(taken, default=-1) + 1, 99)     # never a freed lower slot: order is the name
+        _write_atomic(hist / f"{base}-{n:02d}.json", payload, ".voidorigin_")
         for old in sorted(hist.glob("*.json"))[:-PROFILE_HISTORY_KEEP]:
             try:
                 old.unlink()
