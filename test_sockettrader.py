@@ -11589,3 +11589,48 @@ class TestProfileImportPreview(_WebClient):
                                     "rules": [{"strategies": ["X"]}, {"strategies": ["Y"], "enabled": True}]}
         assert st.describe_profile(st.account_profiles["A"]) == st.profile_summary("A")
         assert st.describe_profile(None) == "default"
+
+
+class TestLiveBridgeReconnectStorm:
+    """2026-10-27 08:58: the AddOn refused the token and the bridge task
+    reconnected 23,000 times in 16 s, rotating three log files away."""
+
+    def test_a_refused_token_backs_off_instead_of_spinning(self, monkeypatch, caplog):
+        calls = {"n": 0}
+
+        class _Reader:
+            async def readline(self):
+                return b""                       # closed before any data
+
+        class _Writer:
+            def write(self, b): pass
+            async def drain(self): pass
+            def close(self): pass
+            async def wait_closed(self): pass
+
+        async def fake_open(host, port):
+            calls["n"] += 1
+            return _Reader(), _Writer()
+
+        monkeypatch.setattr(st.asyncio, "open_connection", fake_open)
+        monkeypatch.setattr(st, "live_bridge_enabled", True)
+        monkeypatch.setattr(st, "_nt_host", lambda port: "127.0.0.1")
+        monkeypatch.setattr(st, "bridge_auth_line", lambda: b"auth\n")
+        st.shutdown.clear()
+
+        async def run():
+            task = asyncio.create_task(st.live_bridge_task())
+            await asyncio.sleep(0.6)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        with caplog.at_level(logging.INFO, logger=st.logger.name):
+            asyncio.run(run())
+        # First attempt at t=0, the second only after the 1 s backoff.
+        assert calls["n"] == 1, calls
+        warnings = [r for r in caplog.records if "closed before any data" in r.getMessage()]
+        assert len(warnings) == 1
+        assert st._live_bridge_connected is False

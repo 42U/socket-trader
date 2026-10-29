@@ -52,6 +52,12 @@ machine or by the test suite (1083 tests) unless marked otherwise.
   the profile summary ("⚠ 1 never enters"), in both rule editors (with a
   confirm on save in the web UI), and in the log digest.
 
+- **Bridge reconnect storm.** When the AddOn refused the token (or closed
+  the stream), the bridge task reconnected in a tight loop — 23,000 times
+  in 16 s on 2026-10-27 — and the two lines it logged each time rotated
+  three files of trading history out of the log. It now backs off like an
+  unreachable port (1 → 30 s), says so once per step, and retries a dropped
+  stream after a second.
 - **Profile import shows what it is about to do.** A weeks-old export file
   replaced a live entries-ON profile behind a generic "Replace?" prompt
   (2026-10-29 08:26; the account then sat out every signal of the session).

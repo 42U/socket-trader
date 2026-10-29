@@ -11388,7 +11388,8 @@ async def live_bridge_task():
         # the flag flips only once a line actually comes back — otherwise
         # bridge_send_command would think it had a live bridge.
         got_data = False
-        logger.info(f"live bridge socket open → {host}:{port} (awaiting auth)")
+        if backoff <= 1.0:
+            logger.info(f"live bridge socket open → {host}:{port} (awaiting auth)")
 
         try:
             while not shutdown.is_set():
@@ -11402,13 +11403,17 @@ async def live_bridge_task():
                     if not got_data:
                         # Closed before sending anything: the AddOn refused
                         # our token (rotated secret, stale AddOn, or no
-                        # token file). Back off — retrying instantly here
-                        # spins a reconnect storm against the AddOn's
-                        # single-threaded accept loop.
-                        logger.warning(
-                            "live bridge closed before any data — token rejected? "
-                            "Re-check the AddOn has SocketTraderBridge.token and "
-                            "was recompiled.")
+                        # token file). Said on the first refusal and at each
+                        # backoff step only — on 2026-10-27 this line and
+                        # the "socket open" one were written 23,000 times
+                        # in 16 s and rotated three log files of trading
+                        # history out of existence, because the reconnect
+                        # below never waited.
+                        if backoff <= 1.0 or backoff >= 30.0:
+                            logger.warning(
+                                "live bridge closed before any data — token rejected? "
+                                "Re-check the AddOn has SocketTraderBridge.token and "
+                                f"was recompiled. (retrying every {min(backoff * 2, 30.0):.0f}s)")
                     else:
                         logger.info("live bridge EOF — reconnecting")
                     break
@@ -11463,6 +11468,15 @@ async def live_bridge_task():
             except Exception:
                 pass
             _live_bridge_connected = False
+        # Never reconnect in a tight loop: a refused token backs off like
+        # an unreachable port (1 → 30 s); a stream that was flowing and
+        # dropped (EOF, stale) retries after a second.
+        if got_data:
+            backoff = 1.0
+            await asyncio.sleep(1.0)
+        else:
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
 
 
 async def balance_monitor():
