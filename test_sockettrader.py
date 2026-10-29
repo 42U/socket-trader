@@ -11404,3 +11404,24 @@ class TestOct29SkippedSignals:
                             lambda *a, **k: (_ for _ in ()).throw(OSError("denied")))
         assert st.save_account_profiles() is False
         assert not hist.exists() or not list(hist.glob("*.json"))
+
+
+class TestImportFromProfileHistory:
+    def test_history_file_imports_the_named_account(self, tmp_config):
+        doc = {"saved": "2026-10-29T14:00:00",
+               "account_profiles": {"Sim101": {"default": {"enabled": True}},
+                                    "SimX": {"default": {"enabled": False, "qty_mode": "fixed",
+                                                         "qty_value": 3}}}}
+        ok, msg = st.import_profile("SimX", doc, source="history")
+        assert ok is True, msg
+        assert st.account_profiles["SimX"]["default"]["qty_value"] == 3
+        assert "Sim101" not in st.account_profiles          # only the named account moves
+
+    def test_history_file_without_that_account_is_refused(self):
+        doc = {"account_profiles": {"Sim101": {"default": {"enabled": True}}}}
+        ok, msg = st.import_profile("SimX", doc)
+        assert ok is False and "none for SimX" in msg and "Sim101" in msg
+
+    def test_whole_config_still_refused_without_an_account(self):
+        raw, err = st.parse_profile_import({"account_profiles": {"A": {"default": {}}}})
+        assert raw is None and "whole config file" in err

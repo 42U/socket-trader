@@ -2190,12 +2190,15 @@ def profile_ai_gates(prof: dict) -> list[dict]:
     return gates
 
 
-def parse_profile_import(data) -> tuple[dict | None, str]:
+def parse_profile_import(data, account: str = "") -> tuple[dict | None, str]:
     """Pick the profile entry out of an import document.
 
-    Accepts an export envelope ({"profile": {...}}) or a bare profile in
-    the config file's own shape. Returns (raw_profile, error); the raw
-    profile still has to go through load_account_profiles.
+    Accepts an export envelope ({"profile": {...}}), a bare profile in the
+    config file's own shape, or — when `account` is given — a whole
+    `account_profiles` map (a config file or a `.voidorigin_profile_history`
+    copy) from which that account's own entry is taken. Returns
+    (raw_profile, error); the raw profile still has to go through
+    load_account_profiles.
     """
     if not isinstance(data, dict):
         return None, "a profile document is a JSON object"
@@ -2206,7 +2209,14 @@ def parse_profile_import(data) -> tuple[dict | None, str]:
                           f"(format {PROFILE_EXPORT_FORMAT}) — update SocketTrader")
         return data["profile"], ""
     if isinstance(data.get("account_profiles"), dict):
-        names = ", ".join(sorted(str(k) for k in data["account_profiles"])) or "none"
+        whole = data["account_profiles"]
+        names = ", ".join(sorted(str(k) for k in whole)) or "none"
+        if account and isinstance(whole.get(account), dict):
+            return whole[account], ""
+        if account:
+            return None, (f"that file holds whole profile sets, but none for {account} "
+                          f"(it has: {names}) — export the account's profile, or pick "
+                          "a file that has it")
         return None, ("that is a whole config file, not one profile — export the "
                       f"account's profile instead (it holds profiles for: {names})")
     if not any(k in data for k in _PROFILE_KEYS):
@@ -2224,7 +2234,7 @@ def import_profile(account: str, data, source: str = "the file") -> tuple[bool, 
     account = account.strip()
     if not account:
         return False, "account required"
-    raw_profile, err = parse_profile_import(data)
+    raw_profile, err = parse_profile_import(data, account)
     if err:
         return False, err
     cleaned = load_account_profiles({"account_profiles": {account: raw_profile}}).get(account)
@@ -8680,7 +8690,7 @@ async def _import_profile_prompt(account: str):
         # whose value is sent to it as a bearer token. From a FILE that is
         # an exfiltration recipe unless the operator wanted exactly that,
         # so it is shown and must be accepted; the default drops it.
-        prof_raw, _err = parse_profile_import(data)
+        prof_raw, _err = parse_profile_import(data, account)
         gates = profile_ai_gates(prof_raw if isinstance(prof_raw, dict) else {})
         for gate in gates:
             print(Fore.YELLOW + f"  ⚠  The file carries an AI gate: {gate.get('provider')} · "
