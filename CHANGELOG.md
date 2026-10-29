@@ -83,8 +83,18 @@ machine or by the test suite (1083 tests) unless marked otherwise.
   resource; `install.bat` installs the exe when present (no Python on the
   target), registers in Settings → Apps with an uninstaller, stamps an
   AppUserModelID on the shortcuts; the app sets its title, icon and App ID on
-  its console window at start-up. Release workflow builds and attaches the
-  zip on a `vX.Y.Z` tag after the test suite passes.
+  its console window at start-up.
+- **`SocketTrader-Setup-X.Y.Z.exe`** — a one-click per-user installer (Inno
+  Setup; `installer/SocketTrader.iss`) built and smoke-installed by the
+  release workflow on a `vX.Y.Z` tag and attached to the GitHub release next
+  to the bare zip, each with a SHA-256. Upgrades in place; asks to close a
+  running SocketTrader (the app now holds a named mutex for it).
+- **In-app updates.** The installed app checks GitHub's latest release at
+  start-up and every six hours; a newer one shows in the alert line and the
+  web header. `U` / the UPDATE chip downloads the installer and its
+  published SHA-256, refuses a mismatch, stops cleanly and lets the silent
+  installer replace the files and restart the app. `"update_check": false`
+  disables the check.
 - Installer installs from the folder it runs in and refuses to downgrade an
   installed copy to an older GitHub release (`-FromGitHub` to force).
 - Open/close effects: digital rain on open, CRT switch-off on close — in the

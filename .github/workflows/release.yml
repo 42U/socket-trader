@@ -1,8 +1,12 @@
 name: Release
 
 # Tag a commit `vX.Y.Z` and this builds SocketTrader.exe on a clean Windows
-# runner, checks it starts, and attaches dist\SocketTrader as a zip (plus
-# its SHA-256) to a GitHub release — the artifact the installer consumes.
+# runner, checks it starts, and attaches to a GitHub release:
+#   SocketTrader-Setup-X.Y.Z.exe        one-click per-user installer (Inno Setup)
+#   SocketTrader-X.Y.Z-windows-x64.zip  the bare app folder, for install.bat / by hand
+# each with its SHA-256. A tag with a suffix (v1.0.0rc1) becomes a pre-release.
+# "Run workflow" (workflow_dispatch) builds the same files as run artifacts
+# without tagging or releasing anything.
 on:
   push:
     tags: ['v*']
@@ -51,7 +55,7 @@ jobs:
         shell: pwsh
         run: .\build.ps1
 
-      - name: Package
+      - name: Package zip
         shell: pwsh
         run: |
           $zip = "SocketTrader-$env:APP_VERSION-windows-x64.zip"
@@ -59,10 +63,47 @@ jobs:
           (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() + "  $zip" | Out-File "$zip.sha256" -Encoding ascii
           "ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      - name: Build Setup.exe (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress | Out-Null
+            $iscc = Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $iscc) { throw 'Inno Setup (ISCC.exe) not available on this runner' }
+          # Four-part numeric file version from the app version (1.0.0rc1 -> 1.0.0.1).
+          $parts = ($env:APP_VERSION -split '[^0-9]+' | Where-Object { $_ -ne '' } | Select-Object -First 4) + @(0, 0, 0, 0)
+          $fv = "$($parts[0]).$($parts[1]).$($parts[2]).$($parts[3])"
+          & $iscc.FullName "/DAppVersion=$env:APP_VERSION" "/DFileVersion=$fv" installer\SocketTrader.iss
+          if ($LASTEXITCODE -ne 0) { throw 'ISCC failed' }
+          $setup = Get-ChildItem dist\installer\SocketTrader-Setup-*.exe | Select-Object -First 1
+          if (-not $setup) { throw 'Setup.exe was not produced' }
+          Copy-Item $setup.FullName $setup.Name
+          (Get-FileHash $setup.Name -Algorithm SHA256).Hash.ToLower() + "  $($setup.Name)" | Out-File "$($setup.Name).sha256" -Encoding ascii
+          "SETUP=$($setup.Name)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "built $($setup.Name) ($([math]::Round($setup.Length / 1MB, 1)) MB)"
+
+      - name: Setup.exe smoke test (silent install into a scratch folder)
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'st-smoke'
+          $p = Start-Process -FilePath ".\$env:SETUP" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=`"$dir`"", "/LOG=`"$env:RUNNER_TEMP\st-setup.log`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content "$env:RUNNER_TEMP\st-setup.log" | Select-Object -Last 40; throw "Setup.exe exited $($p.ExitCode)" }
+          $exe = Join-Path $dir 'SocketTrader.exe'
+          if (-not (Test-Path $exe)) { throw "installed exe missing at $exe" }
+          $reported = & $exe --version 2>&1
+          if ("$reported" -notmatch [regex]::Escape($env:APP_VERSION)) { throw "installed exe reports '$reported'" }
+          $un = Get-ChildItem $dir -Filter 'unins*.exe' | Select-Object -First 1
+          if (-not $un) { throw 'uninstaller missing' }
+          Write-Host "installed and reported: $reported"
+
       - uses: actions/upload-artifact@v4
         with:
           name: SocketTrader-windows
           path: |
+            ${{ env.SETUP }}
+            ${{ env.SETUP }}.sha256
             ${{ env.ZIP }}
             ${{ env.ZIP }}.sha256
 
@@ -71,6 +112,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
+            ${{ env.SETUP }}
+            ${{ env.SETUP }}.sha256
             ${{ env.ZIP }}
             ${{ env.ZIP }}.sha256
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
           generate_release_notes: true

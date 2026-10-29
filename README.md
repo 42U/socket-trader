@@ -92,9 +92,20 @@ The sim account is automatically swapped with your real NinjaTrader account name
 
 ## Installation
 
-### One double-click (Windows)
+### The app (Windows) — download, double-click, done
 
-The whole setup — Python, dependencies, the app, NinjaTrader's ATM templates, and shortcuts — is one file:
+1. Download **`SocketTrader-Setup-<version>.exe`** from the [latest release](https://github.com/42U/socket-trader/releases/latest).
+2. Double-click it.
+
+No Python, no admin rights, no build. It installs per user into `%LOCALAPPDATA%\SocketTrader`, puts SocketTrader in the Start Menu and on the desktop with its own icon, registers it in Settings → Apps with an Uninstall button, copies the ATM strategy templates into NinjaTrader's templates folder (never over one you have edited), and offers to start it. Run a newer Setup over it to upgrade in place; your config, P&L archive and log live in your user folder and are never touched.
+
+> Windows SmartScreen may show *"Windows protected your PC"* the first time (the installer is not code-signed) — click **More info → Run anyway**. Every release also carries a `.sha256` next to each file.
+
+**Updates come to you.** The installed app asks GitHub once at start-up (and every six hours) whether a newer release exists, and says so in the alert line and in the web header (`⬆ v1.0.1 — UPDATE`). Press **U** in the terminal, or click that chip, when you are between trades: it downloads the installer **and its published SHA-256**, refuses the file unless they match, stops cleanly (P&L saved, lock released), runs the installer silently and starts the new version. A script install gets the notice and is pointed at its checkout instead. `"update_check": false` in the config turns the check off — it is the only outbound request the app makes besides the signal server and NinjaTrader.
+
+### From source (Windows, one double-click)
+
+The script route, for a checkout or the repo zip — Python, dependencies, the app, NinjaTrader's ATM templates, and shortcuts from one file:
 
 1. [**Download the repo ZIP**](https://github.com/42U/socket-trader/archive/refs/heads/main.zip) and extract it anywhere.
 2. Double-click **`install.bat`**.
@@ -751,13 +762,11 @@ Each signal displays delivery time from server to client. The first signal on ea
 
 ---
 
-## Installing as an app (no Python on the trading machine)
+## Building the app yourself
 
-`build.bat` turns the program into **`SocketTrader.exe`** — a self-contained Windows app with the icon and version embedded, its own Python runtime, time-zone data and the bundled templates inside. Build once (needs Python 3.10+ on the building machine only), then `install.bat` from the same folder installs the exe: Desktop and Start Menu shortcuts with the icon, an entry in Settings → Apps with an Uninstall button, the taskbar grouping and pinning it as SocketTrader. Hand the `dist\SocketTrader` folder (zipped) to another machine and run its `install.bat` there — nothing else to install.
+`build.bat` turns the program into **`SocketTrader.exe`** — a self-contained Windows app with the icon and version embedded, its own Python runtime, time-zone data and the bundled templates inside (needs Python 3.10+ on the building machine only). `install.bat` from the same folder then installs that exe the script-installer way, or hand the `dist\SocketTrader` folder (zipped) to another machine.
 
-Tagging a commit `vX.Y.Z` makes the release workflow build the same exe on a clean Windows runner, run the full test suite first, and attach `SocketTrader-X.Y.Z-windows-x64.zip` (with its SHA-256) to a GitHub release.
-
-The script install (`install.bat` from a checkout without a build) keeps working exactly as before.
+The release pipeline does this on a clean Windows runner: tagging a commit `vX.Y.Z` runs the full test suite, builds the exe, wraps it in **`SocketTrader-Setup-X.Y.Z.exe`** with [Inno Setup](installer/SocketTrader.iss), installs that silently into a scratch folder and checks the installed exe reports the version, and attaches the Setup, the bare `SocketTrader-X.Y.Z-windows-x64.zip` and both SHA-256 files to a GitHub release (a tag with a suffix such as `v1.0.0rc1` becomes a pre-release). *Actions → Release → Run workflow* builds the same files as run artifacts without tagging anything.
 
 ## Where your data lives
 

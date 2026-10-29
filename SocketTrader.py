@@ -7956,6 +7956,27 @@ def _fx_on_console_close() -> None:
 
 
 APP_USER_MODEL_ID = "VoidOrigin.SocketTrader"   # must match the installer's shortcut stamp
+_app_mutex_handle = None                         # held for the process lifetime (see below)
+
+
+def _hold_app_mutex() -> None:
+    """Create the named mutex the Setup.exe installer looks for (its
+    AppMutex): while SocketTrader runs, an upgrade asks the operator to
+    close it instead of failing half-way on a locked SocketTrader.exe.
+    Nothing else reads it; the instance lock is what keeps two
+    SocketTraders apart."""
+    global _app_mutex_handle
+    if not IS_WINDOWS or _app_mutex_handle:
+        return
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+        k32 = ctypes.windll.kernel32
+        k32.CreateMutexW.restype = wt.HANDLE
+        k32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
+        _app_mutex_handle = k32.CreateMutexW(None, False, APP_USER_MODEL_ID) or None
+    except Exception:
+        _app_mutex_handle = None
 
 
 def apply_windows_app_identity() -> None:
@@ -7967,6 +7988,7 @@ def apply_windows_app_identity() -> None:
     with WM_SETICON. Cosmetic: every failure is ignored."""
     if not IS_WINDOWS:
         return
+    _hold_app_mutex()
     try:
         import ctypes
         import ctypes.wintypes as wt
@@ -7991,6 +8013,256 @@ def apply_windows_app_identity() -> None:
                 u32.SendMessageW(hwnd, WM_SETICON, which, hicon)
     except Exception:
         pass
+
+
+# ---------- Updates: "a newer SocketTrader is on GitHub" ----------
+# The installed app (SocketTrader.exe from SocketTrader-Setup-<ver>.exe)
+# asks GitHub's releases API for the latest release once at start-up and
+# every few hours after that, and says so in the alert line and the web
+# header when it is newer than this build. Updating is the operator's
+# call: U in the terminal or the UPDATE button on the web page downloads
+# the installer AND its published SHA-256, refuses the file unless the
+# hash matches, then hands over to it — the app stops cleanly (P&L saved,
+# lock released), the silent installer replaces the files in place, and
+# the new version is started again. A script install (SocketTrader.py)
+# gets the notice but is pointed at its checkout instead. "update_check":
+# false in the config turns the check off (it is the only outbound
+# request the app makes that is not the signal server or NinjaTrader).
+UPDATE_REPO = "42U/socket-trader"
+UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+UPDATE_CHECK_DELAY_S = 20.0          # after start-up, once the session is on its feet
+UPDATE_CHECK_INTERVAL_S = 6 * 3600
+UPDATE_HTTP_TIMEOUT_S = 8.0
+UPDATE_MAX_SETUP_BYTES = 400 * 1024 * 1024
+_update_info: dict | None = None     # the newer release, once seen (see parse_release)
+_update_last_check = 0.0
+_update_last_error = ""
+_update_in_progress = False
+
+
+def version_key(text: str) -> tuple:
+    """Orderable form of a version string: numeric parts, then a final
+    release above a pre-release of the same numbers (1.0.0 > 1.0.0rc2 >
+    1.0.0rc1 > 0.23.0). Tolerates a leading 'v' and junk after the numbers."""
+    m = re.match(r"^\s*[vV]?(\d+(?:\.\d+)*)(.*)$", text or "")
+    if not m:
+        return ((), 0, "")
+    nums = tuple(int(x) for x in m.group(1).split("."))
+    nums = nums + (0,) * (4 - len(nums))
+    suffix = m.group(2).strip().lower().lstrip(".-_")
+    return (nums, 0 if suffix else 1, suffix)
+
+
+def is_newer_version(candidate: str, current: str) -> bool:
+    return version_key(candidate) > version_key(current)
+
+
+def parse_release(doc) -> dict | None:
+    """The parts of a GitHub release document the updater uses, or None
+    when it is not a usable release (draft, no tag)."""
+    if not isinstance(doc, dict) or doc.get("draft"):
+        return None
+    tag = str(doc.get("tag_name") or "").strip()
+    version = tag.lstrip("vV")
+    if not version or not re.match(r"^\d", version):
+        return None
+    assets = [a for a in (doc.get("assets") or []) if isinstance(a, dict)]
+    setup = next((a for a in assets
+                  if re.match(r"^SocketTrader-Setup-[^/\\]+\.exe$", str(a.get("name") or ""))), None)
+    sha = None
+    if setup:
+        sha = next((a for a in assets if a.get("name") == f"{setup.get('name')}.sha256"), None)
+    return {
+        "version": version,
+        "tag": tag,
+        "url": str(doc.get("html_url") or f"https://github.com/{UPDATE_REPO}/releases"),
+        "prerelease": bool(doc.get("prerelease")),
+        "published_at": str(doc.get("published_at") or ""),
+        "setup_name": (setup or {}).get("name"),
+        "setup_url": (setup or {}).get("browser_download_url"),
+        "setup_size": (setup or {}).get("size"),
+        "sha_url": (sha or {}).get("browser_download_url"),
+    }
+
+
+def _http_get(url: str, max_bytes: int, accept: str = "*/*") -> bytes:
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        "User-Agent": f"SocketTrader/{__version__}",
+        "Accept": accept,
+    })
+    with urllib.request.urlopen(req, timeout=UPDATE_HTTP_TIMEOUT_S) as resp:
+        out = bytearray()
+        while True:
+            chunk = resp.read(1024 * 256)
+            if not chunk:
+                break
+            out += chunk
+            if len(out) > max_bytes:
+                raise OSError(f"{url} is larger than {max_bytes // (1024 * 1024)} MB")
+        return bytes(out)
+
+
+def update_check_enabled() -> bool:
+    return bool(config_get("update_check", True))
+
+
+def check_for_update(force: bool = False) -> dict | None:
+    """Ask GitHub for the latest release (blocking; call off the loop).
+    Remembers a newer release in _update_info and says so once."""
+    global _update_info, _update_last_check, _update_last_error
+    if not force and not update_check_enabled():
+        return None
+    _update_last_check = time.time()
+    try:
+        doc = json.loads(_http_get(UPDATE_API_URL, 2 * 1024 * 1024,
+                                   "application/vnd.github+json").decode("utf-8"))
+        rel = parse_release(doc)
+    except Exception as exc:               # offline, rate-limited, odd JSON: never a failure of ours
+        _update_last_error = f"{type(exc).__name__}: {exc}"
+        logger.info(f"UPDATE CHECK  unavailable — {_update_last_error}")
+        return None
+    _update_last_error = ""
+    if not rel:
+        return None
+    if not is_newer_version(rel["version"], __version__):
+        logger.info(f"UPDATE CHECK  this is the latest ({__version__}; GitHub has {rel['version']})")
+        return None
+    first = not _update_info or _update_info.get("version") != rel["version"]
+    _update_info = rel
+    if first:
+        how = ("press U (or UPDATE on the web page) to install" if FROZEN and IS_WINDOWS
+               else "update the checkout and re-run install.bat")
+        logger.info(f"UPDATE AVAILABLE  v{rel['version']} ({rel['url']}) — {how}")
+        _dash_set_alert(Fore.CYAN + f"  ⬆  SocketTrader v{rel['version']} is available — {how}"
+                        + Style.RESET_ALL, sticky=True)
+    return rel
+
+
+async def update_check_task():
+    """Start-up check, then every UPDATE_CHECK_INTERVAL_S."""
+    await asyncio.sleep(UPDATE_CHECK_DELAY_S)
+    while not shutdown.is_set():
+        try:
+            await asyncio.to_thread(check_for_update)
+        except Exception as exc:
+            logger.info(f"UPDATE CHECK  error — {exc}")
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=UPDATE_CHECK_INTERVAL_S)
+        except asyncio.TimeoutError:
+            pass
+
+
+def _verify_sha256(payload: bytes, sha_text: str, name: str) -> bool:
+    """`sha_text` is the published `<hex>  <name>` line (or a bare hex)."""
+    import hashlib
+    first = (sha_text or "").strip().split()
+    if not first:
+        return False
+    want = first[0].lower()
+    if len(first) > 1 and first[1].strip("*") != name:
+        return False
+    return hashlib.sha256(payload).hexdigest() == want
+
+
+def download_update(rel: dict) -> tuple[Path | None, str]:
+    """Fetch the release's installer into %TEMP%, verified against its
+    published SHA-256. Returns (path, "") or (None, reason)."""
+    if not rel or not rel.get("setup_url"):
+        return None, "that release has no SocketTrader-Setup-*.exe attached"
+    if not rel.get("sha_url"):
+        return None, "that release has no .sha256 for its installer — not installing an unverified file"
+    name = str(rel["setup_name"])
+    if not re.match(r"^SocketTrader-Setup-[A-Za-z0-9._-]+\.exe$", name):
+        return None, f"unexpected installer name {name!r}"
+    try:
+        payload = _http_get(str(rel["setup_url"]), UPDATE_MAX_SETUP_BYTES, "application/octet-stream")
+        sha_text = _http_get(str(rel["sha_url"]), 4096).decode("utf-8", errors="replace")
+    except Exception as exc:
+        return None, f"download failed — {type(exc).__name__}: {exc}"
+    if not _verify_sha256(payload, sha_text, name):
+        return None, "the installer's SHA-256 does not match the published one — NOT installing it"
+    dest = Path(tempfile.gettempdir()) / name
+    try:
+        dest.write_bytes(payload)
+    except OSError as exc:
+        return None, f"could not write {dest}: {exc}"
+    return dest, ""
+
+
+def _launch_installer_after_exit(setup: Path) -> str:
+    """Hand over to the installer from a detached cmd.exe that waits for
+    THIS process to be gone first (the installer's AppMutex check would
+    otherwise see the app still running), runs Setup silently, then starts
+    the newly installed SocketTrader. Returns the script path."""
+    exe = Path(sys.executable).resolve()
+    script = Path(tempfile.gettempdir()) / f"SocketTrader-update-{os.getpid()}.cmd"
+    pid = os.getpid()
+    script.write_text(
+        "@echo off\r\n"
+        f"title SocketTrader update\r\n"
+        f"echo Waiting for SocketTrader to close...\r\n"
+        f":wait\r\n"
+        f"tasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul && (timeout /t 1 /nobreak >nul & goto wait)\r\n"
+        f"echo Installing {setup.name}...\r\n"
+        f"\"{setup}\" /SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS\r\n"
+        f"if errorlevel 1 (echo Setup failed with code %errorlevel% & pause & exit /b 1)\r\n"
+        f"start \"\" \"{exe}\"\r\n"
+        f"del \"%~f0\"\r\n",
+        encoding="utf-8")
+    flags = 0
+    for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP"):
+        flags |= getattr(subprocess, name, 0)
+    cmd_exe = win_system_exe("cmd.exe") or "cmd.exe"
+    subprocess.Popen([cmd_exe, "/c", str(script)], creationflags=flags, close_fds=True,
+                     cwd=str(script.parent))
+    return str(script)
+
+
+def install_update() -> tuple[bool, str]:
+    """U / the web UPDATE button: download, verify, hand over, stop.
+    Blocking (network); run off the loop. Returns (handed_over, message)."""
+    global _update_in_progress
+    if not (FROZEN and IS_WINDOWS):
+        return False, ("this is a script install — update it from its checkout "
+                       "(git pull or a fresh download) and re-run install.bat")
+    if _update_in_progress:
+        return False, "an update is already in progress"
+    rel = _update_info or check_for_update(force=True)
+    if not rel:
+        return False, (f"no newer release than v{__version__} on GitHub"
+                       + (f" (last check: {_update_last_error})" if _update_last_error else ""))
+    _update_in_progress = True
+    try:
+        setup, why = download_update(rel)
+        if not setup:
+            return False, why
+        logger.info(f"UPDATE  verified {setup.name} ({setup.stat().st_size // 1024} KB) — "
+                    "stopping for the installer")
+        _launch_installer_after_exit(setup)
+        _dash_set_alert(Fore.CYAN + f"  ⬆  Installing v{rel['version']} — SocketTrader restarts itself."
+                        + Style.RESET_ALL, sticky=True)
+        # The orderly exit path: pause_indicator sees the flag, main tears
+        # everything down (P&L saved, config flushed, lock released). From
+        # the web button the answer must leave before the server stops, so
+        # the flag is set a second later on the loop.
+        loop = _web_loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(loop.call_later, 1.0, shutdown.set)
+        else:
+            shutdown.set()
+        return True, f"installing v{rel['version']} — SocketTrader will restart"
+    finally:
+        _update_in_progress = False
+
+
+def update_state() -> dict | None:
+    """What the web header shows; None when this is the latest."""
+    if not _update_info:
+        return None
+    return {"version": _update_info["version"], "url": _update_info["url"],
+            "installable": bool(FROZEN and IS_WINDOWS and _update_info.get("setup_url")),
+            "prerelease": _update_info.get("prerelease", False)}
 
 
 def install_console_close_handler() -> None:
@@ -9757,6 +10029,17 @@ async def keyboard_loop():
                 await close_positions_menu()
             elif key.lower() == "o":
                 await manual_trade_menu()
+            elif key.lower() == "u":
+                if _update_info:
+                    _dash_set_alert(Fore.CYAN + f"  ⬆  Downloading v{_update_info['version']}…"
+                                    + Style.RESET_ALL)
+                else:
+                    _dash_set_alert(Fore.CYAN + "  ⬆  Checking GitHub for a newer release…"
+                                    + Style.RESET_ALL)
+                ok, msg = await asyncio.to_thread(install_update)
+                if not ok:
+                    _dash_set_alert(Fore.YELLOW + f"  ⬆  {msg}" + Style.RESET_ALL)
+                    logger.info(f"UPDATE  not started — {msg}")
             elif key == "X":  # Shift+X only
                 unpin_layout()
                 clear()
@@ -12474,6 +12757,7 @@ def web_state() -> dict:
     atm_templates = list_atm_strategies()   # one disk glob, reused below
     return {
         "version": __version__,
+        "update": update_state(),
         "state": _session_state,
         "status_text": _WEB_ANSI_RE.sub("", get_session_status_text()),
         "paused": paused, "hard_stopped": hard_stopped, "soft_stopped": soft_stopped,
@@ -13039,6 +13323,23 @@ async def _web_import_profile(account, data, preview: bool = False) -> tuple[boo
         if dropped:
             msg += "  ⚠  its AI gate was not imported — AI gates are set from the terminal"
     return ok, msg
+
+
+async def _web_update(action) -> tuple[bool, str]:
+    """UPDATE button: "check" asks GitHub now; "install" downloads the
+    verified installer and stops the app for it (see install_update)."""
+    act = str(action or "install").strip().lower()
+    if act == "check":
+        rel = await asyncio.to_thread(check_for_update, True)
+        if rel:
+            return True, f"v{rel['version']} is available"
+        return True, (f"v{__version__} is the latest"
+                      + (f" (GitHub not reachable: {_update_last_error})" if _update_last_error else ""))
+    if act != "install":
+        return False, "action must be check or install"
+    if hard_stopped:
+        return False, "session hard-locked — exit to clear, then update"
+    return await asyncio.to_thread(install_update)
 
 
 async def _web_copy_profile(account, source) -> tuple[bool, str]:
@@ -15373,6 +15674,8 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
             elif path == "/api/profile_copy":
                 ok, msg = _web_run(_web_copy_profile(
                     data.get("account"), data.get("source")))
+            elif path == "/api/update":
+                ok, msg = _web_run(_web_update(data.get("action")))
             else:
                 self._json({"ok": False, "message": "not found"}, 404)
                 return
@@ -15728,6 +16031,7 @@ box-shadow:var(--shadow);max-width:280px}
   <span class="chip" id="chMicro"></span>
   <div class="spacer"></div>
   <span class="chip dim" id="chCount"></span>
+  <span class="chip info" id="chUpdate" style="display:none;cursor:pointer"></span>
   <button class="sm" id="btnPause">PAUSE</button>
   <button class="sm solid-red" id="btnFlatten">FLATTEN ALL</button>
 </div>
@@ -17371,6 +17675,17 @@ function renderChips(){
   $("chAtm").textContent="ATM "+(S.atm_strategy||"—")+
     (S.follow_publisher_strategy?" · follow":"");
   $("chCount").textContent=S.signal_count+" signals · v"+S.version;
+  const up=$("chUpdate");
+  if(up){const u=S.update;
+    if(u){up.style.display="";up.textContent="⬆ v"+u.version+(u.installable?" — UPDATE":" available");
+      up.className="chip info";up.title=u.installable
+        ?"Download the verified installer, stop and restart on the new version"
+        :"Open the release page";
+      up.onclick=()=>{if(u.installable){
+          if(confirm("Install SocketTrader v"+u.version+" now?\n\nThe app stops cleanly, the installer runs silently and SocketTrader starts again. Do this between trades."))
+            api("/api/update",{action:"install"},"update")}
+        else window.open(u.url,"_blank","noopener")}}
+    else{up.style.display="none";up.onclick=null}}
   const p=$("btnPause");
   p.textContent=S.paused?"▶ RESUME":"⏸ PAUSE";
   p.className="sm "+(S.paused?"on":"");
@@ -17955,6 +18270,7 @@ async def main():
             asyncio.create_task(live_bridge_task()),
             asyncio.create_task(pnl_tracker_task()),
             asyncio.create_task(bracket_guard_task()),
+            asyncio.create_task(update_check_task()),
         ]
 
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
