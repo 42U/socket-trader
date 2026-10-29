@@ -376,7 +376,7 @@ Each account has a **default rule** plus optional **scoped rules** keyed by symb
 
 | Rule field | What it does |
 |------------|--------------|
-| **Entries** | `off` blocks **new entries only** for that scope — exits always flow |
+| **Entries** | `off` blocks **new entries only** for that scope — exits always flow. In a scoped rule, `inherit` takes the account default: on an **ENTRIES OFF** profile a rule that leaves Entries at INHERIT **never enters**, even with strategies listed in it — set it **ON** for the strategies the account should trade. Such rules are flagged `⚠ never enters` in the summary, the editors and the log |
 | **Size** | `inherit` the global micro toggle, or force `micros` / `full` for this account regardless of what the leader trades |
 | **Contracts** | `copy` the publisher's quantity, a `fixed` count, or a `multiplier` (`x0.5`, `x10`), plus a hard per-entry `cap` |
 | **Direction** | `invert` fades the signal — BUY↔SELL flipped. Non-market entries are skipped (their price levels are for the other side) and publisher `CHANGE` orders are dropped; the account's own ATM template manages its stops |
@@ -776,6 +776,8 @@ So a profile edited on Windows is there the next morning in WSL, and the calenda
 Machine-specific values travel safely: the NinjaTrader `incoming` folder is stored in whichever form the saving OS uses and translated on load (`C:\Users\…` ⇄ `/mnt/c/Users/…`); an explicit `nt_host` override is remembered with the OS that set it and ignored by the other, which auto-detects as usual.
 
 **One SocketTrader at a time.** Two instances writing the same home — say a WSL window left open while a Windows one starts — would overwrite each other's month, so the data home carries a heartbeat lock (`.voidorigin.lock`). A second instance refuses to start and names the holder; an instance that crashed stops counting as live 45 s later. `SOCKETTRADER_IGNORE_LOCK=1` overrides.
+
+**Every saved profile set is kept.** Each successful profile save also drops a dated copy in `.voidorigin_profile_history/` beside the config (newest 60; unchanged sets are not duplicated), and the log prints a `PROFILE DIGEST` — per account, what it does and every scoped rule — whenever profiles are loaded or saved. If the app ever comes up on an older profile set than the one that was trading, the digest shows it at that minute, and the history holds every version that reached the disk; copy the wanted `account_profiles` block back into the config while the app is stopped, or import one account from it (`I` on the profile screen takes an export file; a history file's `account_profiles.<account>` is the same shape as an export's `profile`).
 
 **Saves that cannot land are not silent.** On Windows a rename over a file another handle has open fails with *Access is denied*; the config is now served from memory and written under a lock with retries, and if the disk still refuses, the alert line and the web reply say `NOT written to disk … retrying` — the setting stays live, and the next successful save (retried every few seconds) carries it. The P&L archive keeps the month dirty on a failed write for the same reason.
 
