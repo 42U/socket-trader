@@ -1008,6 +1008,41 @@ def load_config() -> dict:
         return json.loads(json.dumps(_cfg_cache))
 
 
+def config_get(key: str, default=None):
+    """One config value (deep-copied), served from the same cache as
+    load_config — without copying the whole config. The hot paths that
+    read a single setting (get_account_limits for every account on every
+    dashboard poll, the guard policies on every signal) used to pay a
+    full JSON round-trip of the file each time."""
+    with _cfg_lock:
+        cfg = _cfg_cache
+        path = str(CONFIG_FILE)
+        if (cfg is None or _cfg_cache_path != path
+                or (not _cfg_unsaved and _cfg_stat() != _cfg_cache_stat)):
+            cfg = load_config()                  # (re)fills the cache; returns a copy
+            return cfg.get(key, default)
+        val = cfg.get(key, default)
+        if isinstance(val, (dict, list)):
+            return json.loads(json.dumps(val))
+        return val
+
+
+def config_get_sub(key: str, sub: str, default=None):
+    """One entry of a dict-valued setting (deep-copied) — account_limits
+    for ONE account, without copying every account's row first."""
+    with _cfg_lock:
+        cfg = _cfg_cache
+        path = str(CONFIG_FILE)
+        if (cfg is None or _cfg_cache_path != path
+                or (not _cfg_unsaved and _cfg_stat() != _cfg_cache_stat)):
+            cfg = load_config()
+        top = cfg.get(key)
+        val = top.get(sub, default) if isinstance(top, dict) else default
+        if isinstance(val, (dict, list)):
+            return json.loads(json.dumps(val))
+        return val
+
+
 def _replace_file(tmp: str, dst: Path) -> None:
     """os.replace that waits out a transient Windows sharing lock (another
     process reading, Defender scanning the new file). The Windows drive
@@ -2017,7 +2052,7 @@ def multi_strategy_enabled() -> bool:
     makes a close less likely to fire than the publisher intended unless
     the position provably belongs to a different live strategy.
     """
-    return bool(load_config().get("multi_strategy", False))
+    return bool(config_get("multi_strategy", False))
 
 
 def _parse_hhmm(raw) -> tuple[int, int] | None:
@@ -2766,7 +2801,7 @@ def hedge_guard_mode() -> str:
     setting — for those accounts an opposite position across accounts is
     an account-closure event, not a strategy.
     """
-    mode = str(load_config().get("hedge_guard", "warn")).strip().lower()
+    mode = str(config_get("hedge_guard", "warn")).strip().lower()
     return mode if mode in ("block", "warn", "off") else "warn"
 
 
@@ -3011,7 +3046,7 @@ def _reset_verify_policy() -> str:
     proof. Neither path ever writes the entry while a close may still be
     working; 'on' never writes it without proof of flat at all.
     Per-account/strategy rules override it (resolve_rule)."""
-    return "off" if str(load_config().get(RESET_VERIFY_KEY, "on") or "on").lower() == "off" else "on"
+    return "off" if str(config_get(RESET_VERIFY_KEY, "on") or "on").lower() == "off" else "on"
 
 
 def _reset_verify_on(rule: dict) -> bool:
@@ -4789,15 +4824,31 @@ def _nt_base() -> Path | None:
     return None
 
 
+ATM_LIST_TTL_S = 5.0
+_atm_list_cache: tuple[float, str, list[str]] = (0.0, "", [])
+
+
 def list_atm_strategies() -> list[str]:
-    """List available ATM strategy template names from the NinjaTrader directory."""
+    """ATM strategy template names from the NinjaTrader directory.
+
+    Cached for ATM_LIST_TTL_S: the dashboard asks on every 1.5 s poll, and
+    on a OneDrive-hosted NinjaTrader folder a directory listing is not
+    free. A template installed in between shows up within the TTL."""
+    global _atm_list_cache
     base = _nt_base()
     if not base:
         return []
+    now = time.monotonic()
+    ts, key, names = _atm_list_cache
+    if key == str(base) and now - ts < ATM_LIST_TTL_S:
+        return list(names)
     atm_dir = base / "templates" / "AtmStrategy"
-    if not atm_dir.is_dir():
-        return []
-    return sorted(p.stem for p in atm_dir.glob("*.xml"))
+    try:
+        names = sorted(p.stem for p in atm_dir.glob("*.xml")) if atm_dir.is_dir() else []
+    except OSError:
+        names = []
+    _atm_list_cache = (now, str(base), names)
+    return list(names)
 
 
 def validate_strategy(name: str) -> bool:
@@ -5901,6 +5952,11 @@ SNAPSHOT_SLOW_S = 3.0
 SNAPSHOT_SLOW_FACTOR = 2.0
 SNAPSHOT_SLOW_MAX_PAUSE_S = 30.0
 SNAPSHOT_FIRST_WAIT = 3.0      # the first dashboard poll waits this long for a first dump
+# A terminal menu opens on whatever the stream already has (the bridged
+# dump interval is 10 s) instead of opening a dump of its own: with a
+# NinjaTrader that takes seconds to serialise its session, that direct
+# dump was the pause between a keypress and the menu appearing.
+MENU_SNAPSHOT_MAX_AGE = 15.0
 
 _snap_cond = threading.Condition()
 _snap_latest: dict | None = None      # newest snapshot, complete or not
@@ -5923,7 +5979,7 @@ def _snapshot_interval() -> float:
     if not _bridge_fresh():
         return SNAPSHOT_INTERVAL
     try:
-        v = float(load_config().get("snapshot_interval_bridged", SNAPSHOT_INTERVAL_BRIDGED))
+        v = float(config_get("snapshot_interval_bridged", SNAPSHOT_INTERVAL_BRIDGED))
     except (TypeError, ValueError):
         v = SNAPSHOT_INTERVAL_BRIDGED
     return max(SNAPSHOT_INTERVAL, v)
@@ -6915,13 +6971,28 @@ def _dash_add_signal(text: str):
     _redraw_signals()
 
 
+def _dash_write_many(rows: list[tuple[int, str]]):
+    """Several fixed rows in ONE console write: each write+flush is a
+    round-trip to the console host, and on Windows that is the slow part
+    of redrawing, not the text."""
+    if _menu_active or not _controls_pinned or not rows:
+        return
+    out = ["\033[s"]
+    for row_offset, text in rows:
+        out.append(f"\033[{_header_lines + 1 + row_offset};1H\033[K{text}")
+    out.append("\033[u")
+    sys.stdout.write("".join(out))
+    sys.stdout.flush()
+
+
 def _redraw_signals():
     """Redraw signal rows (newest at top)."""
     buf = list(_signal_buffer)
+    rows = []
     for i in range(DASH_SIGNAL_COUNT):
         idx = len(buf) - 1 - i
-        _dash_write(DASH_SIGNAL_START + i,
-                    buf[idx] if 0 <= idx < len(buf) else "")
+        rows.append((DASH_SIGNAL_START + i, buf[idx] if 0 <= idx < len(buf) else ""))
+    _dash_write_many(rows)
 
 
 def _dash_set_heartbeat(text: str):
@@ -6970,13 +7041,15 @@ def _dash_expire_alert():
 
 
 def _dash_redraw_all():
-    """Redraw entire dashboard (after menu exit or resize)."""
-    _dash_write(DASH_ROW_HEARTBEAT, _heartbeat_text)
-    _dash_separator(DASH_ROW_SEP1)
-    _redraw_signals()
-    _dash_separator(DASH_ROW_SEP2)
-    _dash_write(DASH_ROW_MOTD, _motd_text)
-    _dash_write(DASH_ROW_ALERT, _alert_text)
+    """Redraw entire dashboard (after menu exit or resize) — one write."""
+    sep = Fore.CYAN + Style.DIM + f"  {'─' * (term_width() - 4)}" + Style.RESET_ALL
+    buf = list(_signal_buffer)
+    rows = [(DASH_ROW_HEARTBEAT, _heartbeat_text), (DASH_ROW_SEP1, sep)]
+    for i in range(DASH_SIGNAL_COUNT):
+        idx = len(buf) - 1 - i
+        rows.append((DASH_SIGNAL_START + i, buf[idx] if 0 <= idx < len(buf) else ""))
+    rows += [(DASH_ROW_SEP2, sep), (DASH_ROW_MOTD, _motd_text), (DASH_ROW_ALERT, _alert_text)]
+    _dash_write_many(rows)
 
 
 def _dash_enter_menu():
@@ -7111,6 +7184,127 @@ async def signal_pulse(label="SIGNAL RECEIVED"):
 
 
 # ---------- Pause indicator ----------
+# ---------- Open / close effects ----------
+# A second of "digital rain" when the trading window opens and a CRT
+# switch-off when it closes. Pure ANSI, one write per frame, nothing
+# touched but the screen; skipped when stdout is not a terminal, when the
+# config says `"fx": false`, and in the test suite. Glyphs are plain ASCII
+# so a console with a raster font never shows boxes.
+FX_KEY = "fx"
+FX_RAIN_S = 1.1
+FX_TV_S = 0.45
+_FX_GLYPHS = "01ABCDEFGHJKLMNPQRSTUVWXYZ23456789$#@%&+=*<>/\\|"
+
+
+def fx_enabled() -> bool:
+    try:
+        if not sys.stdout.isatty():
+            return False
+    except (AttributeError, ValueError):
+        return False
+    return bool(config_get(FX_KEY, True))
+
+
+def fx_matrix_rain(seconds: float = FX_RAIN_S, fps: int = 24) -> None:
+    """Columns of glyphs falling down the whole terminal, bright heads and
+    dim tails, thinning out over the last third so the banner can land."""
+    if not fx_enabled():
+        return
+    cols, rows = term_width(), term_height()
+    rng = random.Random()
+    heads = [rng.randint(-rows, rows) for _ in range(cols)]   # some streams already mid-screen
+    speed = [rng.choice((1, 1, 2)) for _ in range(cols)]
+    tail = max(4, rows // 3)
+    frames = max(1, int(seconds * fps))
+    hide_cursor()
+    try:
+        sys.stdout.write("\033[2J")
+        styles = (Style.BRIGHT + Fore.WHITE, Style.BRIGHT + Fore.GREEN, Style.DIM + Fore.GREEN)
+        for f in range(frames):
+            fade = f / frames
+            # cell = (style index, glyph); 0 = blank. Colour codes are
+            # emitted only where the style changes along a row, so a frame
+            # is a few KB, not a code per cell — the console, not Python,
+            # is the slow part on Windows.
+            grid = [[None] * cols for _ in range(rows)]
+            for c in range(cols):
+                h = heads[c]
+                for k in range(tail):
+                    r = h - k
+                    if 0 <= r < rows and rng.random() > fade * 0.9:
+                        grid[r][c] = (0 if k == 0 else 1 if k < 3 else 2, rng.choice(_FX_GLYPHS))
+                heads[c] = h + speed[c]
+                if heads[c] - tail > rows:
+                    heads[c] = rng.randint(-rows // 2, 0)
+            lines = []
+            for row in grid:
+                cur = None
+                parts = []
+                for cell in row:
+                    if cell is None:
+                        parts.append(" ")
+                        continue
+                    if cell[0] != cur:
+                        parts.append(styles[cell[0]])
+                        cur = cell[0]
+                    parts.append(cell[1])
+                lines.append("".join(parts).rstrip() + Style.RESET_ALL)
+            sys.stdout.write("\033[H" + "\n".join(lines))
+            sys.stdout.flush()
+            time.sleep(1.0 / fps)
+    except (OSError, ValueError):
+        pass
+    finally:
+        sys.stdout.write(Style.RESET_ALL + "\033[2J\033[H")
+        sys.stdout.flush()
+        show_cursor()
+
+
+def fx_tv_off(seconds: float = FX_TV_S) -> None:
+    """The old-television switch-off: the picture collapses to a bright
+    horizontal line, the line shrinks to a dot, the dot goes out."""
+    if not fx_enabled():
+        return
+    cols, rows = term_width(), term_height()
+    mid = max(1, rows // 2)
+    steps_v = max(4, min(14, mid))
+    steps_h = max(6, min(18, cols // 6))
+    per = seconds / (steps_v + steps_h + 2)
+    hide_cursor()
+    try:
+        # Vertical collapse: black bands close in from top and bottom,
+        # the picture squeezed between them, a white edge where they meet.
+        for i in range(steps_v + 1):
+            top = int(mid * i / steps_v)
+            bot = rows - int((rows - mid) * i / steps_v)
+            out = []
+            for r in range(1, rows + 1):
+                if r < top or r > bot:
+                    out.append(f"\033[{r};1H\033[K")
+                elif r == top or r == bot:
+                    out.append(f"\033[{r};1H" + Style.BRIGHT + Fore.WHITE + "─" * cols + Style.RESET_ALL)
+            sys.stdout.write("".join(out))
+            sys.stdout.flush()
+            time.sleep(per)
+        # Horizontal collapse of the remaining line to a dot.
+        for i in range(steps_h + 1):
+            half = int((cols // 2) * (1 - i / steps_h))
+            left = max(1, cols // 2 - half)
+            line = ("░" * half + "█" * max(1, half // 2)) if half else "•"
+            line = line[:cols]
+            sys.stdout.write(f"\033[{mid};1H\033[K\033[{mid};{left}H" + Style.BRIGHT + Fore.WHITE
+                             + line + Style.RESET_ALL)
+            sys.stdout.flush()
+            time.sleep(per)
+        time.sleep(per * 2)
+    except (OSError, ValueError):
+        pass
+    finally:
+        sys.stdout.write(Style.RESET_ALL + "\033[2J\033[H")
+        sys.stdout.flush()
+        show_cursor()
+
+
 PAUSE_FRAMES = [
     "⏸  SIGNAL OUTPUT PAUSED    ",
     "⏸  SIGNAL OUTPUT PAUSED  · ",
@@ -7225,16 +7419,18 @@ def _print_account_menu(accounts: list[dict], leader: str | None, followers: lis
     rows, width = _account_menu_rows(accounts, leader, followers, robins)
     title = "─ ACCOUNTS — LEADER · FOLLOWERS · ROUND-ROBIN "
     top = f"┌{title}{'─' * max(0, width + 2 - len(title))}┐"
-    print(Fore.CYAN + "\n" + top + Style.RESET_ALL)
+    out = [Fore.CYAN + "\n" + top + Style.RESET_ALL]
     if rows:
         for line in rows:
-            print(Fore.CYAN + f"│  {line[:width].ljust(width)}│" + Style.RESET_ALL)
+            out.append(Fore.CYAN + f"│  {line[:width].ljust(width)}│" + Style.RESET_ALL)
     else:
-        print(Fore.CYAN + f"│  {'NinjaTrader ATI unreachable — enter names.'.ljust(width)}│" + Style.RESET_ALL)
-    print(Fore.CYAN + f"│  {'Leader + followers copy every signal.'.ljust(width)}│" + Style.RESET_ALL)
-    print(Fore.CYAN + f"│  {'Round-robin: each entry rotates to ONE pool account.'.ljust(width)[:width]}│" + Style.RESET_ALL)
-    print(Fore.CYAN + f"│  {'Pick with numbers/names, the word all, or ENTER=none.'.ljust(width)[:width]}│" + Style.RESET_ALL)
-    print(Fore.CYAN + f"└{'─' * (width + 2)}┘" + Style.RESET_ALL)
+        out.append(Fore.CYAN + f"│  {'NinjaTrader ATI unreachable — enter names.'.ljust(width)}│" + Style.RESET_ALL)
+    out.append(Fore.CYAN + f"│  {'Leader + followers copy every signal.'.ljust(width)}│" + Style.RESET_ALL)
+    out.append(Fore.CYAN + f"│  {'Round-robin: each entry rotates to ONE pool account.'.ljust(width)[:width]}│" + Style.RESET_ALL)
+    out.append(Fore.CYAN + f"│  {'Pick with numbers/names, the word all, or ENTER=none.'.ljust(width)[:width]}│" + Style.RESET_ALL)
+    out.append(Fore.CYAN + f"└{'─' * (width + 2)}┘" + Style.RESET_ALL)
+    sys.stdout.write("\n".join(out) + "\n")      # one console write, not one per account
+    sys.stdout.flush()
 
 
 def _parse_follower_tokens(raw: str, names: list[str], leader: str) -> list[str]:
@@ -7278,7 +7474,7 @@ async def prompt_accounts():
     global active_account, follower_accounts, roundrobin_accounts, awaiting_user_input
     awaiting_user_input = True
     show_cursor()
-    accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
+    accounts = await asyncio.to_thread(_accounts_now, MENU_SNAPSHOT_MAX_AGE)
     names = [a["name"] for a in accounts]
 
     _print_account_menu(accounts, active_account, follower_accounts, roundrobin_accounts)
@@ -7503,13 +7699,17 @@ _SIZE_LABELS = {"inherit": "inherit global micros toggle",
 def _prof_box(title: str, lines: list[str], footer: list[str] | None = None):
     """Draw a profile-editor box in the house style."""
     top = f"┌─ {title} "
-    print(Fore.CYAN + "\n\r\033[K" + top + "─" * max(0, _PROF_INNER + 3 - len(top)) + "┐" + Style.RESET_ALL)
+    out = [Fore.CYAN + "\n\r\033[K" + top + "─" * max(0, _PROF_INNER + 3 - len(top)) + "┐" + Style.RESET_ALL]
     for line in lines:
-        print(Fore.CYAN + f"\r\033[K│  {line[:_PROF_INNER].ljust(_PROF_INNER)}│" + Style.RESET_ALL)
+        out.append(Fore.CYAN + f"\r\033[K│  {line[:_PROF_INNER].ljust(_PROF_INNER)}│" + Style.RESET_ALL)
     for line in footer or []:
-        print(Fore.CYAN + "\r\033[K│  " + Style.DIM
-              + line[:_PROF_INNER].ljust(_PROF_INNER) + Style.NORMAL + "│" + Style.RESET_ALL)
-    print(Fore.CYAN + "\r\033[K└" + "─" * (_PROF_INNER + 2) + "┘" + Style.RESET_ALL)
+        out.append(Fore.CYAN + "\r\033[K│  " + Style.DIM
+                   + line[:_PROF_INNER].ljust(_PROF_INNER) + Style.NORMAL + "│" + Style.RESET_ALL)
+    out.append(Fore.CYAN + "\r\033[K└" + "─" * (_PROF_INNER + 2) + "┘" + Style.RESET_ALL)
+    # One write: a box is a dozen lines, a line-at-a-time print is a dozen
+    # console round-trips, and on Windows that is what a menu "feels" like.
+    sys.stdout.write("\n".join(out) + "\n")
+    sys.stdout.flush()
 
 
 async def _ask_line(prompt: str) -> str:
@@ -8090,7 +8290,7 @@ async def prompt_profiles():
     awaiting_user_input = True
     show_cursor()
     try:
-        nt_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
+        nt_accounts = await asyncio.to_thread(_accounts_now, MENU_SNAPSHOT_MAX_AGE)
         names: list[str] = []
         for name in target_accounts() + [a["name"] for a in nt_accounts] + sorted(account_profiles):
             if name and name not in names:
@@ -8561,7 +8761,7 @@ async def setup_menu():
 # ---------- Balances display ----------
 async def show_balances():
     """Display all NinjaTrader account balances with session P&L."""
-    accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
+    accounts = await asyncio.to_thread(_accounts_now, MENU_SNAPSHOT_MAX_AGE)
     if not accounts:
         _dash_set_alert(Fore.YELLOW + "  ⚠  Could not reach NinjaTrader ATI." + Style.RESET_ALL)
         return
@@ -8661,7 +8861,7 @@ async def close_positions_menu():
         _dash_set_alert(Fore.YELLOW + "  ⚠  Set an output directory first (press D)." + Style.RESET_ALL)
         return
 
-    positions = await asyncio.to_thread(query_nt_positions, active_account, nt_port)
+    positions = await asyncio.to_thread(_positions_now, active_account, MENU_SNAPSHOT_MAX_AGE)
     open_pos = {k: v for k, v in positions.items() if v != 0}
 
     if not open_pos:
@@ -9085,8 +9285,7 @@ async def dispatch_signal(raw_signal: str, pub_strategy: str = "",
 # ---------- Risk management ----------
 def get_account_limits(account: str) -> dict:
     """Get target/stop for an account from config."""
-    cfg = load_config()
-    limits = cfg.get("account_limits", {}).get(account, {})
+    limits = config_get_sub("account_limits", account) or {}
     return {
         "target": limits.get("target", 0),
         "target_mode": limits.get("target_mode", "soft"),
@@ -9111,6 +9310,15 @@ def query_nt_balance(account: str) -> float | None:
     """Query current cash balance for a specific account from ATI."""
     accounts = query_nt_accounts(nt_port)
     for a in accounts:
+        if a["name"] == account:
+            return a["cash"]
+    return None
+
+
+def _account_balance_now(account: str) -> float | None:
+    """One account's cash from the shared stream (a direct query only when
+    the stream is not running)."""
+    for a in _accounts_now(MENU_SNAPSHOT_MAX_AGE):
         if a["name"] == account:
             return a["cash"]
     return None
@@ -9579,7 +9787,7 @@ class _LogTail:
 
 
 def _bracket_guard_policy() -> str:
-    return str(load_config().get(BRACKET_GUARD_KEY, "close") or "close").lower()
+    return str(config_get(BRACKET_GUARD_KEY, "close") or "close").lower()
 
 
 def _bracket_guard_act(acct: str, instrument: str, key: str, reason: str,
@@ -10673,8 +10881,11 @@ async def prompt_limits():
 
     limits = get_account_limits(acct)
     start_bal = session_start_balances.get(acct)
-    current_bal = _held_balance(
-        acct, await asyncio.to_thread(query_nt_balance, acct))
+    # The balance monitor keeps this current every 3 s; no dump needed.
+    current_bal = session_current_balances.get(acct)
+    if current_bal is None:
+        current_bal = _held_balance(
+            acct, await asyncio.to_thread(_account_balance_now, acct))
 
     _lim_inner = 52
     _lim_title = f"─ SESSION LIMITS ({'ALL ACCOUNTS' if apply_all else acct}) "
@@ -10912,7 +11123,7 @@ async def listen(token: str):
                 # session P&L baseline. When an ATM stop or target fills and
                 # the position closes, CashValue jumps by the realized delta
                 # — the monitor then trips the session limit if crossed.
-                nt_accounts = await asyncio.to_thread(query_nt_accounts, nt_port)
+                nt_accounts = await asyncio.to_thread(_accounts_now, BALANCE_POLL_INTERVAL)
                 for a in nt_accounts:
                     if _ingest_balance(a["name"], a["cash"], "session snapshot"):
                         _seed_start_balance(a["name"], a["cash"])
@@ -11507,7 +11718,7 @@ def web_state() -> dict:
         "strategies_seen": list(pub_strategies_seen),
         "rule_defaults": dict(DEFAULT_RULE),
         "catalog": instrument_catalog(),
-        "favorites": [f for f in (load_config().get("web_favorites") or [])
+        "favorites": [f for f in (config_get("web_favorites") or [])
                       if isinstance(f, str)][:12],
         "events": list(_web_events),
         # Snapshot (the loop thread clears/repopulates this dict, and
@@ -12123,7 +12334,7 @@ def hidden_accounts() -> list[str]:
     """Accounts the operator folded away in the web UI (config
     "web_hidden_accounts"). Display only — a hidden account that holds a
     role is still shown and still traded."""
-    raw = load_config().get("web_hidden_accounts")
+    raw = config_get("web_hidden_accounts")
     return [str(a) for a in raw if isinstance(a, str) and a] if isinstance(raw, list) else []
 
 
@@ -14650,6 +14861,29 @@ box-shadow:var(--shadow);max-width:280px}
   .pcal-head,.pcal-week{gap:5px;min-width:430px;
     grid-template-columns:repeat(5,1fr) minmax(74px,.72fr)}
 }
+/* ---- open / close effects: digital rain on first open, CRT switch-off
+   when the app goes away. Overlays only; the page under them is untouched.
+   Honour reduced-motion. ---- */
+#fxrain{position:fixed;inset:0;z-index:200;background:var(--bg);opacity:1;
+  transition:opacity .45s ease;pointer-events:none}
+#fxrain.out{opacity:0}
+/* Always in the DOM and fully transparent when off — a display:none
+   element has no start state for its transitions to run from. */
+#fxtv{position:fixed;inset:0;z-index:201;pointer-events:none;background:transparent}
+#fxtv .band{position:absolute;left:0;right:0;background:#000;height:0;
+  transition:height .32s cubic-bezier(.6,0,.9,.4)}
+#fxtv .top{top:0}#fxtv .bot{bottom:0}
+#fxtv .line{position:absolute;left:50%;top:50%;height:3px;width:100%;transform:translate(-50%,-50%);
+  background:#fff;box-shadow:0 0 18px 4px #fff,0 0 40px 10px rgba(180,255,220,.6);opacity:0;
+  transition:width .28s ease-in .3s,opacity .1s linear .3s,height .18s ease .58s}
+#fxtv.on .band.top{height:50%}#fxtv.on .band.bot{height:50%}
+#fxtv.on .line{opacity:1;width:0;height:0}
+#fxtv .after{position:absolute;inset:0;background:#000;opacity:0;transition:opacity .2s linear .7s}
+#fxtv.on .after{opacity:1}
+#fxtv .msg{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);color:var(--dim);
+  font:12px ui-monospace,Menlo,Consolas,monospace;letter-spacing:.2em;opacity:0;transition:opacity .4s linear 1s}
+#fxtv.on .msg{opacity:1}
+@media (prefers-reduced-motion:reduce){#fxrain{display:none}#fxtv .band,#fxtv .line,#fxtv .after{transition:none}}
 </style></head><body>
 
 <div id="top">
@@ -14784,6 +15018,9 @@ box-shadow:var(--shadow);max-width:280px}
 <div id="veil"><div id="modal"></div></div>
 <div id="ptip" class="hide"></div>
 <div id="toast"></div>
+<canvas id="fxrain"></canvas>
+<div id="fxtv"><div class="band top"></div><div class="band bot"></div><div class="line"></div>
+  <div class="after"></div><div class="msg">SOCKETTRADER OFFLINE</div></div>
 
 <script>
 "use strict";
@@ -16313,11 +16550,54 @@ async function refresh(){
   if(stateInFlight)return;
   stateInFlight=true;
   try{S=await get("/api/state");
+    fxOnline();
     if(!instrument&&S.last_manual&&S.last_manual.instrument)
       instrument=S.last_manual.instrument;
     render()}
-  catch(e){const st=$("chState");st.textContent="app offline";st.className="chip bad"}
+  catch(e){const st=$("chState");st.textContent="app offline";st.className="chip bad";
+    fxOffline()}
   finally{stateInFlight=false}}
+
+/* ---- open / close effects ----
+   Rain: a canvas overlay for ~1.2 s on the first open of a browser
+   session, then fades out and is removed (a reload mid-day does not
+   replay it). TV-off: when the app stops answering after having been
+   online — the trading window closed — the page collapses to a line, the
+   line to a dot. Both are skipped under prefers-reduced-motion, both are
+   overlays, nothing else on the page is touched. */
+const FX_REDUCED=matchMedia&&matchMedia("(prefers-reduced-motion: reduce)").matches;
+let fxSeenOnline=false,fxOfflineShown=false;
+function fxRain(){
+  const cv=$("fxrain");if(!cv)return;
+  let seen=false;try{seen=sessionStorage.getItem("st-fx-rain")==="1"}catch(e){}
+  if(seen||FX_REDUCED){cv.remove();return}
+  try{sessionStorage.setItem("st-fx-rain","1")}catch(e){}
+  const ctx=cv.getContext("2d");const W=cv.width=innerWidth,H=cv.height=innerHeight;
+  const fs=14,cols=Math.ceil(W/fs);
+  const y=Array.from({length:cols},()=>Math.random()*H/fs|0);
+  const spd=Array.from({length:cols},()=>0.6+Math.random()*0.9);
+  const G="01ABCDEFGHJKLMNPQRSTUVWXYZ23456789$#@%&+=*<>/|";
+  const t0=performance.now(),dur=1250;
+  ctx.fillStyle="#080b11";ctx.fillRect(0,0,W,H);ctx.font=fs+"px ui-monospace,Menlo,Consolas,monospace";
+  function tick(){
+    const el=performance.now()-t0;
+    ctx.fillStyle="rgba(8,11,17,0.22)";ctx.fillRect(0,0,W,H);
+    for(let i=0;i<cols;i++){
+      if(Math.random()<el/dur*0.6)continue;              // thin out toward the end
+      const ch=G[Math.random()*G.length|0],x=i*fs,yy=(y[i]|0)*fs;   // whole cells: no half-overlapped glyphs
+      ctx.fillStyle="#2fbf84";ctx.fillText(ch,x,yy-fs);
+      ctx.fillStyle="#e8fff3";ctx.fillText(ch,x,yy);
+      y[i]+=spd[i];if(y[i]*fs>H+fs*4)y[i]=-Math.random()*20}
+    if(el<dur)requestAnimationFrame(tick);
+    else{cv.classList.add("out");setTimeout(()=>cv.remove(),500)}}
+  requestAnimationFrame(tick)}
+function fxOffline(){
+  if(!fxSeenOnline||fxOfflineShown||FX_REDUCED)return;
+  fxOfflineShown=true;$("fxtv").classList.add("on")}
+function fxOnline(){
+  fxSeenOnline=true;
+  if(fxOfflineShown){fxOfflineShown=false;$("fxtv").classList.remove("on")}}
+fxRain();
 
 async function refreshLive(){
   if(liveInFlight)return;
@@ -16719,7 +16999,9 @@ async def main():
         print(Fore.RED + f"\n  ✖  {why}\n" + Style.RESET_ALL)
         logger.error(f"INSTANCE LOCK  refused to start: {why}")
         return
-    for line in migrate_legacy_home():
+    notes = migrate_legacy_home()
+    fx_matrix_rain()
+    for line in notes:
         print(Fore.CYAN + f"  ↻  {line}" + Style.RESET_ALL)
 
     token, cfg = setup()
@@ -16844,6 +17126,10 @@ async def main():
 
 def print_exit_summary():
     unpin_layout()
+    try:
+        fx_tv_off()
+    except Exception:
+        pass            # a cosmetic must never block the exit path
     clear()
     show_cursor()
     log_str = str(LOG_FILE)

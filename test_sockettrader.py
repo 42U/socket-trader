@@ -11093,3 +11093,70 @@ class TestHiddenAndDisconnectedAccounts:
         monkeypatch.setattr(st.subprocess, "run",
                             lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
         assert st._wsl_distros_from_windows() == []
+
+
+
+class TestPerformancePass:
+    def test_config_get_reads_one_key_and_tracks_disk(self, tmp_config, fresh_cfg_cache):
+        st.save_config({"account_limits": {"A": {"target": 1}, "B": {"target": 2}}, "hedge_guard": "block"})
+        assert st.config_get("hedge_guard") == "block"
+        assert st.config_get_sub("account_limits", "B") == {"target": 2}
+        assert st.config_get_sub("account_limits", "Z") is None
+        assert st.get_account_limits("A")["target"] == 1
+        # Copies, not the cache itself.
+        st.config_get("account_limits")["A"]["target"] = 99
+        assert st.config_get_sub("account_limits", "A")["target"] == 1
+        # An edit on disk is seen without a save in between.
+        time.sleep(0.01)
+        tmp_config.write_text(json.dumps({"hedge_guard": "off"}))
+        assert st.config_get("hedge_guard") == "off"
+        assert st.hedge_guard_mode() == "off"
+
+    def test_atm_template_listing_is_cached_briefly(self, tmp_path, monkeypatch):
+        (tmp_path / "templates" / "AtmStrategy").mkdir(parents=True)
+        (tmp_path / "templates" / "AtmStrategy" / "A.xml").write_text("<x/>")
+        monkeypatch.setattr(st, "output_directory", str(tmp_path / "incoming"))
+        st._atm_list_cache = (0.0, "", [])
+        assert st.list_atm_strategies() == ["A"]
+        (tmp_path / "templates" / "AtmStrategy" / "B.xml").write_text("<x/>")
+        assert st.list_atm_strategies() == ["A"]              # within the TTL
+        monkeypatch.setattr(st, "ATM_LIST_TTL_S", 0.0)
+        assert st.list_atm_strategies() == ["A", "B"]
+
+    def test_effects_are_no_ops_off_a_terminal(self, monkeypatch, capsys):
+        # pytest captures stdout, so isatty() is False here: nothing drawn.
+        st.fx_matrix_rain(seconds=0.05)
+        st.fx_tv_off(seconds=0.05)
+        assert capsys.readouterr().out == ""
+
+    def test_effects_respect_the_config_switch(self, tmp_config, fresh_cfg_cache, monkeypatch):
+        class TTY:
+            def __init__(self): self.buf = []
+            def write(self, s): self.buf.append(s)
+            def flush(self): pass
+            def isatty(self): return True
+        out = TTY()
+        monkeypatch.setattr(st.sys, "stdout", out)
+        monkeypatch.setattr(st, "term_width", lambda: 40)
+        monkeypatch.setattr(st, "term_height", lambda: 10)
+        st.save_config({st.FX_KEY: False})
+        st.fx_matrix_rain(seconds=0.05)
+        assert out.buf == []
+        st.save_config({st.FX_KEY: True})
+        st.fx_matrix_rain(seconds=0.05, fps=10)
+        joined = "".join(out.buf)
+        assert "\033[2J" in joined and "\033[H" in joined       # drew frames and cleared after
+        out.buf.clear()
+        st.fx_tv_off(seconds=0.05)
+        assert "─" in "".join(out.buf)
+
+    def test_menu_account_reads_come_from_the_stream(self, monkeypatch):
+        """Opening a menu must not open an ATI dump of its own."""
+        calls = {"direct": 0}
+        monkeypatch.setattr(st, "query_nt_accounts", lambda *a, **k: calls.__setitem__("direct", calls["direct"] + 1) or [])
+        snap = {"ok": True, "accounts": {"Sim101": {"cash": 5.0}}, "positions": [],
+                "working": {}, "open_orders": {}, "ts": time.time(), "req_ts": time.time()}
+        monkeypatch.setattr(st, "_bridge_snapshot", lambda: snap)
+        assert st._accounts_now(st.MENU_SNAPSHOT_MAX_AGE) == [{"name": "Sim101", "cash": 5.0}]
+        assert st._account_balance_now("Sim101") == 5.0
+        assert calls["direct"] == 0

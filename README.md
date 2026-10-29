@@ -771,6 +771,10 @@ Machine-specific values travel safely: the NinjaTrader `incoming` folder is stor
 
 **Saves that cannot land are not silent.** On Windows a rename over a file another handle has open fails with *Access is denied*; the config is now served from memory and written under a lock with retries, and if the disk still refuses, the alert line and the web reply say `NOT written to disk … retrying` — the setting stays live, and the next successful save (retried every few seconds) carries it. The P&L archive keeps the month dirty on a failed write for the same reason.
 
+## Open and close effects
+
+The trading window opens with a second of digital rain and closes with a CRT switch-off — in the terminal (drawn with plain ANSI, one write per frame, ASCII glyphs so no console shows boxes) and in the web UI (a canvas overlay on the first open of a browser session, and the page collapsing to a line when the app goes away). They are overlays only, never delay a trade, and are skipped when stdout is not a terminal, when the browser asks for reduced motion, or when the config says `"fx": false`.
+
 ## Configuration
 
 Settings persist in `.voidorigin_config.json` in the [data home](#where-your-data-lives):
