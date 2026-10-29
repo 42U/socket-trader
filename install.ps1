@@ -41,6 +41,18 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $RepoZip = 'https://github.com/42U/socket-trader/archive/refs/heads/main.zip'
+
+# The install folder is written into a generated uninstall script and
+# removed recursively by it, so it has to be a folder of its own: never a
+# drive root, the user profile, Desktop or Documents, and never a path
+# that would break out of a quoted batch argument.
+$InstallDir = [IO.Path]::GetFullPath($InstallDir).TrimEnd('\')
+if ($InstallDir -match '[&|<>^"%!]') { throw "InstallDir must not contain any of & | < > ^ `" % ! : $InstallDir" }
+$forbidden = @([IO.Path]::GetPathRoot($InstallDir).TrimEnd('\'), $env:USERPROFILE, $env:LOCALAPPDATA, $env:APPDATA,
+               [Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('MyDocuments'),
+               $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:SystemRoot) |
+             Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') }
+if ($forbidden -contains $InstallDir) { throw "InstallDir must be a folder of its own, not $InstallDir" }
 $MinPython = [version]'3.10'
 
 function Write-Step { param($n, $t) Write-Host "`n[$n/6] $t" -ForegroundColor Cyan }
@@ -360,10 +372,12 @@ $uninst = Join-Path $InstallDir 'uninstall.cmd'
 $desktopLnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'SocketTrader.lnk'   # Desktop may be OneDrive-redirected
 @"
 @echo off
-rem A batch file cannot delete the folder it runs from, so hop to %TEMP% first.
+rem A batch file cannot delete the folder it runs from, so hop to %TEMP%
+rem first - under a name nobody can pre-place.
+set "ST_UN=%TEMP%\sockettrader_uninstall_%RANDOM%%RANDOM%%RANDOM%.cmd"
 if /i not "%~dp0"=="%TEMP%\" (
-  copy /y "%~f0" "%TEMP%\sockettrader_uninstall.cmd" >nul
-  start "" /d "%TEMP%" cmd /c "%TEMP%\sockettrader_uninstall.cmd"
+  copy /y "%~f0" "%ST_UN%" >nul
+  start "" /d "%TEMP%" cmd /c ""%ST_UN%""
   exit /b
 )
 echo Removing SocketTrader program files and shortcuts (your config and P&L history are kept).

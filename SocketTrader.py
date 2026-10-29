@@ -292,20 +292,65 @@ def _run_quiet(args: list[str], timeout: float = 8.0) -> str | None:
     return out or None
 
 
+def win_system_exe(name: str) -> str | None:
+    """Absolute path of a Windows system executable (cmd.exe, powershell.exe,
+    wsl.exe) — never a bare name. A bare name is resolved through PATH,
+    and these programs decide where the data home is and what the app
+    trusts from it, so a planted copy earlier on PATH would own the trust
+    root. On Windows the system folder comes from SystemRoot; from WSL it
+    is the mounted Windows drive's System32. None when it is not there —
+    the callers then fall back to the Linux home, never to PATH."""
+    candidates: list[Path] = []
+    if IS_WINDOWS:
+        root = os.environ.get("SystemRoot") or r"C:\Windows"
+        candidates.append(Path(root) / "System32" / name)
+        candidates.append(Path(r"C:\Windows\System32") / name)
+    elif IS_WSL:
+        tails = ["Windows/System32/" + name]
+        if name.lower() == "powershell.exe":
+            tails = ["Windows/System32/WindowsPowerShell/v1.0/powershell.exe"]
+        roots = [Path("/mnt")]
+        try:
+            # A custom automount root shows up as the parent of the drive dirs.
+            for mnt in Path("/proc/mounts").read_text(encoding="utf-8", errors="ignore").splitlines():
+                parts = mnt.split()
+                if len(parts) >= 3 and parts[2] in ("9p", "drvfs") and len(Path(parts[1]).name) == 1:
+                    roots.append(Path(parts[1]).parent)
+        except OSError:
+            pass
+        for root in roots:
+            for drive in "cdefgh":
+                for tail in tails:
+                    candidates.append(root / drive / tail)
+    for c in candidates:
+        try:
+            if c.is_file():
+                return str(c)
+        except OSError:
+            continue
+    return None
+
+
 def _wsl_windows_userprofile() -> Path | None:
     """The Windows %USERPROFILE% as a WSL path, or None when Windows interop
-    is unavailable (cmd.exe/powershell.exe/wslpath missing or disabled)."""
-    for args in (["cmd.exe", "/c", "echo %USERPROFILE%"],
-                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-                  "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
-                  "[Environment]::GetFolderPath('UserProfile')"]):
+    is unavailable (cmd.exe/powershell.exe missing or disabled)."""
+    cmd_exe, ps_exe = win_system_exe("cmd.exe"), win_system_exe("powershell.exe")
+    attempts = []
+    if cmd_exe:
+        attempts.append([cmd_exe, "/c", "echo %USERPROFILE%"])
+    if ps_exe:
+        attempts.append([ps_exe, "-NoProfile", "-NonInteractive", "-Command",
+                         "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+                         "[Environment]::GetFolderPath('UserProfile')"])
+    wslpath = next((w for w in ("/usr/bin/wslpath", "/bin/wslpath") if Path(w).exists()), None)
+    for args in attempts:
         out = _run_quiet(args)
         if not out:
             continue
         win = out.splitlines()[-1].strip().strip('"')
-        if not re.match(r"^[A-Za-z]:\\", win):
+        if not re.match(r"^[A-Za-z]:\\[^\r\n]*$", win):
             continue
-        unix = _run_quiet(["wslpath", "-u", win])
+        unix = _run_quiet([wslpath, "-u", win]) if wslpath else None
         if not unix:
             # wslpath missing: the default DrvFs layout (/mnt/<drive>/...).
             unix = "/mnt/" + win[0].lower() + win[2:].replace("\\", "/")
@@ -5300,7 +5345,8 @@ def _run_cmd(args: list[str], timeout: float = 6.0) -> str | None:
 
 def _windows_to_wsl_path(win_path: str) -> str | None:
     """Convert a Windows path to a WSL (/mnt/...) path via wslpath."""
-    return _run_cmd(["wslpath", "-u", win_path])
+    wslpath = next((w for w in ("/usr/bin/wslpath", "/bin/wslpath") if Path(w).exists()), None)
+    return _run_cmd([wslpath, "-u", win_path]) if wslpath else None
 
 
 def _query_windows_docs_folder() -> str | None:
@@ -5312,8 +5358,11 @@ def _query_windows_docs_folder() -> str | None:
     """
     if not (IS_WINDOWS or IS_WSL):
         return None
+    ps_exe = win_system_exe("powershell.exe")
+    if not ps_exe:
+        return None
     win_path = _run_cmd([
-        "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+        ps_exe, "-NoProfile", "-NonInteractive", "-Command",
         "[Environment]::GetFolderPath('MyDocuments')",
     ])
     if not win_path:
@@ -8466,6 +8515,23 @@ async def _import_profile_prompt(account: str):
             f"Replace {account}'s current profile with {label}? [y/N]")).lower()
         if confirm != "y":
             return
+    if raw not in sources and _has_ai_config(data):
+        # A gate names an outbound endpoint and the environment variable
+        # whose value is sent to it as a bearer token. From a FILE that is
+        # an exfiltration recipe unless the operator wanted exactly that,
+        # so it is shown and must be accepted; the default drops it.
+        prof_raw, _err = parse_profile_import(data)
+        gates = profile_ai_gates(prof_raw if isinstance(prof_raw, dict) else {})
+        for gate in gates:
+            print(Fore.YELLOW + f"  ⚠  The file carries an AI gate: {gate.get('provider')} · "
+                  f"{gate.get('model') or 'default model'} → "
+                  f"{gate.get('endpoint') or 'provider default endpoint'}"
+                  + (f" · sends ${gate['api_key_env']}" if gate.get('api_key_env') else "")
+                  + Style.RESET_ALL)
+        keep = (await _ask_line("Keep the AI gate and send that key there? [y/N]")).lower()
+        if keep != "y":
+            data = _strip_ai_config(data)
+            print(Fore.GREEN + "  ✔  Importing without the AI gate." + Style.RESET_ALL)
     ok, msg = import_profile(account, data, source=label)
     if not ok:
         print(Fore.YELLOW + f"  ⚠  {msg}" + Style.RESET_ALL)
@@ -17208,8 +17274,11 @@ WSL_LEGACY_SCAN_KEY = "wsl_legacy_scanned"   # config: Windows looked inside WSL
 def _wsl_distros_from_windows() -> list[str]:
     """Installed WSL distributions, as `wsl.exe -l -q` lists them. Its
     output is UTF-16; an absent WSL answers with an error, i.e. []."""
+    wsl_exe = win_system_exe("wsl.exe")
+    if not wsl_exe:
+        return []
     try:
-        result = subprocess.run(["wsl.exe", "-l", "-q"], capture_output=True, timeout=15)
+        result = subprocess.run([wsl_exe, "-l", "-q"], capture_output=True, timeout=15)
     except (OSError, subprocess.SubprocessError, ValueError):
         return []
     if result.returncode != 0:
@@ -17275,7 +17344,7 @@ def migrate_legacy_home() -> list[str]:
             scanned_wsl = True
     notes: list[str] = []
     for legacy in sources:
-        notes.extend(_migrate_legacy_from(legacy))
+        notes.extend(_migrate_legacy_from(legacy, adopt_config=IS_WSL))
     if scanned_wsl:
         cfg = load_config()
         cfg[WSL_LEGACY_SCAN_KEY] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -17283,8 +17352,14 @@ def migrate_legacy_home() -> list[str]:
     return notes
 
 
-def _migrate_legacy_from(legacy: Path) -> list[str]:
-    """Fold one old install directory into the data home (see above)."""
+def _migrate_legacy_from(legacy: Path, adopt_config: bool = True) -> list[str]:
+    """Fold one old install directory into the data home (see above).
+
+    `adopt_config=False` (the Windows side reading WSL distributions) merges
+    the P&L history only: a config is the trust root — signal server, auth
+    token, order folder, bridge secret — and a file found inside some WSL
+    distribution is not something to start trading from unseen. It is set
+    aside next to its origin with a note telling the operator where it is."""
     notes: list[str] = []
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -17293,6 +17368,10 @@ def _migrate_legacy_from(legacy: Path) -> list[str]:
         set_aside = False
         if CONFIG_FILE.exists():
             notes.append(f"kept the shared config at {CONFIG_FILE}; the WSL copy was set aside")
+            set_aside = True
+        elif not adopt_config:
+            notes.append(f"a WSL config was found at {old_cfg} — NOT adopted (review it by hand; "
+                         "the Windows side keeps its own settings)")
             set_aside = True
         else:
             try:

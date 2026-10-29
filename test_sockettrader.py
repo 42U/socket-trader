@@ -11089,7 +11089,11 @@ class TestHiddenAndDisconnectedAccounts:
             returncode = 0
             stdout = "Ubuntu\r\ndocker-desktop\r\n".encode("utf-16-le")
         monkeypatch.setattr(st.subprocess, "run", lambda *a, **k: R())
+        monkeypatch.setattr(st, "win_system_exe", lambda name: r"C:\Windows\System32\wsl.exe")
         assert st._wsl_distros_from_windows() == ["Ubuntu", "docker-desktop"]
+        monkeypatch.setattr(st, "win_system_exe", lambda name: None)     # no system wsl.exe → no PATH lookup
+        assert st._wsl_distros_from_windows() == []
+        monkeypatch.setattr(st, "win_system_exe", lambda name: r"C:\Windows\System32\wsl.exe")
         monkeypatch.setattr(st.subprocess, "run",
                             lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
         assert st._wsl_distros_from_windows() == []
@@ -11160,3 +11164,70 @@ class TestPerformancePass:
         assert st._accounts_now(st.MENU_SNAPSHOT_MAX_AGE) == [{"name": "Sim101", "cash": 5.0}]
         assert st._account_balance_now("Sim101") == 5.0
         assert calls["direct"] == 0
+
+
+
+class TestLocalSurfaceHardening:
+    def test_windows_system_exes_never_come_from_path(self, monkeypatch, tmp_path):
+        # WSL: only the mounted Windows System32 is consulted, never $PATH.
+        monkeypatch.setattr(st, "IS_WSL", True)
+        monkeypatch.setattr(st, "IS_WINDOWS", False)
+        fake = tmp_path / "bin"; fake.mkdir()
+        (fake / "cmd.exe").write_text("evil"); (fake / "cmd.exe").chmod(0o755)
+        monkeypatch.setenv("PATH", str(fake))
+        monkeypatch.setattr(st.Path, "is_file", lambda self: False)      # no /mnt/<d>/Windows/System32
+        assert st.win_system_exe("cmd.exe") is None
+        assert st._wsl_windows_userprofile() is None                      # falls back, does not run PATH's cmd.exe
+
+    def test_windows_side_migration_never_adopts_a_wsl_config(self, tmp_path, tmp_config,
+                                                              fresh_cfg_cache, monkeypatch):
+        legacy = tmp_path / "wsl_home"; legacy.mkdir()
+        shared = tmp_config.parent
+        monkeypatch.setattr(st, "IS_WSL", False)
+        monkeypatch.setattr(st, "IS_WINDOWS", True)
+        monkeypatch.setattr(st, "DATA_HOME", shared)
+        monkeypatch.setattr(st, "PNL_DIR", shared / ".voidorigin_pnl")
+        monkeypatch.setattr(st, "_wsl_legacy_homes_from_windows", lambda: [legacy])
+        (legacy / ".voidorigin_config.json").write_text(json.dumps(
+            {"ws_host": "wss://attacker.example/ws", "token": "PWNED", "output_directory": "/tmp/x"}))
+        (legacy / ".voidorigin_pnl").mkdir()
+        (legacy / ".voidorigin_pnl" / "2026-10.json").write_text(json.dumps({"v": 2, "days": {
+            "2026-10-20": {"accounts": {}, "trades": [{"ts": 1.0, "account": "Sim101", "symbol": "GC", "pnl": 7.0}]}}}))
+        notes = st.migrate_legacy_home()
+        cfg = st.load_config()                                            # only the scan marker was written
+        assert "ws_host" not in cfg and "token" not in cfg and "output_directory" not in cfg
+        assert cfg.get(st.WSL_LEGACY_SCAN_KEY)
+        assert any("NOT adopted" in n for n in notes)
+        assert st._pnl_shard("2026-10").exists()                           # history still merged
+        assert list(legacy.glob(".voidorigin_config.json.migrated-*"))     # set aside, not deleted
+
+    def test_wsl_own_home_still_moves_its_config(self, tmp_path, tmp_config, fresh_cfg_cache, monkeypatch):
+        legacy = tmp_path / "linuxhome"; legacy.mkdir()
+        shared = tmp_config.parent
+        monkeypatch.setattr(st, "IS_WSL", True)
+        monkeypatch.setattr(st, "IS_WINDOWS", False)
+        monkeypatch.setattr(st, "DATA_HOME", shared)
+        monkeypatch.setattr(st, "PNL_DIR", shared / ".voidorigin_pnl")
+        monkeypatch.setattr(st.Path, "home", classmethod(lambda cls: legacy))
+        (legacy / ".voidorigin_config.json").write_text(json.dumps({"account": "Sim101", "token": "t"}))
+        st.migrate_legacy_home()
+        assert st.load_config()["account"] == "Sim101"
+
+    def test_terminal_import_drops_ai_gate_unless_accepted(self, tmp_config, fresh_cfg_cache,
+                                                           monkeypatch, tmp_path):
+        doc = tmp_path / "p.json"
+        doc.write_text(json.dumps({"profile": {"default": {"enabled": True, "ai": {
+            "provider": "openai", "endpoint": "https://attacker.example.com/collect",
+            "api_key_env": "OPENAI_API_KEY", "model": "x"}}}}))
+        answers = iter([str(doc), "n"])                       # SOURCE, then "keep the gate?" → no
+        async def ask(prompt): return next(answers)
+        monkeypatch.setattr(st, "_ask_line", ask)
+        monkeypatch.setattr(st, "_prof_box", lambda *a, **k: None)
+        st.account_profiles.clear()
+        asyncio.run(st._import_profile_prompt("Sim101"))
+        assert "ai" not in st.account_profiles["Sim101"].get("default", {})
+        # Accepted explicitly → kept.
+        answers = iter([str(doc), "y"])
+        asyncio.run(st._import_profile_prompt("Sim202"))
+        assert st.account_profiles["Sim202"]["default"]["ai"]["endpoint"] == "https://attacker.example.com/collect"
+        st.account_profiles.clear()
