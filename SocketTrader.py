@@ -861,11 +861,19 @@ MAX_FIELD_LENGTH = 256      # max bytes per ATI field — prevent oversized payl
 MAX_SIGNAL_FIELDS = 20      # hard cap on semicolon-delimited fields
 
 # All valid NinjaTrader 8 ATI OIF commands
+# CANCELALLORDERS and FLATTENEVERYTHING are deliberately NOT accepted from
+# the wire. Per the NT8 OIF docs both act across EVERY account and broker
+# connection on the NinjaTrader instance — the account field is not a
+# parameter — so a publisher (or anyone who could speak as one) could
+# flatten a discretionary account or strip every ATM stop on the machine
+# with one 20-byte message. Nothing in this app writes them either: the
+# manual flatten and the hard-stop flatten are per-account CLOSEPOSITIONs
+# and per-order CANCELs (see fire_cancel_account_orders).
 VALID_ATI_COMMANDS = {
     "PLACE", "CANCEL", "CHANGE", "CLOSEPOSITION",
     "CLOSESTRATEGY", "REVERSEPOSITION",
-    "CANCELALLORDERS", "FLATTENEVERYTHING",
 }
+GLOBAL_ATI_COMMANDS = {"CANCELALLORDERS", "FLATTENEVERYTHING"}   # refused with their own reason
 VALID_ACTIONS = {"BUY", "SELL"}
 # Per NT8 docs (Commands and Valid Parameters) the stop type is
 # STOPMARKET — NT rejects "STOP" ("holds invalid order type parameter").
@@ -915,6 +923,9 @@ def validate_signal(parts: list[str]) -> str | None:
             return f"field {i} too long: {len(field)} bytes (max {MAX_FIELD_LENGTH})"
 
     cmd = parts[0].upper()
+    if cmd in GLOBAL_ATI_COMMANDS:
+        return (f"{cmd} refused: it acts on EVERY account and connection on this "
+                "NinjaTrader, not on the managed accounts")
     if cmd not in VALID_ATI_COMMANDS:
         return f"unknown command: {cmd}"
 
@@ -1154,6 +1165,9 @@ _cfg_unreadable = False               # a file exists that could not be parsed, 
 _cfg_last_error = ""                  # last save failure, for the UI
 _cfg_read_error = ""                  # last read failure logged (polls must not spam the log)
 _cfg_overwrite_warned: tuple | None = None   # the external edit already warned about (retry runs every 2 s)
+_cfg_last_save_failed = False         # the most recent save_config did not reach disk (any reason)
+_cfg_writing = False                  # a rename is in flight: readers must not re-read the file mid-swap
+_cfg_unreadable_next_try = 0.0        # monotonic: re-parse an unreadable file at most every 2 s
 _cfg_disk_fail_count = 0
 _cfg_gen = 0                          # bumped on every save_config; what the disk holds is _cfg_written_gen
 _cfg_written_gen = 0
@@ -1191,16 +1205,22 @@ def load_config() -> dict:
     last good copy is served instead, and if there is none, saves are
     refused until a read succeeds (see save_config)."""
     global _cfg_cache, _cfg_cache_path, _cfg_cache_stat, _cfg_unreadable, _cfg_read_error
+    global _cfg_unreadable_next_try
     with _cfg_lock:
         path = str(CONFIG_FILE)
         current = _cfg_stat()
         if _cfg_cache is not None and _cfg_cache_path == path:
-            if _cfg_unsaved or current == _cfg_cache_stat:
+            # While our own rename is in flight the file on disk is the
+            # state being written; re-reading it here would hand a reader
+            # the older copy and let it overwrite a newer in-memory save.
+            if _cfg_unsaved or _cfg_writing or current == _cfg_cache_stat:
                 return json.loads(json.dumps(_cfg_cache))
         if current is None:                       # no file
             _cfg_cache, _cfg_cache_path, _cfg_cache_stat = {}, path, None
             _cfg_unreadable = False
             return {}
+        if _cfg_unreadable and _cfg_cache_path == path and time.monotonic() < _cfg_unreadable_next_try:
+            return {}                             # still unreadable a moment ago: do not re-parse per poll
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
@@ -1220,6 +1240,8 @@ def load_config() -> dict:
                 logger.error(msg)
                 _cfg_read_error = msg
             _cfg_unreadable = True
+            _cfg_cache_path = path
+            _cfg_unreadable_next_try = time.monotonic() + 2.0
             return {}
         if _cfg_read_error:
             logger.info(f"CONFIG  {CONFIG_FILE} readable again")
@@ -1328,7 +1350,7 @@ def save_config(cfg: dict) -> bool:
     On failure the intended state stays in memory (every later load_config
     sees it, and the next save from anyone writes it), the failure is
     logged and shown, and False is returned so the caller can say so."""
-    global _cfg_cache, _cfg_cache_path, _cfg_gen, _cfg_last_error
+    global _cfg_cache, _cfg_cache_path, _cfg_gen, _cfg_last_error, _cfg_last_save_failed
     with _cfg_lock:
         path = str(CONFIG_FILE)
         if _cfg_unreadable and _cfg_stat() is not None:
@@ -1339,6 +1361,7 @@ def save_config(cfg: dict) -> bool:
                 logger.error(f"CONFIG  save refused — {msg}")
                 _save_failed_notice("config", OSError(msg))
                 _cfg_last_error = msg
+            _cfg_last_save_failed = True
             return False
         _cfg_cache = _sanitize_cfg(json.loads(json.dumps(cfg)))   # same healing as a read
         _cfg_cache_path = path
@@ -1356,6 +1379,7 @@ def _cfg_write_latest() -> bool:
     another never puts an older copy on disk over a newer one."""
     global _cfg_cache_stat, _cfg_unsaved, _cfg_unreadable, _cfg_last_error
     global _cfg_disk_fail_count, _cfg_written_gen, _cfg_overwrite_warned
+    global _cfg_last_save_failed, _cfg_writing
     with _cfg_write_lock:
         with _cfg_lock:
             if _cfg_cache is None:
@@ -1364,6 +1388,7 @@ def _cfg_write_latest() -> bool:
                 return True                      # already on disk
             gen, path = _cfg_gen, Path(_cfg_cache_path)
             payload = json.dumps(_cfg_cache, indent=2)
+            _cfg_writing = True
             now_stat = _cfg_stat()
             if (_cfg_unsaved and _cfg_cache_stat is not None and now_stat != _cfg_cache_stat
                     and now_stat != _cfg_overwrite_warned):
@@ -1378,7 +1403,9 @@ def _cfg_write_latest() -> bool:
             _write_atomic(path, payload, ".voidorigin_")
         except OSError as exc:
             with _cfg_lock:
+                _cfg_writing = False
                 _cfg_unsaved = True
+                _cfg_last_save_failed = True
                 _cfg_disk_fail_count += 1
                 msg = str(exc)
                 if msg != _cfg_last_error:
@@ -1390,13 +1417,23 @@ def _cfg_write_latest() -> bool:
             _cfg_written_gen = gen
             if str(CONFIG_FILE) == str(path):
                 _cfg_cache_stat = _cfg_stat()
-            if _cfg_unsaved:
+            _cfg_writing = False
+            recovered = _cfg_unsaved
+            if recovered:
                 logger.info(f"CONFIG  save recovered after {_cfg_disk_fail_count} refusal(s)")
             _cfg_unsaved = False
             _cfg_unreadable = False
+            _cfg_last_save_failed = False
             _cfg_last_error = ""
             _cfg_disk_fail_count = 0
             newer = _cfg_gen != gen
+        if recovered:
+            try:
+                if _controls_pinned:
+                    _dash_set_alert(Fore.GREEN + "  ✔  Config saves recovered — settings are on disk."
+                                    + Style.RESET_ALL)
+            except Exception:
+                pass
     # A save landed while this one was writing: write again so the disk
     # ends on the newest state.
     return _cfg_write_latest() if newer else True
@@ -1410,11 +1447,15 @@ def config_flush_pending() -> bool:
 
 
 def config_save_warning() -> str:
-    """Suffix for a UI message when the last save did not reach disk."""
+    """Suffix for a UI message when the last save did not reach disk —
+    whether it is being retried (a refused rename) or cannot be retried
+    at all (the file on disk is unreadable and must be fixed by hand)."""
     with _cfg_lock:
-        if not _cfg_unsaved:
-            return ""
-        return f"  ⚠  NOT written to disk yet ({_cfg_last_error}) — retrying"
+        if _cfg_unsaved:
+            return f"  ⚠  NOT written to disk yet ({_cfg_last_error}) — retrying"
+        if _cfg_last_save_failed:
+            return f"  ⚠  NOT saved ({_cfg_last_error})"
+        return ""
 
 
 # ---------- Machine-specific config values ----------
@@ -2012,9 +2053,76 @@ def save_account_profiles() -> bool:
     ok = save_config(cfg)
     if ok:
         logger.info(f"PROFILES SAVED  accounts={sorted(pruned)}")
+        _profile_history_snapshot(pruned)
     else:
         logger.error(f"PROFILES NOT SAVED (disk refused)  accounts={sorted(pruned)}")
+    log_profile_digest("saved" if ok else "in memory, NOT on disk")
     return ok
+
+
+def log_profile_digest(why: str):
+    """One log line per profiled account saying what it will actually do —
+    entries, size, qty, direction and each scoped rule with its scope. A
+    restart that loads an older profile set than the one that was trading
+    (2026-10-29: the file held the Oct 16–23 profiles, the process that
+    died had been trading the Oct 25 ones from memory) is then visible in
+    the log at the minute it happened, instead of three signals later."""
+    try:
+        for acct in sorted(account_profiles):
+            prof = account_profiles[acct]
+            rules = []
+            for i, r in enumerate(prof.get("rules", []), 1):
+                scope = ",".join(r.get("strategies") or []) or "any"
+                syms = ",".join(r.get("symbols") or [])
+                flags = []
+                if "enabled" in r:
+                    flags.append("on" if r["enabled"] else "OFF")
+                elif rule_never_enters(prof, r):
+                    flags.append("NEVER-ENTERS")
+                for k in ("size", "qty_mode", "qty_value", "direction", "atm"):
+                    if k in r:
+                        flags.append(f"{k}={r[k]}")
+                rules.append(f"{i}:{scope}{('@' + syms) if syms else ''}[{' '.join(flags)}]")
+            logger.info(f"PROFILE DIGEST ({why})  {acct}: {profile_summary(acct)}"
+                        + (f"  rules: {' '.join(rules)}" if rules else ""))
+    except Exception as exc:          # a log line must never break a save or a boot
+        logger.warning(f"PROFILE DIGEST  could not be written: {exc}")
+
+
+PROFILE_HISTORY_DIR_NAME = ".voidorigin_profile_history"
+PROFILE_HISTORY_KEEP = 60
+
+
+def _profile_history_snapshot(profiles: dict):
+    """Keep a dated copy of every profile set that reached the disk, under
+    <data home>/.voidorigin_profile_history/<stamp>.json, newest 60 kept.
+    Nothing reads them automatically: they exist so an operator who finds
+    the app running on a profile set from a week ago has every version
+    that was ever saved to go back to, with no other copy anywhere else."""
+    try:
+        # Beside the config (= DATA_HOME in production; the tests redirect
+        # CONFIG_FILE and must never write into a real data home).
+        hist = Path(CONFIG_FILE).parent / PROFILE_HISTORY_DIR_NAME
+        hist.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({"saved": datetime.now().isoformat(timespec="seconds"),
+                              "account_profiles": profiles}, indent=2, sort_keys=True)
+        latest = sorted(hist.glob("*.json"))
+        if latest:
+            try:
+                prev = json.loads(latest[-1].read_text(encoding="utf-8"))
+                if prev.get("account_profiles") == json.loads(payload)["account_profiles"]:
+                    return                      # unchanged — no new copy
+            except (OSError, ValueError):
+                pass
+        name = datetime.now().strftime("%Y%m%d-%H%M%S.%f")[:-3] + ".json"   # ms: sorts, never collides
+        _write_atomic(hist / name, payload, ".voidorigin_")
+        for old in sorted(hist.glob("*.json"))[:-PROFILE_HISTORY_KEEP]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    except Exception as exc:
+        logger.warning(f"PROFILE HISTORY  snapshot not written: {exc}")
 
 
 def _save_profiles_tty() -> bool:
@@ -2426,6 +2534,23 @@ def _qty_label(rule: dict) -> str:
     return "copy"
 
 
+def rule_never_enters(prof: dict, rule: dict) -> bool:
+    """A scoped rule that can never place an entry: the account's default
+    says ENTRIES OFF and the rule leaves `enabled` to inherit. Such a rule
+    still shapes exits and reversals, but a strategy listed in it is NOT
+    traded — the trap behind "it has a Bhorgini rule, why didn't it take
+    it": the editors default a new rule's Entries to INHERIT."""
+    if not isinstance(rule, dict) or "enabled" in rule:
+        return False
+    return not {**DEFAULT_RULE, **(prof or {}).get("default", {})}.get("enabled", True)
+
+
+def inert_rules(account: str) -> list[int]:
+    """1-based positions of this account's rules that never enter."""
+    prof = account_profiles.get(account) or {}
+    return [i for i, r in enumerate(prof.get("rules", []), 1) if rule_never_enters(prof, r)]
+
+
 def profile_summary(account: str) -> str:
     """One-line profile description for menus/status."""
     prof = account_profiles.get(account)
@@ -2463,6 +2588,10 @@ def profile_summary(account: str) -> str:
     n_rules = len(prof.get("rules", []))
     if n_rules:
         bits.append(f"{n_rules} scoped rule{'s' if n_rules > 1 else ''}")
+        inert = inert_rules(account)
+        if inert:
+            bits.append(f"⚠ {len(inert)} never enter{'s' if len(inert) == 1 else ''} "
+                        "(Entries inherit OFF)")
     return " · ".join(bits) or "default"
 
 
@@ -2694,6 +2823,24 @@ def publisher_envelope_of(msg: str) -> dict:
                 "event_id": sanitize_ati(str(data.get("event_id") or "").strip())}
     except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
         return {}
+
+
+def skip_summary(skipped: list[tuple[str, str]]) -> str:
+    """Every account that sat a signal out, grouped by reason — plus the
+    accounts plan_signal_legs never even planned because a stop/target
+    lock holds them. The old alert named the first three skipped legs and
+    nothing else, so on 2026-10-29 it read "SimAI: entries disabled,
+    Sim84651238: entries disabled, SimAlwaySummer: entries disabled" for a
+    nine-account fan-out while the one entries-ON follower (Sim101) was
+    missing from it entirely: it was under a soft lock, not skipped."""
+    by_reason: dict[str, list[str]] = {}
+    for acct, why in skipped:
+        by_reason.setdefault(why or "skipped", []).append(acct)
+    bits = [f"{why}: {', '.join(accts)}" for why, accts in by_reason.items()]
+    locked = [f"{a} ({m} lock)" for a, m in account_stops.items() if a in target_accounts()]
+    if locked:
+        bits.append("locked: " + ", ".join(locked))
+    return " · ".join(bits) or "no tradeable accounts"
 
 
 def plan_signal_legs(signal_text: str, pub_strategy: str = "",
@@ -8411,17 +8558,26 @@ async def _edit_scoped_rules(account: str):
         prof = account_profiles.setdefault(account, {})
         rules = prof.setdefault("rules", [])
         lines = []
+        inert = False
         for i, r in enumerate(rules, 1):
             scope = (f"{','.join(r.get('symbols', [])) or 'any sym'} · "
                      f"{','.join(r.get('strategies', [])) or 'any strat'}")
             overrides = ", ".join(k for k in r if k in DEFAULT_RULE) or "no overrides"
-            lines.append(f"{i}. [{scope[:26]}]  {overrides[:24]}")
+            mark = ""
+            if rule_never_enters(prof, r):
+                inert = True
+                mark = "  ⚠ never enters"
+            lines.append(f"{i}. [{scope[:26]}]  {overrides[:24]}{mark}")
         if not rules:
             lines.append("No scoped rules — the DEFAULT rule covers everything.")
-        _prof_box(f"SCOPED RULES — {account}", lines, [
+        hints = [
             "First matching rule wins and overrides the default rule.",
             "A = add · number = edit · D number = delete · ENTER = back",
-        ])
+        ]
+        if inert:
+            hints.insert(0, "⚠ never enters: default is ENTRIES OFF and the rule's Entries is "
+                            "INHERIT — set it ON to trade those strategies.")
+        _prof_box(f"SCOPED RULES — {account}", lines, hints)
         raw = (await _ask_line("RULES")).lower()
         if raw in ("", "q"):
             if not rules:
@@ -8435,6 +8591,10 @@ async def _edit_scoped_rules(account: str):
             if rule:
                 rules.append(rule)
                 print(Fore.GREEN + "  ✔  Rule added." + Style.RESET_ALL)
+                if rule_never_enters(prof, rule):
+                    print(Fore.YELLOW + "  ⚠  This rule never enters: the account default is "
+                          "ENTRIES OFF and the rule's Entries is INHERIT. Edit it and set "
+                          "Entries ON if it should trade." + Style.RESET_ALL)
             _save_profiles_tty()
         elif raw.startswith("d") and raw[1:].strip().isdigit():
             idx = int(raw[1:].strip())
@@ -11746,10 +11906,11 @@ async def listen(token: str):
                                 envelope=publisher_envelope_of(msg))
                             if not plans:
                                 _dash_add_signal(format_signal(raw_signal, signal_count, lat_str, tag="SKIPPED"))
-                                why = ", ".join(f"{a}: {r}" for a, r in skipped_legs[:3]) or "no tradeable accounts"
                                 _dash_set_alert(
-                                    Fore.YELLOW + f"  ⚠  Signal skipped by profiles — {why}" + Style.RESET_ALL)
-                                logger.info(f"SIGNAL #{signal_count} (ALL LEGS SKIPPED)  {skipped_legs}  {raw_signal}")
+                                    Fore.YELLOW + f"  ⚠  Signal skipped — {skip_summary(skipped_legs)}"
+                                    + Style.RESET_ALL)
+                                logger.info(f"SIGNAL #{signal_count} (ALL LEGS SKIPPED)  {skipped_legs}  "
+                                            f"locked={dict(account_stops)}  {raw_signal}")
                                 continue
 
                             # Snapshot every instant leg's position BEFORE
@@ -12482,6 +12643,7 @@ async def _web_set_strategy(name, follow_publisher=None) -> tuple[bool, str]:
 
 
 async def _web_set_limits(account, target, target_mode, stop, stop_mode) -> tuple[bool, str]:
+    global soft_stopped
     # Risk limits are a safety control: a hard-locked session freezes them so
     # they cannot be weakened while a lockout is in force.
     if hard_stopped:
@@ -12504,11 +12666,34 @@ async def _web_set_limits(account, target, target_mode, stop, stop_mode) -> tupl
     if not (math.isfinite(t_val) and math.isfinite(s_val)):
         return False, "limits must be finite numbers"
     try:
-        set_account_limits(acct, t_val, t_mode, s_val, s_mode)
+        saved = set_account_limits(acct, t_val, t_mode, s_val, s_mode)
     except (TypeError, ValueError) as exc:
         return False, f"invalid limits: {exc}"
-    logger.info(f"WEB LIMITS  {acct}  target={target}/{target_mode}  stop={stop}/{stop_mode}")
-    return True, f"limits saved for {acct}" + config_save_warning()
+    logger.info(f"WEB LIMITS  {acct}  target={target}/{target_mode}  stop={stop}/{stop_mode}"
+                + ("" if saved else "  (NOT SAVED)"))
+    if not saved and not _cfg_unsaved:
+        # Refused outright (unreadable file): the limit is NOT in force —
+        # get_account_limits reads the file, and the file still says the old thing.
+        return False, f"limits for {acct} were NOT saved{config_save_warning()}"
+    # Same contract as the terminal's limits prompt: new limits re-arm a
+    # soft (resumable) lockout against the new numbers. Without this an
+    # account tripped on a stale target stayed out for the whole session
+    # after the operator raised it from the web (Sim101, 2026-10-29: locked
+    # at 11:50 on a $600 target, target set to $1,000, never traded again
+    # until the 4:20 PM reset). A hard lock stays until reset/exit; the
+    # balance monitor re-trips within seconds if the new limit is already met.
+    relit = ""
+    if account_stops.get(acct) == "soft":
+        del account_stops[acct]
+        soft_stopped = False
+        _recompute_session_lock()
+        relit = " · lockout lifted — re-armed against the new limits"
+        if paused:
+            relit += " (session is paused — resume to trade)"
+        logger.info(f"WEB LIMITS  {acct}  soft lockout lifted by new limits")
+        _dash_set_alert(Fore.GREEN + f"  ▶  {acct} re-armed — new limits lift its lockout"
+                        + Style.RESET_ALL)
+    return True, f"limits saved for {acct}{relit}" + config_save_warning()
 
 
 def _strip_ai_config(raw):
@@ -13498,12 +13683,19 @@ def _pnl_save(force: bool = False):
     Only the current month is ever rewritten, so the cost of a save does
     not grow with the depth of the archive."""
     global _pnl_dirty, _pnl_last_save
+    # Left-behind months first. Serialised under the lock, WRITTEN outside
+    # it: a rename waiting out a sharing lock must not park the observer
+    # (the asyncio thread) or the calendar behind it.
     with _pnl_lock:
-        for month in list(_pnl_unflushed):
-            days = _pnl_unflushed[month]
-            _pnl_merge_from_disk(month, days)
-            if _pnl_write_shard(month, json.dumps({"v": 2, "days": days})):
-                del _pnl_unflushed[month]
+        pending = []
+        for m, d in _pnl_unflushed.items():
+            _pnl_merge_from_disk(m, d)
+            pending.append((m, json.dumps({"v": 2, "days": d})))
+    for month, payload in pending:
+        if _pnl_write_shard(month, payload):
+            with _pnl_lock:
+                _pnl_unflushed.pop(month, None)
+    with _pnl_lock:
         if _pnl_history is None or not _pnl_dirty or not _pnl_hot_month:
             return
         if not force and time.monotonic() - _pnl_last_save < PNL_SAVE_MIN_GAP_S:
@@ -13517,10 +13709,18 @@ def _pnl_save(force: bool = False):
         # The write was refused (a Windows lock, a full or missing drive):
         # the record is still in memory, so mark it dirty again or the
         # next save — the one at exit included — would find nothing to do
-        # and the day's last trades would never reach disk.
+        # and the day's last trades would never reach disk. If the session
+        # rolled into a new month while the write was out, the old month
+        # is no longer the live one: park its payload for the retry loop
+        # above instead of letting it fall between the two.
         with _pnl_lock:
             if _pnl_hot_month == month:
                 _pnl_dirty = True
+            elif month not in _pnl_unflushed:
+                try:
+                    _pnl_unflushed[month] = json.loads(payload)["days"]
+                except (ValueError, KeyError, TypeError):
+                    pass
 
 
 def _pnl_side(action: str) -> int:
@@ -16034,7 +16234,7 @@ function accountModal(a){
 
     P.appendChild(el("label",null,"Entries"));
     const en=pickGroup(P,[{label:"ON",value:true},{label:"OFF — exits only",value:false}],
-      rule.enabled!==false);
+      rule.enabled!==false,()=>{if(typeof drawRules==="function")drawRules()});
     P.appendChild(el("label",null,"Contract size"));
     const sz=pickGroup(P,[{label:"INHERIT",value:"inherit"},{label:"MICROS",value:"micros"},
       {label:"FULL",value:"full"}],rule.size||"inherit");
@@ -16081,8 +16281,13 @@ function accountModal(a){
     function ruleScope(r){
       return ((r.symbols||[]).join(", ")||"any symbol")+" · "+
              ((r.strategies||[]).join(", ")||"any strategy")}
+    /* Entries INHERIT on an ENTRIES-OFF profile = the rule never enters
+       (it still shapes exits). Said everywhere the rule is shown, because a
+       strategy listed in such a rule looks enabled and is not. */
+    const neverEnters=r=>!("enabled"in r)&&en.value===false;
     function ruleBits(r){
       const b=[];
+      if(neverEnters(r))b.push("\u26a0 NEVER ENTERS (inherits entries OFF)");
       if(r.enabled===false)b.push("entries OFF");
       if(r.enabled===true)b.push("entries on");
       if(r.direction)b.push(r.direction==="invert"?"INVERT":"normal");
@@ -16154,9 +16359,15 @@ function accountModal(a){
         B.appendChild(srow);
 
         B.appendChild(el("label",null,"Entries"));
+        const enNote=el("div","sub");
+        const enRefresh=()=>{enNote.textContent=neverEnters(r)
+          ?"\u26a0 INHERIT resolves to OFF here (the profile above is ENTRIES OFF) — "+
+           "this rule will never place an entry. Pick ON if these strategies should trade."
+          :"";enNote.style.display=neverEnters(r)?"":"none"};
         pickGroup(B,[{label:"INHERIT",value:"i"},{label:"ON",value:true},
           {label:"OFF — exits only",value:false}],
-          "enabled"in r?r.enabled:"i",v=>set("enabled",v,v==="i"));
+          "enabled"in r?r.enabled:"i",v=>{set("enabled",v,v==="i");enRefresh()});
+        B.appendChild(enNote);enRefresh();
         B.appendChild(el("label",null,"Contract size (GLOBAL = session micro toggle)"));
         pickGroup(B,[{label:"INHERIT",value:"i"},{label:"MICROS",value:"micros"},
           {label:"FULL",value:"full"},{label:"GLOBAL",value:"inherit"}],
@@ -16230,6 +16441,10 @@ function accountModal(a){
     const pcut=el("input");pcut.value=prof.prop_cutoff_et||"";P.appendChild(pcut);
 
     P.appendChild(btn("SAVE PROFILE","wide on",()=>{
+      const inert=rules.filter(r=>neverEnters(r)&&(r.strategies||r.symbols));
+      if(inert.length&&!confirm(inert.length+" scoped rule"+(inert.length>1?"s":"")+
+         " will NEVER enter (Entries INHERIT on an ENTRIES-OFF profile): "+
+         inert.map(ruleScope).join("; ")+"\n\nSave anyway?"))return;
       const profiles=JSON.parse(JSON.stringify(S.profiles||{}));
       const e=profiles[a.name]||{};const d=e.default||{};
       d.enabled=en.value;d.size=sz.value;d.qty_mode=qm.value;
@@ -17517,6 +17732,7 @@ async def main():
     account_profiles.update(load_account_profiles(cfg))
     if account_profiles:
         logger.info(f"PROFILES LOADED  accounts={sorted(account_profiles)}")
+        log_profile_digest("loaded from " + str(CONFIG_FILE))
     _restore_replay_guard(cfg)
     if _recent_signal_ids or _recent_fired:
         logger.info(f"REPLAY GUARD RESTORED  ids={len(_recent_signal_ids)}  "
@@ -17606,6 +17822,10 @@ async def main():
 
     stop_web_ui()
     stop_snapshot_poller()
+    try:
+        config_flush_pending()          # a save the disk refused earlier gets its last chance
+    except Exception:
+        pass
     release_instance_lock()
 
 

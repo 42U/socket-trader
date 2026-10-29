@@ -316,11 +316,14 @@ class TestValidateSignal:
         parts = ["REVERSEPOSITION", "Sim101", "NQ 06-26", "BUY", "1", "MARKET", "", "", "DAY", "", "", "NQ_Med", "1020"]
         assert st.validate_signal(parts) is None
 
-    def test_cancelallorders_no_extra_fields_needed(self):
-        assert st.validate_signal(["CANCELALLORDERS"]) is None
-
-    def test_flatteneverything_no_extra_fields_needed(self):
-        assert st.validate_signal(["FLATTENEVERYTHING"]) is None
+    def test_machine_wide_commands_are_refused_from_the_wire(self):
+        # Both act on every account and connection on the NinjaTrader
+        # instance; a publisher must never be able to send them.
+        for cmd in ("CANCELALLORDERS", "FLATTENEVERYTHING", "flatteneverything"):
+            err = st.validate_signal([cmd] + [""] * 12)
+            assert err and "EVERY account" in err
+            err = st.validate_signal([cmd])
+            assert err and "EVERY account" in err
 
 
 # ── extract_signal_string ─────────────────────────────────────────────
@@ -10564,12 +10567,16 @@ def fresh_cfg_cache():
     st._cfg_last_error = ""
     st._cfg_read_error = ""
     st._cfg_disk_fail_count = 0
+    st._cfg_last_save_failed = False
+    st._cfg_writing = False
     yield
     st._cfg_cache = None
     st._cfg_cache_path = ""
     st._cfg_unsaved = False
     st._cfg_unreadable = False
     st._cfg_last_error = ""
+    st._cfg_last_save_failed = False
+    st._cfg_writing = False
 
 
 class TestConfigCache:
@@ -11231,3 +11238,169 @@ class TestLocalSurfaceHardening:
         asyncio.run(st._import_profile_prompt("Sim202"))
         assert st.account_profiles["Sim202"]["default"]["ai"]["endpoint"] == "https://attacker.example.com/collect"
         st.account_profiles.clear()
+
+
+class TestOct29SkippedSignals:
+    """2026-10-29: every afternoon signal was skipped. The signal path was
+    sound; what failed was visibility (three names in the alert, the locked
+    account absent), a web limits edit that could not lift a soft lock, and
+    scoped rules whose Entries=INHERIT silently meant OFF."""
+
+    PROFILES = {
+        "SimAI": {"default": {"enabled": False},
+                  "rules": [{"strategies": ["Gooping"], "enabled": True, "direction": "invert"}]},
+        "Sim101": {"default": {"enabled": True},
+                   "rules": [{"strategies": ["Bhorgini"], "direction": "normal"}]},
+        "Sim84651238": {"default": {"enabled": False, "size": "micros", "qty_mode": "fixed",
+                                    "qty_value": 2},
+                        "rules": [{"strategies": ["SI-Squeeze"], "direction": "normal"},
+                                  {"strategies": ["Bhorgini"], "enabled": True,
+                                   "direction": "normal"}]},
+        "SimWhop": {"default": {"enabled": False},
+                    "rules": [{"strategies": ["NQ-Sides"], "enabled": True}]},
+    }
+    SIGNAL = ("PLACE;SimAI;NQ 12-26;BUY;1;MARKET;;;DAY;;;Bhorgini;"
+              "ent:nq_bhorgini:Nasdaq:2026-10-29T14:00:00-04:00")
+
+    def _load(self):
+        st.account_profiles.clear()
+        st.account_profiles.update(st.load_account_profiles({"account_profiles": self.PROFILES}))
+        st.active_account = "SimAI"
+        st.follower_accounts = ["Sim101", "Sim84651238", "SimWhop"]
+
+    def test_live_profiles_do_route_bhorgini_to_the_enabled_followers(self):
+        # The replay that cleared the signal path: the exact live profiles
+        # and wire name produce legs for Sim101 and Sim84651238.
+        self._load()
+        plans, skipped = st.plan_signal_legs(self.SIGNAL, "Bhorgini")
+        assert sorted(p["account"] for p in plans) == ["Sim101", "Sim84651238"]
+        assert dict(skipped) == {"SimAI": "entries disabled", "SimWhop": "entries disabled"}
+        # Sim84651238's own default (micros, fixed 2) shapes the leg.
+        leg = next(p for p in plans if p["account"] == "Sim84651238")
+        assert leg["signal"].split(";")[2] == "MNQ 12-26" and leg["signal"].split(";")[4] == "2"
+
+    def test_skip_summary_names_every_account_and_the_locked_ones(self):
+        self._load()
+        st.account_stops["Sim101"] = "soft"
+        plans, skipped = st.plan_signal_legs(self.SIGNAL, "GC-ChopFade")
+        assert plans == []
+        text = st.skip_summary(skipped)
+        for acct in ("SimAI", "Sim84651238", "SimWhop"):
+            assert acct in text
+        assert "entries disabled: " in text
+        assert "locked: Sim101 (soft lock)" in text
+        # Reasons are grouped, not repeated per account.
+        assert text.count("entries disabled") == 1
+
+    def test_skip_summary_without_anything(self):
+        assert st.skip_summary([]) == "no tradeable accounts"
+
+    def test_web_limits_lift_a_soft_lock_like_the_terminal_does(self, tmp_config):
+        self._load()
+        st.account_stops["Sim101"] = "soft"
+        st.soft_stopped = False
+        ok, msg = asyncio.run(st._web_set_limits("Sim101", 1000, "soft", -600, "soft"))
+        assert ok is True
+        assert "Sim101" not in st.account_stops
+        assert "lockout lifted" in msg
+        assert st.get_account_limits("Sim101")["target"] == 1000
+
+    def test_web_limits_never_lift_a_hard_lock(self, tmp_config):
+        self._load()
+        st.account_stops["Sim101"] = "hard"
+        ok, msg = asyncio.run(st._web_set_limits("Sim101", 1000, "soft", -600, "soft"))
+        assert ok is True
+        assert st.account_stops["Sim101"] == "hard"
+        assert "lockout lifted" not in msg
+
+    def test_web_limits_on_an_unlocked_account_say_nothing_about_locks(self, tmp_config):
+        self._load()
+        ok, msg = asyncio.run(st._web_set_limits("Sim101", 500, "soft", 0, "off"))
+        assert ok is True and "lockout" not in msg
+
+    def test_rule_without_enabled_on_an_entries_off_profile_never_enters(self):
+        self._load()
+        prof = st.account_profiles["Sim84651238"]
+        assert st.rule_never_enters(prof, prof["rules"][0]) is True      # SI-Squeeze inherits OFF
+        assert st.rule_never_enters(prof, prof["rules"][1]) is False     # Bhorgini says ON
+        assert st.inert_rules("Sim84651238") == [1]
+        # On an entries-ON profile INHERIT means ON: nothing to warn about.
+        assert st.inert_rules("Sim101") == []
+        assert st.rule_never_enters({}, {"strategies": ["X"]}) is False
+        assert st.rule_never_enters({"default": {"enabled": False}}, {"strategies": ["X"]}) is True
+        assert st.rule_never_enters({"default": {"enabled": False}},
+                                    {"strategies": ["X"], "enabled": False}) is False
+
+    def test_profile_summary_flags_rules_that_never_enter(self):
+        self._load()
+        assert "never enters (Entries inherit OFF)" in st.profile_summary("Sim84651238")
+        assert "never enter" not in st.profile_summary("Sim101")
+        assert "never enter" not in st.profile_summary("SimWhop")
+
+    def test_profile_digest_logs_one_line_per_account(self, caplog):
+        self._load()
+        with caplog.at_level(logging.INFO, logger=st.logger.name):
+            st.log_profile_digest("test")
+        lines = [r.getMessage() for r in caplog.records if "PROFILE DIGEST" in r.getMessage()]
+        assert len(lines) == 4
+        sim = next(l for l in lines if "Sim84651238:" in l)
+        assert "1:SI-Squeeze[NEVER-ENTERS direction=normal]" in sim
+        assert "2:Bhorgini[on direction=normal]" in sim
+
+    def test_profile_digest_is_written_when_profiles_load_and_save(self, tmp_config, caplog):
+        self._load()
+        with caplog.at_level(logging.INFO, logger=st.logger.name):
+            assert st.save_account_profiles() is True
+        assert any("PROFILE DIGEST (saved)" in r.getMessage() for r in caplog.records)
+
+    def test_every_saved_profile_set_is_kept_in_history(self, tmp_config):
+        self._load()
+        hist = tmp_config.parent / st.PROFILE_HISTORY_DIR_NAME
+        assert st.save_account_profiles() is True
+        files = sorted(hist.glob("*.json"))
+        assert len(files) == 1
+        doc = json.loads(files[0].read_text(encoding="utf-8"))
+        assert doc["account_profiles"] == st.account_profiles
+        assert "saved" in doc
+        # Unchanged content: no second copy.
+        assert st.save_account_profiles() is True
+        assert len(sorted(hist.glob("*.json"))) == 1
+        # A change: a new dated copy, the old one kept.
+        st.account_profiles["SimWhop"]["default"]["enabled"] = True
+        assert st.save_account_profiles() is True
+        files = sorted(hist.glob("*.json"))
+        assert len(files) == 2
+        assert json.loads(files[0].read_text())["account_profiles"]["SimWhop"]["default"]["enabled"] is False
+        assert json.loads(files[1].read_text())["account_profiles"]["SimWhop"]["default"]["enabled"] is True
+
+    def test_history_is_pruned_to_the_newest_copies(self, tmp_config, monkeypatch):
+        self._load()
+        hist = tmp_config.parent / st.PROFILE_HISTORY_DIR_NAME
+        monkeypatch.setattr(st, "PROFILE_HISTORY_KEEP", 3)
+        for i in range(6):
+            st.account_profiles["SimWhop"]["default"]["qty_value"] = i + 1
+            assert st.save_account_profiles() is True
+        files = sorted(hist.glob("*.json"))
+        assert len(files) == 3
+        newest = json.loads(files[-1].read_text())
+        assert newest["account_profiles"]["SimWhop"]["default"]["qty_value"] == 6
+
+    def test_history_failure_never_blocks_the_save(self, tmp_config, monkeypatch):
+        self._load()
+        monkeypatch.setattr(st, "_write_atomic",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+        # save_config uses _write_atomic too, so patch after the config write
+        # by pointing the history at an unwritable place instead.
+        monkeypatch.undo()
+        hist = tmp_config.parent / st.PROFILE_HISTORY_DIR_NAME
+        hist.write_text("not a directory")        # mkdir will fail
+        assert st.save_account_profiles() is True
+        assert json.loads(tmp_config.read_text())["account_profiles"]["Sim101"]["default"]["enabled"] is True
+
+    def test_a_refused_save_takes_no_snapshot(self, tmp_config, fresh_cfg_cache, monkeypatch):
+        self._load()
+        hist = tmp_config.parent / st.PROFILE_HISTORY_DIR_NAME
+        monkeypatch.setattr(st, "_write_atomic",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("denied")))
+        assert st.save_account_profiles() is False
+        assert not hist.exists() or not list(hist.glob("*.json"))

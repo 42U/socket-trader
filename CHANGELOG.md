@@ -32,6 +32,26 @@ machine or by the test suite (1083 tests) unless marked otherwise.
   template listing cached; console redraws batched.
 - Closing the console with the X skipped the final P&L save and left the
   instance lock stale; a console-control handler now does the orderly stop.
+- **Limits set from the web UI did not lift a soft lockout** (the terminal's
+  limits prompt always did). An account tripped on a stale target stayed out
+  for the rest of the session after the target was raised — Sim101,
+  2026-10-29, 11:50 to the 4:20 PM reset. New limits now re-arm the account
+  on both paths; hard locks still hold until reset/exit.
+- The "signal skipped" alert named the first three skipped legs and left out
+  accounts held by a stop/target lock. It now lists every account grouped by
+  reason, plus `locked: …`, and the log line carries the lock map.
+- A scoped rule whose Entries is INHERIT on an ENTRIES OFF profile never
+  enters, yet a strategy listed in it looked enabled. It is now flagged in
+  the profile summary ("⚠ 1 never enters"), in both rule editors (with a
+  confirm on save in the web UI), and in the log digest.
+
+### Added (operability, after the 2026-10-29 stale-profile restart)
+- `PROFILE DIGEST` log lines whenever profiles are loaded or saved: per
+  account, what it will do and every scoped rule with its scope — a restart
+  that comes up on an older profile set is visible at the minute it happens.
+- `.voidorigin_profile_history/` beside the config: a dated copy of every
+  profile set that reached the disk (newest 60, unchanged sets not
+  duplicated), so a lost or overwritten profile can be put back by hand.
 
 ### Added
 - **One data home** for Windows and WSL runs (`C:\Users\<you>`, reached from
