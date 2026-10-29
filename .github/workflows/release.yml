@@ -1,0 +1,76 @@
+name: Release
+
+# Tag a commit `vX.Y.Z` and this builds SocketTrader.exe on a clean Windows
+# runner, checks it starts, and attaches dist\SocketTrader as a zip (plus
+# its SHA-256) to a GitHub release — the artifact the installer consumes.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: tests before release
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest test_sockettrader.py -q
+      - run: python scripts/check_webui.py
+
+  build:
+    name: build SocketTrader.exe
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Version must match the tag
+        shell: pwsh
+        run: |
+          $m = Select-String -Path SocketTrader.py -Pattern '^__version__\s*=\s*"([^"]+)"' | Select-Object -First 1
+          $v = $m.Matches[0].Groups[1].Value
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          if ("${{ github.event_name }}" -eq 'push' -and $v -ne $tag) {
+            throw "SocketTrader.py says $v but the tag is ${{ github.ref_name }}"
+          }
+          "APP_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build
+        shell: pwsh
+        run: .\build.ps1
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $zip = "SocketTrader-$env:APP_VERSION-windows-x64.zip"
+          Compress-Archive -Path dist\SocketTrader\* -DestinationPath $zip -Force
+          (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() + "  $zip" | Out-File "$zip.sha256" -Encoding ascii
+          "ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SocketTrader-windows
+          path: |
+            ${{ env.ZIP }}
+            ${{ env.ZIP }}.sha256
+
+      - name: GitHub release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ZIP }}
+            ${{ env.ZIP }}.sha256
+          generate_release_notes: true

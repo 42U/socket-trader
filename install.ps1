@@ -95,10 +95,28 @@ Write-Host "  SOCKET TRADER - Windows installer" -ForegroundColor White
 Write-Host "  ---------------------------------" -ForegroundColor DarkGray
 Write-Host "  Installs to: $InstallDir" -ForegroundColor DarkGray
 
+# Two kinds of install. An APP install ships SocketTrader.exe (built by
+# build.ps1 / the release workflow) with everything inside it — no Python
+# on the target machine. A SCRIPT install is the classic one: the .py
+# files plus a Python the installer finds or fetches. The exe is used
+# whenever one sits next to this script (a release zip, or a checkout
+# that has been built).
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$exeSrc = $null
+foreach ($cand in @((Join-Path $here 'SocketTrader.exe'),
+                    (Join-Path $here 'dist\SocketTrader\SocketTrader.exe'))) {
+    if (Test-Path $cand) { $exeSrc = Split-Path -Parent $cand; break }
+}
+$appMode = [bool]$exeSrc -and -not $FromGitHub
+if ($appMode) { Write-Host "  Mode: app (SocketTrader.exe from $exeSrc)" -ForegroundColor DarkGray }
+else          { Write-Host "  Mode: script (Python + SocketTrader.py)" -ForegroundColor DarkGray }
+
 # ---- 1. Python -----------------------------------------------------------
 Write-Step 1 'Checking for Python 3.10 or newer'
-$py = Get-PythonCommand
-if ($py) {
+$py = $null
+if ($appMode) {
+    Write-Ok 'Not needed - the app bundles its own runtime'
+} elseif ($py = Get-PythonCommand) {
     Write-Ok "Python $($py.Version) found"
 } else {
     Write-Info 'Not found - installing via winget (this can take a few minutes)'
@@ -129,11 +147,36 @@ function Get-LocalVersion { param($dir)
     $m = Select-String -Path $f -Pattern '^__version__\s*=\s*"([^"]+)"' | Select-Object -First 1
     if ($m) { return $m.Matches[0].Groups[1].Value } else { return $null }
 }
-$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+function Get-ExeVersion { param($exe)
+    try { $v = (Get-Item $exe).VersionInfo.ProductVersion; if ($v) { return ($v -split '[+ ]')[0] } } catch {}
+    return $null
+}
 $localSrc = if (-not $FromGitHub -and (Test-Path (Join-Path $here 'SocketTrader.py'))) { $here } else { $null }
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 $installedBefore = Get-LocalVersion $InstallDir
-if ($localSrc -and ((Resolve-Path $localSrc).Path -eq (Resolve-Path $InstallDir).Path)) {
+if (-not $installedBefore -and (Test-Path (Join-Path $InstallDir 'SocketTrader.exe'))) {
+    $installedBefore = Get-ExeVersion (Join-Path $InstallDir 'SocketTrader.exe')
+}
+if ($appMode) {
+    Write-Step 2 'Installing SocketTrader.exe'
+    $newVer = Get-ExeVersion (Join-Path $exeSrc 'SocketTrader.exe')
+    Write-Info "$exeSrc  (v$newVer)"
+    if ($installedBefore) { Write-Info "replacing installed v$installedBefore" }
+    # A previous script install leaves .py files behind; an app install
+    # must not keep both, or the shortcut and the uninstaller disagree.
+    Get-ChildItem $InstallDir -Force | Where-Object { $_.Name -ne 'SocketTrader.cmd' } |
+        ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    Copy-Item (Join-Path $exeSrc '*') $InstallDir -Recurse -Force
+    # The repo's extras that are useful next to the exe (docs, templates,
+    # the AddOn source) when installing from a built checkout.
+    foreach ($extra in @('README.md', 'PROP_RULES.md', 'LICENSE', 'strategy', 'addon', 'images')) {
+        $src = Join-Path $here $extra
+        if ((Test-Path $src) -and -not (Test-Path (Join-Path $InstallDir $extra))) {
+            Copy-Item $src (Join-Path $InstallDir $extra) -Recurse -Force
+        }
+    }
+    Write-Ok "Installed SocketTrader.exe v$newVer to $InstallDir"
+} elseif ($localSrc -and ((Resolve-Path $localSrc).Path -eq (Resolve-Path $InstallDir).Path)) {
     Write-Step 2 'SocketTrader files'
     Write-Ok "Running from the install folder itself (v$installedBefore) - files left as they are"
 } elseif ($localSrc) {
@@ -166,18 +209,27 @@ if ($localSrc -and ((Resolve-Path $localSrc).Path -eq (Resolve-Path $InstallDir)
 
 # ---- 3. Dependencies -----------------------------------------------------
 Write-Step 3 'Installing Python packages'
-$reqs = Join-Path $InstallDir 'requirements.txt'
-& $py.Exe @($py.Prefix) -m pip install --upgrade pip --quiet
-& $py.Exe @($py.Prefix) -m pip install -r $reqs --quiet
-if ($LASTEXITCODE -ne 0) { throw 'pip install failed.' }
-Write-Ok 'Dependencies installed'
+if ($appMode) {
+    Write-Ok 'Not needed - bundled in SocketTrader.exe'
+    # Prove the exe starts at all before calling it installed.
+    $exePath = Join-Path $InstallDir 'SocketTrader.exe'
+    $appVer = & $exePath --version 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "SocketTrader.exe failed its start check: $appVer" }
+    Write-Ok "SocketTrader.exe reports $appVer"
+} else {
+    $reqs = Join-Path $InstallDir 'requirements.txt'
+    & $py.Exe @($py.Prefix) -m pip install --upgrade pip --quiet
+    & $py.Exe @($py.Prefix) -m pip install -r $reqs --quiet
+    if ($LASTEXITCODE -ne 0) { throw 'pip install failed.' }
+    Write-Ok 'Dependencies installed'
 
-# Prove the app actually starts with THIS interpreter before calling it
-# installed — a broken dependency or a stub Python surfaces here, at
-# install time, instead of at the user's first launch. Same check CI runs.
-$appVer = & $py.Exe @($py.Prefix) -c "import sys; sys.path.insert(0, r'$InstallDir'); import SocketTrader; print(SocketTrader.__version__)" 2>&1
-if ($LASTEXITCODE -ne 0) { throw "SocketTrader failed its import check: $appVer" }
-Write-Ok "SocketTrader v$appVer imports cleanly"
+    # Prove the app actually starts with THIS interpreter before calling it
+    # installed — a broken dependency or a stub Python surfaces here, at
+    # install time, instead of at the user's first launch. Same check CI runs.
+    $appVer = & $py.Exe @($py.Prefix) -c "import sys; sys.path.insert(0, r'$InstallDir'); import SocketTrader; print(SocketTrader.__version__)" 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "SocketTrader failed its import check: $appVer" }
+    Write-Ok "SocketTrader v$appVer imports cleanly"
+}
 
 # ---- 4. ATM strategy templates ------------------------------------------
 Write-Step 4 'Installing ATM strategy templates into NinjaTrader'
@@ -221,13 +273,18 @@ if (-not $ntRoot) {
 
 # ---- 5. Shortcuts --------------------------------------------------------
 Write-Step 5 'Creating shortcuts'
-$launcher = Join-Path $InstallDir 'SocketTrader.cmd'
+if ($appMode) {
+    $launcher = Join-Path $InstallDir 'SocketTrader.exe'
+    Remove-Item (Join-Path $InstallDir 'SocketTrader.cmd') -Force -ErrorAction SilentlyContinue
+} else {
+    $launcher = Join-Path $InstallDir 'SocketTrader.cmd'
 @"
 @echo off
 cd /d "%~dp0"
 $($py.Exe) $($py.Prefix -join ' ') SocketTrader.py
 pause
 "@ | Set-Content -Path $launcher -Encoding ASCII
+}
 
 # Windows identifies a running app by its AppUserModelID. A shortcut that
 # carries one is how a script-based app gets treated like a real one: the
@@ -284,7 +341,8 @@ foreach ($dir in @([Environment]::GetFolderPath('Desktop'),
     $lnk.Description = 'SocketTrader - NinjaTrader signal gateway'
     # The shortcut's icon is also what the console window and taskbar show
     # when the app is launched through it.
-    if (Test-Path $ico) { $lnk.IconLocation = "$ico,0" }
+    if ($appMode) { $lnk.IconLocation = "$launcher,0" }          # the exe carries the icon
+    elseif (Test-Path $ico) { $lnk.IconLocation = "$ico,0" }
     $lnk.Save()
     if ($appIdReady) {
         try { [STInstall.AppId]::Set($path, $AppId) }
@@ -312,14 +370,14 @@ echo Done.
 pause
 "@ | Set-Content -Path $uninst -Encoding ASCII
 try {
-    $ver = Get-LocalVersion $InstallDir
+    $ver = if ($appMode) { Get-ExeVersion (Join-Path $InstallDir 'SocketTrader.exe') } else { Get-LocalVersion $InstallDir }
     $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\SocketTrader'
     New-Item -Path $key -Force | Out-Null
     Set-ItemProperty -Path $key -Name DisplayName -Value 'SocketTrader'
     Set-ItemProperty -Path $key -Name DisplayVersion -Value ($(if ($ver) { $ver } else { '0' }))
     Set-ItemProperty -Path $key -Name Publisher -Value 'VoidOrigin'
     Set-ItemProperty -Path $key -Name InstallLocation -Value $InstallDir
-    Set-ItemProperty -Path $key -Name DisplayIcon -Value "$ico,0"
+    Set-ItemProperty -Path $key -Name DisplayIcon -Value ($(if ($appMode) { "$launcher,0" } else { "$ico,0" }))
     Set-ItemProperty -Path $key -Name UninstallString -Value "`"$uninst`""
     Set-ItemProperty -Path $key -Name NoModify -Value 1 -Type DWord
     Set-ItemProperty -Path $key -Name NoRepair -Value 1 -Type DWord
@@ -350,6 +408,7 @@ if ($atiOpen) {
 
 Write-Host ""
 Write-Host "  Done. Launch SocketTrader from the desktop shortcut." -ForegroundColor Green
+if ($appMode) { Write-Host "  Installed as an app: no Python needed on this machine." -ForegroundColor DarkGray }
 Write-Host "  First run asks for your server, token and account - nothing else." -ForegroundColor DarkGray
 Write-Host "  Re-run this installer any time to update: your config and any" -ForegroundColor DarkGray
 Write-Host "  templates you have edited are left untouched." -ForegroundColor DarkGray

@@ -2,6 +2,14 @@ from __future__ import annotations
 
 import sys
 
+__version__ = "0.23.0"
+
+# `SocketTrader.exe --version` / `python SocketTrader.py --version`: answered
+# before any import so installers and build checks get it in milliseconds.
+if len(sys.argv) == 2 and sys.argv[1] in ("--version", "-V"):
+    print(f"SocketTrader {__version__}")
+    raise SystemExit(0)
+
 # ---------- Window-close effect helper (Windows) ----------
 # `python SocketTrader.py --fx-overlay <frame> <x> <y> <w> <h>` is the
 # detached helper the trading process spawns when its console window is
@@ -211,8 +219,6 @@ try:
     import anthropic
 except ImportError:
     anthropic = None
-
-__version__ = "0.23.0"
 
 IS_WINDOWS = platform.system() == "Windows"
 
@@ -7589,12 +7595,18 @@ def _fx_spawn_overlay() -> None:
         w, h = int(sw * 0.6), int(sh * 0.6)
         x, y = (sw - w) // 2, (sh - h) // 2
     exe = Path(sys.executable)
-    pythonw = exe.with_name("pythonw.exe")
-    cmd = [str(pythonw if pythonw.exists() else exe), str(Path(__file__).resolve()), "--fx-overlay",
-           str(path), str(x), str(y), str(w), str(h)]
+    args = ["--fx-overlay", str(path), str(x), str(y), str(w), str(h)]
     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    if not pythonw.exists():
+    if FROZEN:
+        # SocketTrader.exe re-launches itself; it is a console build, so
+        # the helper must be told not to open a console of its own.
+        cmd = [str(exe)] + args
         flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        pythonw = exe.with_name("pythonw.exe")
+        cmd = [str(pythonw if pythonw.exists() else exe), str(Path(__file__).resolve())] + args
+        if not pythonw.exists():
+            flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.Popen(cmd, creationflags=flags, close_fds=True,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -11844,7 +11856,11 @@ async def listen(token: str):
 
 # ---------- Setup (runs before async loop) ----------
 # ---------- Strategy template installer ----------
-SCRIPT_DIR = Path(__file__).resolve().parent
+# Where the bundled resources live (strategy templates, the AddOn source,
+# the icon): next to this file when run as a script, inside the frozen
+# bundle when built into SocketTrader.exe (PyInstaller sets _MEIPASS).
+FROZEN = bool(getattr(sys, "frozen", False))
+SCRIPT_DIR = Path(getattr(sys, "_MEIPASS", "") or Path(__file__).resolve().parent)
 STRATEGY_FILES = {
     "AtmStrategy": "NQ_Med.xml",
     "StopStrategy": "algoNQmed.xml",

@@ -751,6 +751,14 @@ Each signal displays delivery time from server to client. The first signal on ea
 
 ---
 
+## Installing as an app (no Python on the trading machine)
+
+`build.bat` turns the program into **`SocketTrader.exe`** — a self-contained Windows app with the icon and version embedded, its own Python runtime, time-zone data and the bundled templates inside. Build once (needs Python 3.10+ on the building machine only), then `install.bat` from the same folder installs the exe: Desktop and Start Menu shortcuts with the icon, an entry in Settings → Apps with an Uninstall button, the taskbar grouping and pinning it as SocketTrader. Hand the `dist\SocketTrader` folder (zipped) to another machine and run its `install.bat` there — nothing else to install.
+
+Tagging a commit `vX.Y.Z` makes the release workflow build the same exe on a clean Windows runner, run the full test suite first, and attach `SocketTrader-X.Y.Z-windows-x64.zip` (with its SHA-256) to a GitHub release.
+
+The script install (`install.bat` from a checkout without a build) keeps working exactly as before.
+
 ## Where your data lives
 
 Everything durable — the config (server, token, accounts, risk limits, profiles, session baseline), the P&L calendar archive (`.voidorigin_pnl/`), the signal log and the default profile-export location — lives in **one data home**, and it is the **same folder whether you start SocketTrader from Windows Python or from WSL**:
