@@ -40,6 +40,13 @@ machine or by the test suite (1083 tests) unless marked otherwise.
 - The "signal skipped" alert named the first three skipped legs and left out
   accounts held by a stop/target lock. It now lists every account grouped by
   reason, plus `locked: …`, and the log line carries the lock map.
+- **A refused save no longer erases another writer's changes.** While the
+  disk refused this app's saves, a config edit made meanwhile by something
+  the instance lock does not cover (an older build, the other OS with the
+  lock overridden, an edit by hand) was replaced wholesale by this app's
+  memory on the next successful write. The pending save now merges: the
+  file is the base, this app's changed keys go over it, and the log names
+  both sides (`CONFIG … merged: this app's [...] over the file's [...]`).
 - A scoped rule whose Entries is INHERIT on an ENTRIES OFF profile never
   enters, yet a strategy listed in it looked enabled. It is now flagged in
   the profile summary ("⚠ 1 never enters"), in both rule editors (with a

@@ -10569,6 +10569,8 @@ def fresh_cfg_cache():
     st._cfg_disk_fail_count = 0
     st._cfg_last_save_failed = False
     st._cfg_writing = False
+    st._cfg_disk_snapshot = None
+    st._cfg_overwrite_warned = None
     yield
     st._cfg_cache = None
     st._cfg_cache_path = ""
@@ -11425,3 +11427,98 @@ class TestImportFromProfileHistory:
     def test_whole_config_still_refused_without_an_account(self):
         raw, err = st.parse_profile_import({"account_profiles": {"A": {"default": {}}}})
         assert raw is None and "whole config file" in err
+
+
+class TestExternalEditMerge:
+    """A save refused by the disk must not later erase what another writer
+    put in the file meanwhile (an older build without the instance lock,
+    the other OS with the lock overridden, an edit by hand)."""
+
+    @staticmethod
+    def _refuse(*a, **k):
+        raise PermissionError(13, "Access is denied", "x.tmp")
+
+    def _external_write(self, tmp_config, cfg):
+        time.sleep(0.01)                     # a new mtime, whatever the filesystem's resolution
+        tmp_config.write_text(json.dumps(cfg), encoding="utf-8")
+
+    def test_pending_save_merges_over_the_other_writers_changes(self, tmp_config, fresh_cfg_cache,
+                                                                monkeypatch, caplog):
+        st.save_config({"account": "SimAI", "account_limits": {"Sim101": {"target": 600}},
+                        "account_profiles": {"Sim84651238": {"default": {"enabled": False}}}})
+        real = st._write_atomic
+        monkeypatch.setattr(st, "_write_atomic", self._refuse)
+        cfg = st.load_config()
+        cfg["account_limits"]["Sim101"] = {"target": 1000}          # this app's change
+        assert st.save_config(cfg) is False
+        # Meanwhile the other writer saved newer profiles.
+        on_disk = json.loads(tmp_config.read_text())
+        on_disk["account_profiles"] = {"Sim84651238": {"default": {"enabled": True}}}
+        on_disk["strategies_seen"] = ["Bhorgini"]
+        self._external_write(tmp_config, on_disk)
+        monkeypatch.setattr(st, "_write_atomic", real)
+        with caplog.at_level(logging.WARNING):
+            assert st.config_flush_pending() is True
+        final = json.loads(tmp_config.read_text())
+        assert final["account_limits"]["Sim101"] == {"target": 1000}            # ours kept
+        assert final["account_profiles"]["Sim84651238"]["default"]["enabled"] is True   # theirs kept
+        assert final["strategies_seen"] == ["Bhorgini"]
+        assert st.load_config() == final                                        # memory follows
+        text = "\n".join(r.message for r in caplog.records)
+        assert "merged" in text and "account_limits" in text and "account_profiles" in text
+
+    def test_a_key_both_sides_changed_goes_to_this_app(self, tmp_config, fresh_cfg_cache,
+                                                        monkeypatch, caplog):
+        st.save_config({"account_profiles": {"A": {"default": {"enabled": False}}}, "x": 1})
+        real = st._write_atomic
+        monkeypatch.setattr(st, "_write_atomic", self._refuse)
+        cfg = st.load_config()
+        cfg["account_profiles"] = {"A": {"default": {"enabled": True}}}
+        assert st.save_config(cfg) is False
+        self._external_write(tmp_config, {"account_profiles": {"B": {"prop": True}}, "x": 2})
+        monkeypatch.setattr(st, "_write_atomic", real)
+        with caplog.at_level(logging.WARNING):
+            assert st.config_flush_pending() is True
+        final = json.loads(tmp_config.read_text())
+        assert final["account_profiles"] == {"A": {"default": {"enabled": True}}}
+        assert final["x"] == 2
+        assert "both changed ['account_profiles']" in "\n".join(r.message for r in caplog.records)
+
+    def test_a_key_this_app_removed_stays_removed(self, tmp_config, fresh_cfg_cache, monkeypatch):
+        st.save_config({"a": 1, "b": 2})
+        real = st._write_atomic
+        monkeypatch.setattr(st, "_write_atomic", self._refuse)
+        cfg = st.load_config()
+        del cfg["b"]
+        assert st.save_config(cfg) is False
+        self._external_write(tmp_config, {"a": 1, "b": 2, "c": 3})
+        monkeypatch.setattr(st, "_write_atomic", real)
+        assert st.config_flush_pending() is True
+        assert json.loads(tmp_config.read_text()) == {"a": 1, "c": 3}
+
+    def test_unparseable_external_edit_falls_back_to_this_apps_state(self, tmp_config,
+                                                                      fresh_cfg_cache, monkeypatch,
+                                                                      caplog):
+        st.save_config({"a": 1})
+        real = st._write_atomic
+        monkeypatch.setattr(st, "_write_atomic", self._refuse)
+        assert st.save_config({"a": 2}) is False
+        time.sleep(0.01)
+        tmp_config.write_text("{garbage", encoding="utf-8")
+        monkeypatch.setattr(st, "_write_atomic", real)
+        with caplog.at_level(logging.WARNING):
+            assert st.config_flush_pending() is True
+        assert json.loads(tmp_config.read_text()) == {"a": 2}
+        assert "cannot be read" in "\n".join(r.message for r in caplog.records)
+
+    def test_no_external_change_means_no_merge_and_no_warning(self, tmp_config, fresh_cfg_cache,
+                                                              monkeypatch, caplog):
+        st.save_config({"a": 1})
+        real = st._write_atomic
+        monkeypatch.setattr(st, "_write_atomic", self._refuse)
+        assert st.save_config({"a": 2, "b": 1}) is False
+        monkeypatch.setattr(st, "_write_atomic", real)
+        with caplog.at_level(logging.WARNING):
+            assert st.config_flush_pending() is True
+        assert json.loads(tmp_config.read_text()) == {"a": 2, "b": 1}
+        assert "changed by something else" not in "\n".join(r.message for r in caplog.records)

@@ -1165,6 +1165,7 @@ _cfg_unreadable = False               # a file exists that could not be parsed, 
 _cfg_last_error = ""                  # last save failure, for the UI
 _cfg_read_error = ""                  # last read failure logged (polls must not spam the log)
 _cfg_overwrite_warned: tuple | None = None   # the external edit already warned about (retry runs every 2 s)
+_cfg_disk_snapshot: dict | None = None  # the config as the DISK last had it (last good read or write): the base a pending save is diffed against
 _cfg_last_save_failed = False         # the most recent save_config did not reach disk (any reason)
 _cfg_writing = False                  # a rename is in flight: readers must not re-read the file mid-swap
 _cfg_unreadable_next_try = 0.0        # monotonic: re-parse an unreadable file at most every 2 s
@@ -1205,7 +1206,7 @@ def load_config() -> dict:
     last good copy is served instead, and if there is none, saves are
     refused until a read succeeds (see save_config)."""
     global _cfg_cache, _cfg_cache_path, _cfg_cache_stat, _cfg_unreadable, _cfg_read_error
-    global _cfg_unreadable_next_try
+    global _cfg_unreadable_next_try, _cfg_disk_snapshot
     with _cfg_lock:
         path = str(CONFIG_FILE)
         current = _cfg_stat()
@@ -1217,6 +1218,7 @@ def load_config() -> dict:
                 return json.loads(json.dumps(_cfg_cache))
         if current is None:                       # no file
             _cfg_cache, _cfg_cache_path, _cfg_cache_stat = {}, path, None
+            _cfg_disk_snapshot = {}
             _cfg_unreadable = False
             return {}
         if _cfg_unreadable and _cfg_cache_path == path and time.monotonic() < _cfg_unreadable_next_try:
@@ -1249,6 +1251,7 @@ def load_config() -> dict:
         _cfg_unreadable = False
         _cfg_cache = _sanitize_cfg(cfg)
         _cfg_cache_path, _cfg_cache_stat = path, current
+        _cfg_disk_snapshot = json.loads(json.dumps(_cfg_cache))
         return json.loads(json.dumps(_cfg_cache))
 
 
@@ -1369,6 +1372,53 @@ def save_config(cfg: dict) -> bool:
     return _cfg_write_latest()
 
 
+def _cfg_merge_external(path: Path, now_stat: tuple) -> None:
+    """Fold an external edit of the config file into the pending in-memory
+    state before that state is written (caller holds both config locks).
+
+    Base = the file as it is now. Over it go the top-level keys THIS app
+    changed since the disk and the cache last agreed (_cfg_disk_snapshot):
+    set keys are set, keys this app removed are removed. Everything else
+    is taken from the file. The file not parsing falls back to the old
+    behaviour (this app's state replaces it), said once per edit."""
+    global _cfg_cache, _cfg_overwrite_warned
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            disk = json.load(f)
+        if not isinstance(disk, dict):
+            raise ValueError("config root is not a JSON object")
+    except (OSError, ValueError) as exc:
+        if now_stat != _cfg_overwrite_warned:
+            logger.warning(f"CONFIG  {path} was changed by something else while saves were "
+                           f"refused and cannot be read ({exc}) — replacing it with this "
+                           "app's state")
+            _cfg_overwrite_warned = now_stat
+        return
+    disk = _sanitize_cfg(disk)
+    base = _cfg_disk_snapshot if isinstance(_cfg_disk_snapshot, dict) else {}
+    cache = _cfg_cache if isinstance(_cfg_cache, dict) else {}
+    missing = object()
+    ours = [k for k in set(cache) | set(base) if cache.get(k, missing) != base.get(k, missing)]
+    merged = json.loads(json.dumps(disk))
+    kept_theirs = [k for k in disk if k not in ours and disk.get(k) != cache.get(k, missing)]
+    conflicts = []
+    for k in ours:
+        if k in disk and disk[k] != base.get(k, missing) and disk[k] != cache.get(k, missing):
+            conflicts.append(k)
+        if k in cache:
+            merged[k] = json.loads(json.dumps(cache[k]))
+        else:
+            merged.pop(k, None)
+    _cfg_cache = merged
+    if now_stat != _cfg_overwrite_warned:
+        logger.warning(
+            f"CONFIG  {path} was changed by something else while saves were refused — "
+            f"merged: this app's {sorted(ours) or 'nothing'} over the file's "
+            f"{sorted(kept_theirs) or 'nothing'}"
+            + (f"; both changed {sorted(conflicts)} — this app's version kept" if conflicts else ""))
+        _cfg_overwrite_warned = now_stat
+
+
 def _cfg_write_latest() -> bool:
     """Put the newest in-memory config on disk. True when the disk holds it.
 
@@ -1379,7 +1429,7 @@ def _cfg_write_latest() -> bool:
     another never puts an older copy on disk over a newer one."""
     global _cfg_cache_stat, _cfg_unsaved, _cfg_unreadable, _cfg_last_error
     global _cfg_disk_fail_count, _cfg_written_gen, _cfg_overwrite_warned
-    global _cfg_last_save_failed, _cfg_writing
+    global _cfg_last_save_failed, _cfg_writing, _cfg_cache, _cfg_disk_snapshot
     with _cfg_write_lock:
         with _cfg_lock:
             if _cfg_cache is None:
@@ -1387,18 +1437,23 @@ def _cfg_write_latest() -> bool:
             if _cfg_gen == _cfg_written_gen and not _cfg_unsaved:
                 return True                      # already on disk
             gen, path = _cfg_gen, Path(_cfg_cache_path)
-            payload = json.dumps(_cfg_cache, indent=2)
             _cfg_writing = True
             now_stat = _cfg_stat()
-            if (_cfg_unsaved and _cfg_cache_stat is not None and now_stat != _cfg_cache_stat
-                    and now_stat != _cfg_overwrite_warned):
-                # The file changed under us while saves were being refused
-                # (the other OS, or an edit by hand). The in-memory state
-                # is what the operator set in THIS app, so it wins — but
-                # say so once per such edit, because it is about to be replaced.
-                logger.warning(f"CONFIG  {path} was changed by something else while "
-                               "saves were refused — overwriting it with this app's state")
-                _cfg_overwrite_warned = now_stat
+            if (_cfg_unsaved and now_stat is not None and now_stat != _cfg_cache_stat
+                    and str(CONFIG_FILE) == str(path)):
+                # The file changed under us while saves were being refused:
+                # another writer this process's lock does not cover (an
+                # older build, the other OS with the lock overridden, an
+                # edit by hand). Writing our whole cache over it would throw
+                # that writer's changes away — the 2026-10-29 failure mode,
+                # where the profiles a week of trading ran on existed in
+                # one process's memory only. So: take the disk as the base
+                # and lay THIS app's pending changes over it, key by key;
+                # a key both sides changed goes to this app (the operator
+                # set it here, and it is the state the UI shows).
+                _cfg_merge_external(path, now_stat)
+            payload = json.dumps(_cfg_cache, indent=2)
+            written = json.loads(payload)
         try:
             _write_atomic(path, payload, ".voidorigin_")
         except OSError as exc:
@@ -1417,6 +1472,7 @@ def _cfg_write_latest() -> bool:
             _cfg_written_gen = gen
             if str(CONFIG_FILE) == str(path):
                 _cfg_cache_stat = _cfg_stat()
+                _cfg_disk_snapshot = written
             _cfg_writing = False
             recovered = _cfg_unsaved
             if recovered:
