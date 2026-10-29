@@ -1528,7 +1528,9 @@ _WSL_MNT_RE = re.compile(r"^(?:/mnt)?/([a-zA-Z])(?:/(.*))?$")   # /mnt/c/… or 
 def _wsl_mount_root() -> str:
     """Where WSL mounts Windows drives — "/mnt" unless the data home says
     otherwise (a custom automount root shows up in its own path)."""
-    m = re.match(r"^(.*)/[a-zA-Z]/Users/", str(DATA_HOME))
+    # as_posix-style: a WindowsPath (the test suite on windows-latest
+    # exercises the WSL branch there) stringifies with backslashes.
+    m = re.match(r"^(.*)/[a-zA-Z]/Users/", str(DATA_HOME).replace("\\", "/"))
     return m.group(1) if m else "/mnt"
 
 
@@ -2483,14 +2485,21 @@ def _parse_prop_hhmm(raw) -> tuple[int, int] | None:
 
 
 def _prop_preset(account: str) -> tuple[tuple[int, int], tuple[int, int]]:
-    firm = str(account_profiles.get(account, {}).get("prop_firm", "")).strip().lower()
+    return _prop_preset_for(account_profiles.get(account, {}))
+
+
+def _prop_preset_for(prof: dict) -> tuple[tuple[int, int], tuple[int, int]]:
+    firm = str((prof or {}).get("prop_firm", "")).strip().lower()
     return PROP_FIRM_PRESETS.get(firm, (PROP_FLAT_ET_DEFAULT, PROP_CUTOFF_ET_DEFAULT))
 
 
 def prop_flat_time(account: str) -> tuple[int, int]:
     """ET (hour, minute) this prop account is force-flattened at."""
-    return (_parse_prop_hhmm(account_profiles.get(account, {}).get("prop_flat_et"))
-            or _prop_preset(account)[0])
+    return _prop_flat_time_for(account_profiles.get(account, {}))
+
+
+def _prop_flat_time_for(prof: dict) -> tuple[int, int]:
+    return _parse_prop_hhmm((prof or {}).get("prop_flat_et")) or _prop_preset_for(prof)[0]
 
 
 def prop_cutoff_time(account: str) -> tuple[int, int]:
@@ -2625,13 +2634,19 @@ def inert_rules(account: str) -> list[int]:
 
 def profile_summary(account: str) -> str:
     """One-line profile description for menus/status."""
-    prof = account_profiles.get(account)
+    return describe_profile(account_profiles.get(account))
+
+
+def describe_profile(prof: dict | None) -> str:
+    """profile_summary for a profile dict that need not be installed — an
+    import preview describes the file's profile with the same words the
+    account list uses for the live one."""
     if not prof:
         return "default"
     base = {**DEFAULT_RULE, **prof.get("default", {})}
     bits: list[str] = []
     if prof.get("prop"):
-        fh, fm = prop_flat_time(account)
+        fh, fm = _prop_flat_time_for(prof)
         firm = prof.get("prop_firm", "")
         bits.append(f"PROP{f' {firm}' if firm else ''} flat {fh:02d}:{fm:02d}")
     elif prof.get("close_before_open"):
@@ -2660,11 +2675,44 @@ def profile_summary(account: str) -> str:
     n_rules = len(prof.get("rules", []))
     if n_rules:
         bits.append(f"{n_rules} scoped rule{'s' if n_rules > 1 else ''}")
-        inert = inert_rules(account)
+        inert = [i for i, r in enumerate(prof.get("rules", []), 1) if rule_never_enters(prof, r)]
         if inert:
             bits.append(f"⚠ {len(inert)} never enter{'s' if len(inert) == 1 else ''} "
                         "(Entries inherit OFF)")
     return " · ".join(bits) or "default"
+
+
+def profile_import_preview(account: str, data) -> tuple[dict | None, str]:
+    """What an import WOULD do, without doing it: the account's current
+    setup, the file's, where and when the file came from, and the scoped
+    strategies it carries. Shown in the confirm so a weeks-old export is
+    recognisable before it replaces a live profile (2026-10-29 08:26: an
+    entries-ON account was replaced by its Oct 16–23 export and sat out
+    every signal for the rest of the session)."""
+    account = (account or "").strip()
+    if not account:
+        return None, "account required"
+    raw_profile, err = parse_profile_import(data, account)
+    if err:
+        return None, err
+    cleaned = load_account_profiles({"account_profiles": {account: raw_profile}}).get(account)
+    if not cleaned:
+        return None, "nothing usable in that profile — every setting was empty or unrecognized"
+    strategies: list[str] = []
+    for r in cleaned.get("rules", []):
+        for name in r.get("strategies") or []:
+            if name not in strategies:
+                strategies.append(name)
+    meta = data if isinstance(data, dict) else {}
+    return {
+        "account": account,
+        "current": profile_summary(account) if account_profiles.get(account) else "no profile (plain copy of the leader)",
+        "incoming": describe_profile(cleaned),
+        "incoming_strategies": strategies,
+        "exported_from": str(meta.get("exported_from") or "") or None,
+        "exported_at": str(meta.get("exported_at") or meta.get("saved") or "") or None,
+        "app_version": str(meta.get("app_version") or "") or None,
+    }, ""
 
 
 def _flip_action(action: str) -> str:
@@ -8742,6 +8790,24 @@ async def _import_profile_prompt(account: str):
             print(Fore.RED + f"  ✖  {path.name} is not valid JSON: {exc}" + Style.RESET_ALL)
             return
         label = path.name
+    info, err = profile_import_preview(account, data)
+    if err:
+        print(Fore.YELLOW + f"  ⚠  {err}" + Style.RESET_ALL)
+        return
+    origin = ""
+    if raw not in sources:
+        bits = ([f"exported from {info['exported_from']}"] if info.get("exported_from") else [])
+        if info.get("exported_at"):
+            bits.append(f"on {info['exported_at']}")
+        if info.get("app_version"):
+            bits.append(f"(v{info['app_version']})")
+        origin = " ".join(bits) or "origin unknown"
+    print(Fore.CYAN + f"  NOW:  {info['current']}" + Style.RESET_ALL)
+    print(Fore.CYAN + f"  FILE: {info['incoming']}" + Style.RESET_ALL)
+    if info.get("incoming_strategies"):
+        print(Fore.CYAN + f"        strategies: {', '.join(info['incoming_strategies'])}" + Style.RESET_ALL)
+    if origin:
+        print(Fore.CYAN + f"        {origin}" + Style.RESET_ALL)
     if account_profiles.get(account):
         confirm = (await _ask_line(
             f"Replace {account}'s current profile with {label}? [y/N]")).lower()
@@ -12929,8 +12995,11 @@ def _web_export_profile(account) -> tuple[bool, object]:
     return True, doc
 
 
-async def _web_import_profile(account, data) -> tuple[bool, str]:
+async def _web_import_profile(account, data, preview: bool = False) -> tuple[bool, object]:
     """Replace one account's profile with an exported profile document.
+
+    `preview=True` changes nothing and answers with profile_import_preview
+    (current vs. incoming), which the page puts in its confirm.
 
     Like every profile payload arriving over HTTP the document is stripped
     of AI gates first (see _strip_ai_config). The account's previous
@@ -12945,6 +13014,9 @@ async def _web_import_profile(account, data) -> tuple[bool, str]:
         return False, "account required"
     if not isinstance(data, dict):
         return False, "profile document must be a JSON object"
+    if preview:
+        info, err = profile_import_preview(acct, _strip_ai_config(data))
+        return (True, info) if info else (False, err)
     dropped = _has_ai_config(data)
     ok, msg = import_profile(acct, _strip_ai_config(data), source="the imported file")
     if ok:
@@ -15280,7 +15352,10 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
                                                      data.get("only")))
             elif path == "/api/profile_import":
                 ok, msg = _web_run(_web_import_profile(
-                    data.get("account"), data.get("data")))
+                    data.get("account"), data.get("data"), bool(data.get("preview"))))
+                if ok and isinstance(msg, dict):
+                    self._json({"ok": True, "preview": msg})
+                    return
             elif path == "/api/profile_copy":
                 ok, msg = _web_run(_web_copy_profile(
                     data.get("account"), data.get("source")))
@@ -16584,7 +16659,22 @@ function accountModal(a){
       let doc;
       try{doc=JSON.parse(await f.text())}
       catch(e){toast(f.name+" is not valid JSON","bad");return}
-      if(hasProf&&!confirm("Replace "+a.name+"'s profile with "+f.name+"?"))return;
+      /* Preview first: the file's setup next to the live one, with where
+         and when it was exported, so an old export is recognised before
+         it replaces a live profile. */
+      let pv=null;
+      try{const r=await fetch("/api/profile_import",{method:"POST",headers:{
+          "Content-Type":"application/json","X-ST-Token":TOKEN},
+          body:JSON.stringify({account:a.name,data:doc,preview:true})});
+        const j=await r.json();
+        if(!j||!j.ok||!j.preview){toast((j&&j.message)||"could not read that profile","bad");return}
+        pv=j.preview}catch(e){toast("preview failed: "+e,"bad");return}
+      const origin=(pv.exported_from?"exported from "+pv.exported_from:"origin unknown")+
+        (pv.exported_at?" on "+pv.exported_at:"")+(pv.app_version?" (v"+pv.app_version+")":"");
+      const strats=(pv.incoming_strategies||[]).length
+        ?"\nStrategies in its rules: "+pv.incoming_strategies.join(", "):"";
+      if(!confirm("Replace "+a.name+"'s profile with "+f.name+"?\n\n"+
+        "NOW:  "+pv.current+"\nFILE: "+pv.incoming+strats+"\n("+origin+")"))return;
       api("/api/profile_import",{account:a.name,data:doc},"import profile")
         .then(j=>{if(j.ok)closeModal()})};
     xrow.appendChild(btn("IMPORT FILE","sm",()=>fi.click()));

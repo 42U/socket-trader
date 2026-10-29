@@ -52,6 +52,12 @@ machine or by the test suite (1083 tests) unless marked otherwise.
   the profile summary ("⚠ 1 never enters"), in both rule editors (with a
   confirm on save in the web UI), and in the log digest.
 
+- **Profile import shows what it is about to do.** A weeks-old export file
+  replaced a live entries-ON profile behind a generic "Replace?" prompt
+  (2026-10-29 08:26; the account then sat out every signal of the session).
+  The web and terminal confirms now show the account's current setup, the
+  file's setup, its scoped strategies, and where/when the file was exported.
+
 ### Added (operability, after the 2026-10-29 stale-profile restart)
 - `PROFILE DIGEST` log lines whenever profiles are loaded or saved: per
   account, what it will do and every scoped rule with its scope — a restart

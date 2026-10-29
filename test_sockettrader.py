@@ -11522,3 +11522,70 @@ class TestExternalEditMerge:
             assert st.config_flush_pending() is True
         assert json.loads(tmp_config.read_text()) == {"a": 2, "b": 1}
         assert "changed by something else" not in "\n".join(r.message for r in caplog.records)
+
+
+class TestProfileImportPreview(_WebClient):
+    """2026-10-29 08:26: a weeks-old export replaced a live entries-ON profile
+    behind a generic "Replace?" prompt. The confirm now shows both sides."""
+
+    OLD_EXPORT = {"sockettrader_profile": 1, "app_version": "0.21.0",
+                  "exported_from": "Sim84651238", "exported_at": "2026-10-18T14:02:11Z",
+                  "profile": {"default": {"enabled": False, "size": "micros", "qty_mode": "fixed",
+                                          "qty_value": 2},
+                              "rules": [{"strategies": ["SI-Squeeze"], "direction": "normal"},
+                                        {"strategies": ["NQ-XRetest"], "enabled": True}]}}
+
+    def test_preview_describes_both_sides_and_the_files_origin(self):
+        st.account_profiles["Sim84651238"] = {"default": {"enabled": True}}
+        info, err = st.profile_import_preview("Sim84651238", self.OLD_EXPORT)
+        assert err == "" and info["account"] == "Sim84651238"
+        assert info["current"] == "default"            # entries on, nothing else set
+        assert "ENTRIES OFF" in info["incoming"] and "micros" in info["incoming"]
+        assert "fixed 2" in info["incoming"] and "2 scoped rules" in info["incoming"]
+        assert "never enters" in info["incoming"]       # SI-Squeeze inherits OFF
+        assert info["incoming_strategies"] == ["SI-Squeeze", "NQ-XRetest"]
+        assert info["exported_from"] == "Sim84651238"
+        assert info["exported_at"] == "2026-10-18T14:02:11Z"
+        assert info["app_version"] == "0.21.0"
+        # Nothing changed.
+        assert st.account_profiles["Sim84651238"] == {"default": {"enabled": True}}
+
+    def test_preview_for_an_account_without_a_profile(self):
+        info, err = st.profile_import_preview("SimNew", self.OLD_EXPORT)
+        assert err == "" and info["current"].startswith("no profile")
+
+    def test_preview_rejects_what_import_rejects(self):
+        info, err = st.profile_import_preview("SimX", {"nothing": 1})
+        assert info is None and "no profile settings" in err
+        info, err = st.profile_import_preview("", self.OLD_EXPORT)
+        assert info is None and "account required" in err
+
+    def test_web_preview_flag_changes_nothing(self, tmp_config):
+        st.account_profiles["Sim84651238"] = {"default": {"enabled": True}}
+        ok, info = asyncio.run(st._web_import_profile("Sim84651238", self.OLD_EXPORT, preview=True))
+        assert ok is True and isinstance(info, dict) and "ENTRIES OFF" in info["incoming"]
+        assert st.account_profiles["Sim84651238"] == {"default": {"enabled": True}}
+        # The real import still works and still logs its source.
+        ok, msg = asyncio.run(st._web_import_profile("Sim84651238", self.OLD_EXPORT))
+        assert ok is True and "ENTRIES OFF" in msg
+        assert st.account_profiles["Sim84651238"]["default"]["enabled"] is False
+
+    def test_web_endpoint_answers_preview_without_importing(self, web, tmp_config):
+        st.account_profiles["Sim84651238"] = {"default": {"enabled": True}}
+        body = self._post(web + "/api/profile_import",
+                          {"account": "Sim84651238", "data": self.OLD_EXPORT, "preview": True})
+        assert body["ok"] is True
+        assert "ENTRIES OFF" in body["preview"]["incoming"]
+        assert body["preview"]["exported_at"] == "2026-10-18T14:02:11Z"
+        assert st.account_profiles["Sim84651238"] == {"default": {"enabled": True}}
+        # Without the flag the same request imports, and answers with a message.
+        body = self._post(web + "/api/profile_import",
+                          {"account": "Sim84651238", "data": self.OLD_EXPORT})
+        assert body["ok"] is True and "ENTRIES OFF" in body["message"]
+        assert st.account_profiles["Sim84651238"]["default"]["enabled"] is False
+
+    def test_describe_profile_matches_profile_summary(self):
+        st.account_profiles["A"] = {"default": {"enabled": False},
+                                    "rules": [{"strategies": ["X"]}, {"strategies": ["Y"], "enabled": True}]}
+        assert st.describe_profile(st.account_profiles["A"]) == st.profile_summary("A")
+        assert st.describe_profile(None) == "default"
