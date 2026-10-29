@@ -1,5 +1,175 @@
 from __future__ import annotations
 
+import sys
+
+# ---------- Window-close effect helper (Windows) ----------
+# `python SocketTrader.py --fx-overlay <frame> <x> <y> <w> <h>` is the
+# detached helper the trading process spawns when its console window is
+# closed with the X: Windows hides the console BEFORE the process is told,
+# so nothing drawn in the console at that point is ever seen. The helper
+# is a bare popup window over the spot the console occupied, playing the
+# CRT switch-off on the last snapshot the app took of itself — a dark
+# panel when no snapshot exists (Windows Terminal hides the real console
+# window from GetConsoleWindow). It runs before any heavy import so it is
+# on screen within a fraction of a second, touches nothing but its own
+# window, and exits. Not a trading path: every failure is swallowed.
+if len(sys.argv) >= 7 and sys.argv[1] == "--fx-overlay" and sys.platform == "win32":
+    def _fx_overlay_main(frame_path: str, x: int, y: int, w: int, h: int) -> None:
+        import ctypes
+        import ctypes.wintypes as wt
+        import math
+        import time
+        import struct
+        u32, g32, k32 = ctypes.windll.user32, ctypes.windll.gdi32, ctypes.windll.kernel32
+        HWND, HDC, HBITMAP, HGDIOBJ = wt.HWND, wt.HDC, wt.HBITMAP, wt.HGDIOBJ
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+        for fn, res, args in (
+            (u32.DefWindowProcW, LRESULT, [HWND, wt.UINT, wt.WPARAM, wt.LPARAM]),
+            (u32.CreateWindowExW, HWND, [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, ctypes.c_int,
+                                         ctypes.c_int, ctypes.c_int, ctypes.c_int, HWND, wt.HMENU,
+                                         wt.HINSTANCE, wt.LPVOID]),
+            (u32.ShowWindow, wt.BOOL, [HWND, ctypes.c_int]),
+            (u32.SetWindowPos, wt.BOOL, [HWND, HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                         ctypes.c_int, wt.UINT]),
+            (u32.GetDC, HDC, [HWND]), (u32.ReleaseDC, ctypes.c_int, [HWND, HDC]),
+            (u32.DestroyWindow, wt.BOOL, [HWND]),
+            (u32.PeekMessageW, wt.BOOL, [ctypes.POINTER(wt.MSG), HWND, wt.UINT, wt.UINT, wt.UINT]),
+            (u32.TranslateMessage, wt.BOOL, [ctypes.POINTER(wt.MSG)]),
+            (u32.DispatchMessageW, LRESULT, [ctypes.POINTER(wt.MSG)]),
+            (u32.FillRect, ctypes.c_int, [HDC, ctypes.POINTER(wt.RECT), wt.HBRUSH]),
+            (g32.CreateCompatibleDC, HDC, [HDC]), (g32.DeleteDC, wt.BOOL, [HDC]),
+            (g32.SelectObject, HGDIOBJ, [HDC, HGDIOBJ]), (g32.DeleteObject, wt.BOOL, [HGDIOBJ]),
+            (g32.CreateSolidBrush, wt.HBRUSH, [wt.COLORREF]),
+            (g32.SetStretchBltMode, ctypes.c_int, [HDC, ctypes.c_int]),
+            (g32.StretchBlt, wt.BOOL, [HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                       HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wt.DWORD]),
+            (g32.CreateDIBSection, HBITMAP, [HDC, wt.LPVOID, wt.UINT, ctypes.POINTER(wt.LPVOID),
+                                             wt.HANDLE, wt.DWORD]),
+            (k32.GetModuleHandleW, wt.HMODULE, [wt.LPCWSTR]),
+        ):
+            fn.restype, fn.argtypes = res, args
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [("style", wt.UINT), ("lpfnWndProc", WNDPROC), ("cbClsExtra", ctypes.c_int),
+                        ("cbWndExtra", ctypes.c_int), ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON),
+                        ("hCursor", wt.HANDLE), ("hbrBackground", wt.HBRUSH),
+                        ("lpszMenuName", wt.LPCWSTR), ("lpszClassName", wt.LPCWSTR)]
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG),
+                        ("biPlanes", wt.WORD), ("biBitCount", wt.WORD), ("biCompression", wt.DWORD),
+                        ("biSizeImage", wt.DWORD), ("biXPelsPerMeter", wt.LONG),
+                        ("biYPelsPerMeter", wt.LONG), ("biClrUsed", wt.DWORD), ("biClrImportant", wt.DWORD)]
+
+        # The snapshot: a tiny private format — "STFX", width, height, then
+        # top-down BGRA rows — or nothing (synthetic panel).
+        fw = fh = 0
+        pixels = b""
+        try:
+            with open(frame_path, "rb") as f:
+                head = f.read(12)
+                if head[:4] == b"STFX":
+                    fw, fh = struct.unpack("<ii", head[4:12])
+                    pixels = f.read(fw * fh * 4)
+                    if len(pixels) != fw * fh * 4:
+                        fw = fh = 0
+        except OSError:
+            fw = fh = 0
+
+        proc = WNDPROC(lambda hw, m, wp, lp: u32.DefWindowProcW(hw, m, wp, lp))
+        wc = WNDCLASSW()
+        wc.style = 0
+        wc.lpfnWndProc = proc
+        wc.hInstance = k32.GetModuleHandleW(None)
+        wc.hbrBackground = 0
+        wc.lpszClassName = "SocketTraderFxOverlay"
+        u32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        u32.RegisterClassW(ctypes.byref(wc))
+        WS_POPUP = 0x80000000
+        WS_EX_TOPMOST, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE = 0x8, 0x80, 0x08000000
+        hwnd = u32.CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                                   "SocketTraderFxOverlay", "", WS_POPUP, x, y, w, h,
+                                   None, None, wc.hInstance, None)
+        if not hwnd:
+            return
+        u32.ShowWindow(hwnd, 8)            # SW_SHOWNA: visible, takes no focus
+        hdc = u32.GetDC(hwnd)
+        mem = g32.CreateCompatibleDC(hdc)
+        hbm = None
+        if fw and fh:
+            bmi = BITMAPINFOHEADER()
+            bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            bmi.biWidth, bmi.biHeight = fw, -fh       # negative: top-down rows
+            bmi.biPlanes, bmi.biBitCount = 1, 32
+            bits = wt.LPVOID()
+            hbm = g32.CreateDIBSection(hdc, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+            if hbm and bits:
+                ctypes.memmove(bits, pixels, len(pixels))
+                g32.SelectObject(mem, hbm)
+            else:
+                hbm = None
+        white = g32.CreateSolidBrush(0x00FFFFFF)
+        dark = g32.CreateSolidBrush(0x00170F0B)          # COLORREF is BGR: #0b0f17
+        glow = g32.CreateSolidBrush(0x0084BF2F)          # the app's green
+        g32.SetStretchBltMode(hdc, 4)                    # HALFTONE
+        HWND_TOPMOST = HWND(-1)
+        SWP_NOACTIVATE, SWP_SHOWWINDOW = 0x10, 0x40
+        msg = wt.MSG()
+
+        def pump():
+            while u32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                u32.TranslateMessage(ctypes.byref(msg))
+                u32.DispatchMessageW(ctypes.byref(msg))
+
+        def rect(l, t, r, b):
+            return wt.RECT(l, t, r, b)
+
+        try:
+            cy = y + h // 2
+            frames_a, frames_b = 26, 18          # ~0.43 s squash, ~0.3 s line → dot
+            for i in range(frames_a + 1):
+                e = i / frames_a
+                bh = max(3, int(h * (1 - e) ** 2.2))
+                top = cy - bh // 2
+                u32.SetWindowPos(hwnd, HWND_TOPMOST, x, top, w, bh, SWP_NOACTIVATE | SWP_SHOWWINDOW)
+                if hbm:
+                    g32.StretchBlt(hdc, 0, 0, w, bh, mem, 0, 0, fw, fh, 0x00CC0020)   # SRCCOPY
+                else:
+                    u32.FillRect(hdc, ctypes.byref(rect(0, 0, w, bh)), dark)
+                    u32.FillRect(hdc, ctypes.byref(rect(0, bh // 2, w, bh // 2 + 1)), glow)
+                edge = 1 + int(3 * e)
+                u32.FillRect(hdc, ctypes.byref(rect(0, 0, w, edge)), white)
+                u32.FillRect(hdc, ctypes.byref(rect(0, max(0, bh - edge), w, bh)), white)
+                pump()
+                time.sleep(1 / 60)
+            for i in range(frames_b + 1):
+                e = i / frames_b
+                bw = max(6, int(w * (1 - e) ** 1.6))
+                left = x + (w - bw) // 2
+                u32.SetWindowPos(hwnd, HWND_TOPMOST, left, cy - 1, bw, 3, SWP_NOACTIVATE | SWP_SHOWWINDOW)
+                u32.FillRect(hdc, ctypes.byref(rect(0, 0, bw, 3)), white)
+                pump()
+                time.sleep(1 / 60)
+            u32.SetWindowPos(hwnd, HWND_TOPMOST, x + w // 2 - 3, cy - 3, 6, 6, SWP_NOACTIVATE | SWP_SHOWWINDOW)
+            u32.FillRect(hdc, ctypes.byref(rect(0, 0, 6, 6)), white)
+            pump()
+            time.sleep(0.09)
+        finally:
+            for b in (white, dark, glow):
+                g32.DeleteObject(b)
+            if hbm:
+                g32.DeleteObject(hbm)
+            g32.DeleteDC(mem)
+            u32.ReleaseDC(hwnd, hdc)
+            u32.DestroyWindow(hwnd)
+
+    try:
+        _fx_overlay_main(sys.argv[2], *(int(v) for v in sys.argv[3:7]))
+    except Exception:
+        pass
+    raise SystemExit(0)
+
 import asyncio
 import websockets
 import json
@@ -7303,6 +7473,182 @@ def fx_tv_off(seconds: float = FX_TV_S) -> None:
         sys.stdout.write(Style.RESET_ALL + "\033[2J\033[H")
         sys.stdout.flush()
         show_cursor()
+
+
+# ---- Closing with the X (Windows) ----
+# Windows hides the console the instant the X is clicked, then gives the
+# process a few seconds in a console-control callback before killing it.
+# Two things happen in that callback: the orderly part of shutdown that
+# the normal exit path does and an X-close used to skip (final P&L save,
+# replay-guard mirror, instance lock release), and the switch-off effect —
+# handed to a detached helper process with the last snapshot of our own
+# window, because nothing we draw in the hidden console is ever seen.
+FX_SNAPSHOT_EVERY_S = 1.5
+_fx_frame: tuple[tuple[int, int, int, int], int, int, bytes] | None = None   # (rect, w, h, BGRA)
+_fx_frame_lock = threading.Lock()
+_fx_ctrl_handler = None            # kept referenced: a collected callback crashes the process
+_fx_closed_once = False
+
+
+def _fx_capture_console() -> tuple[tuple[int, int, int, int], int, int, bytes] | None:
+    """One snapshot of this process's console window (conhost). Returns
+    None under Windows Terminal, whose real window is not the console
+    window the process can see, and on any failure."""
+    import ctypes
+    import ctypes.wintypes as wt
+    u32, g32, k32 = ctypes.windll.user32, ctypes.windll.gdi32, ctypes.windll.kernel32
+    # 64-bit handles must never travel as default c_int: declare every signature.
+    k32.GetConsoleWindow.restype = wt.HWND
+    u32.IsWindowVisible.argtypes = [wt.HWND]
+    u32.IsIconic.argtypes = [wt.HWND]
+    u32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+    u32.GetDC.argtypes = [wt.HWND]
+    hwnd = k32.GetConsoleWindow()
+    if not hwnd or not u32.IsWindowVisible(hwnd) or u32.IsIconic(hwnd):
+        return None
+    r = wt.RECT()
+    if not u32.GetWindowRect(hwnd, ctypes.byref(r)):
+        return None
+    w, h = r.right - r.left, r.bottom - r.top
+    if w < 40 or h < 40 or w * h > 4_200_000:        # ≤ ~16 MB per snapshot
+        return None
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG),
+                    ("biPlanes", wt.WORD), ("biBitCount", wt.WORD), ("biCompression", wt.DWORD),
+                    ("biSizeImage", wt.DWORD), ("biXPelsPerMeter", wt.LONG),
+                    ("biYPelsPerMeter", wt.LONG), ("biClrUsed", wt.DWORD), ("biClrImportant", wt.DWORD)]
+    u32.GetDC.restype = wt.HDC
+    g32.CreateCompatibleDC.restype = wt.HDC
+    g32.CreateDIBSection.restype = wt.HBITMAP
+    g32.CreateDIBSection.argtypes = [wt.HDC, ctypes.c_void_p, wt.UINT, ctypes.POINTER(ctypes.c_void_p),
+                                     wt.HANDLE, wt.DWORD]
+    g32.SelectObject.restype = wt.HGDIOBJ
+    g32.SelectObject.argtypes = [wt.HDC, wt.HGDIOBJ]
+    g32.DeleteObject.argtypes = [wt.HGDIOBJ]
+    g32.DeleteDC.argtypes = [wt.HDC]
+    u32.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+    u32.PrintWindow.argtypes = [wt.HWND, wt.HDC, wt.UINT]
+    sdc = u32.GetDC(None)
+    mem = g32.CreateCompatibleDC(sdc)
+    bmi = BITMAPINFOHEADER()
+    bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bmi.biWidth, bmi.biHeight, bmi.biPlanes, bmi.biBitCount = w, -h, 1, 32
+    bits = ctypes.c_void_p()
+    hbm = g32.CreateDIBSection(sdc, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+    out = None
+    try:
+        if hbm and bits:
+            old = g32.SelectObject(mem, hbm)
+            if u32.PrintWindow(hwnd, mem, 2):                  # PW_RENDERFULLCONTENT
+                out = ((r.left, r.top, w, h), w, h, ctypes.string_at(bits, w * h * 4))
+            g32.SelectObject(mem, old)
+    finally:
+        if hbm:
+            g32.DeleteObject(hbm)
+        g32.DeleteDC(mem)
+        u32.ReleaseDC(None, sdc)
+    return out
+
+
+def _fx_snapshot_loop(stop: threading.Event) -> None:
+    global _fx_frame
+    while not stop.wait(FX_SNAPSHOT_EVERY_S):
+        try:
+            frame = _fx_capture_console()
+        except Exception:
+            frame = None
+        if frame is not None:
+            with _fx_frame_lock:
+                _fx_frame = frame
+
+
+def _fx_spawn_overlay() -> None:
+    """Hand the last window snapshot to the detached helper (see the top of
+    the file). Without a snapshot the helper draws a dark panel where the
+    console was, or screen-centre if even that is unknown."""
+    import ctypes
+    with _fx_frame_lock:
+        frame = _fx_frame
+    path = Path(tempfile.gettempdir()) / f"sockettrader_fx_{os.getpid()}.bin"
+    if frame is not None:
+        (x, y, w, h), fw, fh, px = frame
+        try:
+            with open(path, "wb") as f:
+                f.write(b"STFX" + fw.to_bytes(4, "little", signed=True)
+                        + fh.to_bytes(4, "little", signed=True) + px)
+        except OSError:
+            path = Path("-")
+    else:
+        path = Path("-")
+        try:
+            u32 = ctypes.windll.user32
+            sw, sh = u32.GetSystemMetrics(0), u32.GetSystemMetrics(1)
+        except Exception:
+            sw, sh = 1920, 1080
+        w, h = int(sw * 0.6), int(sh * 0.6)
+        x, y = (sw - w) // 2, (sh - h) // 2
+    exe = Path(sys.executable)
+    pythonw = exe.with_name("pythonw.exe")
+    cmd = [str(pythonw if pythonw.exists() else exe), str(Path(__file__).resolve()), "--fx-overlay",
+           str(path), str(x), str(y), str(w), str(h)]
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    if not pythonw.exists():
+        flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    subprocess.Popen(cmd, creationflags=flags, close_fds=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _fx_on_console_close() -> None:
+    """The console-control callback's work. Order matters: the record first
+    (the helper is cosmetic), each step on its own so one failure cannot
+    take the others with it. Must finish well inside Windows' ~5 s grace."""
+    global _fx_closed_once
+    if _fx_closed_once:
+        return
+    _fx_closed_once = True
+    for step in (lambda: _pnl_save(force=True),
+                 lambda: _flush_replay_guard(force=True),
+                 config_flush_pending,
+                 release_instance_lock,
+                 lambda: logger.info("SESSION END  (console window closed)")):
+        try:
+            step()
+        except Exception:
+            pass
+    try:
+        if fx_enabled():
+            _fx_spawn_overlay()
+    except Exception:
+        pass
+
+
+def install_console_close_handler() -> None:
+    """Windows only: react to the console window's X (and logoff/shutdown)."""
+    global _fx_ctrl_handler
+    if not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+        HANDLER = ctypes.WINFUNCTYPE(wt.BOOL, wt.DWORD)
+
+        def handler(event):
+            if event in (0, 1):               # Ctrl+C / Ctrl+Break: Python's own handling
+                return False
+            if event in (2, 5, 6):            # CLOSE, LOGOFF, SHUTDOWN
+                _fx_on_console_close()
+                return True
+            return False
+
+        _fx_ctrl_handler = HANDLER(handler)
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_fx_ctrl_handler, True)
+        if fx_enabled():
+            stop = threading.Event()
+            threading.Thread(target=_fx_snapshot_loop, args=(stop,), name="fx-snapshot",
+                             daemon=True).start()
+    except Exception as exc:
+        logger.warning(f"console close handler not installed ({exc})")
 
 
 PAUSE_FRAMES = [
@@ -17006,6 +17352,7 @@ async def main():
 
     token, cfg = setup()
     instance_lock_beat(force=True)      # setup() can sit at a prompt longer than the stale window
+    install_console_close_handler()     # the X on the console window: orderly stop + switch-off effect
     active_account = cfg.get("account", "")
     follower_accounts = [a for a in cfg.get("follower_accounts", []) if a and a != active_account]
     roundrobin_accounts = sanitize_roundrobin(

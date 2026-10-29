@@ -773,7 +773,7 @@ Machine-specific values travel safely: the NinjaTrader `incoming` folder is stor
 
 ## Open and close effects
 
-The trading window opens with a second of digital rain and closes with a CRT switch-off — in the terminal (drawn with plain ANSI, one write per frame, ASCII glyphs so no console shows boxes) and in the web UI (a canvas overlay on the first open of a browser session, and the page collapsing to a line when the app goes away). They are overlays only, never delay a trade, and are skipped when stdout is not a terminal, when the browser asks for reduced motion, or when the config says `"fx": false`.
+The trading window opens with a second of digital rain and closes with a CRT switch-off — in the terminal (drawn with plain ANSI, one write per frame, ASCII glyphs so no console shows boxes) and in the web UI (a canvas overlay on the first open of a browser session, and the page collapsing to a line when the app goes away). Closing the console with its **X** plays the switch-off too: Windows hides the window before the app hears about it, so a detached helper draws the collapse over the spot the window occupied, from the app's last snapshot of itself, while the app itself finishes cleanly (final P&L save, lock released). They are overlays only, never delay a trade, and are skipped when stdout is not a terminal, when the browser asks for reduced motion, or when the config says `"fx": false`.
 
 ## Configuration
 

@@ -237,6 +237,10 @@ foreach ($dir in @([Environment]::GetFolderPath('Desktop'),
     $lnk.TargetPath = $launcher
     $lnk.WorkingDirectory = $InstallDir
     $lnk.Description = 'SocketTrader - NinjaTrader signal gateway'
+    # The shortcut's icon is also what the console window and taskbar show
+    # when the app is launched through it.
+    $ico = Join-Path $InstallDir 'images\sockettrader.ico'
+    if (Test-Path $ico) { $lnk.IconLocation = "$ico,0" }
     $lnk.Save()
 }
 Write-Ok 'Desktop and Start Menu shortcuts created'
