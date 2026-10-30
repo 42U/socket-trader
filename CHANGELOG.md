@@ -12,24 +12,24 @@ findings are listed under "Deferred to 1.0.1".
 
 ### Fixed
 - **The trading loop froze when Remote Desktop connected.** 2026-10-29
-  21:48:58, nine hours of missed signals while the web page still showed
-  cached state. Cause: the X-close switch-off effect took a picture of the
-  console window every 1.5 s with `PrintWindow`, which makes the console host
-  render under its console lock — the lock every dashboard write from the
-  trading loop needs. A Remote Desktop connection was switching the session's
-  display at that moment, the render never returned, and the next dashboard
-  write blocked for good. The app no longer asks the console host for anything:
-  it reads the window's position only, and the switch-off helper draws its
-  panel at that spot (no window image any more — see Known limits). The 1.0.0
-  release was rebuilt with this fix on 2026-10-30; a first-day 1.0.0 install
-  must run the Setup again by hand (same version number, so the in-app
-  updater does not offer it).
-- **A frozen trading loop looked healthy.** Two independent guards now: the web
-  header turns red with `MAIN LOOP STALLED <n> min — restart SocketTrader` as
-  soon as the loop misses 15 s of turns (`loop_stalled_s` in `/api/state`), and
-  Windows QuickEdit is switched off for the app's console at start-up (a click
-  in the window used to pause every write the same way; `"console_quick_edit":
-  true` keeps it).
+  21:48:58 to 08:54 the next morning: nine hours of missed signals while the
+  web page still showed cached state. Cause, confirmed when a single Esc in the
+  console window brought it back: the console was in Windows' QuickEdit
+  *selection* mode — a click in the window (the one that lands on it when a
+  Remote Desktop session takes over the screen) pauses every write to the
+  console until Esc or Enter, and the dashboard is written from the trading
+  loop. QuickEdit is now switched off for the app's window at start-up
+  (`"console_quick_edit": true` keeps it). The 1.0.0 release was rebuilt with
+  this on 2026-10-30; a first-day 1.0.0 install must run the Setup again by
+  hand (same version number, so the in-app updater does not offer it).
+- Hardening from the same incident: the X-close switch-off effect no longer
+  asks the console host to render the window every 1.5 s (`PrintWindow`,
+  which runs under the console lock the loop's writes need); it tracks the
+  window's position only and the helper draws its panel there (see Known
+  limits).
+- **A frozen trading loop looked healthy.** The web header now turns red with
+  `MAIN LOOP STALLED <n> min — restart SocketTrader` as soon as the loop misses
+  15 s of turns (`loop_stalled_s` in `/api/state`), whatever the cause.
 - Release workflow no longer appends generated notes to a hand-written release
   body (the duplicated *Full Changelog* line on 1.0.0).
 - **Config saves silently dropped on Windows.** A rename over a file another
