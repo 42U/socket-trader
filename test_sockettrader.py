@@ -11914,3 +11914,52 @@ class TestBridgeTokenAndPortFiles:
         assert ok is False and "NinjaTrader's ATI port" in why and "Setup → 9 → 4" in why
         ok, why = st._probe_live_bridge_detail("127.0.0.1", 36999)
         assert ok is False and "something other than the AddOn" in why
+
+
+class TestLoopLiveness(_WebClient):
+    """2026-10-29 21:48:58: the trading loop froze (console QuickEdit) while
+    the web thread kept serving cached state for nine hours."""
+
+    def test_stall_is_measured_from_the_loops_last_turn(self, monkeypatch):
+        monkeypatch.setattr(st, "_loop_last_tick", 0.0)
+        assert st.loop_stalled_seconds() == 0.0                   # not started yet
+        monkeypatch.setattr(st, "_loop_last_tick", time.time() - 3)
+        assert st.loop_stalled_seconds() == 0.0                   # alive
+        monkeypatch.setattr(st, "_loop_last_tick", time.time() - 600)
+        assert 599 <= st.loop_stalled_seconds() <= 602
+
+    def test_pause_indicator_ticks_the_beacon(self, monkeypatch):
+        monkeypatch.setattr(st, "_loop_last_tick", 0.0)
+        st.shutdown.clear()
+
+        async def run():
+            task = asyncio.create_task(st.pause_indicator())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        asyncio.run(run())
+        assert time.time() - st._loop_last_tick < 5
+
+    def test_web_state_carries_the_stall(self, web, monkeypatch):
+        monkeypatch.setattr(st, "_loop_last_tick", time.time() - 600)
+        state = json.loads(self._get(web + "/api/state").read())
+        assert 599 <= state["loop_stalled_s"] <= 602
+        monkeypatch.setattr(st, "_loop_last_tick", time.time())
+        state = json.loads(self._get(web + "/api/state").read())
+        assert state["loop_stalled_s"] == 0
+
+    def test_quick_edit_is_left_alone_off_windows_and_when_kept_by_config(self, tmp_config, monkeypatch):
+        calls = {"n": 0}
+        monkeypatch.setattr(st, "IS_WINDOWS", False)
+        st.disable_console_quick_edit()                            # no ctypes.windll off Windows: must not raise
+        monkeypatch.setattr(st, "IS_WINDOWS", True)
+        st.save_config({"console_quick_edit": True})
+        import types
+        monkeypatch.setitem(st.sys.modules, "ctypes", types.SimpleNamespace(
+            windll=types.SimpleNamespace(kernel32=types.SimpleNamespace(
+                GetStdHandle=lambda *a: calls.__setitem__("n", calls["n"] + 1)))))
+        st.disable_console_quick_edit()
+        assert calls["n"] == 0                                     # config said keep it

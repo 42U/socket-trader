@@ -8042,6 +8042,35 @@ def _hold_app_mutex() -> None:
         _app_mutex_handle = None
 
 
+def disable_console_quick_edit() -> None:
+    """Windows console QuickEdit: a left-click in the window starts a text
+    selection and PAUSES every write to the console until Esc/Enter — and
+    this app writes its dashboard many times a second from the trading
+    loop, so one stray click froze trading for nine hours (2026-10-29
+    21:48:58 → 07:xx) while the web page kept showing cached state. Off
+    by default, as in every console trading tool; `"console_quick_edit":
+    true` in the config keeps it. Text can still be copied via the window
+    menu (Edit → Mark). Windows Terminal selects without pausing anyway."""
+    if not IS_WINDOWS or config_get("console_quick_edit", False):
+        return
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+        k32 = ctypes.windll.kernel32
+        k32.GetStdHandle.restype = wt.HANDLE
+        h = k32.GetStdHandle(-10)                  # STD_INPUT_HANDLE
+        mode = wt.DWORD()
+        if not h or not k32.GetConsoleMode(h, ctypes.byref(mode)):
+            return
+        ENABLE_QUICK_EDIT_MODE, ENABLE_EXTENDED_FLAGS = 0x0040, 0x0080
+        wanted = (mode.value | ENABLE_EXTENDED_FLAGS) & ~ENABLE_QUICK_EDIT_MODE
+        if wanted != mode.value and k32.SetConsoleMode(h, wanted):
+            logger.info("CONSOLE  QuickEdit mode disabled for this window (a click can no "
+                        "longer pause the trading loop)")
+    except Exception as exc:
+        logger.info(f"CONSOLE  QuickEdit not changed ({exc})")
+
+
 def apply_windows_app_identity() -> None:
     """Make the console window look like ours on Windows: our title, our
     icon in the title bar and taskbar, and the App ID the installer puts
@@ -8387,9 +8416,28 @@ PAUSE_FRAMES = [
 ]
 
 
+_loop_last_tick = 0.0          # wall clock of the main loop's last turn (see loop_stalled_seconds)
+LOOP_STALL_AFTER_S = 15.0
+
+
+def loop_stalled_seconds() -> float:
+    """How long the trading loop has gone without a turn — 0 while it is
+    alive or before it started. Read from the web thread: on 2026-10-29 the
+    loop froze at 21:48:58 (a click into the console window: Windows
+    QuickEdit pauses every write to it) while the web server thread kept
+    answering from cached state, so the dashboard looked healthy for nine
+    hours of missed signals. The web header now goes red instead."""
+    if not _loop_last_tick:
+        return 0.0
+    age = time.time() - _loop_last_tick
+    return age if age >= LOOP_STALL_AFTER_S else 0.0
+
+
 async def pause_indicator():
+    global _loop_last_tick
     i = 0
     while not shutdown.is_set():
+        _loop_last_tick = time.time()
         if paused and not awaiting_user_input:
             # Use MOTD line so it doesn't overwrite alerts
             _dash_set_motd(
@@ -12849,6 +12897,7 @@ def web_state() -> dict:
     return {
         "version": __version__,
         "update": update_state(),
+        "loop_stalled_s": round(loop_stalled_seconds()),
         "state": _session_state,
         "status_text": _WEB_ANSI_RE.sub("", get_session_status_text()),
         "paused": paused, "hard_stopped": hard_stopped, "soft_stopped": soft_stopped,
@@ -17755,6 +17804,12 @@ function renderChips(){
   st.className="chip "+(S.hard_stopped?"bad":S.paused?"warn":"on");
   const rd=$("chReady");rd.textContent=S.trade_ready?"READY":"NOT READY";
   rd.className="chip "+(S.trade_ready?"on":"bad");
+  if(S.loop_stalled_s>0){
+    const m=Math.floor(S.loop_stalled_s/60);
+    st.textContent="MAIN LOOP STALLED "+(m>=1?m+" min":S.loop_stalled_s+" s")+" — restart SocketTrader";
+    st.className="chip bad";st.title="The trading loop has not run since "+
+      new Date((S.ts-S.loop_stalled_s)*1000).toLocaleTimeString()+
+      ". A click inside the console window (QuickEdit) does this: press Esc there, or close and start again."}
   const nt=$("chNt");
   nt.textContent=(L&&L.ok)?"NT LINKED":"NT OFFLINE";
   nt.className="chip "+((L&&L.ok)?"info":"bad");
@@ -18281,6 +18336,7 @@ async def main():
     # must not touch the month that instance holds in memory, not even to
     # migrate into it.
     apply_windows_app_identity()
+    disable_console_quick_edit()
     ok, why = acquire_instance_lock()
     if not ok:
         print(Fore.RED + f"\n  ✖  {why}\n" + Style.RESET_ALL)

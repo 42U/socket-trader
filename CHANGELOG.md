@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.1 — (unreleased)
+
+### Fixed
+- **A frozen trading loop looked healthy.** 2026-10-29 21:48:58: the loop
+  stopped (a click inside the console window — Windows QuickEdit pauses every
+  write to the console, and the dashboard is written from the loop) while the
+  web server thread kept answering from cached state for nine hours of missed
+  signals. QuickEdit is now switched off for the app's window at start-up
+  (`"console_quick_edit": true` keeps it), and the web header turns red with
+  `MAIN LOOP STALLED <n> min — restart SocketTrader` as soon as the loop misses
+  15 s of turns (`loop_stalled_s` in `/api/state`).
+- Release workflow no longer appends generated notes to a hand-written release
+  body (the duplicated *Full Changelog* line on 1.0.0).
+
 ## 1.0.0 — 2026-10-30
 
 The first release that installs and updates like a Windows application
