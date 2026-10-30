@@ -623,7 +623,11 @@ With prop accounts under management the same stream doubles as the **live positi
 4. The Output tab should print:
    `SocketTraderBridge listening on 0.0.0.0:36984`
 
-**Enable in SocketTrader:** `S → 7 → 1` to toggle. The menu shows three states:
+**Port.** The AddOn listens on **36984** unless a `SocketTraderBridge.port` file next to its token says otherwise — and SocketTrader writes that file from its own *Live Monitor port* setting (`S → 9 → 4`) at every start, so moving the bridge is a setting, not a source edit. You must move it when NinjaTrader's own AT Interface is set to 36984 (the default is 36973): then a probe of 36984 reaches NinjaTrader's ATI, which hangs up on the bridge's JSON greeting — `read error: [WinError 10053] An established connection was aborted …` — and SocketTrader says so. Pick a free port (36999, say), then recompile the AddOn (F5) or restart NinjaTrader so it reads the new file.
+
+**Token.** SocketTrader writes the shared secret to `Documents\NinjaTrader 8\SocketTraderBridge.token`. That file is the truth the AddOn trusts: a second machine whose NinjaTrader folder is the same OneDrive folder **adopts** the token already there instead of overwriting it (otherwise each SocketTrader would knock the other's bridge offline at every start). Rotating is still yours: change `live_bridge_token` in the config of the machine that wrote the file, and the new one is published; delete the file to start over.
+
+**Enable in SocketTrader:** `S → 9 → 1` to toggle. The menu shows three states:
 
 - `disabled` — plain ATI only, session limits fire post-close.
 - `enabled · active` — AddOn reachable, live P&L stream is flowing.

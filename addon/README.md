@@ -83,8 +83,13 @@ Socket Trader can also send one-line JSON commands over the same port
 
 ## Changing the port
 
-Edit the `ListenPort` constant at the top of `SocketTraderBridge.cs`,
-recompile (F5), and restart NinjaTrader. If you restrict `BindAddress`
+Set the *Live Monitor port* in SocketTrader (`S → 9 → 4`): it writes
+`SocketTraderBridge.port` next to the token in `Documents\NinjaTrader 8\`,
+and the AddOn reads that file when it starts (recompile with F5 or restart
+NinjaTrader after changing it). Without the file, or with a bad value, it
+listens on `DefaultListenPort` (36984). Do this when NinjaTrader's own AT
+Interface is set to 36984 — a bridge probe then reaches NT's ATI, which
+aborts the connection (`WinError 10053`). If you restrict `BindAddress`
 from `IPAddress.Any` to `IPAddress.Loopback`, only local connections will
 be accepted — useful if NT and Socket Trader run on the same machine or
 WSL with mirrored networking.

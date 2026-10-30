@@ -5974,8 +5974,18 @@ def bridge_token() -> str:
     return token
 
 
+_BRIDGE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_\-]{16,128}$")
+
+
 def write_bridge_token(token: str | None = None) -> Path | None:
-    """Publish the token where the AddOn reads it. Returns the path written."""
+    """Publish the token where the AddOn reads it. Returns the path written.
+
+    The file is what the AddOn trusts, so when one is already there with a
+    different secret it is ADOPTED into this config rather than replaced:
+    a NinjaTrader folder shared between two machines (OneDrive) would
+    otherwise have each SocketTrader overwrite the other's token at every
+    start and knock the other's bridge offline. Delete the file to rotate.
+    """
     token = token or bridge_token()
     base = _nt_base()
     if not base:
@@ -5983,6 +5993,20 @@ def write_bridge_token(token: str | None = None) -> Path | None:
     path = Path(base) / BRIDGE_TOKEN_FILE
     try:
         existing = path.read_text(encoding="utf-8").strip() if path.exists() else None
+        # The token this config last put in (or took from) the file. A file
+        # that still holds it while the config says otherwise is a rotation
+        # by the operator: write the new one. A file holding something else
+        # was written by another SocketTrader: take it.
+        published = str(config_get("live_bridge_token_published") or "")
+        if (existing and existing != token and existing != published
+                and _BRIDGE_TOKEN_RE.match(existing)):
+            cfg = load_config()
+            cfg["live_bridge_token"] = existing
+            cfg["live_bridge_token_published"] = existing
+            save_config(cfg)
+            logger.info(f"live bridge token adopted from {path} (another SocketTrader "
+                        "shares this NinjaTrader folder, or the file predates this config)")
+            return path
         if existing != token:
             # Atomic + private, mirroring save_config: a truncating in-place
             # write can be read as empty by the AddOn mid-update, which
@@ -6004,9 +6028,38 @@ def write_bridge_token(token: str | None = None) -> Path | None:
                 raise
             logger.info(f"live bridge token written → {path} "
                         "(restart or recompile the AddOn to pick it up)")
+        if published != token:
+            cfg = load_config()
+            cfg["live_bridge_token_published"] = token
+            save_config(cfg)
         return path
     except OSError as exc:
         logger.error(f"could not write bridge token to {path}: {exc}")
+        return None
+
+
+BRIDGE_PORT_FILE = "SocketTraderBridge.port"
+
+
+def write_bridge_port(port: int | None = None) -> Path | None:
+    """Tell the AddOn which port to listen on: it reads this file next to
+    the token when it starts (falls back to its built-in 36984 without
+    one), so moving the bridge off a port NinjaTrader's own ATI occupies
+    is a SocketTrader setting, not a source edit on every machine."""
+    port = int(live_bridge_port if port is None else port)
+    base = _nt_base()
+    if not base or not (1 <= port <= 65535):
+        return None
+    path = Path(base) / BRIDGE_PORT_FILE
+    try:
+        if path.exists() and path.read_text(encoding="utf-8").strip() == str(port):
+            return path
+        _write_atomic(path, f"{port}\n", ".stport")
+        logger.info(f"live bridge port written → {path} ({port}; the AddOn reads it when "
+                    "NinjaTrader starts or the AddOn is recompiled)")
+        return path
+    except OSError as exc:
+        logger.error(f"could not write bridge port to {path}: {exc}")
         return None
 
 
@@ -6056,7 +6109,17 @@ def _probe_live_bridge_detail(host: str, port: int, timeout: float = 2.5) -> tup
     except socket.timeout:
         return False, "socket accepted but no data arrived (timeout)"
     except OSError as e:
-        return False, f"read error: {e}"
+        # 10053/10054 right after our auth line: something answered on
+        # the port and hung up on JSON it did not expect — NinjaTrader's
+        # own ATI server when it is set to this port (nt_port), or another
+        # program. The AddOn itself closes a bad token quietly (EOF).
+        hint = ""
+        if port == nt_port:
+            hint = (f" — port {port} is NinjaTrader's ATI port in this config; the AddOn "
+                    "needs a different one (Setup → 9 → 4, then recompile the AddOn)")
+        elif getattr(e, "winerror", None) in (10053, 10054):
+            hint = " — something other than the AddOn answers on this port"
+        return False, f"read error: {e}{hint}"
     finally:
         try:
             if s is not None:
@@ -9675,9 +9738,13 @@ async def prompt_live_bridge():
                     live_bridge_port = p
                     cfg["live_bridge_port"] = p
                     save_config(cfg)
+                    wrote = write_bridge_port(p)
                     _dash_set_alert(
                         Fore.GREEN +
-                        f"  ✔  Live monitor port set → {p}." + Style.RESET_ALL)
+                        f"  ✔  Live monitor port set → {p}."
+                        + (f"  {BRIDGE_PORT_FILE} updated — recompile the AddOn (F5) or "
+                           "restart NinjaTrader so it listens there." if wrote else "")
+                        + Style.RESET_ALL)
                 else:
                     _dash_set_alert(
                         Fore.RED + "  ✖  Port must be 1–65535." + Style.RESET_ALL)
@@ -12604,6 +12671,7 @@ def install_live_bridge_addon(nt_base: Path) -> tuple[bool, str]:
     # connection until this file exists, so installing one without the
     # other yields a listener that never talks to anyone.
     write_bridge_token()
+    write_bridge_port()
     dest_dir = nt_base / "bin" / "Custom" / "AddOns"
     dest = dest_dir / "SocketTraderBridge.cs"
     try:
@@ -18273,6 +18341,7 @@ async def main():
         # connections without it, and NT's folder can be moved or restored
         # independently of this config.
         write_bridge_token()
+        write_bridge_port()
     live_bridge_port = int(cfg.get("live_bridge_port", 36984))
     nt_host_override = effective_nt_host(cfg)
 

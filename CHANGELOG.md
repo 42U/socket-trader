@@ -73,6 +73,15 @@ machine or by the test suite (1083 tests) unless marked otherwise.
 - `build.ps1` / CI: the plain `python` fallback (no `py` launcher) was
   broken by a PowerShell descending-range slice.
 
+- **Second machine, same NinjaTrader folder.** The bridge token file is now
+  adopted when another SocketTrader already put one there (OneDrive-shared
+  NinjaTrader folders), instead of each start overwriting the other's and
+  taking its bridge down; a rotation from the config still publishes. The
+  AddOn's port is a file (`SocketTraderBridge.port`, written from the Live
+  Monitor setting) rather than a constant to edit per machine, and the probe
+  names an ATI-port clash for what it is (`read error: [WinError 10053]` on a
+  port NinjaTrader's own AT Interface occupies).
+
 ### Added (operability, after the 2026-10-29 stale-profile restart)
 - `PROFILE DIGEST` log lines whenever profiles are loaded or saved: per
   account, what it will do and every scoped rule with its scope — a restart

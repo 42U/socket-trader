@@ -25,6 +25,7 @@
 //   - Multiple clients supported (list of TcpClient, broadcast on each event).
 //   - Binds to 0.0.0.0 by default; change BindAddress below to restrict.
 //   - Default port 36984 to sit alongside NT's built-in ATI on 36973
+//     (SocketTraderBridge.port next to the token overrides it)
 //     without colliding with VSCode's auto-port-forwarder (which claims
 //     36974 on loopback if your terminal session is using it).
 
@@ -53,7 +54,13 @@ namespace NinjaTrader.NinjaScript.AddOns
         // runs in the same session — that creates a silent loopback-only
         // listener that wins over our 0.0.0.0 binding and starves clients
         // on the same box of data.
-        private const int ListenPort = 36984;
+        private const int DefaultListenPort = 36984;
+        // SocketTrader writes the port it expects into this file next to
+        // the token (Setup > 9 > 4 / every start); without one, or with a
+        // bad value, the default above applies. So a machine whose NT ATI
+        // already sits on 36984 moves the bridge without editing this file.
+        private const string PortFileName = "SocketTraderBridge.port";
+        private int listenPort = DefaultListenPort;
         private static readonly IPAddress BindAddress = IPAddress.Any;
 
         // Heartbeat snapshot while idle so stale-detection on the client side
@@ -93,6 +100,30 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return Path.Combine(NinjaTrader.Core.Globals.UserDataDir, TokenFileName);
             }
             catch { return null; }
+        }
+
+        private int ResolveListenPort()
+        {
+            try
+            {
+                var path = Path.Combine(NinjaTrader.Core.Globals.UserDataDir, PortFileName);
+                if (!File.Exists(path))
+                    return DefaultListenPort;
+                int p;
+                var text = File.ReadAllText(path).Trim();
+                if (int.TryParse(text, out p) && p >= 1 && p <= 65535)
+                    return p;
+                NinjaTrader.Code.Output.Process(
+                    $"SocketTraderBridge: ignoring {path} ('{text}' is not a port) — using {DefaultListenPort}",
+                    PrintTo.OutputTab1);
+            }
+            catch (Exception ex)
+            {
+                NinjaTrader.Code.Output.Process(
+                    $"SocketTraderBridge: could not read port file: {ex.Message} — using {DefaultListenPort}",
+                    PrintTo.OutputTab1);
+            }
+            return DefaultListenPort;
         }
 
         private void LoadToken()
@@ -194,7 +225,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 heartbeatTimer = new Timer(_ => SafeBroadcast(), null,
                     HeartbeatInterval, HeartbeatInterval);
                 NinjaTrader.Code.Output.Process(
-                    $"SocketTraderBridge listening on {BindAddress}:{ListenPort}",
+                    $"SocketTraderBridge listening on {BindAddress}:{listenPort}",
                     PrintTo.OutputTab1);
             }
             else if (State == State.Terminated)
@@ -218,7 +249,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                         "refused until SocketTrader writes one (Setup > 9). " +
                         $"Expected at {TokenPath()}",
                         PrintTo.OutputTab1);
-                listener = new TcpListener(BindAddress, ListenPort);
+                listenPort = ResolveListenPort();
+                listener = new TcpListener(BindAddress, listenPort);
                 listener.Start();
                 acceptThread = new Thread(AcceptLoop) { IsBackground = true, Name = "STB-Accept" };
                 acceptThread.Start();

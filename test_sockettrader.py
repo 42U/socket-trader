@@ -11827,3 +11827,76 @@ class TestConsoleCloseHandler:
         assert st._pid_alive(4242) is None            # access denied → unknown
         calls["err"] = 87
         assert st._pid_alive(4242) is False           # invalid parameter → no such process
+
+
+class TestBridgeTokenAndPortFiles:
+    """A NinjaTrader folder shared between two machines (OneDrive) carries
+    ONE token file and ONE port file: the second SocketTrader must adopt
+    them, not overwrite them, or the first one's bridge goes dark."""
+
+    def test_existing_token_file_is_adopted_not_overwritten(self, tmp_path, tmp_config, monkeypatch,
+                                                            fresh_cfg_cache):
+        nt = tmp_path / "NinjaTrader 8"; (nt / "incoming").mkdir(parents=True)
+        monkeypatch.setattr(st, "output_directory", str(nt / "incoming"))
+        other = "A" * 43
+        (nt / st.BRIDGE_TOKEN_FILE).write_text(other + "\n", encoding="utf-8")
+        st.save_config({"live_bridge_token": "B" * 43})
+        path = st.write_bridge_token()
+        assert path == nt / st.BRIDGE_TOKEN_FILE
+        assert path.read_text(encoding="utf-8").strip() == other          # file untouched
+        assert st.load_config()["live_bridge_token"] == other             # config follows the file
+        assert st.bridge_token() == other
+        # Now a rotation BY THIS OPERATOR (config edited): the file still
+        # holds what this config published, so the new token is written.
+        cfg = st.load_config(); cfg["live_bridge_token"] = "C" * 43; st.save_config(cfg)
+        assert st.write_bridge_token().read_text(encoding="utf-8").strip() == "C" * 43
+        assert st.load_config()["live_bridge_token_published"] == "C" * 43
+        # And the other machine's rotation is adopted again.
+        path.write_text("D" * 43, encoding="utf-8")
+        st.write_bridge_token()
+        assert st.load_config()["live_bridge_token"] == "D" * 43
+
+    def test_missing_or_junk_token_file_is_written(self, tmp_path, tmp_config, monkeypatch,
+                                                   fresh_cfg_cache):
+        nt = tmp_path / "NinjaTrader 8"; (nt / "incoming").mkdir(parents=True)
+        monkeypatch.setattr(st, "output_directory", str(nt / "incoming"))
+        st.save_config({"live_bridge_token": "B" * 43})
+        assert st.write_bridge_token().read_text(encoding="utf-8").strip() == "B" * 43
+        (nt / st.BRIDGE_TOKEN_FILE).write_text("   \n", encoding="utf-8")   # empty: ours goes in
+        assert st.write_bridge_token().read_text(encoding="utf-8").strip() == "B" * 43
+        (nt / st.BRIDGE_TOKEN_FILE).write_text("not a token!\n", encoding="utf-8")
+        assert st.write_bridge_token().read_text(encoding="utf-8").strip() == "B" * 43
+        assert st.load_config()["live_bridge_token"] == "B" * 43
+
+    def test_port_file_follows_the_setting(self, tmp_path, monkeypatch):
+        nt = tmp_path / "NinjaTrader 8"; (nt / "incoming").mkdir(parents=True)
+        monkeypatch.setattr(st, "output_directory", str(nt / "incoming"))
+        monkeypatch.setattr(st, "live_bridge_port", 36999)
+        path = st.write_bridge_port()
+        assert path == nt / st.BRIDGE_PORT_FILE and path.read_text() == "36999\n"
+        assert st.write_bridge_port(36984).read_text() == "36984\n"
+        assert st.write_bridge_port(0) is None
+        monkeypatch.setattr(st, "output_directory", "")
+        assert st.write_bridge_port(36999) is None
+
+    def test_probe_names_the_ati_port_clash(self, monkeypatch):
+        import socket as _socket
+
+        class _Sock:
+            def __init__(self, *a, **k): pass
+            def settimeout(self, t): pass
+            def connect(self, addr): pass
+            def sendall(self, b): pass
+            def recv(self, n):
+                err = OSError(10053, "An established connection was aborted by the software in your host machine")
+                err.winerror = 10053
+                raise err
+            def close(self): pass
+
+        monkeypatch.setattr(st.socket, "socket", _Sock)
+        monkeypatch.setattr(st, "bridge_token", lambda: "t" * 43)
+        monkeypatch.setattr(st, "nt_port", 36984)
+        ok, why = st._probe_live_bridge_detail("127.0.0.1", 36984)
+        assert ok is False and "NinjaTrader's ATI port" in why and "Setup → 9 → 4" in why
+        ok, why = st._probe_live_bridge_detail("127.0.0.1", 36999)
+        assert ok is False and "something other than the AddOn" in why
