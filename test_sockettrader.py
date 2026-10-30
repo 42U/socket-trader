@@ -11639,14 +11639,25 @@ class TestLiveBridgeReconnectStorm:
         assert st._live_bridge_connected is False
 
 
+def _next_version() -> str:
+    """One patch above the running version, so the fake release is newer
+    whatever the version under test is."""
+    nums = [int(x) for x in re.match(r"^(\d+)\.(\d+)\.(\d+)", st.__version__).groups()]
+    nums[2] += 1
+    return ".".join(str(n) for n in nums)
+
+
+NEXT = _next_version()
+
+
 class TestUpdater(_WebClient):
     RELEASE = {
-        "tag_name": "v1.0.0", "html_url": "https://github.com/42U/socket-trader/releases/tag/v1.0.0",
+        "tag_name": f"v{NEXT}", "html_url": f"https://github.com/42U/socket-trader/releases/tag/v{NEXT}",
         "draft": False, "prerelease": False, "published_at": "2026-11-01T12:00:00Z",
         "assets": [
-            {"name": "SocketTrader-1.0.0-windows-x64.zip", "browser_download_url": "https://x/zip", "size": 10},
-            {"name": "SocketTrader-Setup-1.0.0.exe", "browser_download_url": "https://x/setup", "size": 20},
-            {"name": "SocketTrader-Setup-1.0.0.exe.sha256", "browser_download_url": "https://x/sha", "size": 90},
+            {"name": f"SocketTrader-{NEXT}-windows-x64.zip", "browser_download_url": "https://x/zip", "size": 10},
+            {"name": f"SocketTrader-Setup-{NEXT}.exe", "browser_download_url": "https://x/setup", "size": 20},
+            {"name": f"SocketTrader-Setup-{NEXT}.exe.sha256", "browser_download_url": "https://x/sha", "size": 90},
         ]}
 
     @pytest.fixture(autouse=True)
@@ -11669,8 +11680,8 @@ class TestUpdater(_WebClient):
 
     def test_parse_release_picks_the_installer_and_its_hash(self):
         rel = st.parse_release(self.RELEASE)
-        assert rel["version"] == "1.0.0" and rel["tag"] == "v1.0.0"
-        assert rel["setup_name"] == "SocketTrader-Setup-1.0.0.exe"
+        assert rel["version"] == NEXT and rel["tag"] == f"v{NEXT}"
+        assert rel["setup_name"] == f"SocketTrader-Setup-{NEXT}.exe"
         assert rel["setup_url"] == "https://x/setup" and rel["sha_url"] == "https://x/sha"
         assert rel["prerelease"] is False
         assert st.parse_release({**self.RELEASE, "draft": True}) is None
@@ -11682,11 +11693,11 @@ class TestUpdater(_WebClient):
         monkeypatch.setattr(st, "_http_get", lambda *a, **k: json.dumps(self.RELEASE).encode())
         with caplog.at_level(logging.INFO, logger=st.logger.name):
             rel = st.check_for_update()
-            assert rel and rel["version"] == "1.0.0"
-            assert st.check_for_update()["version"] == "1.0.0"
-        assert st._update_info["version"] == "1.0.0"
+            assert rel and rel["version"] == NEXT
+            assert st.check_for_update()["version"] == NEXT
+        assert st._update_info["version"] == NEXT
         assert sum("UPDATE AVAILABLE" in r.getMessage() for r in caplog.records) == 1
-        assert st.update_state()["version"] == "1.0.0"
+        assert st.update_state()["version"] == NEXT
 
     def test_check_is_quiet_when_current_or_offline(self, monkeypatch):
         current = {**self.RELEASE, "tag_name": "v" + st.__version__}
@@ -11704,7 +11715,7 @@ class TestUpdater(_WebClient):
         def fake(*a, **k): called["n"] += 1; return json.dumps(self.RELEASE).encode()
         monkeypatch.setattr(st, "_http_get", fake)
         assert st.check_for_update() is None and called["n"] == 0
-        assert st.check_for_update(force=True)["version"] == "1.0.0" and called["n"] == 1
+        assert st.check_for_update(force=True)["version"] == NEXT and called["n"] == 1
 
     def test_sha_verification(self):
         import hashlib
@@ -11720,20 +11731,20 @@ class TestUpdater(_WebClient):
         import hashlib
         rel = st.parse_release(self.RELEASE)
         body = b"installer bytes"
-        good = f"{hashlib.sha256(body).hexdigest()}  SocketTrader-Setup-1.0.0.exe"
+        good = f"{hashlib.sha256(body).hexdigest()}  SocketTrader-Setup-{NEXT}.exe"
         monkeypatch.setattr(st.tempfile, "gettempdir", lambda: str(tmp_path))
         # No .sha256 on the release: refused before any download.
         path, why = st.download_update({**rel, "sha_url": None})
         assert path is None and "unverified" in why
         # Hash mismatch: refused, nothing written.
-        monkeypatch.setattr(st, "_http_get", lambda url, *a, **k: body if url == "https://x/setup" else b"deadbeef  SocketTrader-Setup-1.0.0.exe")
+        monkeypatch.setattr(st, "_http_get", lambda url, *a, **k: body if url == "https://x/setup" else f"deadbeef  SocketTrader-Setup-{NEXT}.exe".encode())
         path, why = st.download_update(rel)
         assert path is None and "does not match" in why
         assert not list(tmp_path.glob("*.exe"))
         # Good: written to the temp folder under the asset's own name.
         monkeypatch.setattr(st, "_http_get", lambda url, *a, **k: body if url == "https://x/setup" else good.encode())
         path, why = st.download_update(rel)
-        assert why == "" and path == tmp_path / "SocketTrader-Setup-1.0.0.exe" and path.read_bytes() == body
+        assert why == "" and path == tmp_path / f"SocketTrader-Setup-{NEXT}.exe" and path.read_bytes() == body
 
     def test_install_from_a_script_run_points_at_the_checkout(self, monkeypatch):
         monkeypatch.setattr(st, "FROZEN", False)
@@ -11745,13 +11756,13 @@ class TestUpdater(_WebClient):
         monkeypatch.setattr(st, "FROZEN", True)
         monkeypatch.setattr(st, "IS_WINDOWS", True)
         st._update_info = st.parse_release(self.RELEASE)
-        setup = tmp_path / "SocketTrader-Setup-1.0.0.exe"
+        setup = tmp_path / f"SocketTrader-Setup-{NEXT}.exe"
         setup.write_bytes(b"x")
         monkeypatch.setattr(st, "download_update", lambda rel: (setup, ""))
         launched = {}
         monkeypatch.setattr(st, "_launch_installer_after_exit", lambda p: launched.setdefault("path", p))
         ok, msg = st.install_update()
-        assert ok is True and "1.0.0" in msg
+        assert ok is True and NEXT in msg
         assert launched["path"] == setup
         assert st.shutdown.is_set()
 
@@ -11769,7 +11780,7 @@ class TestUpdater(_WebClient):
             def __init__(self, args, **kw): spawned["args"] = args; spawned["kw"] = kw
         monkeypatch.setattr(st.subprocess, "Popen", _P)
         monkeypatch.setattr(st, "win_system_exe", lambda name: r"C:\Windows\System32\cmd.exe")
-        setup = tmp_path / "SocketTrader-Setup-1.0.0.exe"
+        setup = tmp_path / f"SocketTrader-Setup-{NEXT}.exe"
         script = Path(st._launch_installer_after_exit(setup))
         text = script.read_text(encoding="utf-8")
         assert f"PID eq {os.getpid()}" in text
@@ -11780,9 +11791,9 @@ class TestUpdater(_WebClient):
     def test_web_state_carries_the_update_and_the_endpoint_checks(self, web, monkeypatch):
         monkeypatch.setattr(st, "_http_get", lambda *a, **k: json.dumps(self.RELEASE).encode())
         body = self._post(web + "/api/update", {"action": "check"})
-        assert body["ok"] is True and "1.0.0" in body["message"]
+        assert body["ok"] is True and NEXT in body["message"]
         state = json.loads(self._get(web + "/api/state").read())
-        assert state["update"]["version"] == "1.0.0"
+        assert state["update"]["version"] == NEXT
         assert state["update"]["installable"] is False      # tests run the script, not the exe
         body = self._post(web + "/api/update", {"action": "install"})
         assert body["ok"] is False and "install.bat" in body["message"]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-__version__ = "0.23.0"
+__version__ = "1.0.0"
 
 # `SocketTrader.exe --version` / `python SocketTrader.py --version`: answered
 # before any import so installers and build checks get it in milliseconds.

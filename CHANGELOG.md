@@ -1,10 +1,14 @@
 # Changelog
 
-## 1.0.0 — (pending release review)
+## 1.0.0 — 2026-10-30
 
-The first release that runs as an installed Windows application and keeps one
-record across Windows and WSL. Everything below was verified on the operator's
-machine or by the test suite (1083 tests) unless marked otherwise.
+The first release that installs and updates like a Windows application
+(`SocketTrader-Setup-1.0.0.exe`, in-app updates) and keeps one record across
+Windows and WSL. Everything below was verified on the operator's machine or by
+the test suite (1,133 tests, Linux and Windows, Python 3.10–3.13) unless
+marked otherwise. Reviewed live with the operator on 2026-10-29; the QA pass
+and three adversarial security sweeps are in, their remaining lower-severity
+findings are listed under "Deferred to 1.0.1".
 
 ### Fixed
 - **Config saves silently dropped on Windows.** A rename over a file another
@@ -127,6 +131,21 @@ machine or by the test suite (1083 tests) unless marked otherwise.
   been running since October 25. A connection-status field was prototyped and
   withdrawn: it compiled against NinjaTrader.Core.dll but stalled the first
   snapshot on a live NinjaTrader; the dashboard does not need it.
+
+### Deferred to 1.0.1 (review findings, lower severity — none affect an order that is placed)
+- Replay-guard false positive on an id-less close repeated legitimately within the window.
+- `CLOSESTRATEGY` fan-out can send one close per tranche id twice when a stagger was recorded
+  under both ids; NinjaTrader rejects the duplicate.
+- Deferred (delayed/staggered) legs are cancelled on exit but not on a mid-flight role change.
+- Per-entry quantity ceiling and coercion of odd limit values in the web limits form.
+- Prop flat time cap, micro-map and role validation on config load; day-record hardening in
+  the P&L archive against a hand-edited month file.
+- ANSI scrubbing of server-sent strings before they reach the terminal; linear
+  `_parse_ati_fields` with a buffer cap; envelope type validation; strategy-name path
+  characters in file names; a missing `Host` header answered 403; `RecursionError` guard on
+  nested JSON; a warning when the server URL is `ws://` rather than `wss://`.
+- Installer: refuse a non-empty custom `InstallDir`; `Unblock-File` on extracted scripts;
+  `uninstall.cmd` OEM encoding; bundle `anthropic` in the exe for the AI gate.
 
 ### Known limits
 - The in-console effects cannot show on an X-close (Windows hides the window
