@@ -11782,14 +11782,75 @@ class TestUpdater(_WebClient):
         class _P:
             def __init__(self, args, **kw): spawned["args"] = args; spawned["kw"] = kw
         monkeypatch.setattr(st.subprocess, "Popen", _P)
+        monkeypatch.setattr(st.subprocess, "CREATE_NEW_CONSOLE", 0x10, raising=False)
+        monkeypatch.setattr(st.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, raising=False)
+        monkeypatch.setattr(st.subprocess, "DETACHED_PROCESS", 0x8, raising=False)
         monkeypatch.setattr(st, "win_system_exe", lambda name: r"C:\Windows\System32\cmd.exe")
         setup = tmp_path / f"SocketTrader-Setup-{NEXT}.exe"
         script = Path(st._launch_installer_after_exit(setup))
-        text = script.read_text(encoding="utf-8")
+        raw = script.read_bytes()
+        text = raw.decode("utf-8")
+        exe = str(Path(st.sys.executable).resolve())
+        setup_log = tmp_path / f"SocketTrader-Setup-{NEXT}.log"
         assert f"PID eq {os.getpid()}" in text
-        assert f'"{setup}" /SILENT /SUPPRESSMSGBOXES /NORESTART' in text
-        assert str(Path(st.sys.executable).resolve()) in text
+        assert f'"{setup}" /SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /LOG="{setup_log}"' in text
+        # The outcome is recorded where the next start reads it, redirect
+        # first ("exit code 0>> file" would redirect handle 0 instead).
+        assert f'> "{tmp_path / st.UPDATE_RESULT_NAME}" echo %CODE% {setup.name} "{setup_log}"' in text
+        assert f'>> "{tmp_path / st.UPDATE_HISTORY_NAME}" echo' in text
+        assert "set CODE=%errorlevel%" in text
+        # SocketTrader is started again whether Setup succeeded or not.
+        assert text.count(f'start "" "{exe}"') == 2
+        assert "pause >nul" in text and 'del "%~f0"' in text
+        # 2026-10-30: a detached, windowless cmd swallowed the failure;
+        # it is a visible window now, and the CRLFs are not doubled.
+        assert spawned["kw"]["creationflags"] == 0x10 | 0x200
+        assert b"\r\r\n" not in raw and raw.endswith(b"\r\n") and b"\n" not in raw.replace(b"\r\n", b"")
         assert spawned["args"][0].endswith("cmd.exe") and spawned["args"][1:] == ["/c", str(script)]
+
+    def test_next_start_reports_what_the_last_update_did(self, monkeypatch, tmp_path, caplog):
+        monkeypatch.setattr(st.tempfile, "gettempdir", lambda: str(tmp_path))
+        alerts = []
+        monkeypatch.setattr(st, "_dash_set_alert", lambda text, **kw: alerts.append(text))
+        result = tmp_path / st.UPDATE_RESULT_NAME
+        assert st.report_last_update_attempt() == ""            # nothing left behind: silent
+        # Setup failed (exit code 1) and the app is still the old version.
+        result.write_text(f"1 SocketTrader-Setup-{NEXT}.exe C:\\Temp\\SocketTrader-Setup-{NEXT}.log\n", encoding="utf-8")
+        with caplog.at_level(logging.ERROR):
+            line = st.report_last_update_attempt()
+        assert f"install v{NEXT} FAILED" in line and "exit code 1" in line
+        assert "already running" in line and f"SocketTrader-Setup-{NEXT}.log" in line
+        assert f"still v{st.__version__}" in line
+        assert alerts and "exit code 1" in alerts[-1]
+        assert not result.exists()                                # reported once
+        assert st.report_last_update_attempt() == ""
+        # Setup said 0 but this is still the old version: a warning, not "installed".
+        result.write_text(f"0 SocketTrader-Setup-{NEXT}.exe\n", encoding="utf-8")
+        line = st.report_last_update_attempt()
+        assert "reported success" in line and "run the Setup by hand" in line
+        # Setup said 0 and this IS that version: installed.
+        result.write_text(f'0 SocketTrader-Setup-{st.__version__}.exe "C:\\T e m p\\x.log"', encoding="utf-8")
+        assert st.report_last_update_attempt() == f"UPDATE  installed v{st.__version__} — Setup's log: C:\\T e m p\\x.log"
+        # An unknown code still names the log; garbage is dropped, not crashed on.
+        result.write_text(f"9 SocketTrader-Setup-{NEXT}.exe", encoding="utf-8")
+        assert "does not document" in st.report_last_update_attempt()
+        result.write_text("what", encoding="utf-8")
+        assert "unreadable" in st.report_last_update_attempt() and not result.exists()
+
+    def test_only_the_instance_that_owns_the_lock_holds_the_installer_mutex(self):
+        # A refused "already running" window must not hold the AppMutex, or
+        # the silent Setup of an in-app update quits at its running-app check.
+        assert "_hold_app_mutex" not in inspect.getsource(st.apply_windows_app_identity)
+        main_src = inspect.getsource(st.main)
+        lock_at = main_src.index("ok, why = acquire_instance_lock()")
+        refused_at = main_src.index("_hold_window_open(")
+        mutex_at = main_src.index("_hold_app_mutex()")
+        report_at = main_src.index("report_last_update_attempt()")
+        assert lock_at < refused_at < mutex_at < report_at
+
+    def test_session_start_names_the_version(self):
+        src = Path(st.__file__).read_text(encoding="utf-8")
+        assert 'logger.info(f"SESSION START  v{__version__}' in src
 
     def test_web_state_carries_the_update_and_the_endpoint_checks(self, web, monkeypatch):
         monkeypatch.setattr(st, "_http_get", lambda *a, **k: json.dumps(self.RELEASE).encode())

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 # `SocketTrader.exe --version` / `python SocketTrader.py --version`: answered
 # before any import so installers and build checks get it in milliseconds.
@@ -8058,7 +8058,6 @@ def apply_windows_app_identity() -> None:
     with WM_SETICON. Cosmetic: every failure is ignored."""
     if not IS_WINDOWS:
         return
-    _hold_app_mutex()
     try:
         import ctypes
         import ctypes.wintypes as wt
@@ -8260,33 +8259,128 @@ def download_update(rel: dict) -> tuple[Path | None, str]:
     return dest, ""
 
 
+UPDATE_RESULT_NAME = "SocketTrader-update-result.txt"   # "<exit code> <setup name> <setup log>"
+UPDATE_HISTORY_NAME = "SocketTrader-update.log"          # one line per attempt, for the operator
+# Inno Setup's exit codes (Setup Exit Codes in its help), in operator terms.
+SETUP_EXIT_CODES = {
+    1: "Setup failed to initialize — usually its running-app check: another SocketTrader "
+       "window was still open (one saying \"already running\" counts)",
+    2: "Setup was cancelled before it started installing",
+    3: "a fatal error while preparing to install",
+    4: "a fatal error while installing (its log says which file)",
+    5: "the install was aborted part-way",
+    6: "Setup was terminated from outside",
+    7: "Setup could not proceed (files still in use — a SocketTrader.exe was still running)",
+    8: "Setup could not proceed and Windows needs a restart first",
+}
+
+
+def _update_result_path() -> Path:
+    return Path(tempfile.gettempdir()) / UPDATE_RESULT_NAME
+
+
 def _launch_installer_after_exit(setup: Path) -> str:
-    """Hand over to the installer from a detached cmd.exe that waits for
-    THIS process to be gone first (the installer's AppMutex check would
-    otherwise see the app still running), runs Setup silently, then starts
-    the newly installed SocketTrader. Returns the script path."""
+    """Hand over to the installer from a cmd.exe window of its own that
+    waits for THIS process to be gone first (the installer's AppMutex
+    check would otherwise see the app still running), runs Setup silently
+    with a log, records the exit code where the next start can read it
+    (UPDATE_RESULT_NAME) and starts SocketTrader again — the new one when
+    Setup succeeded, the old one when it did not, so the operator is never
+    left with nothing running. Returns the script path.
+
+    2026-10-30 15:46: the first version of this ran detached with no
+    window and no log. Setup quit without installing and the only trace
+    was the script still sitting in %TEMP%; the exit code went to a window
+    that did not exist, `timeout` and `pause` cannot work without a
+    console, and the old version was not restarted. Hence: a visible
+    window, Setup's /LOG, the result file, and a restart either way."""
     exe = Path(sys.executable).resolve()
-    script = Path(tempfile.gettempdir()) / f"SocketTrader-update-{os.getpid()}.cmd"
+    temp = Path(tempfile.gettempdir())
     pid = os.getpid()
-    script.write_text(
-        "@echo off\r\n"
-        f"title SocketTrader update\r\n"
-        f"echo Waiting for SocketTrader to close...\r\n"
-        f":wait\r\n"
-        f"tasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul && (timeout /t 1 /nobreak >nul & goto wait)\r\n"
-        f"echo Installing {setup.name}...\r\n"
-        f"\"{setup}\" /SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS\r\n"
-        f"if errorlevel 1 (echo Setup failed with code %errorlevel% & pause & exit /b 1)\r\n"
-        f"start \"\" \"{exe}\"\r\n"
-        f"del \"%~f0\"\r\n",
-        encoding="utf-8")
+    script = temp / f"SocketTrader-update-{pid}.cmd"
+    setup_log = temp / (setup.stem + ".log")
+    result = temp / UPDATE_RESULT_NAME
+    history = temp / UPDATE_HISTORY_NAME
+    lines = [
+        "@echo off",
+        "title SocketTrader update",
+        "echo Waiting for SocketTrader to close...",
+        ":wait",
+        f"tasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul && (timeout /t 1 /nobreak >nul & goto wait)",
+        "timeout /t 2 /nobreak >nul",
+        f"echo Installing {setup.name} ...",
+        f"\"{setup}\" /SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /LOG=\"{setup_log}\"",
+        "set CODE=%errorlevel%",
+        # Redirection first: "exit code 0>> file" would read as handle 0.
+        f">> \"{history}\" echo %DATE% %TIME%  {setup.name}  exit code %CODE%",
+        f"> \"{result}\" echo %CODE% {setup.name} \"{setup_log}\"",
+        "if not \"%CODE%\"==\"0\" (",
+        "  echo.",
+        # Quoted: a ")" or "&" in the path would otherwise end the block.
+        f"  echo Setup failed with exit code %CODE%. Its log: \"{setup_log}\"",
+        "  echo Starting the installed SocketTrader again...",
+        f"  start \"\" \"{exe}\"",
+        "  echo Press any key to close this window.",
+        "  pause >nul",
+        "  exit /b %CODE%",
+        ")",
+        "echo Setup finished. Starting SocketTrader...",
+        f"start \"\" \"{exe}\"",
+        "del \"%~f0\"",
+    ]
+    # Bytes, not text mode: text mode on Windows turns \r\n into \r\r\n.
+    script.write_bytes(("\r\n".join(lines) + "\r\n").encode("utf-8"))
     flags = 0
-    for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP"):
+    for name in ("CREATE_NEW_CONSOLE", "CREATE_NEW_PROCESS_GROUP"):
         flags |= getattr(subprocess, name, 0)
     cmd_exe = win_system_exe("cmd.exe") or "cmd.exe"
     subprocess.Popen([cmd_exe, "/c", str(script)], creationflags=flags, close_fds=True,
                      cwd=str(script.parent))
     return str(script)
+
+
+def report_last_update_attempt() -> str:
+    """At start-up: say what the previous U / UPDATE did. The handover
+    script leaves UPDATE_RESULT_NAME in %TEMP% ("<exit code> <setup name>
+    <setup log>"); it is reported once (logged, and in the alert line when
+    it failed) and removed. Returns the line logged, "" when there was
+    nothing to report."""
+    path = _update_result_path()
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    parts = raw.split(None, 2)
+    if len(parts) < 2 or not parts[0].lstrip("-").isdigit():
+        line = f"UPDATE  unreadable result left by the last attempt ({raw[:80]!r}) — ignored"
+        logger.warning(line)
+        return line
+    code = int(parts[0])
+    setup_name = parts[1]
+    setup_log = parts[2].strip().strip('"') if len(parts) > 2 else ""
+    m = re.search(r"SocketTrader-Setup-(.+?)\.exe$", setup_name)
+    target = m.group(1) if m else "?"
+    where = f" — Setup's log: {setup_log}" if setup_log else ""
+    if code == 0 and target == __version__:
+        line = f"UPDATE  installed v{target}{where}"
+        logger.info(line)
+        return line
+    if code == 0:
+        line = (f"UPDATE  Setup reported success for v{target} but this is v{__version__} — "
+                f"run the Setup by hand{where}")
+        logger.warning(line)
+    else:
+        why = SETUP_EXIT_CODES.get(code, "an exit code Setup does not document")
+        line = (f"UPDATE  the last attempt to install v{target} FAILED — Setup exit code {code}: "
+                f"{why}{where}. This is still v{__version__}; run the Setup by hand or press U again.")
+        logger.error(line)
+    _dash_set_alert(Fore.RED + f"  ⬆  last update failed (Setup exit code {code}) — see the log"
+                    + Style.RESET_ALL, sticky=True)
+    return line
 
 
 def install_update() -> tuple[bool, str]:
@@ -18321,6 +18415,12 @@ async def main():
         logger.error(f"INSTANCE LOCK  refused to start: {why}")
         _hold_window_open("SocketTrader is already running — this window can be closed.")
         return
+    # Only the instance that owns the lock holds the installer's AppMutex.
+    # Taken before the lock, a refused "already running" window left open
+    # would hold it too, and a silent Setup (the in-app update) then quits
+    # at its running-app check with nothing installed.
+    _hold_app_mutex()
+    report_last_update_attempt()
     notes = migrate_legacy_home()
     fx_matrix_rain()
     for line in notes:
@@ -18483,7 +18583,7 @@ def print_exit_summary():
 
 
 if __name__ == "__main__":
-    logger.info("SESSION START")
+    logger.info(f"SESSION START  v{__version__} ({'installed app' if FROZEN else 'script'}, {sys.platform})")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

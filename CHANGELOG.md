@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.0.2 — 2026-10-30
+
+### Fixed
+- **The in-app update (U / UPDATE) could do nothing, silently.** 2026-10-30
+  15:46 on the operator's PC: 1.0.1 was downloaded and SHA-256-verified, the
+  app stopped cleanly, and then nothing — no install, no restart, the
+  handover script still sitting in `%TEMP%`. The handover ran the Setup
+  from a *detached* cmd with no window: Setup's failure exit code was
+  echoed into a window that did not exist, `timeout`/`pause` cannot run
+  without a console, `/SUPPRESSMSGBOXES` turned any question into Cancel,
+  and the script quit without restarting the old version. What exactly
+  made Setup quit on that PC was therefore not recorded. The handover is
+  now a visible **SocketTrader update** window; Setup runs with
+  `/LOG=%TEMP%\SocketTrader-Setup-<version>.log`; its exit code goes to
+  `%TEMP%\SocketTrader-update.log` (one line per attempt) and to a result
+  file the next start reads back and reports — `UPDATE  installed v…`, or
+  `UPDATE  the last attempt … FAILED — Setup exit code N: <what that code
+  means>` in the log and the alert line; SocketTrader is started again
+  whether Setup succeeded (the new one) or not (the old one); the script
+  waits two seconds after the app is gone; and it is written with plain
+  CRLFs (text mode had doubled them).
+- **A refused "already running" window held the installer's running-app
+  mutex.** The AppMutex was taken before the instance-lock check, so a
+  second SocketTrader left open on its "already running — this window can
+  be closed" screen made any silent Setup (the in-app update) quit at its
+  running-app check. Only the instance that owns the lock holds the mutex
+  now.
+- `SESSION START` logs the version and whether it is the installed app or
+  a script run, so a log shows which build was running.
+
 ## 1.0.1 — 2026-10-30
 
 ### Fixed
