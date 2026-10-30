@@ -3,14 +3,22 @@
 ## 1.0.1 — (unreleased)
 
 ### Fixed
-- **A frozen trading loop looked healthy.** 2026-10-29 21:48:58: the loop
-  stopped (a click inside the console window — Windows QuickEdit pauses every
-  write to the console, and the dashboard is written from the loop) while the
-  web server thread kept answering from cached state for nine hours of missed
-  signals. QuickEdit is now switched off for the app's window at start-up
-  (`"console_quick_edit": true` keeps it), and the web header turns red with
-  `MAIN LOOP STALLED <n> min — restart SocketTrader` as soon as the loop misses
-  15 s of turns (`loop_stalled_s` in `/api/state`).
+- **The trading loop froze when Remote Desktop connected.** 2026-10-29
+  21:48:58, nine hours of missed signals while the web page still showed
+  cached state. Cause: the X-close switch-off effect took a picture of the
+  console window every 1.5 s with `PrintWindow`, which makes the console host
+  render under its console lock — the lock every dashboard write from the
+  trading loop needs. A Remote Desktop connection was switching the session's
+  display at that moment, the render never returned, and the next dashboard
+  write blocked for good. The app no longer asks the console host for anything:
+  it reads the window's position only, and the switch-off helper draws its
+  panel at that spot (no window image any more — see Known limits).
+- **A frozen trading loop looked healthy.** Two independent guards now: the web
+  header turns red with `MAIN LOOP STALLED <n> min — restart SocketTrader` as
+  soon as the loop misses 15 s of turns (`loop_stalled_s` in `/api/state`), and
+  Windows QuickEdit is switched off for the app's console at start-up (a click
+  in the window used to pause every write the same way; `"console_quick_edit":
+  true` keeps it).
 - Release workflow no longer appends generated notes to a hand-written release
   body (the duplicated *Full Changelog* line on 1.0.0).
 
@@ -164,7 +172,8 @@ findings are listed under "Deferred to 1.0.1".
 ### Known limits
 - The in-console effects cannot show on an X-close (Windows hides the window
   first); the detached helper covers that case.
-- Under Windows Terminal the X-close helper draws a dark panel instead of the
-  window's own image (the real window is not visible to the process).
+- The X-close helper draws a dark panel at the window's last position rather
+  than the window's own image: capturing that image went through the console
+  host's renderer and could freeze the trading loop (1.0.1).
 - The session clock treats 4:20–6:00 PM ET as closed; a fill in the 4:30–5:00
   PM reopening would be dated to the next session as an unattributed amount.

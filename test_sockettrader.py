@@ -11963,3 +11963,54 @@ class TestLoopLiveness(_WebClient):
                 GetStdHandle=lambda *a: calls.__setitem__("n", calls["n"] + 1)))))
         st.disable_console_quick_edit()
         assert calls["n"] == 0                                     # config said keep it
+
+
+class TestFxNeverTouchesTheConsoleRenderer:
+    """2026-10-29 21:48:58: a PrintWindow snapshot of the console every 1.5 s
+    (for the X-close effect) asked conhost to render under its console lock
+    while a Remote Desktop connection switched the display; the render never
+    came back and the trading loop froze on its next dashboard write."""
+
+    def test_no_window_capture_api_is_used_anywhere(self):
+        src = Path(st.__file__).read_text(encoding="utf-8")
+        body = src.split("# ---- Closing with the X (Windows) ----", 1)[1]
+        for api in ("PrintWindow(", "BitBlt(", "CreateDIBSection(", "GetDC("):
+            assert api not in body, f"{api} must not be used by the running app"
+
+    def test_snapshot_is_position_only(self, monkeypatch):
+        import types
+        class _R(types.SimpleNamespace):
+            pass
+        calls = []
+        import ctypes.wintypes as wt
+        def rect(hwnd, p):
+            calls.append("GetWindowRect")
+            r = p._obj if hasattr(p, "_obj") else p.contents       # byref() argument
+            r.left, r.top, r.right, r.bottom = 100, 50, 900, 650
+            return 1
+        fake_u32 = types.SimpleNamespace(IsWindowVisible=lambda h: 1, IsIconic=lambda h: 0,
+                                         GetWindowRect=rect)
+        fake_k32 = types.SimpleNamespace(GetConsoleWindow=lambda: 4242)
+        import ctypes
+        real_windll = getattr(ctypes, "windll", None)
+        monkeypatch.setattr(ctypes, "windll", types.SimpleNamespace(user32=fake_u32, kernel32=fake_k32),
+                            raising=False)
+        try:
+            frame = st._fx_console_rect()
+        finally:
+            if real_windll is None:
+                monkeypatch.delattr(ctypes, "windll", raising=False)
+        assert frame == ((100, 50, 800, 600), 0, 0, b"")
+        assert calls == ["GetWindowRect"]
+
+    def test_overlay_gets_the_position_and_no_frame_file(self, monkeypatch, tmp_path):
+        import types
+        monkeypatch.setattr(st, "_fx_frame", ((100, 50, 800, 600), 0, 0, b""))
+        monkeypatch.setattr(st.tempfile, "gettempdir", lambda: str(tmp_path))
+        spawned = {}
+        monkeypatch.setattr(st.subprocess, "Popen", lambda cmd, **kw: spawned.setdefault("cmd", cmd))
+        monkeypatch.setattr(st, "FROZEN", True)
+        st._fx_spawn_overlay()
+        cmd = spawned["cmd"]
+        assert cmd[1:] == ["--fx-overlay", "-", "100", "50", "800", "600"]
+        assert not list(tmp_path.glob("sockettrader_fx_*"))

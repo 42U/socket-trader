@@ -7870,28 +7870,38 @@ def fx_tv_off(seconds: float = FX_TV_S) -> None:
 # Two things happen in that callback: the orderly part of shutdown that
 # the normal exit path does and an X-close used to skip (final P&L save,
 # replay-guard mirror, instance lock release), and the switch-off effect —
-# handed to a detached helper process with the last snapshot of our own
-# window, because nothing we draw in the hidden console is ever seen.
+# handed to a detached helper process with the last known position of our
+# own window, because nothing we draw in the hidden console is ever seen.
 FX_SNAPSHOT_EVERY_S = 1.5
-_fx_frame: tuple[tuple[int, int, int, int], int, int, bytes] | None = None   # (rect, w, h, BGRA)
+_fx_frame: tuple[tuple[int, int, int, int], int, int, bytes] | None = None   # (rect, w, h, BGRA); w=h=0, b"" = position only
 _fx_frame_lock = threading.Lock()
 _fx_ctrl_handler = None            # kept referenced: a collected callback crashes the process
 _fx_closed_once = False
 
 
-def _fx_capture_console() -> tuple[tuple[int, int, int, int], int, int, bytes] | None:
-    """One snapshot of this process's console window (conhost). Returns
-    None under Windows Terminal, whose real window is not the console
-    window the process can see, and on any failure."""
+def _fx_console_rect() -> tuple[tuple[int, int, int, int], int, int, bytes] | None:
+    """Where our console window is right now — and nothing more.
+
+    Until 1.0.0 this took a picture of the window every 1.5 s with
+    PrintWindow, which asks the console host (conhost) to render itself
+    for us. conhost renders under its console lock — the same lock every
+    WriteConsole from the trading loop needs — and on 2026-10-29 21:48:58
+    that render never returned: a Remote Desktop connection was switching
+    the session's display at that moment, the console host sat inside our
+    paint request, and the trading loop froze on its next dashboard write
+    for the rest of the night ("this seems to happen when I remote in").
+    The effect is cosmetic; the trading loop is not. So this reads the
+    window rectangle only (win32k state, no message to conhost, no GDI),
+    and the switch-off helper draws its panel at that spot. Returns None
+    under Windows Terminal (the process's console window is not the
+    visible one) and whenever the window is hidden or minimised."""
     import ctypes
     import ctypes.wintypes as wt
-    u32, g32, k32 = ctypes.windll.user32, ctypes.windll.gdi32, ctypes.windll.kernel32
-    # 64-bit handles must never travel as default c_int: declare every signature.
+    u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
     k32.GetConsoleWindow.restype = wt.HWND
     u32.IsWindowVisible.argtypes = [wt.HWND]
     u32.IsIconic.argtypes = [wt.HWND]
     u32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
-    u32.GetDC.argtypes = [wt.HWND]
     hwnd = k32.GetConsoleWindow()
     if not hwnd or not u32.IsWindowVisible(hwnd) or u32.IsIconic(hwnd):
         return None
@@ -7899,52 +7909,16 @@ def _fx_capture_console() -> tuple[tuple[int, int, int, int], int, int, bytes] |
     if not u32.GetWindowRect(hwnd, ctypes.byref(r)):
         return None
     w, h = r.right - r.left, r.bottom - r.top
-    if w < 40 or h < 40 or w * h > 4_200_000:        # ≤ ~16 MB per snapshot
+    if w < 40 or h < 40:
         return None
-
-    class BITMAPINFOHEADER(ctypes.Structure):
-        _fields_ = [("biSize", wt.DWORD), ("biWidth", wt.LONG), ("biHeight", wt.LONG),
-                    ("biPlanes", wt.WORD), ("biBitCount", wt.WORD), ("biCompression", wt.DWORD),
-                    ("biSizeImage", wt.DWORD), ("biXPelsPerMeter", wt.LONG),
-                    ("biYPelsPerMeter", wt.LONG), ("biClrUsed", wt.DWORD), ("biClrImportant", wt.DWORD)]
-    u32.GetDC.restype = wt.HDC
-    g32.CreateCompatibleDC.restype = wt.HDC
-    g32.CreateDIBSection.restype = wt.HBITMAP
-    g32.CreateDIBSection.argtypes = [wt.HDC, ctypes.c_void_p, wt.UINT, ctypes.POINTER(ctypes.c_void_p),
-                                     wt.HANDLE, wt.DWORD]
-    g32.SelectObject.restype = wt.HGDIOBJ
-    g32.SelectObject.argtypes = [wt.HDC, wt.HGDIOBJ]
-    g32.DeleteObject.argtypes = [wt.HGDIOBJ]
-    g32.DeleteDC.argtypes = [wt.HDC]
-    u32.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
-    u32.PrintWindow.argtypes = [wt.HWND, wt.HDC, wt.UINT]
-    sdc = u32.GetDC(None)
-    mem = g32.CreateCompatibleDC(sdc)
-    bmi = BITMAPINFOHEADER()
-    bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-    bmi.biWidth, bmi.biHeight, bmi.biPlanes, bmi.biBitCount = w, -h, 1, 32
-    bits = ctypes.c_void_p()
-    hbm = g32.CreateDIBSection(sdc, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
-    out = None
-    try:
-        if hbm and bits:
-            old = g32.SelectObject(mem, hbm)
-            if u32.PrintWindow(hwnd, mem, 2):                  # PW_RENDERFULLCONTENT
-                out = ((r.left, r.top, w, h), w, h, ctypes.string_at(bits, w * h * 4))
-            g32.SelectObject(mem, old)
-    finally:
-        if hbm:
-            g32.DeleteObject(hbm)
-        g32.DeleteDC(mem)
-        u32.ReleaseDC(None, sdc)
-    return out
+    return ((r.left, r.top, w, h), 0, 0, b"")
 
 
 def _fx_snapshot_loop(stop: threading.Event) -> None:
     global _fx_frame
     while not stop.wait(FX_SNAPSHOT_EVERY_S):
         try:
-            frame = _fx_capture_console()
+            frame = _fx_console_rect()
         except Exception:
             frame = None
         if frame is not None:
@@ -7960,7 +7934,11 @@ def _fx_spawn_overlay() -> None:
     with _fx_frame_lock:
         frame = _fx_frame
     path = Path(tempfile.gettempdir()) / f"sockettrader_fx_{os.getpid()}.bin"
-    if frame is not None:
+    if frame is not None and not frame[3]:
+        # Position only (the normal case now): the helper draws its panel there.
+        (x, y, w, h) = frame[0]
+        path = Path("-")
+    elif frame is not None:
         (x, y, w, h), fw, fh, px = frame
         try:
             with open(path, "wb") as f:
