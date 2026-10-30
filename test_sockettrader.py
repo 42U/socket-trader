@@ -8425,7 +8425,10 @@ class TestStreamFlatten:
             closed = st.close_all_open_positions()
             elapsed = time.monotonic() - t0
         assert closed == ["NQ SEP26"] and order[0] == "A" and set(order) == {"A", "B"}
-        assert elapsed < 0.5                       # no dump on the flatten path
+        # No dump on the flatten path: a dump would cost seconds (the stream
+        # here answers in 0.2 s). Generous bound — a loaded CI runner measured
+        # exactly 0.5 s once.
+        assert elapsed < 2.0
         assert len(s.calls) - n_before <= 2        # the stream kept its own pace
 
     def test_verify_flat_trusts_only_a_dump_requested_after_the_closes(self, monkeypatch):
