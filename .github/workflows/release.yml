@@ -11,6 +11,14 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      attach_to:
+        description: >-
+          Existing release tag to (re)attach the files built from this ref to,
+          replacing same-named assets (e.g. v1.0.0 after a fix shipped under the
+          same version). Blank: build run artifacts only.
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -48,6 +56,10 @@ jobs:
           $tag = "${{ github.ref_name }}".TrimStart('v')
           if ("${{ github.event_name }}" -eq 'push' -and $v -ne $tag) {
             throw "SocketTrader.py says $v but the tag is ${{ github.ref_name }}"
+          }
+          $attach = "${{ inputs.attach_to }}"
+          if ($attach -and $attach.TrimStart('v') -ne $v) {
+            throw "SocketTrader.py says $v but the files would be attached to $attach"
           }
           "APP_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append
 
@@ -108,9 +120,11 @@ jobs:
             ${{ env.ZIP }}.sha256
 
       - name: GitHub release
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || inputs.attach_to != ''
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event_name == 'push' && github.ref_name || inputs.attach_to }}
+          overwrite_files: true
           files: |
             ${{ env.SETUP }}
             ${{ env.SETUP }}.sha256
