@@ -117,4 +117,7 @@ jobs:
             ${{ env.ZIP }}
             ${{ env.ZIP }}.sha256
           prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
-          generate_release_notes: true
+          # The release body is written when the release is created (UI or
+          # CHANGELOG); generated notes appended here duplicated the
+          # "Full Changelog" line on v1.0.0.
+          generate_release_notes: false
