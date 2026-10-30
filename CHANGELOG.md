@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.0.1 — 2026-10-30
+
+### Fixed
+- **Installing 1.0.0 made NinjaTrader show "Unable to load ATM strategy
+  template from file '…\templates\AtmStrategy\algoNQmed.xml'".**
+  `algoNQmed.xml` is a *stop* strategy template (the one `NQ_Med` uses);
+  NinjaTrader keeps those in `templates\StopStrategy`, but the 1.0.0
+  Setup.exe copied every file in `strategy\` into `templates\AtmStrategy`,
+  so NinjaTrader found a stop template in its ATM folder and could not read
+  it as one. Orders were never affected — the ATM templates themselves were
+  in the right place — only the error dialog. The installer now sorts the
+  templates by kind at build time (`scripts/sort_templates.py`; a file that
+  is neither kind fails the build), installs each kind to its own
+  NinjaTrader folder, and removes the misplaced copy 1.0.0 left behind
+  (only a file with the name of a shipped stop template whose content is a
+  stop strategy document; an operator's own ATM template of that name is
+  left alone). Existing templates are still never overwritten. The release
+  smoke test now installs against a fake `Documents\NinjaTrader 8` with the
+  stray 1.0.0 file planted and checks the placement and the cleanup.
+- **`U` (check for / install an update) was a hidden key.** It worked but was
+  not listed in the controls bar. The bar now shows `U=UPDATE`, the README
+  key table has the row, and a test parses the keyboard loop and fails if a
+  handled key is missing from the bar.
+
+Already on 1.0.0: the app offers this update in its alert line and web
+header; `U` or the UPDATE chip installs it, and the installer cleans up the
+stray template. The review findings listed under 1.0.0 as "Deferred to
+1.0.1" remain open and move to the next release.
+
 ## 1.0.0 — 2026-10-30
 
 The first release that installs and updates like a Windows application
