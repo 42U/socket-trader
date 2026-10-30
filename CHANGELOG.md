@@ -1,6 +1,14 @@
 # Changelog
 
-## 1.0.1 — (unreleased)
+## 1.0.0 — 2026-10-30
+
+The first release that installs and updates like a Windows application
+(`SocketTrader-Setup-1.0.0.exe`, in-app updates) and keeps one record across
+Windows and WSL. Everything below was verified on the operator's machine or by
+the test suite (1,140 tests, Linux and Windows, Python 3.10–3.13) unless
+marked otherwise. Reviewed live with the operator on 2026-10-29; the QA pass
+and three adversarial security sweeps are in, their remaining lower-severity
+findings are listed under "Deferred to 1.0.1".
 
 ### Fixed
 - **The trading loop froze when Remote Desktop connected.** 2026-10-29
@@ -12,7 +20,10 @@
   display at that moment, the render never returned, and the next dashboard
   write blocked for good. The app no longer asks the console host for anything:
   it reads the window's position only, and the switch-off helper draws its
-  panel at that spot (no window image any more — see Known limits).
+  panel at that spot (no window image any more — see Known limits). The 1.0.0
+  release was rebuilt with this fix on 2026-10-30; a first-day 1.0.0 install
+  must run the Setup again by hand (same version number, so the in-app
+  updater does not offer it).
 - **A frozen trading loop looked healthy.** Two independent guards now: the web
   header turns red with `MAIN LOOP STALLED <n> min — restart SocketTrader` as
   soon as the loop misses 15 s of turns (`loop_stalled_s` in `/api/state`), and
@@ -21,18 +32,6 @@
   true` keeps it).
 - Release workflow no longer appends generated notes to a hand-written release
   body (the duplicated *Full Changelog* line on 1.0.0).
-
-## 1.0.0 — 2026-10-30
-
-The first release that installs and updates like a Windows application
-(`SocketTrader-Setup-1.0.0.exe`, in-app updates) and keeps one record across
-Windows and WSL. Everything below was verified on the operator's machine or by
-the test suite (1,133 tests, Linux and Windows, Python 3.10–3.13) unless
-marked otherwise. Reviewed live with the operator on 2026-10-29; the QA pass
-and three adversarial security sweeps are in, their remaining lower-severity
-findings are listed under "Deferred to 1.0.1".
-
-### Fixed
 - **Config saves silently dropped on Windows.** A rename over a file another
   thread had open failed with "Access is denied … .tmp" and the setting was
   lost while the app believed it had saved — the cause of profiles that
@@ -174,6 +173,6 @@ findings are listed under "Deferred to 1.0.1".
   first); the detached helper covers that case.
 - The X-close helper draws a dark panel at the window's last position rather
   than the window's own image: capturing that image went through the console
-  host's renderer and could freeze the trading loop (1.0.1).
+  host's renderer and could freeze the trading loop.
 - The session clock treats 4:20–6:00 PM ET as closed; a fill in the 4:30–5:00
   PM reopening would be dated to the next session as an unattributed amount.
