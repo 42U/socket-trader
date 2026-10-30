@@ -13,7 +13,7 @@ if not defined PID (
   echo SocketTrader.exe is not running. > "%OUT%"
   goto :show
 )
-echo SocketTrader pid %PID% — fetching py-spy (first time only)...
+echo SocketTrader pid %PID% - fetching py-spy (first time only)...
 py -3 -m pip install --quiet --disable-pip-version-check py-spy >nul 2>&1 || python -m pip install --quiet --disable-pip-version-check py-spy >nul 2>&1
 set "PYSPY="
 for /f "delims=" %%s in ('py -3 -c "import sysconfig,os;print(os.path.join(sysconfig.get_path('scripts'),'py-spy.exe'))" 2^>nul') do set "PYSPY=%%s"
