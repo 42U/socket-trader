@@ -207,7 +207,7 @@ All settings are saved and loaded automatically on subsequent runs. To change an
 The controls bar is **pinned to the bottom** of the terminal at all times:
 
 ```
-  O=ORDER  P=PAUSE  B=BAL  T=LIMITS  C=CLOSE  R=RECONN  S=SETUP  ⇧X=EXIT
+  O=ORDER  P=PAUSE  B=BAL  T=LIMITS  C=CLOSE  R=RECONN  S=SETUP  U=UPDATE  ⇧X=EXIT
 ```
 
 | Key | Action |
@@ -219,6 +219,7 @@ The controls bar is **pinned to the bottom** of the terminal at all times:
 | `C` | Close open positions (arrow keys to select, `Y` to confirm) |
 | `R` | Force immediate reconnect (resets backoff) |
 | `S` | Open Setup menu (see below) |
+| `U` | Check GitHub for a newer release and, if there is one, download it (SHA-256 verified) and install it — stops cleanly first, so use it between trades |
 | `Shift+X` | Exit SocketTrader |
 
 ### Setup Menu

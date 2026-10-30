@@ -12014,3 +12014,135 @@ class TestFxNeverTouchesTheConsoleRenderer:
         cmd = spawned["cmd"]
         assert cmd[1:] == ["--fx-overlay", "-", "100", "50", "800", "600"]
         assert not list(tmp_path.glob("sockettrader_fx_*"))
+
+
+# ── NinjaTrader templates: each kind in its own folder ───────────────
+#
+# 1.0.0's Setup.exe copied strategy\*.xml wholesale into
+# templates\AtmStrategy. strategy\algoNQmed.xml is a *stop* strategy
+# template (root <StopStrategy>), so NinjaTrader showed "Unable to load ATM
+# strategy template from file '...\AtmStrategy\algoNQmed.xml'" on every PC
+# the installer ran on. build.ps1 now sorts the templates by root element
+# (scripts/sort_templates.py) and the installer routes each kind to its
+# own NinjaTrader folder and removes the stray copy 1.0.0 left behind.
+
+
+def _load_sort_templates():
+    import importlib.util
+    path = Path(st.__file__).parent / "scripts" / "sort_templates.py"
+    spec = importlib.util.spec_from_file_location("sort_templates", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ATM_DOC = ('<?xml version="1.0" encoding="utf-8"?>\n<NinjaTrader>\n  <AtmStrategy>\n'
+           '    <StopStrategy><Template>inner</Template></StopStrategy>\n'
+           '    <Template>{name}</Template>\n  </AtmStrategy>\n</NinjaTrader>\n')
+STOP_DOC = ('﻿<?xml version="1.0" encoding="utf-8"?>\r\n<NinjaTrader>\r\n'
+            '  <StopStrategy>\r\n    <Template>{name}</Template>\r\n  </StopStrategy>\r\n</NinjaTrader>\r\n')
+
+
+class TestNinjaTraderTemplateKinds:
+    STRATEGY_DIR = Path(st.__file__).parent / "strategy"
+
+    def test_every_shipped_template_is_an_atm_or_stop_document(self):
+        mod = _load_sort_templates()
+        kinds = {p.name: mod.template_kind(p) for p in sorted(self.STRATEGY_DIR.glob("*.xml"))}
+        assert kinds, "strategy/ has no templates"
+        assert set(kinds.values()) <= {"AtmStrategy", "StopStrategy"}
+        # The two the app's own Setup installs by name, each of its kind.
+        assert kinds["NQ_Med.xml"] == "AtmStrategy"
+        assert kinds["algoNQmed.xml"] == "StopStrategy"
+
+    def test_the_apps_setup_puts_each_named_template_in_its_own_folder(self):
+        mod = _load_sort_templates()
+        for folder, filename in st.STRATEGY_FILES.items():
+            assert mod.template_kind(self.STRATEGY_DIR / filename) == folder, (folder, filename)
+
+    def test_template_kind_rejects_what_ninjatrader_cannot_load(self, tmp_path):
+        mod = _load_sort_templates()
+        (tmp_path / "atm.xml").write_text(ATM_DOC.format(name="a"), encoding="utf-8")
+        (tmp_path / "stop.xml").write_text(STOP_DOC.format(name="s"), encoding="utf-8")
+        assert mod.template_kind(tmp_path / "atm.xml") == "AtmStrategy"
+        assert mod.template_kind(tmp_path / "stop.xml") == "StopStrategy"     # BOM + CRLF, as NT writes them
+        (tmp_path / "other.xml").write_text("<NinjaTrader><Workspace/></NinjaTrader>", encoding="utf-8")
+        with pytest.raises(ValueError, match="other.xml.*<Workspace>"):
+            mod.template_kind(tmp_path / "other.xml")
+        (tmp_path / "broken.xml").write_text("<NinjaTrader><AtmStrategy>", encoding="utf-8")
+        with pytest.raises(ValueError, match="broken.xml.*not well-formed"):
+            mod.template_kind(tmp_path / "broken.xml")
+        (tmp_path / "bare.xml").write_text("<AtmStrategy/>", encoding="utf-8")
+        with pytest.raises(ValueError, match="not <NinjaTrader>"):
+            mod.template_kind(tmp_path / "bare.xml")
+
+    def test_sort_templates_splits_by_kind_and_replaces_the_out_dir(self, tmp_path):
+        mod = _load_sort_templates()
+        src, out = tmp_path / "strategy", tmp_path / "dist" / "templates"
+        src.mkdir()
+        (src / "A.xml").write_text(ATM_DOC.format(name="A"), encoding="utf-8")
+        (src / "B.xml").write_text(ATM_DOC.format(name="B"), encoding="utf-8")
+        (src / "s.xml").write_text(STOP_DOC.format(name="s"), encoding="utf-8")
+        (src / "notes.txt").write_text("not a template", encoding="utf-8")
+        stale = out / "AtmStrategy" / "Old.xml"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("from a previous build", encoding="utf-8")
+        result = mod.sort_templates(src, out)
+        assert result == {"AtmStrategy": ["A.xml", "B.xml"], "StopStrategy": ["s.xml"]}
+        assert sorted(p.name for p in (out / "AtmStrategy").iterdir()) == ["A.xml", "B.xml"]
+        assert sorted(p.name for p in (out / "StopStrategy").iterdir()) == ["s.xml"]
+        assert not stale.exists()
+        assert (out / "StopStrategy" / "s.xml").read_bytes() == (src / "s.xml").read_bytes()
+
+    def test_sort_templates_writes_nothing_when_one_file_is_unknown(self, tmp_path):
+        mod = _load_sort_templates()
+        src, out = tmp_path / "strategy", tmp_path / "out"
+        src.mkdir()
+        (src / "A.xml").write_text(ATM_DOC.format(name="A"), encoding="utf-8")
+        (src / "z.xml").write_text("<NinjaTrader><Chart/></NinjaTrader>", encoding="utf-8")
+        with pytest.raises(ValueError, match="z.xml"):
+            mod.sort_templates(src, out)
+        assert not out.exists()
+        # The command-line entry point turns that into a failed build.
+        assert mod.main(["sort_templates.py", str(src), str(out)]) == 1
+        assert mod.main(["sort_templates.py", str(tmp_path / "missing"), str(out)]) == 2
+
+    def test_build_sorts_the_templates_and_the_installer_routes_each_kind(self):
+        root = Path(st.__file__).parent
+        build = (root / "build.ps1").read_text(encoding="utf-8")
+        assert r"scripts\sort_templates.py" in build
+        assert r"dist\templates" in build
+        iss = (root / "installer" / "SocketTrader.iss").read_text(encoding="utf-8")
+        # Never again the whole folder into the ATM folder.
+        assert r'Source: "..\strategy\*.xml"' not in iss
+        assert r'Source: "..\dist\templates\AtmStrategy\*.xml"; DestDir: "{code:NtTemplates|AtmStrategy}"' in iss
+        assert r'Source: "..\dist\templates\StopStrategy\*.xml"; DestDir: "{code:NtTemplates|StopStrategy}"' in iss
+        assert "RemoveMisplacedStopTemplates();" in iss
+        assert "'\\templates\\' + Kind" in iss
+        # The release smoke test exercises the placement on a real install.
+        wf = (root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        for needle in ("templates\\AtmStrategy", "templates\\StopStrategy",
+                       "stop strategy template still in templates\\AtmStrategy",
+                       "algoNQmed.xml missing from templates\\StopStrategy"):
+            assert needle in wf, needle
+
+
+class TestControlsBarListsEveryKey:
+    """Every key the keyboard loop acts on is shown in the pinned controls
+    bar — U (update) was handled but never listed, so it was a hidden
+    feature. Parse the loop rather than hard-code the set, so the next key
+    added to one place without the other fails here."""
+
+    def test_every_handled_key_is_in_the_controls_bar(self):
+        src = inspect.getsource(st.keyboard_loop)
+        handled = set(re.findall(r'key\.lower\(\) == "([a-z])"', src))
+        assert handled >= {"p", "b", "s", "t", "r", "c", "o", "u"}
+        listed = {m.lower() for m in re.findall(r"(?<![A-Z⇧])([A-Z])=", st.CONTROLS_TEXT)}
+        missing = handled - listed
+        assert not missing, f"handled but not shown in the controls bar: {sorted(missing)}"
+        assert "⇧X=EXIT" in st.CONTROLS_TEXT and 'key == "X"' in src   # Shift+X, shown as such
+
+    def test_readme_matches_the_controls_bar(self):
+        readme = (Path(st.__file__).parent / "README.md").read_text(encoding="utf-8")
+        assert st.CONTROLS_TEXT in readme
+        assert "| `U` |" in readme

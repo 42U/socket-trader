@@ -99,9 +99,22 @@ jobs:
       - name: Setup.exe smoke test (silent install into a scratch folder)
         shell: pwsh
         run: |
+          # A "NinjaTrader 8" folder under Documents makes the installer place
+          # the templates, exactly as on an operator's PC. Plant what 1.0.0
+          # left behind (a stop strategy document in the ATM folder) and an
+          # operator's own template that carries a shipped name.
+          $nt = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'NinjaTrader 8'
+          $atm = Join-Path $nt 'templates\AtmStrategy'
+          $stop = Join-Path $nt 'templates\StopStrategy'
+          New-Item -ItemType Directory -Force -Path $atm, $stop | Out-Null
+          Copy-Item strategy\algoNQmed.xml (Join-Path $atm 'algoNQmed.xml')
+          $own = '<?xml version="1.0" encoding="utf-8"?><NinjaTrader><AtmStrategy><Template>Bhorgini</Template><Operator>edited</Operator></AtmStrategy></NinjaTrader>'
+          Set-Content -Path (Join-Path $atm 'Bhorgini.xml') -Value $own -Encoding ascii
+
           $dir = Join-Path $env:RUNNER_TEMP 'st-smoke'
-          $p = Start-Process -FilePath ".\$env:SETUP" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=`"$dir`"", "/LOG=`"$env:RUNNER_TEMP\st-setup.log`"" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { Get-Content "$env:RUNNER_TEMP\st-setup.log" | Select-Object -Last 40; throw "Setup.exe exited $($p.ExitCode)" }
+          $log = Join-Path $env:RUNNER_TEMP 'st-setup.log'
+          $p = Start-Process -FilePath ".\$env:SETUP" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=`"$dir`"", "/LOG=`"$log`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content $log | Select-Object -Last 40; throw "Setup.exe exited $($p.ExitCode)" }
           $exe = Join-Path $dir 'SocketTrader.exe'
           if (-not (Test-Path $exe)) { throw "installed exe missing at $exe" }
           $reported = & $exe --version 2>&1
@@ -109,6 +122,20 @@ jobs:
           $un = Get-ChildItem $dir -Filter 'unins*.exe' | Select-Object -First 1
           if (-not $un) { throw 'uninstaller missing' }
           Write-Host "installed and reported: $reported"
+
+          # Templates: each kind in its own NinjaTrader folder, the stray
+          # stop template gone from the ATM folder, the operator's file intact.
+          Select-String -Path $log -Pattern 'misplaced' | ForEach-Object { Write-Host $_.Line }
+          if (Test-Path (Join-Path $atm 'algoNQmed.xml')) { throw 'stop strategy template still in templates\AtmStrategy' }
+          if (-not (Test-Path (Join-Path $stop 'algoNQmed.xml'))) { throw 'algoNQmed.xml missing from templates\StopStrategy' }
+          if (-not (Test-Path (Join-Path $atm 'NQ_Med.xml'))) { throw 'NQ_Med.xml missing from templates\AtmStrategy' }
+          if ((Get-Content (Join-Path $atm 'Bhorgini.xml') -Raw) -notmatch '<Operator>edited</Operator>') { throw "the operator's Bhorgini.xml was replaced" }
+          $bad = Get-ChildItem $atm -Filter *.xml | Where-Object { (Get-Content $_.FullName -Raw) -notmatch '<AtmStrategy' }
+          if ($bad) { throw "not ATM templates in templates\AtmStrategy: $($bad.Name -join ', ')" }
+          $shipped = (Get-ChildItem strategy -Filter *.xml).Count
+          $placed = (Get-ChildItem $atm -Filter *.xml).Count + (Get-ChildItem $stop -Filter *.xml).Count
+          if ($placed -lt $shipped) { throw "$shipped templates shipped, $placed in NinjaTrader's folders" }
+          Write-Host "templates: $((Get-ChildItem $atm -Filter *.xml).Count) ATM, $((Get-ChildItem $stop -Filter *.xml).Count) stop"
 
       - uses: actions/upload-artifact@v4
         with:

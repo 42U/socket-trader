@@ -134,6 +134,18 @@ foreach ($extra in @('README.md', 'PROP_RULES.md', 'LICENSE', 'install.ps1', 'in
     if (Test-Path $extra) { Copy-Item $extra (Join-Path $dist (Split-Path $extra -Leaf)) -Recurse -Force }
 }
 
+# ---- NinjaTrader templates for the installer --------------------------------
+# strategy\ holds ATM strategy templates and stop strategy templates side by
+# side; NinjaTrader wants them in templates\AtmStrategy and
+# templates\StopStrategy respectively and shows "Unable to load ATM strategy
+# template from file ..." for a stop template dropped in the ATM folder.
+# Sort them into dist\templates\<kind> so installer\SocketTrader.iss can
+# route each kind to its own folder; an unrecognised file fails the build.
+Step 'Sorting NinjaTrader templates'
+& $vpy (Join-Path $here 'scripts\sort_templates.py') (Join-Path $here 'strategy') (Join-Path $here 'dist\templates')
+if ($LASTEXITCODE -ne 0) { throw 'strategy\ holds a file that is neither an ATM nor a stop strategy template (see above)' }
+Ok 'dist\templates\AtmStrategy and dist\templates\StopStrategy ready for the installer'
+
 # ---- smoke test -----------------------------------------------------------
 Step 'Smoke test'
 $reported = & $exe --version 2>&1

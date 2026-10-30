@@ -7344,7 +7344,7 @@ def show_cursor():
 _controls_pinned = False
 _header_lines = 0  # Number of lines the pinned header occupies
 _status_bar_row = 0  # Terminal row where the status bar starts
-CONTROLS_TEXT = "O=ORDER  P=PAUSE  B=BAL  T=LIMITS  C=CLOSE  R=RECONN  S=SETUP  ⇧X=EXIT"
+CONTROLS_TEXT = "O=ORDER  P=PAUSE  B=BAL  T=LIMITS  C=CLOSE  R=RECONN  S=SETUP  U=UPDATE  ⇧X=EXIT"
 
 
 def _build_controls_line():

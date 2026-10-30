@@ -74,10 +74,16 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; The whole onedir build: SocketTrader.exe, _internal\, and the extras
 ; build.ps1 copies beside it (README, templates, AddOn source, images).
 Source: "..\dist\SocketTrader\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-; ATM templates NinjaTrader loads by name. Only when NinjaTrader 8 is
-; installed for this user, never over a template that already exists
-; (an edited one is the operator's), and left in place on uninstall.
-Source: "..\strategy\*.xml"; DestDir: "{code:NtTemplates}"; Flags: onlyifdoesntexist uninsneveruninstall skipifsourcedoesntexist; Check: NinjaTraderPresent
+; Templates NinjaTrader loads by name. strategy\ holds two kinds that
+; NinjaTrader keeps in different folders — it shows "Unable to load ATM
+; strategy template from file ..." for a stop strategy template found in
+; the ATM folder — so build.ps1 sorts them into dist\templates\<kind>
+; (scripts\sort_templates.py) and each kind is installed to its own folder.
+; Only when NinjaTrader 8 is installed for this user, never over a
+; template that already exists (an edited one is the operator's), and
+; left in place on uninstall.
+Source: "..\dist\templates\AtmStrategy\*.xml"; DestDir: "{code:NtTemplates|AtmStrategy}"; Flags: onlyifdoesntexist uninsneveruninstall skipifsourcedoesntexist; Check: NinjaTraderPresent
+Source: "..\dist\templates\StopStrategy\*.xml"; DestDir: "{code:NtTemplates|StopStrategy}"; Flags: onlyifdoesntexist uninsneveruninstall skipifsourcedoesntexist; Check: NinjaTraderPresent
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; IconFilename: "{app}\images\sockettrader.ico"; AppUserModelID: "{#AppUserModelId}"; Comment: "NinjaTrader signal gateway"
@@ -103,17 +109,74 @@ begin
   Result := DirExists(NtRoot());
 end;
 
-function NtTemplates(Param: String): String;
+// {code:NtTemplates|AtmStrategy} or {code:NtTemplates|StopStrategy}.
+function NtTemplates(Kind: String): String;
 begin
-  Result := NtRoot() + '\templates\AtmStrategy';
+  Result := NtRoot() + '\templates\' + Kind;
 end;
 
-// Upgrading over an older per-user install made by install.bat: that
-// installer registered its own uninstaller under a different key, which
-// would leave two "SocketTrader" entries in Settings > Apps. Drop the old
-// registration (the files are replaced by this install anyway).
+// A stop strategy template document: <StopStrategy> at the top and no
+// <AtmStrategy> (ATM templates embed a <StopStrategy> element of their own).
+function IsStopStrategyDoc(const FileName: String): Boolean;
+var
+  Raw: AnsiString;
+  S: String;
+begin
+  Result := False;
+  if LoadStringFromFile(FileName, Raw) then
+  begin
+    S := Raw;
+    Result := (Pos('<StopStrategy', S) > 0) and (Pos('<AtmStrategy', S) = 0);
+  end;
+end;
+
+// 1.0.0's Setup.exe copied every template into templates\AtmStrategy, the
+// stop strategy template included, and NinjaTrader then showed "Unable to
+// load ATM strategy template from file '...\algoNQmed.xml'" on each machine
+// it was installed on. Remove what that left behind: a file in the ATM
+// folder that has the name of a stop template we ship AND is itself a stop
+// strategy document. An operator's own ATM template of the same name is an
+// ATM document and is left alone.
+procedure RemoveMisplacedStopTemplates();
+var
+  Rec: TFindRec;
+  Shipped, AtmDir, Stray: String;
+begin
+  if not NinjaTraderPresent() then
+    exit;
+  Shipped := ExpandConstant('{app}\strategy');
+  AtmDir := NtTemplates('AtmStrategy');
+  if FindFirst(Shipped + '\*.xml', Rec) then
+  begin
+    try
+      repeat
+        if IsStopStrategyDoc(Shipped + '\' + Rec.Name) then
+        begin
+          Stray := AtmDir + '\' + Rec.Name;
+          if FileExists(Stray) and IsStopStrategyDoc(Stray) then
+          begin
+            if DeleteFile(Stray) then
+              Log('removed misplaced stop strategy template ' + Stray)
+            else
+              Log('could not remove misplaced stop strategy template ' + Stray);
+          end;
+        end;
+      until not FindNext(Rec);
+    finally
+      FindClose(Rec);
+    end;
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
+  begin
+    // Upgrading over an older per-user install made by install.bat: that
+    // installer registered its own uninstaller under a different key, which
+    // would leave two "SocketTrader" entries in Settings > Apps. Drop the old
+    // registration (the files are replaced by this install anyway).
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\SocketTrader');
+    RemoveMisplacedStopTemplates();
+  end;
 end;
