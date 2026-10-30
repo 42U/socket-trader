@@ -219,13 +219,20 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             else if (State == State.Active)
             {
-                StartListener();
+                bool listening = StartListener();
                 HookAccounts();
                 SubscribeExistingPositions();
                 heartbeatTimer = new Timer(_ => SafeBroadcast(), null,
                     HeartbeatInterval, HeartbeatInterval);
-                NinjaTrader.Code.Output.Process(
-                    $"SocketTraderBridge listening on {BindAddress}:{listenPort}",
+                // Say "listening" only when the bind succeeded: after a
+                // failed start this line used to follow the failure and
+                // read as if the port were open (2026-10-29, port held by
+                // NinjaTrader's own ATI).
+                NinjaTrader.Code.Output.Process(listening
+                    ? $"SocketTraderBridge listening on {BindAddress}:{listenPort}"
+                    : $"SocketTraderBridge NOT listening — port {listenPort} is in use " +
+                      "(NinjaTrader's AT Interface on the same port?). Change the Live Monitor " +
+                      "port in SocketTrader (Setup > 9 > 4) and press F5.",
                     PrintTo.OutputTab1);
             }
             else if (State == State.Terminated)
@@ -238,7 +245,8 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         // ---------- TCP ----------
-        private void StartListener()
+        /// <summary>True when the listener is bound and accepting.</summary>
+        private bool StartListener()
         {
             try
             {
@@ -254,12 +262,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                 listener.Start();
                 acceptThread = new Thread(AcceptLoop) { IsBackground = true, Name = "STB-Accept" };
                 acceptThread.Start();
+                return true;
             }
             catch (Exception ex)
             {
                 NinjaTrader.Code.Output.Process(
                     $"SocketTraderBridge: failed to start listener: {ex.Message}",
                     PrintTo.OutputTab1);
+                return false;
             }
         }
 
@@ -329,6 +339,14 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // AUTHENTICATE BEFORE ANYTHING IS SENT. The snapshot carries
                 // account balances and open positions, so it must not go out
                 // to an unverified peer — the client speaks first here.
+                //
+                // Started before the token file existed (fresh machine: the
+                // AddOn is compiled first, SocketTrader writes the token when
+                // the live monitor is enabled)? Look again now, rate-limited
+                // like a mismatch — otherwise every connection is refused
+                // until the next compile or NinjaTrader restart.
+                if (string.IsNullOrEmpty(sharedToken))
+                    RefreshTokenIfStale();
                 if (string.IsNullOrEmpty(sharedToken))
                 {
                     NinjaTrader.Code.Output.Process(
