@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.0.3 — 2026-10-31
+
+### Fixed
+- **Every trade on an account whose ATM uses a simulated stop was closed
+  15 s after entry.** NinjaTrader holds a simulated stop locally until its
+  trigger trades and logs it as `Name='SimStop1' New state='Trigger
+  pending'`. The bracket guard's naked watch counted only orders named
+  `Stop…` in the states the ATI dump spells (`TriggerPending`), so it saw
+  no stop at all, declared the position unprotected after
+  `BRACKET_ATTACH_S` (15 s) and closed it — on every entry. Reported by a
+  user on 2026-10-30. A stop now counts under any of NinjaTrader's names
+  (`Stop`, `Stop1`, `SimStop1`) and in the log's own spellings (`Trigger
+  pending`, `Partially filled`, `Change submitted`, `Change pending`); a
+  stop mid-trail (`Change submitted`) counts too, and a rejected `SimStop1`
+  is handled as a rejected stop. When the watch does act, the log now also
+  lists every order NinjaTrader shows open on that root, so the next
+  unfamiliar name is diagnosable from the log alone.
+
 ## 1.0.2 — 2026-10-30
 
 ### Fixed

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 # `SocketTrader.exe --version` / `python SocketTrader.py --version`: answered
 # before any import so installers and build checks get it in milliseconds.
@@ -10752,11 +10752,28 @@ def fire_close_position(account: str, contract: str):
 
 
 # NT order states that still carry (or may still gain) working exposure
-# and are therefore worth cancelling when flattening an account.
+# and are therefore worth cancelling when flattening an account. These are
+# the ATI dump's spellings (NinjaTrader's OrderState names).
 OPEN_ORDER_STATES = {
     "Working", "Accepted", "Submitted", "PartFilled",
-    "TriggerPending", "ChangePending", "PendingSubmit", "PendingChange",
+    "TriggerPending", "ChangePending", "ChangeSubmitted", "PendingSubmit", "PendingChange",
 }
+# NinjaTrader's LOG spells the same states as display text — 'Trigger
+# pending', 'Partially filled', 'Change submitted', 'Change pending' — and
+# the bracket guard reads the log. 2026-10-30: a user's ATM used a simulated
+# stop; NinjaTrader logged it as Name='SimStop1' New state='Trigger pending',
+# neither spelling was known here, every position read as having no stop,
+# and the naked watch closed every trade 15 s after entry.
+NT_LOG_OPEN_STATES = OPEN_ORDER_STATES | {
+    "Trigger pending", "Partially filled", "Change submitted", "Change pending",
+}
+# A stop by any of NinjaTrader's names: Stop, Stop1, Stop2 … and SimStop1 —
+# the simulated stop NinjaTrader holds locally until its trigger trades.
+_NT_STOP_NAME_RE = re.compile(r"^(?:Sim)?Stop\d*$", re.IGNORECASE)
+
+
+def _nt_is_stop_name(name: str) -> bool:
+    return bool(_NT_STOP_NAME_RE.match(name or ""))
 
 
 def query_nt_open_orders(account: str, port: int = 36973) -> list[str]:
@@ -10853,7 +10870,7 @@ _bracket_guard_seen: dict[str, float] = {}   # OCO group (or order id) -> when i
 # the moment the second fills. NT logs the fill, then the position line
 # with Operation_Add. Nobody's trade either way: closed.
 _NT_BRACKET_FILL_RE = re.compile(
-    r"\|1\|32\|Order='(?P<oid>[0-9a-f]+)/(?P<acct>[^']+)' Name='(?P<name>(?:Stop|Target)\d*|Close)' "
+    r"\|1\|32\|Order='(?P<oid>[0-9a-f]+)/(?P<acct>[^']+)' Name='(?P<name>(?:(?:Sim)?Stop|Target)\d*|Close)' "
     r"New state='Filled' Instrument='(?P<instr>[^']+)'")
 # NinjaTrader answers a CLOSESTRATEGY whose id it does not know with this
 # line and does nothing else. The reset reads it as "no close in flight".
@@ -10874,8 +10891,8 @@ _nt_position_seen: dict[tuple[str, str], float] = {}   # (acct, ROOT) -> stamp o
 _nt_flat_seen: dict[tuple[str, str], float] = {}       # (acct, ROOT) -> stamp of the last Remove line
 # A request to cancel or change is not a cancel: the 2026-10-14 06:23 entry
 # filled after its cancel was submitted. These still count as in flight.
-_NT_INFLIGHT_STATES = OPEN_ORDER_STATES | {"Cancel submitted", "Change submitted",
-                                           "CancelPending", "ChangePending"}
+_NT_INFLIGHT_STATES = NT_LOG_OPEN_STATES | {"Cancel submitted", "Cancel pending",
+                                              "CancelSubmitted", "CancelPending"}
 ENTRY_SETTLE_S = 3.0          # an Entry fill counts as in flight until its position line lands
 ENTRY_INFLIGHT_MAX_S = 180.0  # a working Entry older than this is a lost line, not a live order
 _nt_tail_seen = 0.0           # when the guard last read NinjaTrader's log
@@ -10895,13 +10912,16 @@ def _nt_tail_alive(now: float | None = None) -> bool:
 
 
 def _nt_open_orders(account: str, instrument: str, prefix: str,
-                    since: float = 0.0, states: frozenset | set = OPEN_ORDER_STATES
+                    since: float = 0.0, states: frozenset | set = NT_LOG_OPEN_STATES
                     ) -> list[tuple[str, int, str]]:
     """(name, qty, action) of orders on (account, root) whose name starts
-    with `prefix`, last seen in one of `states` since `since`, per NT's log."""
+    with `prefix` ("Stop" also takes NinjaTrader's SimStop), last seen in
+    one of `states` since `since`, per NT's log."""
     orders = _nt_orders.get((account, _alias_root(instrument).upper())) or {}
+    def wanted(name: str) -> bool:
+        return _nt_is_stop_name(name) if prefix == "Stop" else name.startswith(prefix)
     return [(name, qty, action) for name, state, stamp, qty, action in list(orders.values())
-            if name.startswith(prefix) and state in states and stamp >= since - 2.0]
+            if wanted(name) and state in states and stamp >= since - 2.0]
 
 
 def _nt_close_in_flight(account: str, instrument: str, since: float) -> bool | None:
@@ -10942,10 +10962,12 @@ def _nt_entry_filled_within(account: str, instrument: str, before: float, window
 
 
 def _nt_stop_qty(account: str, instrument: str, side: int = 0) -> int:
-    """Stop quantity NinjaTrader shows working (or resting — a sim stop
-    rests as 'Accepted') on (account, root). With `side` (+1 long, -1
-    short) only stops that would EXIT that side count: a buy stop left
-    from a short is no cover for a long."""
+    """Stop quantity NinjaTrader shows working or resting on (account,
+    root): Stop1 'Working'/'Accepted', a simulated stop ('SimStop1',
+    'Trigger pending' — held locally until its trigger trades), a stop
+    mid-trail ('Change submitted'). With `side` (+1 long, -1 short) only
+    stops that would EXIT that side count: a buy stop left from a short is
+    no cover for a long."""
     total = 0
     for _name, qty, action in _nt_open_orders(account, instrument, "Stop"):
         a = action.lower()
@@ -11112,7 +11134,7 @@ def _bracket_guard_event(line: str, now: float | None = None) -> str | None:
         instrument = (_nt_contract_aliases(m["instr"]) or [m["instr"]])[0]
         err = _NT_NATIVE_ERR_RE.search(line)
         why = (err.group(1) if err else "rejected").rstrip(".")
-        is_stop = m["name"].lower().startswith("stop")
+        is_stop = _nt_is_stop_name(m["name"])
         return _bracket_guard_act(
             m["acct"], instrument, key, now=now,
             reason=f"NinjaTrader REJECTED the ATM {'stop' if is_stop else 'target'} ({why})",
@@ -11207,6 +11229,15 @@ def _naked_watch(now: float | None = None) -> list[str]:
         meta = _pnl_open_meta.get(key) or {}
         ours = bool(_ledger_entries(acct, instrument)) or bool(meta.get("strategies"))
         side = "LONG" if qty > 0 else "SHORT"
+        # What NinjaTrader DOES show open on the root, so a stop under a name
+        # or state this watch does not know (2026-10-30: SimStop1 'Trigger
+        # pending') is in the log beside the action it caused.
+        shown = [f"{name} '{state}' x{q} {a}".rstrip()
+                 for name, state, _s, q, a in list((_nt_orders.get(key) or {}).values())
+                 if state in _NT_INFLIGHT_STATES]
+        if shown:
+            logger.warning(f"BRACKET GUARD  account={acct}  {instrument}  orders NinjaTrader shows "
+                           f"open on this root: {'; '.join(shown)}")
         act = _bracket_guard_act(
             acct, instrument, seen_key, now=now,
             reason=(f"{side} {abs(qty)} has {covered} contract{'s' if covered != 1 else ''} "

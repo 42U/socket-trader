@@ -8981,6 +8981,13 @@ class TestBracketGuard:
     def _closes(self, tmp_output_dir):
         return sorted(p.read_text() for p in tmp_output_dir.glob("oifclose_*.txt"))
 
+    def test_a_rejected_simulated_stop_is_a_rejected_stop(self, tmp_output_dir):
+        now = self._arm(tmp_output_dir)
+        line = self.STOP_REJ.replace("Name='Stop1'", "Name='SimStop1'")
+        assert st._bracket_guard_event(line, now=now) == "close"
+        assert "REJECTED the ATM stop" in st._alert_text
+        assert self._closes(tmp_output_dir)[0].startswith("CLOSEPOSITION;SimAI;NQ 12-26;")
+
     def test_a_rejected_atm_stop_closes_that_leg_at_market(self, tmp_output_dir, caplog):
         now = self._arm(tmp_output_dir)
         with caplog.at_level(logging.WARNING):
@@ -10106,6 +10113,56 @@ class TestNakedWatch:
         assert st._naked_watch(now=t1 + 1) == []
         assert st._naked_watch(now=t1 + 1 + st.BRACKET_ATTACH_S + 1) == ["close"]
         assert "0 contracts of stop working" in st._alert_text and "leg closed at market" in st._alert_text
+
+    # 2026-10-30, a user's account: every trade closed by the naked watch 15 s
+    # after entry. Their ATM's stop strategy has "Simulated stop" on, so
+    # NinjaTrader holds the stop locally and logs it as Name='SimStop1' with
+    # New state='Trigger pending' — a name the watch did not count as a stop
+    # and a state it did not know — and read every position as unprotected.
+    SIMSTOP_TP = ("2026-10-16 02:50:13:653|1|32|Order='7b1c0d2e3f4a5b6c7d8e9f0a1b2c3d4e/SimAI' "
+                  "Name='SimStop1' New state='Trigger pending' Instrument='NQ DEC26' Action='Sell' "
+                  "Limit price=0 Stop price=30145.5 Quantity=1 Type='Stop Market' Time in force=GTC "
+                  "Oco='fac013300ce04bff802b82bc9d6d406d' Filled=0 Fill price=0 Error='No error' Native error=''")
+
+    def test_a_simulated_stop_protects_the_position(self, tmp_output_dir):
+        self._ours()
+        for line in (self.LONG1_ADD, self.SIMSTOP_TP):
+            st._bracket_guard_event(line, now=st._nt_log_stamp(line))
+        assert st._nt_stop_qty("SimAI", "NQ DEC26", 1) == 1
+        t0 = st._nt_log_stamp(self.LONG1_ADD)
+        for dt in (1, st.BRACKET_ATTACH_S + 1, 120, 3600):
+            assert st._naked_watch(now=t0 + dt) == [], dt
+        assert self._closes(tmp_output_dir) == []
+        # The enum spelling (what the ATI dump says) is accepted as well.
+        st._nt_orders.clear(); st._uncovered_since.clear()
+        for line in (self.LONG1_ADD, self.SIMSTOP_TP.replace("Trigger pending", "TriggerPending")):
+            st._bracket_guard_event(line, now=st._nt_log_stamp(line))
+        assert st._naked_watch(now=t0 + st.BRACKET_ATTACH_S + 1) == []
+        # A simulated stop for the OTHER side is no cover.
+        st._nt_orders.clear(); st._uncovered_since.clear()
+        for line in (self.LONG1_ADD, self.SIMSTOP_TP.replace("Action='Sell'", "Action='Buy to cover'")):
+            st._bracket_guard_event(line, now=st._nt_log_stamp(line))
+        assert st._nt_stop_qty("SimAI", "NQ DEC26", 1) == 0
+        assert st._naked_watch(now=t0 + 1) == []
+        assert st._naked_watch(now=t0 + 1 + st.BRACKET_ATTACH_S + 1) == ["close"]
+
+    def test_a_stop_mid_trail_still_counts(self, tmp_output_dir):
+        # NinjaTrader logs 'Change submitted' on every auto-trail step; the
+        # stop is still there.
+        self._ours()
+        trail = self.STOP1_SUB.replace("02:50:13:653", "02:50:20:000").replace("Submitted", "Change submitted")
+        for line in (self.LONG1_ADD, self.STOP1_SUB, self.STOP1_ACC, trail):
+            st._bracket_guard_event(line, now=st._nt_log_stamp(line))
+        assert st._nt_stop_qty("SimAI", "NQ DEC26", 1) == 1
+        assert st._naked_watch(now=st._nt_log_stamp(trail) + st.BRACKET_ATTACH_S + 1) == []
+
+    def test_what_counts_as_a_stop_name(self):
+        for name in ("Stop", "Stop1", "Stop12", "SimStop1", "simstop2", "SIMSTOP"):
+            assert st._nt_is_stop_name(name), name
+        for name in ("Target1", "Close", "Entry", "Stopper", "StopLimit1", "", "Sim"):
+            assert not st._nt_is_stop_name(name), name
+        assert {"Trigger pending", "Partially filled", "Change submitted", "Change pending"} <= st.NT_LOG_OPEN_STATES
+        assert "Cancel submitted" in st._NT_INFLIGHT_STATES and "Cancelled" not in st._NT_INFLIGHT_STATES
 
     def test_a_bracket_submitted_before_the_position_counts(self, tmp_output_dir):
         # REVERSEPOSITION: NinjaTrader submits the new Stop1 while the account
