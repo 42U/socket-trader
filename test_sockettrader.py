@@ -11715,9 +11715,9 @@ class TestUpdater(_WebClient):
         "tag_name": f"v{NEXT}", "html_url": f"https://github.com/42U/socket-trader/releases/tag/v{NEXT}",
         "draft": False, "prerelease": False, "published_at": "2026-11-01T12:00:00Z",
         "assets": [
-            {"name": f"SocketTrader-{NEXT}-windows-x64.zip", "browser_download_url": "https://x/zip", "size": 10},
-            {"name": f"SocketTrader-Setup-{NEXT}.exe", "browser_download_url": "https://x/setup", "size": 20},
-            {"name": f"SocketTrader-Setup-{NEXT}.exe.sha256", "browser_download_url": "https://x/sha", "size": 90},
+            {"name": f"SocketTrader-{NEXT}-windows-x64.zip", "browser_download_url": f"https://github.com/42U/socket-trader/releases/download/v{NEXT}/SocketTrader-{NEXT}-windows-x64.zip", "size": 10},
+            {"name": f"SocketTrader-Setup-{NEXT}.exe", "browser_download_url": f"https://github.com/42U/socket-trader/releases/download/v{NEXT}/SocketTrader-Setup-{NEXT}.exe", "size": 20},
+            {"name": f"SocketTrader-Setup-{NEXT}.exe.sha256", "browser_download_url": f"https://github.com/42U/socket-trader/releases/download/v{NEXT}/SocketTrader-Setup-{NEXT}.exe.sha256", "size": 90},
         ]}
 
     @pytest.fixture(autouse=True)
@@ -11742,7 +11742,9 @@ class TestUpdater(_WebClient):
         rel = st.parse_release(self.RELEASE)
         assert rel["version"] == NEXT and rel["tag"] == f"v{NEXT}"
         assert rel["setup_name"] == f"SocketTrader-Setup-{NEXT}.exe"
-        assert rel["setup_url"] == "https://x/setup" and rel["sha_url"] == "https://x/sha"
+        assert rel["setup_url"].endswith(f"/v{NEXT}/SocketTrader-Setup-{NEXT}.exe")
+        assert rel["sha_url"] == rel["setup_url"] + ".sha256"
+        assert rel["setup_url"].startswith(st.UPDATE_DOWNLOAD_PREFIX)
         assert rel["prerelease"] is False
         assert st.parse_release({**self.RELEASE, "draft": True}) is None
         assert st.parse_release({"tag_name": "latest"}) is None
@@ -11797,14 +11799,27 @@ class TestUpdater(_WebClient):
         path, why = st.download_update({**rel, "sha_url": None})
         assert path is None and "unverified" in why
         # Hash mismatch: refused, nothing written.
-        monkeypatch.setattr(st, "_http_get", lambda url, *a, **k: body if url == "https://x/setup" else f"deadbeef  SocketTrader-Setup-{NEXT}.exe".encode())
+        monkeypatch.setattr(st, "_http_get", lambda url, *a, **k: body if url.endswith(".exe") else f"deadbeef  SocketTrader-Setup-{NEXT}.exe".encode())
         path, why = st.download_update(rel)
         assert path is None and "does not match" in why
         assert not list(tmp_path.glob("*.exe"))
         # Good: written to the temp folder under the asset's own name.
-        monkeypatch.setattr(st, "_http_get", lambda url, *a, **k: body if url == "https://x/setup" else good.encode())
+        monkeypatch.setattr(st, "_http_get", lambda url, *a, **k: body if url.endswith(".exe") else good.encode())
         path, why = st.download_update(rel)
         assert why == "" and path == tmp_path / f"SocketTrader-Setup-{NEXT}.exe" and path.read_bytes() == body
+        # The URLs are GitHub's JSON: anything but this repo's https release
+        # downloads is refused before a byte is fetched, hash or no hash.
+        fetched = []
+        monkeypatch.setattr(st, "_http_get", lambda url, *a, **k: fetched.append(url) or body)
+        for bad in ("https://evil.example/SocketTrader-Setup-9.9.9.exe",
+                    f"http://github.com/42U/socket-trader/releases/download/v{NEXT}/SocketTrader-Setup-{NEXT}.exe",
+                    f"https://github.com/someone-else/socket-trader/releases/download/v{NEXT}/SocketTrader-Setup-{NEXT}.exe",
+                    f"https://github.com/42U/socket-trader/releases/download/../../../../x/SocketTrader-Setup-{NEXT}.exe".replace("download/../", "downloads/")):
+            path, why = st.download_update({**rel, "setup_url": bad})
+            assert path is None and "not this repo's GitHub releases" in why, bad
+        path, why = st.download_update({**rel, "sha_url": "https://evil.example/x.sha256"})
+        assert path is None and "not this repo's GitHub releases" in why
+        assert fetched == []
 
     def test_install_from_a_script_run_points_at_the_checkout(self, monkeypatch):
         monkeypatch.setattr(st, "FROZEN", False)
@@ -12264,3 +12279,62 @@ class TestControlsBarListsEveryKey:
         readme = (Path(st.__file__).parent / "README.md").read_text(encoding="utf-8")
         assert st.CONTROLS_TEXT in readme
         assert "| `U` |" in readme
+
+
+class TestServerFramesAreData:
+    """2026-10-30 review: what the signal server sends is data. A frame the
+    server gets wrong must not drop the connection, and nothing it sends
+    reaches the console unscrubbed."""
+
+    def test_a_non_string_signal_is_rejected_not_raised(self):
+        for bad in (123, ["PLACE"], {"a": 1}, None, True):
+            msg = json.dumps({"signal": bad, "ts": 1700000000000, "id": "x"})
+            shown, ts, sid, why = st.extract_signal_string(msg, "Sim101", "NQ_Med", False, False)
+            assert sid is None and why == "signal is not a string", bad
+            assert shown == st.strip_terminal_input(str(bad))[:200]
+
+    def test_a_non_numeric_timestamp_is_dropped_not_raised(self):
+        sig = "PLACE;Sim101;NQ 12-26;BUY;1;MARKET;;;DAY;;;NQ_Med;sig-1"
+        for bad_ts in ("soon", [1], {"t": 1}, True):
+            msg = json.dumps({"signal": sig, "ts": bad_ts})
+            out, ts, sid, why = st.extract_signal_string(msg, "Sim101", "NQ_Med", False, False)
+            assert ts is None and why is None and sid == "sig-1", bad_ts
+        out, ts, *_ = st.extract_signal_string(json.dumps({"signal": sig, "ts": 1700000000000}),
+                                               "Sim101", "NQ_Med", False, False)
+        assert ts == 1700000000000
+
+    def test_a_rejected_signal_is_shown_without_escape_sequences(self, caplog):
+        # An escape sequence in a field the ATI validator refuses used to
+        # reach the dashboard verbatim (the REJECTED row prints the raw text).
+        raw = "BOGUS\x1b[2J\x1b[31m;Sim101;NQ 12-26;BUY;1;MARKET;;;DAY;;;NQ_Med;sig-2"
+        with caplog.at_level(logging.WARNING):
+            shown, ts, sid, why = st.extract_signal_string(json.dumps({"signal": raw}), "Sim101", "NQ_Med", False, False)
+        assert why and sid is None
+        assert "\x1b" not in shown and "\x1b" not in caplog.text
+        assert shown.startswith("BOGUS;Sim101")
+
+    def test_the_servers_name_is_scrubbed_and_bounded(self, monkeypatch):
+        monkeypatch.setattr(st, "_dash_set_heartbeat", lambda *a, **k: None, raising=False)
+        monkeypatch.setattr(st, "_dash_set_alert", lambda *a, **k: None)
+        async def run(data):
+            await st.display_server_message(data, 10)
+        asyncio.run(run({"welcome": True, "server": "evil\x1b[2J\x1b[31m" + "x" * 100}))
+        assert "\x1b" not in st._server_name and len(st._server_name) <= 40
+        asyncio.run(run({"welcome": True, "server": 42}))
+        assert st._server_name == "42"
+        asyncio.run(run({"welcome": True}))
+        assert st._server_name == "SocketTrader"
+
+    def test_plaintext_server_urls_are_recognised(self):
+        assert st.plaintext_server_url("ws://voidorigin.com:8420/ws")
+        assert st.plaintext_server_url("ws://192.168.1.20/ws")
+        assert not st.plaintext_server_url("wss://voidorigin.com/ws")
+        assert not st.plaintext_server_url("ws://localhost:8420/ws")
+        assert not st.plaintext_server_url("ws://127.0.0.1:8420/ws")
+        assert not st.plaintext_server_url("")
+        assert not st.plaintext_server_url("ws://[::1]:8420/ws")
+
+    def test_the_connection_warns_on_plaintext_and_sends_a_bearer_header(self):
+        src = inspect.getsource(st.listen)
+        assert "plaintext_server_url(ws_host)" in src and "UNENCRYPTED SERVER URL" in src
+        assert 'additional_headers={"Authorization": f"Bearer {token}"}' in src

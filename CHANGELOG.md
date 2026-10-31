@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Security (from the 2026-10-30 review of the installed app)
+- The updater fetches the installer and its `.sha256` only from
+  `https://github.com/42U/socket-trader/releases/download/…`; any other
+  URL in GitHub's release document is refused before a byte is fetched.
+- A `ws://` server URL to anything but this machine is logged as
+  `UNENCRYPTED SERVER URL` on every connection and shown once in the alert
+  line (the token travels in the URL, every signal in cleartext). The token
+  is also sent as an `Authorization: Bearer` header, so a server can stop
+  reading it from the query string without a client change.
+- What the server sends is data: a non-string `signal` or a non-numeric
+  `ts` is a rejected frame, not an exception that dropped the connection
+  into reconnect backoff; the raw text of a rejected signal and the
+  server's self-declared name are scrubbed of escape sequences before the
+  dashboard prints them.
+
 ## 1.0.3 — 2026-10-31
 
 ### Fixed

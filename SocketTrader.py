@@ -8099,6 +8099,9 @@ def apply_windows_app_identity() -> None:
 # request the app makes that is not the signal server or NinjaTrader).
 UPDATE_REPO = "42U/socket-trader"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+# Asset URLs come from GitHub's JSON; only this repo's release downloads
+# (https, github.com) are ever fetched, whatever the document says.
+UPDATE_DOWNLOAD_PREFIX = f"https://github.com/{UPDATE_REPO}/releases/download/"
 UPDATE_CHECK_DELAY_S = 20.0          # after start-up, once the session is on its feet
 UPDATE_CHECK_INTERVAL_S = 6 * 3600
 UPDATE_HTTP_TIMEOUT_S = 8.0
@@ -8244,6 +8247,9 @@ def download_update(rel: dict) -> tuple[Path | None, str]:
     name = str(rel["setup_name"])
     if not re.match(r"^SocketTrader-Setup-[A-Za-z0-9._-]+\.exe$", name):
         return None, f"unexpected installer name {name!r}"
+    for url in (rel["setup_url"], rel["sha_url"]):
+        if not str(url).startswith(UPDATE_DOWNLOAD_PREFIX):
+            return None, f"refusing to download from {str(url)[:120]!r} — not this repo's GitHub releases"
     try:
         payload = _http_get(str(rel["setup_url"]), UPDATE_MAX_SETUP_BYTES, "application/octet-stream")
         sha_text = _http_get(str(rel["sha_url"]), 4096).decode("utf-8", errors="replace")
@@ -10295,6 +10301,24 @@ def format_signal(signal_text: str, idx: int, latency_str: str = "", tag: str | 
     return f"{colour}{prefix}{body}{Style.DIM}{suffix}{Style.RESET_ALL}"
 
 
+def plaintext_server_url(ws_host: str) -> bool:
+    """True for a ws:// URL to anything but this machine: the token (sent
+    in the URL) and every signal would cross the network unencrypted.
+    wss:// and loopback ws:// are fine."""
+    from urllib.parse import urlsplit
+    try:
+        u = urlsplit(str(ws_host or ""))
+    except ValueError:
+        return False
+    if u.scheme.lower() != "ws":
+        return False
+    host = (u.hostname or "").lower()
+    return host not in ("localhost", "127.0.0.1", "::1", "")
+
+
+_plaintext_warned = False
+
+
 # ---------- Server message display ----------
 WELCOME_FRAMES = ["◇", "◆", "◇", "◆", "●"]
 HEARTBEAT_FRAMES = ["♡", "♥", "♡", "♥"]
@@ -10305,7 +10329,7 @@ async def display_server_message(data: dict, connect_latency: int):
     global _server_name
 
     if "welcome" in data:
-        _server_name = data.get("server", "SocketTrader")
+        _server_name = strip_terminal_input(str(data.get("server") or "SocketTrader"))[:40] or "SocketTrader"
         hb_interval = data.get("heartbeat_interval")
         ts = data.get("ts")
 
@@ -10378,12 +10402,22 @@ def extract_signal_string(msg: str, account: str, atm: str, follow_publisher: bo
             logger.info(f"RAW ENVELOPE  {json.dumps(data)[:500]}")
             raw = data["signal"]
             ts = data.get("ts")
+            # The envelope is the server's to get wrong: a number or list
+            # where the signal string belongs, or a timestamp that is not a
+            # number, is a rejected frame — not an exception that drops the
+            # connection and sends this app into reconnect backoff.
+            if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+                ts = None
+            if not isinstance(raw, str):
+                logger.warning(f"REJECTED  signal is not a string  raw={str(raw)[:200]!r}")
+                return strip_terminal_input(str(raw))[:200], ts, None, "signal is not a string"
+            shown = strip_terminal_input(raw)[:200]    # what the dashboard prints: no escapes
             parts = [sanitize_ati(p) for p in raw.split(";")]
             # Validate against NinjaTrader ATI spec
             error = validate_signal(parts)
             if error:
-                logger.warning(f"REJECTED  {error}  raw={raw[:200]}")
-                return raw[:200], ts, None, error
+                logger.warning(f"REJECTED  {error}  raw={shown}")
+                return shown, ts, None, error
             # Extract signal ID (last non-empty field)
             signal_id = parts[-1] if parts else None
             # Replace account (field 1)
@@ -12377,7 +12411,7 @@ def fmt_wait(seconds: int) -> str:
 
 
 async def listen(token: str):
-    global signal_count
+    global signal_count, _plaintext_warned
     fib_prev, fib_curr = BACKOFF_START_S, BACKOFF_START_S  # Start at 1m, 1m → 2m → 3m → 5m → ...
     ever_connected = False       # distinguishes first boot from a reconnect
     conn_lost_at = None          # when the current outage began
@@ -12405,8 +12439,16 @@ async def listen(token: str):
                 return
             token = cfg.get("token", token)
             uri = f"{ws_host}?token={token}"
+            if plaintext_server_url(ws_host):
+                logger.warning(f"UNENCRYPTED SERVER URL  {ws_host} — the token and every signal travel "
+                               "in cleartext; use wss://")
+                if not _plaintext_warned:
+                    _plaintext_warned = True
+                    _dash_set_alert(Fore.RED + f"  ⚠  {ws_host} is ws:// not wss:// — token and signals "
+                                    "travel unencrypted" + Style.RESET_ALL, sticky=True)
             connect_start = time.time()
-            async with websockets.connect(uri) as ws:
+            async with websockets.connect(
+                    uri, additional_headers={"Authorization": f"Bearer {token}"}) as ws:
                 linked_at = time.time()
                 connect_latency = int((time.time() - connect_start) * 1000)
                 baseline_latency = None  # First signal sets the baseline
