@@ -11977,6 +11977,34 @@ class TestUpdater(_WebClient):
         assert launched["path"] == setup
         assert st.shutdown.is_set()
 
+    def test_a_release_cached_before_its_files_were_attached_is_rechecked(self, monkeypatch, tmp_path):
+        # 2026-10-30 22:14:46: U answered "no Setup attached" for a release
+        # whose installer had been uploaded two minutes earlier — the cached
+        # release document predated the upload. One more look first.
+        monkeypatch.setattr(st, "FROZEN", True)
+        monkeypatch.setattr(st, "IS_WINDOWS", True)
+        bare = {**self.RELEASE, "assets": []}
+        st._update_info = st.parse_release(bare)
+        assert st._update_info["setup_url"] is None
+        docs = iter([self.RELEASE])
+        monkeypatch.setattr(st, "_http_get", lambda *a, **k: json.dumps(next(docs)).encode())
+        setup = tmp_path / f"SocketTrader-Setup-{NEXT}.exe"
+        setup.write_bytes(b"x")
+        downloaded = {}
+        real_download = st.download_update
+        monkeypatch.setattr(st, "download_update", lambda rel: downloaded.setdefault("rel", rel) and (setup, ""))
+        monkeypatch.setattr(st, "_launch_installer_after_exit", lambda p: None)
+        ok, msg = st.install_update()
+        assert ok is True, msg
+        assert downloaded["rel"]["setup_url"].endswith(f"SocketTrader-Setup-{NEXT}.exe")
+        st.shutdown.clear()
+        # Still nothing attached after the second look: the honest answer, no download.
+        st._update_info = st.parse_release(bare)
+        monkeypatch.setattr(st, "_http_get", lambda *a, **k: json.dumps(bare).encode())
+        monkeypatch.setattr(st, "download_update", real_download)
+        ok, msg = st.install_update()
+        assert ok is False and "no SocketTrader-Setup" in msg and not st.shutdown.is_set()
+
     def test_install_without_a_newer_release_says_so(self, monkeypatch):
         monkeypatch.setattr(st, "FROZEN", True)
         monkeypatch.setattr(st, "IS_WINDOWS", True)

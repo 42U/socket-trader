@@ -8596,6 +8596,12 @@ def install_update() -> tuple[bool, str]:
     if _update_in_progress:
         return False, "an update is already in progress"
     rel = _update_info or check_for_update(force=True)
+    if rel and not rel.get("setup_url"):
+        # The release was seen before its files were attached — publishing
+        # creates the release, the build attaches the installer two to
+        # three minutes later (2026-10-30 22:14:46: "no Setup attached" on
+        # a release that had one by then). Look once more before saying no.
+        rel = check_for_update(force=True) or rel
     if not rel:
         return False, (f"no newer release than v{__version__} on GitHub"
                        + (f" (last check: {_update_last_error})" if _update_last_error else ""))
