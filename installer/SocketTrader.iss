@@ -42,7 +42,12 @@ VersionInfoProductTextVersion={#AppVersion}
 VersionInfoDescription={#AppName} setup
 DefaultDirName={localappdata}\{#AppName}
 DisableProgramGroupPage=yes
-DisableDirPage=auto
+; Always offer the destination page, upgrades included, so the operator can
+; put the app on another drive (a C: with no room left is a real case).
+; An upgrade pre-fills the folder the previous version used; a silent
+; upgrade (the in-app update) keeps it without asking.
+DisableDirPage=no
+UsePreviousAppDir=yes
 ; Per-user install: no UAC prompt, and the same folder install.bat uses.
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible

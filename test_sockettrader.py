@@ -12252,6 +12252,8 @@ class TestNinjaTraderTemplateKinds:
         assert r'Source: "..\dist\templates\StopStrategy\*.xml"; DestDir: "{code:NtTemplates|StopStrategy}"' in iss
         assert "RemoveMisplacedStopTemplates();" in iss
         assert "'\\templates\\' + Kind" in iss
+        # The operator picks the drive — on a first install and on an upgrade.
+        assert "DisableDirPage=no" in iss and "UsePreviousAppDir=yes" in iss
         # The release smoke test exercises the placement on a real install.
         wf = (root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
         for needle in ("templates\\AtmStrategy", "templates\\StopStrategy",

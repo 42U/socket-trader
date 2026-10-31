@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed
+- The installer always shows the destination page — on an upgrade too, pre-filled
+  with the current folder — so the app can be put on another drive. A silent
+  upgrade (the in-app update) keeps the existing folder.
+
 ### Security (from the 2026-10-30 review of the installed app)
 - The updater fetches the installer and its `.sha256` only from
   `https://github.com/42U/socket-trader/releases/download/…`; any other
