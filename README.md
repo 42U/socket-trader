@@ -622,9 +622,11 @@ With prop accounts under management the same stream doubles as the **live positi
 2. In NinjaTrader: **Control Center → New → NinjaScript Editor**.
 3. Press **F5** to compile. No restart needed — the AddOn hot-loads on successful compile.
 4. The Output tab should print:
-   `SocketTraderBridge listening on 0.0.0.0:36984`
+   `SocketTraderBridge listening on 127.0.0.1:36984 (this machine only; SocketTraderBridge.bind = any opens it to the network)`
 
 **Port.** The AddOn listens on **36984** unless a `SocketTraderBridge.port` file next to its token says otherwise — and SocketTrader writes that file from its own *Live Monitor port* setting (`S → 9 → 4`) at every start, so moving the bridge is a setting, not a source edit. You must move it when NinjaTrader's own AT Interface is set to 36984 (the default is 36973): then a probe of 36984 reaches NinjaTrader's ATI, which hangs up on the bridge's JSON greeting — `read error: [WinError 10053] An established connection was aborted …` — and SocketTrader says so. Pick a free port (36999, say), then recompile the AddOn (F5) or restart NinjaTrader so it reads the new file.
+
+**Bind.** The AddOn listens on **127.0.0.1 only** unless a `SocketTraderBridge.bind` file next to its token says `any`. SocketTrader writes that file at every start: `any` when it runs under WSL (classic NAT reaches Windows over the vEthernet subnet) or when `nt_host` points at another machine, `loopback` otherwise — so a native Windows install never offers the balance stream and the FLATTEN command to the LAN, and a WSL or two-machine setup keeps working after the AddOn is recompiled or NinjaTrader restarted. Repeated wrong tokens from one address are refused quietly for 30 s after three failures (one Output-tab line a minute, not one per attempt).
 
 **Token.** SocketTrader writes the shared secret to `Documents\NinjaTrader 8\SocketTraderBridge.token`. That file is the truth the AddOn trusts: a second machine whose NinjaTrader folder is the same OneDrive folder **adopts** the token already there instead of overwriting it (otherwise each SocketTrader would knock the other's bridge offline at every start). Rotating is still yours: change `live_bridge_token` in the config of the machine that wrote the file, and the new one is published; delete the file to start over.
 
@@ -836,6 +838,8 @@ Settings persist in `.voidorigin_config.json` in the [data home](#where-your-dat
 | `micro_map` | Optional additions/overrides for the micro symbol table, e.g. `{ "GC": "GC" }` opts gold out |
 | `output_directory` | Path to NinjaTrader 8 `incoming/` folder |
 | `nt_port` | NinjaTrader AT Interface port |
+| `max_signal_contracts` | Largest quantity one signal may carry (default **25**; `0` = no cap). A larger entry is rejected and shown as `REJECTED`, whatever the server sent; per-account sizing and a profile's `max_contracts` apply after it |
+| `allowed_roots` | When set (e.g. `["NQ", "MNQ"]`), the only markets an entry may trade — anything else is rejected. Closes are never blocked. Unset = any market |
 | `account_limits` | Per-account risk management settings |
 | `account_profiles` | Per-account trade profiles — allowed-symbols filter (`symbols_allowed`), size, contracts, direction, delay, stagger, ATM override, AI gate, the prop-firm flag (`prop`, `prop_firm`, `prop_flat_et`, `prop_cutoff_et` — see [Prop Firm Mode](#prop-firm-mode)), and `close_before_open` for one-position-at-a-time entries without prop's time rules |
 | `strategy_symbols` | Global strategy → symbol filter, e.g. `{ "GoldStrat": ["GC"] }` — a listed publisher strategy only **enters** trades on its listed markets, on every account (see [Global Strategy → Symbol Filter](#global-strategy--symbol-filter)) |

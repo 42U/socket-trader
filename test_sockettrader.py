@@ -268,6 +268,41 @@ class TestValidateSignal:
         parts = ["PLACE", "Sim101", "NQ 06-26", "BUY", "1", "FOK", "", "", "DAY", "", "", "NQ_Med", "1020"]
         assert "invalid order type" in st.validate_signal(parts)
 
+    # 2026-10-30 review: the server's word is not the last word on size or market.
+    def _place(self, qty="1", inst="NQ 06-26", cmd="PLACE"):
+        return [cmd, "Sim101", inst, "BUY", qty, "MARKET", "", "", "DAY", "", "", "NQ_Med", "1020"]
+
+    def test_quantity_above_the_cap_is_rejected(self, tmp_config, fresh_cfg_cache):
+        assert st.MAX_SIGNAL_CONTRACTS_DEFAULT == 25
+        assert st.validate_signal(self._place("25")) is None
+        err = st.validate_signal(self._place("26"))
+        assert err and "above max_signal_contracts (25)" in err
+        assert "above max_signal_contracts" in st.validate_signal(self._place("26", cmd="REVERSEPOSITION"))
+        st.save_config({"max_signal_contracts": 100})
+        assert st.validate_signal(self._place("26")) is None
+        assert "above max_signal_contracts (100)" in st.validate_signal(self._place("101"))
+        st.save_config({"max_signal_contracts": 0})                    # 0 = no cap
+        assert st.validate_signal(self._place("500")) is None
+        st.save_config({"max_signal_contracts": "lots"})               # junk = no cap, never a crash
+        assert st.validate_signal(self._place("500")) is None
+
+    def test_allowed_roots_gate_entries_but_never_closes(self, tmp_config, fresh_cfg_cache):
+        assert st.validate_signal(self._place(inst="ES 12-26")) is None          # unset: any root
+        st.save_config({"allowed_roots": ["NQ", "mnq"]})
+        assert st.validate_signal(self._place(inst="NQ 06-26")) is None
+        assert st.validate_signal(self._place(inst="MNQ 06-26")) is None
+        assert st.validate_signal(self._place(inst="NQZ6")) is None            # alias forms resolve to the root
+        err = st.validate_signal(self._place(inst="ES 12-26"))
+        assert err == "ES is not in allowed_roots (MNQ, NQ)"
+        assert "not in allowed_roots" in st.validate_signal(self._place(inst="ES 12-26", cmd="REVERSEPOSITION"))
+        # Closing out of a market that is no longer allowed must still work.
+        assert st.validate_signal(["CLOSEPOSITION", "Sim101", "ES 12-26"]) is None
+        assert st.validate_signal(["CLOSESTRATEGY", "Sim101", "ES 12-26", "", "", "", "", "", "", "", "", "", "sid"]) is None
+        st.save_config({"allowed_roots": "NQ, ES"})                           # a string works too
+        assert st.validate_signal(self._place(inst="ES 12-26")) is None
+        st.save_config({"allowed_roots": []})
+        assert st.validate_signal(self._place(inst="GC 12-26")) is None
+
     def test_invalid_tif(self):
         parts = ["PLACE", "Sim101", "NQ 06-26", "BUY", "1", "MARKET", "", "", "IOC", "", "", "NQ_Med", "1020"]
         assert "invalid TIF" in st.validate_signal(parts)
@@ -2133,6 +2168,57 @@ class TestDeferredLegExecution:
         assert ids == {"77~Sim102", "77~Sim102~T2", "77~Sim102~T3"}
         assert st._stagger_placed[("Sim102", "77~Sim102")] == 3
 
+    def test_exit_fan_out_after_a_stagger_writes_each_tranche_id_once(self, tmp_output_dir):
+        # Deferred from the 1.0.0 review ("one close per tranche id twice when
+        # a stagger was recorded under both ids"): the entry below carries
+        # the same id as order id (field 10) AND strategy id (field 12), so
+        # the stagger is recorded under both; the close and the cancel that
+        # follow must still address every tranche exactly once.
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        self._profile(stagger_entries=3, stagger_interval_ms=0)
+        entry = "PLACE;Sim101;NQ 06-26;BUY;4;LIMIT;20000;;DAY;oco-77;77;NQ_Med;77"
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(entry)
+            _run_plans(plans, sig_id="77")
+            assert st._stagger_placed[("Sim102", "77~Sim102")] == 3
+            assert st._stagger_placed[("Sim102", "oco-77~Sim102")] == 3
+            for f in tmp_output_dir.glob("oif*.txt"):
+                f.unlink()
+            for exit_sig, field in (("CLOSESTRATEGY;Sim101;NQ 06-26;;;;;;;;;;77", 12),
+                                    ("CANCEL;Sim101;NQ 06-26;;;;;;;;77;;", 10)):
+                plans, skipped = st.plan_signal_legs(exit_sig)
+                _run_plans(plans, sig_id="78")
+                bodies = sorted(f.read_text() for f in tmp_output_dir.glob("oif*.txt"))
+                for f in tmp_output_dir.glob("oif*.txt"):
+                    f.unlink()
+                assert len(bodies) == len(set(bodies)), bodies          # no id twice
+                follower = [b for b in bodies if b.split(";")[1] == "Sim102"]
+                assert sorted(b.split(";")[field] for b in follower) == \
+                    ["77~Sim102", "77~Sim102~T2", "77~Sim102~T3"], exit_sig
+                assert [b.split(";")[field] for b in bodies if b.split(";")[1] == "Sim101"] == ["77"]
+
+    def test_a_role_change_mid_flight_aborts_the_deferred_leg(self, tmp_output_dir):
+        # Deferred from the 1.0.0 review: a delayed/staggered leg kept
+        # writing for an account that was re-roled or dropped meanwhile.
+        st.active_account = "Sim101"
+        st.follower_accounts = ["Sim102"]
+        self._profile(stagger_entries=3, stagger_interval_ms=0)
+        with patch.object(st, "output_directory", str(tmp_output_dir)):
+            plans, _ = st.plan_signal_legs(SIG)
+            st.follower_accounts = []            # dropped before its leg ran
+            _run_plans(plans)
+        bodies = [f.read_text() for f in tmp_output_dir.glob("oif_*.txt")]
+        assert [b.split(";")[1] for b in bodies] == ["Sim101"]      # leader only
+        # Re-roled (follower -> leader) counts as a change too; a manual leg does not care.
+        assert st._leg_blocked("Sim102", False, "follower") == "role changed (follower → unmanaged) since the signal"
+        st.active_account = "Sim102"
+        assert "role changed (follower → leader)" in st._leg_blocked("Sim102", False, "follower")
+        assert st._leg_blocked("Sim102", True, "follower") is None
+        assert st._leg_blocked("Sim102", False, "leader") is None
+        assert st._leg_blocked("Sim102", False) is None               # no snapshot: no role gate
+        assert st.account_role("Sim102") == "leader" and st.account_role("nobody") == ""
+
     def test_stopped_account_aborts_before_write(self, tmp_output_dir):
         st.active_account = "Sim101"
         st.follower_accounts = ["Sim102"]
@@ -2972,6 +3058,31 @@ class TestReplayGuard:
         for i in range(st._MAX_FIRED_KEYS + 20):
             st._note_fired_signal(f"CLOSEPOSITION;A;SYM{i};;;;;;;;;;")
         assert len(st._recent_fired) == st._MAX_FIRED_KEYS
+
+    # Deferred from the 1.0.0 review: a publisher that closes, re-enters and
+    # closes again inside the window lost the second close as a "replay".
+    ENTRY = "PLACE;Sim101;MNQ 09-26;BUY;1;MARKET;;;DAY;;;NQ_Med;sig-77"
+
+    def test_a_close_after_a_newer_entry_on_the_root_is_real(self):
+        import time as _t
+        st._recent_fired.clear()
+        st._recent_fired[self.CLOSE] = _t.monotonic() - 30     # the first close
+        st._recent_fired[self.ENTRY] = _t.monotonic() - 10     # then OUR entry re-opened the market
+        st.note_connected()
+        assert st._is_idless_replay(self.CLOSE) is False       # so this close has a position to act on
+        # An entry on another root does not vouch for it.
+        st._recent_fired.clear()
+        st._recent_fired[self.CLOSE] = _t.monotonic() - 30
+        st._recent_fired[self.ENTRY.replace("MNQ 09-26", "ES 12-26")] = _t.monotonic() - 10
+        assert st._is_idless_replay(self.CLOSE) is True
+        # Nor an entry fired BEFORE the close (the position that close already closed).
+        st._recent_fired.clear()
+        st._recent_fired[self.ENTRY] = _t.monotonic() - 60
+        st._recent_fired[self.CLOSE] = _t.monotonic() - 30
+        assert st._is_idless_replay(self.CLOSE) is True
+        # A replayed entry is stopped by id dedup and never fired, so a
+        # replayed close still finds no newer entry: still blocked.
+        st._recent_fired.clear()
 
 
 # ── manual trading ────────────────────────────────────────────────────
@@ -11370,6 +11481,31 @@ class TestOct29SkippedSignals:
         assert "lockout lifted" in msg
         assert st.get_account_limits("Sim101")["target"] == 1000
 
+    def test_web_limits_follow_the_terminals_sign_rules(self, tmp_config):
+        # Deferred from the 1.0.0 review: a positive stop or a negative
+        # target saved from the web tripped the moment it was saved.
+        self._load()
+        st.session_start_balances.pop("Sim101", None)
+        st.session_current_balances.pop("Sim101", None)
+        ok, msg = asyncio.run(st._web_set_limits("Sim101", -500, "soft", -300, "soft"))
+        assert ok is True and "target made positive (+500.00)" in msg
+        assert st.get_account_limits("Sim101")["target"] == 500
+        ok, msg = asyncio.run(st._web_set_limits("Sim101", 500, "soft", 300, "hard"))
+        assert ok is False and "positive stop is profit protection" in msg and "unknown" in msg
+        st.session_start_balances["Sim101"] = 10_000.0
+        st.session_current_balances["Sim101"] = 9_900.0           # down $100
+        ok, msg = asyncio.run(st._web_set_limits("Sim101", 500, "soft", 300, "hard"))
+        assert ok is False and "$-100.00" in msg
+        assert st.get_account_limits("Sim101")["stop"] == -300    # the earlier save stands
+        st.session_current_balances["Sim101"] = 10_400.0          # up $400
+        ok, msg = asyncio.run(st._web_set_limits("Sim101", 500, "soft", 390, "hard"))
+        assert ok is True and "stop capped at 90% of session P&L (+360.00)" in msg
+        assert st.get_account_limits("Sim101")["stop"] == 360
+        ok, msg = asyncio.run(st._web_set_limits("Sim101", 500, "soft", 200, "hard"))
+        assert ok is True and "capped" not in msg
+        assert st.get_account_limits("Sim101")["stop"] == 200
+        st.session_start_balances.pop("Sim101", None); st.session_current_balances.pop("Sim101", None)
+
     def test_web_limits_never_lift_a_hard_lock(self, tmp_config):
         self._load()
         st.account_stops["Sim101"] = "hard"
@@ -11865,7 +12001,8 @@ class TestUpdater(_WebClient):
         exe = str(Path(st.sys.executable).resolve())
         setup_log = tmp_path / f"SocketTrader-Setup-{NEXT}.log"
         assert f"PID eq {os.getpid()}" in text
-        assert f'"{setup}" /SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /LOG="{setup_log}"' in text
+        assert f'call "{setup}" /SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /LOG="{setup_log}"' in text
+        assert "timeout /t" not in text and "ping -n 2 127.0.0.1 >nul" in text
         # The outcome is recorded where the next start reads it, redirect
         # first ("exit code 0>> file" would redirect handle 0 instead).
         assert f'> "{tmp_path / st.UPDATE_RESULT_NAME}" echo %CODE% {setup.name} "{setup_log}"' in text
@@ -11873,7 +12010,7 @@ class TestUpdater(_WebClient):
         assert "set CODE=%errorlevel%" in text
         # SocketTrader is started again whether Setup succeeded or not.
         assert text.count(f'start "" "{exe}"') == 2
-        assert "pause >nul" in text and 'del "%~f0"' in text
+        assert "pause >nul" in text and '(goto) 2>nul & del "%~f0"' in text
         # 2026-10-30: a detached, windowless cmd swallowed the failure;
         # it is a visible window now, and the CRLFs are not doubled.
         assert spawned["kw"]["creationflags"] == 0x10 | 0x200
@@ -12014,6 +12151,51 @@ class TestBridgeTokenAndPortFiles:
         (nt / st.BRIDGE_TOKEN_FILE).write_text("not a token!\n", encoding="utf-8")
         assert st.write_bridge_token().read_text(encoding="utf-8").strip() == "B" * 43
         assert st.load_config()["live_bridge_token"] == "B" * 43
+
+    def test_bind_file_follows_how_this_app_reaches_ninjatrader(self, tmp_path, monkeypatch):
+        nt = tmp_path / "NinjaTrader 8"; (nt / "incoming").mkdir(parents=True)
+        monkeypatch.setattr(st, "output_directory", str(nt / "incoming"))
+        monkeypatch.setattr(st, "IS_WSL", False)
+        monkeypatch.setattr(st, "nt_host_override", "")
+        assert st.bridge_bind_mode() == "loopback"
+        path = st.write_bridge_bind()
+        assert path == nt / st.BRIDGE_BIND_FILE and path.read_text() == "loopback\n"
+        monkeypatch.setattr(st, "nt_host_override", "localhost")
+        assert st.bridge_bind_mode() == "loopback"
+        monkeypatch.setattr(st, "nt_host_override", "192.168.1.20")     # NinjaTrader on another PC
+        assert st.bridge_bind_mode() == "any" and st.write_bridge_bind().read_text() == "any\n"
+        monkeypatch.setattr(st, "nt_host_override", "")
+        monkeypatch.setattr(st, "IS_WSL", True)                          # classic NAT: host subnet
+        assert st.bridge_bind_mode() == "any"
+        assert st.write_bridge_bind("junk") is None                      # only the two words
+
+    def test_start_up_reads_the_config_before_publishing_the_addon_files(self, tmp_path, tmp_config,
+                                                                           monkeypatch, fresh_cfg_cache):
+        # Until 1.0.4 the files were written before the folder and the port
+        # were loaded: skipped on a normal start, built-in port when not.
+        nt = tmp_path / "NinjaTrader 8"; (nt / "incoming").mkdir(parents=True)
+        monkeypatch.setattr(st, "output_directory", None)
+        monkeypatch.setattr(st, "live_bridge_port", 36984)
+        monkeypatch.setattr(st, "IS_WSL", False)
+        cfg = {"output_directory": str(nt / "incoming"), "live_bridge_enabled": True,
+               "live_bridge_port": 36999, "live_bridge_token": "T" * 43}
+        st.save_config(cfg)
+        st.bridge_startup(cfg)
+        assert st.output_directory == str(nt / "incoming")
+        assert st.live_bridge_port == 36999 and st.live_bridge_enabled is True
+        assert (nt / st.BRIDGE_PORT_FILE).read_text() == "36999\n"       # the configured port, not 36984
+        assert (nt / st.BRIDGE_BIND_FILE).read_text() == "loopback\n"
+        assert (nt / st.BRIDGE_TOKEN_FILE).read_text().strip() == "T" * 43
+        # Live monitor off: settings load, nothing is written.
+        for f in (st.BRIDGE_PORT_FILE, st.BRIDGE_BIND_FILE, st.BRIDGE_TOKEN_FILE):
+            (nt / f).unlink()
+        st.bridge_startup({**cfg, "live_bridge_enabled": False, "live_bridge_port": 40000})
+        assert st.live_bridge_port == 40000 and st.live_bridge_enabled is False
+        assert not list(nt.glob("SocketTraderBridge.*"))
+        # main() publishes through this, before anything reads the bridge.
+        src = inspect.getsource(st.main)
+        assert src.index("bridge_startup(cfg)") < src.index("start_snapshot_poller()")
+        assert "write_bridge_port()" not in src and "write_bridge_token()" not in src
 
     def test_port_file_follows_the_setting(self, tmp_path, monkeypatch):
         nt = tmp_path / "NinjaTrader 8"; (nt / "incoming").mkdir(parents=True)
@@ -12336,7 +12518,260 @@ class TestServerFramesAreData:
         assert not st.plaintext_server_url("")
         assert not st.plaintext_server_url("ws://[::1]:8420/ws")
 
-    def test_the_connection_warns_on_plaintext_and_sends_a_bearer_header(self):
+    def test_the_connection_warns_on_plaintext(self):
         src = inspect.getsource(st.listen)
         assert "plaintext_server_url(ws_host)" in src and "UNENCRYPTED SERVER URL" in src
-        assert 'additional_headers={"Authorization": f"Bearer {token}"}' in src
+        assert "_ws_connect(ws_host, token)" in src
+
+    def test_the_server_receives_the_token_in_the_url_and_as_a_bearer_header(self):
+        # A real websocket server on loopback, the production connect call.
+        import websockets
+
+        async def run():
+            seen = {}
+
+            async def handler(conn):
+                seen["auth"] = conn.request.headers.get("Authorization")
+                seen["path"] = conn.request.path
+                await conn.send(json.dumps({"welcome": True, "server": "test"}))
+                await conn.close()
+
+            async with websockets.serve(handler, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+                async with st._ws_connect(f"ws://127.0.0.1:{port}/ws", "tok-123") as ws:
+                    first = await asyncio.wait_for(ws.recv(), 5)
+            return seen, first
+
+        seen, first = asyncio.run(run())
+        assert seen["auth"] == "Bearer tok-123"
+        assert seen["path"] == "/ws?token=tok-123"
+        assert json.loads(first)["welcome"] is True
+
+
+@pytest.mark.skipif(st.sys.platform != "win32", reason="runs the real cmd.exe handover; Windows only")
+class TestUpdateHandoverRunsOnWindows:
+    """The handover script executed for real by cmd.exe — twice this script
+    was only checked as text, and 2026-10-30 15:46 it failed silently on the
+    operator's PC. Setup and the exe to restart are stubs that record what
+    reached them; the PID waited for is a short-lived child."""
+
+    def _run(self, monkeypatch, tmp_path, setup_exit: int):
+        import subprocess
+        monkeypatch.setattr(st.tempfile, "gettempdir", lambda: str(tmp_path))
+        # The "installer": records its arguments, exits as told.
+        setup = tmp_path / "SocketTrader-Setup-9.9.9.cmd"
+        setup.write_bytes(b"@echo off\r\necho %*> \"%~dp0setup-args.txt\"\r\nexit /b %SETUP_EXIT%\r\n")
+        # The "SocketTrader.exe" the script restarts: leaves a marker, then
+        # exits explicitly so its window — which inherits handles from the
+        # script's cmd — is gone before this test waits on that cmd.
+        exe = tmp_path / "started.cmd"
+        exe.write_bytes(b"@echo off\r\necho started> \"%~dp0started.txt\"\r\nexit\r\n")
+        monkeypatch.setattr(st.sys, "executable", str(exe))
+        # The process the script waits for: gone in about two seconds.
+        child = subprocess.Popen(["cmd", "/c", "ping -n 3 127.0.0.1 >nul"],
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        spawned = {}
+        # Only the app's own spawn is intercepted; subprocess.run below
+        # needs the real Popen (st.subprocess IS the subprocess module).
+        real_popen, real_getpid = subprocess.Popen, os.getpid
+        subprocess.Popen = lambda args, **kw: spawned.setdefault("args", args)
+        os.getpid = lambda: child.pid
+        try:
+            script = Path(st._launch_installer_after_exit(setup))
+        finally:
+            subprocess.Popen, os.getpid = real_popen, real_getpid
+        assert spawned["args"][1:] == ["/c", str(script)]
+        env = {**os.environ, "SETUP_EXIT": str(setup_exit)}
+        # Output to a file, not a pipe: a pipe stays open for as long as any
+        # process the script started holds an inherited handle to it.
+        out_path = tmp_path / "handover-output.txt"
+        with open(out_path, "wb") as out:
+            try:
+                proc = subprocess.run(["cmd", "/c", str(script)], stdin=subprocess.DEVNULL,
+                                      stdout=out, stderr=subprocess.STDOUT, env=env, timeout=120,
+                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except subprocess.TimeoutExpired:
+                pytest.fail("the handover script did not finish in 120 s:\n"
+                            + out_path.read_text(encoding="utf-8", errors="replace"))
+        child.wait(timeout=30)
+        for _ in range(100):                       # `start` is asynchronous
+            if (tmp_path / "started.txt").exists():
+                break
+            time.sleep(0.1)
+        proc.stdout = out_path.read_bytes()
+        return script, proc, setup
+
+    def test_success_installs_restarts_and_cleans_up(self, monkeypatch, tmp_path):
+        script, proc, setup = self._run(monkeypatch, tmp_path, 0)
+        out = proc.stdout.decode("utf-8", "replace")
+        assert proc.returncode == 0, out
+        args = (tmp_path / "setup-args.txt").read_text()
+        assert "/SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS" in args
+        assert f'/LOG="{tmp_path / "SocketTrader-Setup-9.9.9.log"}"' in args
+        assert (tmp_path / "started.txt").exists(), out            # the new version was started
+        result = (tmp_path / st.UPDATE_RESULT_NAME).read_text().strip()
+        assert result == f'0 {setup.name} "{tmp_path / "SocketTrader-Setup-9.9.9.log"}"'
+        assert "exit code 0" in (tmp_path / st.UPDATE_HISTORY_NAME).read_text()
+        assert not script.exists()                                 # deleted itself
+        assert "Setup finished" in out and "cannot be found" not in out
+
+    def test_failure_records_the_code_restarts_the_old_version_and_keeps_the_script(self, monkeypatch, tmp_path, caplog):
+        script, proc, setup = self._run(monkeypatch, tmp_path, 5)
+        out = proc.stdout.decode("utf-8", "replace")
+        assert proc.returncode == 5, out
+        assert (tmp_path / "started.txt").exists(), out            # the OLD version was started again
+        assert (tmp_path / st.UPDATE_RESULT_NAME).read_text().startswith(f"5 {setup.name} ")
+        assert "exit code 5" in (tmp_path / st.UPDATE_HISTORY_NAME).read_text()
+        assert script.exists()                                     # left for the operator to read
+        assert "Setup failed with exit code 5" in out
+        # And the next start reads that result back.
+        monkeypatch.setattr(st, "_dash_set_alert", lambda *a, **k: None)
+        with caplog.at_level(logging.ERROR):
+            line = st.report_last_update_attempt()
+        assert "FAILED" in line and "exit code 5" in line and "aborted part-way" in line
+        assert str(tmp_path / "SocketTrader-Setup-9.9.9.log") in line
+
+
+class TestBridgeAddOnSource:
+    """The AddOn is compiled by NinjaTrader on the operator's PC, not here;
+    what this suite can hold it to is the contract SocketTrader relies on
+    and the 2026-10-30 review items, read from the source."""
+
+    SRC = (Path(st.__file__).parent / "addon" / "SocketTraderBridge.cs").read_text(encoding="utf-8")
+
+    def test_it_reads_the_files_socket_trader_writes(self):
+        assert f'"{st.BRIDGE_TOKEN_FILE}"' in self.SRC
+        assert f'"{st.BRIDGE_PORT_FILE}"' in self.SRC
+        assert f'"{st.BRIDGE_BIND_FILE}"' in self.SRC
+
+    def test_loopback_unless_told_otherwise(self):
+        assert "private IPAddress bindAddress = IPAddress.Loopback;" in self.SRC
+        assert 'if (text == "any" || text == "all" || text == "0.0.0.0")' in self.SRC
+        assert "IPAddress BindAddress = IPAddress.Any" not in self.SRC
+        assert "new TcpListener(bindAddress, listenPort)" in self.SRC
+
+    def test_no_socket_write_on_ninjatraders_threads(self):
+        # Event handlers only signal; the sender thread writes.
+        body = self.SRC[self.SRC.index("private void SafeBroadcast()"):]
+        body = body[:body.index("private void BroadcastNow()")]
+        assert "broadcastSignal.Set()" in body and "GetStream()" not in body
+        assert 'new Thread(SenderLoop)' in self.SRC
+        for handler in ("OnAccountItemUpdate", "OnPositionUpdate", "OnMarketDataUpdate"):
+            h = self.SRC[self.SRC.index(f"private void {handler}("):]
+            h = h[:h.index("\n        }\n")]
+            assert "SafeBroadcast();" in h and "GetStream" not in h, handler
+
+    def test_commands_are_bounded_and_exactly_matched(self):
+        assert "private const int MaxCommandLineBytes = 4096;" in self.SRC
+        assert "while ((line = ReadCommandLine(stream)) != null)" in self.SRC
+        assert "new StreamReader(" not in self.SRC
+        close = self.SRC[self.SRC.index("private void ClosePositionOnInstrument("):]
+        close = close[:close.index("private void SendFrontMonths(")]
+        assert "IndexOf(" not in close                      # no substring match any more
+        assert "full.Equals(instName, StringComparison.OrdinalIgnoreCase)" in close
+        assert "master.Equals(instName, StringComparison.OrdinalIgnoreCase)" in close
+
+    def test_failed_auth_backs_off_and_logs_once_a_minute(self):
+        assert "if (AuthBackedOff(peer))" in self.SRC
+        assert "if (NoteAuthFailure(peer))" in self.SRC
+        assert "AuthFailuresBeforeBackoff = 3" in self.SRC
+        # The 2026-10-29 fix stays: a token that arrives after NT started is picked up.
+        assert "if (string.IsNullOrEmpty(sharedToken))\n                    RefreshTokenIfStale();" in self.SRC
+
+
+class TestPnlArchiveHandEdited:
+    """Deferred from the 1.0.0 review: a hand-edited month file. Found by
+    fuzzing 2026-10-31 — a day whose record was not an object
+    ('"2026-10-04": -2.5') raised out of _pnl_read_shard, which nothing
+    caught, so the month (and the start-up that loads it) fell over on one
+    bad line. Now the bad pieces are set aside with a log line and the
+    rest of the month loads and serves."""
+
+    MONTH = "2026-11"
+
+    def _write(self, doc):
+        st.PNL_DIR.mkdir(parents=True, exist_ok=True)
+        (st.PNL_DIR / f"{self.MONTH}.json").write_text(json.dumps(doc), encoding="utf-8")
+        st._pnl_written_stat.pop(self.MONTH, None)
+
+    def test_bad_day_records_are_set_aside_and_the_month_still_loads(self, caplog):
+        good = {"accounts": {"Sim101": {"start": 1000.0, "last": 1100.0, "pnl": 100.0, "adj": 0.0}},
+                "trades": [{"ts": 1.0, "account": "Sim101", "symbol": "NQ", "side": "LONG", "qty": 1,
+                            "strategy": "Gooping", "pnl": 100.0}]}
+        self._write({"v": 2, "days": {
+            "2026-11-03": good,
+            "2026-11-04": -2.5,                                   # not an object
+            "2026-11-05": True,
+            "bad-day": {"accounts": {}, "trades": []},            # not a date
+            "2026-11-06": {"accounts": "nope", "trades": "nope"},  # wrong shapes inside
+            "2026-11-07": {"accounts": {}, "trades": [1, "x", None, {"ts": 2.0, "account": "Sim101",
+                                                                      "symbol": "ES", "pnl": 5.0}]},
+        }})
+        with caplog.at_level(logging.ERROR):
+            days = st._pnl_read_shard(self.MONTH)
+        assert sorted(days) == ["2026-11-03", "2026-11-06", "2026-11-07"]
+        assert days["2026-11-03"] == good
+        assert days["2026-11-06"] == {"accounts": {}, "trades": []}
+        assert days["2026-11-07"]["trades"] == [{"ts": 2.0, "account": "Sim101", "symbol": "ES", "pnl": 5.0}]
+        assert "3 day record(s) that are not a dated object and 3 malformed field(s)" in caplog.text
+        month = st._pnl_month(self.MONTH)
+        json.dumps(month)                                          # serves to the web page
+        assert "2026-11-03" in month["days"]
+        assert st._pnl_strip_phantom_pairs({"2026-11-01": 3, "2026-11-02": {"trades": [1, 2]}}) == 0
+
+    def test_a_month_that_is_not_json_or_not_an_object_is_empty_not_fatal(self, caplog):
+        st.PNL_DIR.mkdir(parents=True, exist_ok=True)
+        (st.PNL_DIR / f"{self.MONTH}.json").write_text("{not json", encoding="utf-8")
+        st._pnl_written_stat.pop(self.MONTH, None)
+        with caplog.at_level(logging.ERROR):
+            assert st._pnl_read_shard(self.MONTH) == {}
+        assert "could not be read" in caplog.text
+        for doc in ([1, 2], "text", {"days": [1]}, {"days": None}, 42):
+            self._write(doc)
+            assert st._pnl_read_shard(self.MONTH) == {}
+            json.dumps(st._pnl_month(self.MONTH))
+
+
+class TestHandEditedConfigValues:
+    """Deferred from the 1.0.0 review (role / port / limit validation on
+    config load): values a hand-edited JSON can carry must come back typed
+    or as the default, never flow raw into sockets, account lists or the
+    balance monitor's comparisons."""
+
+    def test_ports(self):
+        assert st.cfg_port(36999, 36973) == 36999
+        assert st.cfg_port("36999", 36973) == 36999
+        assert st.cfg_port(" 36999 ", 36973) == 36999
+        for bad in ("abc", "", None, 0, -1, 65536, 1e9, [], {}, True):
+            assert st.cfg_port(bad, 36973) == 36973, bad
+
+    def test_account_lists(self):
+        assert st.cfg_account_list(["Sim102", "Sim103"]) == ["Sim102", "Sim103"]
+        assert st.cfg_account_list("Sim102") == ["Sim102"]                  # not six one-letter accounts
+        assert st.cfg_account_list(["Sim102", "Sim102", " Sim103 ", "", None, 7, {"a": 1}]) == ["Sim102", "Sim103", "7"]
+        assert st.cfg_account_list(["Sim101", "Sim102"], exclude="Sim101") == ["Sim102"]
+        assert st.cfg_account_list({"Sim102": 1}) == [] and st.cfg_account_list(None) == []
+        assert st.cfg_account_list(["Bad;Name\x1b[2J"]) == ["BadName[2J"]       # separator and ESC gone
+
+    def test_limits_come_back_typed(self, tmp_config, fresh_cfg_cache):
+        st.save_config({"account_limits": {
+            "A": {"target": "500", "target_mode": "HARD", "stop": "-300.5", "stop_mode": "soft"},
+            "B": {"target": "lots", "target_mode": "maybe", "stop": None, "stop_mode": 3},
+            "C": "not a dict",
+            "D": {"target": float("inf"), "stop": True},
+        }})
+        assert st.get_account_limits("A") == {"target": 500.0, "target_mode": "hard",
+                                              "stop": -300.5, "stop_mode": "soft"}
+        assert st.get_account_limits("B") == {"target": 0.0, "target_mode": "soft",
+                                              "stop": 0.0, "stop_mode": "hard"}
+        assert st.get_account_limits("C")["target"] == 0.0
+        assert st.get_account_limits("D") == {"target": 0.0, "target_mode": "soft",
+                                              "stop": 0.0, "stop_mode": "hard"}
+        assert st.get_account_limits("nobody")["stop_mode"] == "hard"
+
+    def test_main_reads_through_the_typed_readers(self):
+        src = inspect.getsource(st.main)
+        assert 'follower_accounts = cfg_account_list(cfg.get("follower_accounts", []), exclude=active_account)' in src
+        assert 'nt_port = cfg_port(cfg.get("nt_port", 36973), 36973)' in src
+        assert 'active_account = sanitize_ati(str(cfg.get("account") or "").strip())' in src
+        assert 'live_bridge_port = cfg_port(' in inspect.getsource(st.bridge_startup)

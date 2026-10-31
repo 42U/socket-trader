@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 
 # `SocketTrader.exe --version` / `python SocketTrader.py --version`: answered
 # before any import so installers and build checks get it in milliseconds.
@@ -859,6 +859,14 @@ def reset_session_pnl():
 MAX_SESSION_CONTRACTS = 50  # cap unique instruments per session
 MAX_FIELD_LENGTH = 256      # max bytes per ATI field — prevent oversized payloads
 MAX_SIGNAL_FIELDS = 20      # hard cap on semicolon-delimited fields
+# A signal is the server's word, and the server can be wrong or taken over.
+# Two limits of this app's own stand in front of every entry it would write:
+# the largest quantity any one signal may carry (config
+# "max_signal_contracts", 0 = no cap) and, when set, the only roots it may
+# trade (config "allowed_roots", e.g. ["NQ", "MNQ"]). Per-account sizing
+# and the profile's own max_contracts apply after these, as before; closes
+# are never blocked by the allow-list — a close reduces exposure.
+MAX_SIGNAL_CONTRACTS_DEFAULT = 25
 
 # All valid NinjaTrader 8 ATI OIF commands
 # CANCELALLORDERS and FLATTENEVERYTHING are deliberately NOT accepted from
@@ -907,8 +915,31 @@ def strip_terminal_input(value: str) -> str:
 
 
 
+def signal_contract_cap() -> int:
+    """config "max_signal_contracts": the largest quantity one signal may
+    carry; 0 (or junk) means no cap; unset means MAX_SIGNAL_CONTRACTS_DEFAULT."""
+    raw = config_get("max_signal_contracts", MAX_SIGNAL_CONTRACTS_DEFAULT)
+    try:
+        cap = int(raw)
+    except (TypeError, ValueError):
+        return 0
+    return cap if cap > 0 else 0
+
+
+def allowed_signal_roots() -> frozenset:
+    """config "allowed_roots": the only roots an entry may trade, upper-cased;
+    empty (the default) means any root."""
+    raw = config_get("allowed_roots", None)
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, (list, tuple, set)):
+        return frozenset()
+    return frozenset(_alias_root(str(r)).upper() for r in raw if str(r).strip())
+
+
 def validate_signal(parts: list[str]) -> str | None:
-    """Validate signal fields against NinjaTrader ATI OIF spec.
+    """Validate signal fields against NinjaTrader ATI OIF spec, then this
+    app's own limits (max_signal_contracts, allowed_roots) on entries.
 
     Returns None if valid, or an error string describing the problem.
     """
@@ -942,6 +973,15 @@ def validate_signal(parts: list[str]) -> str | None:
                 return f"invalid qty: {qty}"
         except ValueError:
             return f"non-numeric qty: {parts[4]}"
+        cap = signal_contract_cap()
+        if cap and qty > cap:
+            return (f"qty {qty} is above max_signal_contracts ({cap}) — raise it in the config "
+                    "if this size is intended")
+        root = _alias_root(parts[2]).upper() if len(parts) > 2 else ""
+        allowed = allowed_signal_roots()
+        if allowed and root not in allowed:
+            return (f"{root or parts[2] or '?'} is not in allowed_roots "
+                    f"({', '.join(sorted(allowed))})")
         order_type = parts[5].upper()
         if order_type not in VALID_ORDER_TYPES:
             return f"invalid order type: {order_type}"
@@ -1064,15 +1104,44 @@ def note_connected():
     _last_connect_mono = time.monotonic()
 
 
+def _signal_root(signal_text: str) -> str:
+    """Root of the instrument field of a wire signal ('' when there is none)."""
+    parts = signal_text.split(";")
+    return _alias_root(parts[2]).upper() if len(parts) > 2 and parts[2].strip() else ""
+
+
+def _entry_fired_after(signal_text: str, fired_at: float) -> bool:
+    """Did this app FIRE an entry (PLACE / REVERSEPOSITION) on the same root
+    after `fired_at`? Then a close identical to one fired before has a new
+    position to act on and is a real close, not a replay — a replayed entry
+    is stopped by id dedup and never fired, so a replay leaves no such mark."""
+    root = _signal_root(signal_text)
+    if not root:
+        return False
+    for text, ts in list(_recent_fired.items()):
+        if ts <= fired_at:
+            continue
+        cmd = text.split(";", 1)[0].upper()
+        if cmd in ("PLACE", "REVERSEPOSITION") and _signal_root(text) == root:
+            return True
+    return False
+
+
 def _is_idless_replay(signal_text: str) -> bool:
-    """True when an id-less signal is a server replay of one already fired."""
+    """True when an id-less signal is a server replay of one already fired:
+    the same text fired within REPLAY_LOOKBACK_S, arriving within
+    REPLAY_GRACE_S of a (re)connect, with no entry of ours on that root
+    fired in between (1.0.4: a publisher that closed, re-entered and closed
+    again inside the window used to lose the second close)."""
     if _last_connect_mono is None:
         return False
     now = time.monotonic()
     if now - _last_connect_mono > REPLAY_GRACE_S:
         return False
     fired_at = _recent_fired.get(signal_text)
-    return fired_at is not None and now - fired_at <= REPLAY_LOOKBACK_S
+    if fired_at is None or now - fired_at > REPLAY_LOOKBACK_S:
+        return False
+    return not _entry_fired_after(signal_text, fired_at)
 
 
 # Both memories above are process state, but the server replays its recent
@@ -1272,6 +1341,34 @@ def config_get(key: str, default=None):
         if isinstance(val, (dict, list)):
             return json.loads(json.dumps(val))
         return val
+
+
+def cfg_port(value, default: int) -> int:
+    """A TCP port from the config: 1–65535 as int, else `default`. A
+    hand-edited `"nt_port": "36973"` or `"nt_port": "abc"` used to flow
+    into socket calls as a string."""
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return port if 1 <= port <= 65535 else default
+
+
+def cfg_account_list(value, exclude: str = "") -> list[str]:
+    """A list of account names from the config: strings only, trimmed,
+    de-duplicated in order, `exclude` left out. A bare string is one
+    account — `"follower_accounts": "Sim102"` used to iterate as six
+    one-letter accounts."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: list[str] = []
+    for a in value:
+        name = sanitize_ati(str(a).strip()) if isinstance(a, (str, int)) else ""
+        if name and name != exclude and name not in out:
+            out.append(name)
+    return out
 
 
 def config_get_sub(key: str, sub: str, default=None):
@@ -3227,6 +3324,9 @@ def plan_signal_legs(signal_text: str, pub_strategy: str = "",
             "signal": final,
             "files": files,
             "deferred": deferred,
+            # The role this leg was planned for; a deferred leg checks it
+            # before every write and aborts if the account was re-roled.
+            "role": account_role(account),
             "command": final_cmd,
             "instrument": meta["instrument"] or (final_parts[2] if len(final_parts) >= 3 else ""),
             "action": meta["action"],
@@ -3375,7 +3475,19 @@ def _note_contract(signal_text: str):
         session_contracts.add(parts[2])
 
 
-def _leg_blocked(account: str, manual: bool = False) -> str | None:
+def account_role(account: str) -> str:
+    """'leader', 'follower', 'robin', or '' when this session does not
+    manage the account."""
+    if account and account == active_account:
+        return "leader"
+    if account in follower_accounts:
+        return "follower"
+    if account in roundrobin_accounts:
+        return "robin"
+    return ""
+
+
+def _leg_blocked(account: str, manual: bool = False, role: str | None = None) -> str | None:
     """Why a pending leg must abort right now, or None to proceed.
 
     `manual` marks a leg the trader typed themselves: pause only mutes the
@@ -3384,6 +3496,11 @@ def _leg_blocked(account: str, manual: bool = False) -> str | None:
     this, routing prop entries through the deferred rail would silently
     swallow a deliberate manual order during pause while the ticket
     reported success.
+
+    `role` is the account's role when the leg was planned: a publisher leg
+    whose account has since been re-roled or dropped (Setup / the web
+    page, mid-delay or mid-stagger) was planned for an account this
+    session no longer trades that way, and does not write.
     """
     if shutdown.is_set():
         return "shutdown"
@@ -3393,17 +3510,21 @@ def _leg_blocked(account: str, manual: bool = False) -> str | None:
         return "signals paused"
     if account in account_stops:
         return "account stop/target hit"
+    if role is not None and not manual:
+        now_role = account_role(account)
+        if now_role != role:
+            return f"role changed ({role or 'unmanaged'} → {now_role or 'unmanaged'}) since the signal"
     if is_prop_account(account) and _prop_entry_blocked_now(account):
         return "prop entry cutoff (flat-by-close window)"
     return None
 
 
 async def _interruptible_sleep(seconds: float, account: str,
-                               manual: bool = False) -> bool:
+                               manual: bool = False, role: str | None = None) -> bool:
     """Sleep in small steps, bailing early (False) if the leg gets blocked."""
     end = time.monotonic() + max(0.0, seconds)
     while True:
-        if _leg_blocked(account, manual):
+        if _leg_blocked(account, manual, role):
             return False
         remaining = end - time.monotonic()
         if remaining <= 0:
@@ -4643,7 +4764,7 @@ async def _run_prop_group(plans: list[dict], sig_id: str | None = None):
         async with _get_prop_lock():
             live = []
             for p in plans:
-                reason = _leg_blocked(p["account"], p.get("manual", False))
+                reason = _leg_blocked(p["account"], p.get("manual", False), p.get("role"))
                 if reason:
                     logger.info(f"LEG ABORTED  account={p['account']}  reason={reason}")
                     if p.get("rr_pick"):
@@ -4659,7 +4780,7 @@ async def _run_prop_group(plans: list[dict], sig_id: str | None = None):
             placed: list[str] = []
             last_reason = ""
             for plan in sorted(live, key=lambda p: order.get(p["account"], len(order))):
-                reason = _leg_blocked(plan["account"], plan.get("manual", False))
+                reason = _leg_blocked(plan["account"], plan.get("manual", False), plan.get("role"))
                 if reason:
                     last_reason = reason
                     logger.info(f"LEG ABORTED  account={plan['account']}  reason={reason}")
@@ -4823,6 +4944,8 @@ async def execute_plans(plans: list[dict], sig_id: str | None = None) -> list[st
     prop_reversals: list[dict] = []
     group = [p for p in plans if p.get("prop_group")]
     if group:
+        for p in group:
+            p.setdefault("role", account_role(p["account"]))
         task = asyncio.create_task(_run_prop_group(group, sig_id))
         _leg_tasks.add(task)
         task.add_done_callback(_leg_tasks.discard)
@@ -4830,6 +4953,7 @@ async def execute_plans(plans: list[dict], sig_id: str | None = None) -> list[st
         if plan.get("prop_group"):
             continue     # riding the close-confirm-enter wave above
         if plan["deferred"]:
+            plan.setdefault("role", account_role(plan["account"]))
             task = asyncio.create_task(_run_deferred_leg(plan, sig_id))
             _leg_tasks.add(task)
             task.add_done_callback(_leg_tasks.discard)
@@ -4891,6 +5015,7 @@ async def _run_deferred_leg(plan: dict, sig_id: str | None = None):
     label = f"[{account}] " if len(target_accounts()) > 1 else ""
     try:
         manual = plan.get("manual", False)
+        role = plan.get("role", account_role(account))
         if plan.get("reset_first"):
             # Opposite-direction entry over a standing position (a
             # teammate strategy's, or one the ledger never wrote): the
@@ -4919,19 +5044,19 @@ async def _run_deferred_leg(plan: dict, sig_id: str | None = None):
                 # Legacy: a fixed settle, no proof. The entry can net against
                 # a close NinjaTrader has not filled yet (Oct 8).
                 _reset_write_close(account, plan["instrument"])
-                if not await _interruptible_sleep(RESET_SETTLE_S, account, manual):
+                if not await _interruptible_sleep(RESET_SETTLE_S, account, manual, role):
                     logger.info(f"LEG ABORTED  account={account}  during=reset settle")
                     return
-            if _leg_blocked(account, manual):
+            if _leg_blocked(account, manual, role):
                 logger.info(f"LEG ABORTED  account={account}  during=reset verify")
                 return
         delay_s = (rule["delay_ms"]
                    + (random.uniform(0, rule["delay_jitter_ms"]) if rule["delay_jitter_ms"] else 0)
                    ) / 1000.0
-        if delay_s > 0 and not await _interruptible_sleep(delay_s, account, manual):
-            logger.info(f"LEG ABORTED  account={account}  during=delay  reason={_leg_blocked(account, manual)}")
+        if delay_s > 0 and not await _interruptible_sleep(delay_s, account, manual, role):
+            logger.info(f"LEG ABORTED  account={account}  during=delay  reason={_leg_blocked(account, manual, role)}")
             return
-        reason = _leg_blocked(account, manual)
+        reason = _leg_blocked(account, manual, role)
         if reason:
             logger.info(f"LEG ABORTED  account={account}  reason={reason}")
             return
@@ -4972,7 +5097,7 @@ async def _run_deferred_leg(plan: dict, sig_id: str | None = None):
                     if plan.get("rr_pick"):
                         _rr_return(account)
                     return
-                reason = _leg_blocked(account, manual)
+                reason = _leg_blocked(account, manual, role)
                 if reason:
                     logger.info(f"LEG ABORTED  account={account}  reason={reason}")
                     if plan.get("rr_pick"):
@@ -5000,14 +5125,16 @@ async def _write_entry_tranches(plan: dict, tranches: list[int],
     (the prop group prints one summary line instead of N)."""
     account, rule = plan["account"], plan["rule"]
     manual = plan.get("manual", False)
+    role = plan.get("role")          # None for a plan that never went through execute_plans
     label = f"[{account}] " if len(target_accounts()) > 1 else ""
     interval_s = rule["stagger_interval_ms"] / 1000.0
     placed = 0
     for i, tranche_qty in enumerate(tranches):
-        if i > 0 and interval_s > 0 and not await _interruptible_sleep(interval_s, account, manual):
-            logger.info(f"LEG ABORTED  account={account}  during=stagger {i + 1}/{len(tranches)}")
+        if i > 0 and interval_s > 0 and not await _interruptible_sleep(interval_s, account, manual, role):
+            logger.info(f"LEG ABORTED  account={account}  during=stagger {i + 1}/{len(tranches)}  "
+                        f"reason={_leg_blocked(account, manual, role)}")
             break
-        reason = _leg_blocked(account, manual)
+        reason = _leg_blocked(account, manual, role)
         if reason:
             logger.info(f"LEG ABORTED  account={account}  at tranche {i + 1}/{len(tranches)}  reason={reason}")
             break
@@ -6061,6 +6188,70 @@ def write_bridge_port(port: int | None = None) -> Path | None:
     except OSError as exc:
         logger.error(f"could not write bridge port to {path}: {exc}")
         return None
+
+
+BRIDGE_BIND_FILE = "SocketTraderBridge.bind"
+
+
+def bridge_bind_mode() -> str:
+    """What the AddOn should bind: 'loopback' when this app talks to
+    NinjaTrader on 127.0.0.1 (native Windows), 'any' when it reaches it
+    over a network path — WSL's NAT subnet, or an nt_host on the LAN. The
+    socket streams balances and takes a FLATTEN, so it is not offered to
+    the network unless this app needs it to be."""
+    if IS_WSL:
+        return "any"
+    host = (nt_host_override or "").strip().lower()
+    if host and host not in ("127.0.0.1", "localhost", "::1"):
+        return "any"
+    return "loopback"
+
+
+def write_bridge_bind(mode: str | None = None) -> Path | None:
+    """Tell the AddOn whether to bind 127.0.0.1 or all interfaces (it reads
+    SocketTraderBridge.bind next to the token when it starts; without the
+    file it binds 127.0.0.1)."""
+    mode = mode or bridge_bind_mode()
+    base = _nt_base()
+    if not base or mode not in ("any", "loopback"):
+        return None
+    path = Path(base) / BRIDGE_BIND_FILE
+    try:
+        if path.exists() and path.read_text(encoding="utf-8").strip() == mode:
+            return path
+        _write_atomic(path, f"{mode}\n", ".stbind")
+        logger.info(f"live bridge bind written → {path} ({mode}; the AddOn reads it when "
+                    "NinjaTrader starts or the AddOn is recompiled)")
+        return path
+    except OSError as exc:
+        logger.error(f"could not write bridge bind to {path}: {exc}")
+        return None
+
+
+def publish_bridge_files() -> None:
+    """Everything the AddOn reads from NinjaTrader's folder — token, port,
+    bind — written in one go. Called on every start with the live monitor
+    on, when the AddOn is installed, and when the port is changed."""
+    write_bridge_token()
+    write_bridge_port()
+    write_bridge_bind()
+
+
+def bridge_startup(cfg: dict) -> None:
+    """Load the live-monitor settings from the config, THEN publish the
+    AddOn's files. Until 1.0.4 main() wrote the files before it had read
+    the NinjaTrader folder and the port from the config: on a normal start
+    the writes were skipped without a word (no folder known yet — the
+    token file on the operator's PC was dated five days back), and when
+    they did run they carried the built-in port, not the configured one."""
+    global live_bridge_enabled, live_bridge_port, nt_host_override, output_directory
+    if cfg.get("output_directory"):
+        output_directory = cfg["output_directory"]
+    live_bridge_enabled = bool(cfg.get("live_bridge_enabled", False))
+    live_bridge_port = cfg_port(cfg.get("live_bridge_port", 36984), 36984)
+    nt_host_override = effective_nt_host(cfg)
+    if live_bridge_enabled:
+        publish_bridge_files()
 
 
 def bridge_auth_line() -> bytes:
@@ -8312,10 +8503,14 @@ def _launch_installer_after_exit(setup: Path) -> str:
         "title SocketTrader update",
         "echo Waiting for SocketTrader to close...",
         ":wait",
-        f"tasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul && (timeout /t 1 /nobreak >nul & goto wait)",
-        "timeout /t 2 /nobreak >nul",
+        # ping is the sleep: `timeout` refuses to run without a console
+        # on its stdin, and this window's input is not always one.
+        f"tasklist /FI \"PID eq {pid}\" 2>nul | find \"{pid}\" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)",
+        "ping -n 3 127.0.0.1 >nul",
         f"echo Installing {setup.name} ...",
-        f"\"{setup}\" /SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /LOG=\"{setup_log}\"",
+        # `call`, so control returns here whatever Setup is (an .exe, or a
+        # .cmd stub in the test suite — a batch run without call never comes back).
+        f"call \"{setup}\" /SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /LOG=\"{setup_log}\"",
         "set CODE=%errorlevel%",
         # Redirection first: "exit code 0>> file" would read as handle 0.
         f">> \"{history}\" echo %DATE% %TIME%  {setup.name}  exit code %CODE%",
@@ -8332,7 +8527,9 @@ def _launch_installer_after_exit(setup: Path) -> str:
         ")",
         "echo Setup finished. Starting SocketTrader...",
         f"start \"\" \"{exe}\"",
-        "del \"%~f0\"",
+        # Self-delete without cmd's "The batch file cannot be found." (and
+        # its exit code 1): the empty goto ends the batch context first.
+        "(goto) 2>nul & del \"%~f0\"",
     ]
     # Bytes, not text mode: text mode on Windows turns \r\n into \r\r\n.
     script.write_bytes(("\r\n".join(lines) + "\r\n").encode("utf-8"))
@@ -9865,6 +10062,7 @@ async def prompt_live_bridge():
                     cfg["live_bridge_port"] = p
                     save_config(cfg)
                     wrote = write_bridge_port(p)
+                    write_bridge_bind()
                     _dash_set_alert(
                         Fore.GREEN +
                         f"  ✔  Live monitor port set → {p}."
@@ -10319,6 +10517,15 @@ def plaintext_server_url(ws_host: str) -> bool:
 _plaintext_warned = False
 
 
+def _ws_connect(ws_host: str, token: str):
+    """The connection to the signal server. The token goes in the URL —
+    what the server reads today — and as an Authorization: Bearer header,
+    so the server can stop reading it from the URL (where it lands in
+    access and proxy logs) without a client change."""
+    return websockets.connect(f"{ws_host}?token={token}",
+                              additional_headers={"Authorization": f"Bearer {token}"})
+
+
 # ---------- Server message display ----------
 WELCOME_FRAMES = ["◇", "◆", "◇", "◆", "●"]
 HEARTBEAT_FRAMES = ["♡", "♥", "♡", "♥"]
@@ -10574,14 +10781,32 @@ async def dispatch_signal(raw_signal: str, pub_strategy: str = "",
 
 
 # ---------- Risk management ----------
+def _limit_value(raw) -> float:
+    """A limit from the config as a finite float; anything else is 0 (off).
+    `"target": "500"` from a hand-edited file used to reach the balance
+    monitor as a string and raise on every poll — limits silently dead."""
+    if isinstance(raw, bool):
+        return 0.0
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return v if math.isfinite(v) else 0.0
+
+
 def get_account_limits(account: str) -> dict:
-    """Get target/stop for an account from config."""
-    limits = config_get_sub("account_limits", account) or {}
+    """Get target/stop for an account from config, typed: numbers finite,
+    modes one of off/soft/hard."""
+    limits = config_get_sub("account_limits", account)
+    if not isinstance(limits, dict):
+        limits = {}
+    t_mode = str(limits.get("target_mode") or "soft").strip().lower()
+    s_mode = str(limits.get("stop_mode") or "hard").strip().lower()
     return {
-        "target": limits.get("target", 0),
-        "target_mode": limits.get("target_mode", "soft"),
-        "stop": limits.get("stop", 0),
-        "stop_mode": limits.get("stop_mode", "hard"),
+        "target": _limit_value(limits.get("target", 0)),
+        "target_mode": t_mode if t_mode in ("off", "soft", "hard") else "soft",
+        "stop": _limit_value(limits.get("stop", 0)),
+        "stop_mode": s_mode if s_mode in ("off", "soft", "hard") else "hard",
     }
 
 
@@ -12438,7 +12663,6 @@ async def listen(token: str):
                 logger.error("No ws_host configured — cannot connect")
                 return
             token = cfg.get("token", token)
-            uri = f"{ws_host}?token={token}"
             if plaintext_server_url(ws_host):
                 logger.warning(f"UNENCRYPTED SERVER URL  {ws_host} — the token and every signal travel "
                                "in cleartext; use wss://")
@@ -12447,8 +12671,7 @@ async def listen(token: str):
                     _dash_set_alert(Fore.RED + f"  ⚠  {ws_host} is ws:// not wss:// — token and signals "
                                     "travel unencrypted" + Style.RESET_ALL, sticky=True)
             connect_start = time.time()
-            async with websockets.connect(
-                    uri, additional_headers={"Authorization": f"Bearer {token}"}) as ws:
+            async with _ws_connect(ws_host, token) as ws:
                 linked_at = time.time()
                 connect_latency = int((time.time() - connect_start) * 1000)
                 baseline_latency = None  # First signal sets the baseline
@@ -12863,8 +13086,7 @@ def install_live_bridge_addon(nt_base: Path) -> tuple[bool, str]:
     # Publish the shared secret alongside the AddOn — it refuses every
     # connection until this file exists, so installing one without the
     # other yields a listener that never talks to anyone.
-    write_bridge_token()
-    write_bridge_port()
+    publish_bridge_files()
     dest_dir = nt_base / "bin" / "Custom" / "AddOns"
     dest = dest_dir / "SocketTraderBridge.cs"
     try:
@@ -13386,6 +13608,27 @@ async def _web_set_limits(account, target, target_mode, stop, stop_mode) -> tupl
     # also serialises as bare NaN which is not valid JSON.
     if not (math.isfinite(t_val) and math.isfinite(s_val)):
         return False, "limits must be finite numbers"
+    # The same sign rules as the terminal's T prompt — the balance monitor
+    # trips a target at pnl >= target and a stop at pnl <= stop, so a
+    # negative target or a positive stop on a flat account would trip the
+    # moment it was saved (a hard one flattening the account). A target is
+    # a profit goal: made positive. A positive stop is profit protection:
+    # only with a positive session P&L, capped at 90% of it.
+    notes = []
+    if t_val < 0:
+        t_val = abs(t_val)
+        notes.append(f"target made positive ({t_val:+,.2f}) — it is a profit goal")
+    if s_val > 0:
+        current = session_current_balances.get(acct)
+        pnl = session_pnl(acct, current, risk=True) if current is not None else None
+        if pnl is None or pnl <= 0:
+            shown = f"${pnl:+,.2f}" if pnl is not None else "unknown"
+            return False, (f"a positive stop is profit protection and needs a positive session P&L "
+                           f"(now {shown}) — use a negative value for a loss limit")
+        max_stop = round(pnl * 0.9, 2)
+        if s_val > max_stop:
+            s_val = max_stop
+            notes.append(f"stop capped at 90% of session P&L ({max_stop:+,.2f})")
     try:
         saved = set_account_limits(acct, t_val, t_mode, s_val, s_mode)
     except (TypeError, ValueError) as exc:
@@ -13414,7 +13657,8 @@ async def _web_set_limits(account, target, target_mode, stop, stop_mode) -> tupl
         logger.info(f"WEB LIMITS  {acct}  soft lockout lifted by new limits")
         _dash_set_alert(Fore.GREEN + f"  ▶  {acct} re-armed — new limits lift its lockout"
                         + Style.RESET_ALL)
-    return True, f"limits saved for {acct}{relit}" + config_save_warning()
+    noted = "".join(f" · {n}" for n in notes)
+    return True, f"limits saved for {acct}{noted}{relit}" + config_save_warning()
 
 
 def _strip_ai_config(raw):
@@ -14126,6 +14370,31 @@ def _pnl_read_shard(month: str) -> dict:
     days = data.get("days") if isinstance(data, dict) else None
     if not isinstance(days, dict):
         return {}
+    # A hand-edited file: a day whose key is not a date or whose record is
+    # not an object is set aside (reported, not served) so one bad line
+    # cannot stop the month — or the app — from loading. Inside a day,
+    # `accounts` and `trades` of the wrong shape are treated as absent by
+    # every reader; a trade row that is not an object is dropped here.
+    bad = [k for k, rec in days.items()
+           if not (isinstance(k, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", k) and isinstance(rec, dict))]
+    for k in bad:
+        days.pop(k, None)
+    fixed = 0
+    for rec in days.values():
+        if "accounts" in rec and not isinstance(rec.get("accounts"), dict):
+            rec["accounts"] = {}
+            fixed += 1
+        trades = rec.get("trades")
+        if "trades" in rec and not isinstance(trades, list):
+            rec["trades"] = []
+            fixed += 1
+        elif isinstance(trades, list) and any(not isinstance(t, dict) for t in trades):
+            rec["trades"] = [t for t in trades if isinstance(t, dict)]
+            fixed += 1
+    if bad or fixed:
+        logger.error(f"PNL HISTORY  {month}: {len(bad)} day record(s) that are not a dated object "
+                     f"and {fixed} malformed field(s) were set aside on load — the file is left "
+                     "as it is until this month is next written")
     healed = _pnl_strip_phantom_pairs(days)
     if healed:
         logger.info(
@@ -14655,7 +14924,7 @@ def _pnl_strip_phantom_pairs(days: dict) -> int:
     of needing a maintenance pass with the trader stopped."""
     dropped = 0
     for rec in days.values():
-        trades = (rec or {}).get("trades")
+        trades = rec.get("trades") if isinstance(rec, dict) else None
         if not isinstance(trades, list) or len(trades) < 2:
             continue
         uns = [(i, t) for i, t in enumerate(trades)
@@ -18502,11 +18771,11 @@ async def main():
     token, cfg = setup()
     instance_lock_beat(force=True)      # setup() can sit at a prompt longer than the stale window
     install_console_close_handler()     # the X on the console window: orderly stop + switch-off effect
-    active_account = cfg.get("account", "")
-    follower_accounts = [a for a in cfg.get("follower_accounts", []) if a and a != active_account]
+    active_account = sanitize_ati(str(cfg.get("account") or "").strip())
+    follower_accounts = cfg_account_list(cfg.get("follower_accounts", []), exclude=active_account)
     roundrobin_accounts = sanitize_roundrobin(
         cfg.get("roundrobin_accounts", []), active_account, follower_accounts)
-    atm_strategy = cfg.get("atm_strategy", "NQ_Med")
+    atm_strategy = str(cfg.get("atm_strategy") or "NQ_Med").strip() or "NQ_Med"
     follow_publisher_strategy = bool(cfg.get("follow_publisher_strategy", False))
     raw_aliases = cfg.get("atm_aliases")
     atm_aliases = ({str(k).strip(): str(v).strip() for k, v in raw_aliases.items()
@@ -18514,7 +18783,7 @@ async def main():
                    if isinstance(raw_aliases, dict) else {})
     micro_mode = bool(cfg.get("micro_mode", False))
     micro_map = load_micro_map(cfg)
-    nt_port = cfg.get("nt_port", 36973)
+    nt_port = cfg_port(cfg.get("nt_port", 36973), 36973)
     strategy_symbols.clear()
     strategy_symbols.update(load_strategy_symbols(cfg))
     if strategy_symbols:
@@ -18541,19 +18810,9 @@ async def main():
         logger.info(f"FRONT MONTHS LOADED  {len(front_months)} roots "
                     f"(synced {_front_months_date or 'unknown'}) — bridge "
                     "refresh replaces on connect; calendar guards staleness")
-    global live_bridge_enabled, live_bridge_port, nt_host_override
-    live_bridge_enabled = bool(cfg.get("live_bridge_enabled", False))
-    if live_bridge_enabled:
-        # Refresh the token file on every start: the AddOn refuses all
-        # connections without it, and NT's folder can be moved or restored
-        # independently of this config.
-        write_bridge_token()
-        write_bridge_port()
-    live_bridge_port = int(cfg.get("live_bridge_port", 36984))
-    nt_host_override = effective_nt_host(cfg)
-
-    if cfg.get("output_directory"):
-        output_directory = cfg["output_directory"]
+    # Live-monitor settings, then the files the AddOn reads (token, port,
+    # bind) — the folder and the port must be known before they are written.
+    bridge_startup(cfg)
 
     # One NinjaTrader state stream for everything that reads it — started
     # before the web UI so its first poll has a dump to answer with.

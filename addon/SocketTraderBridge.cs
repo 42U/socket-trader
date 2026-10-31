@@ -22,8 +22,12 @@
 // PROTOCOL
 //   - Pure push: clients connect, receive a full snapshot immediately,
 //     then receive updates whenever account / position / price changes.
-//   - Multiple clients supported (list of TcpClient, broadcast on each event).
-//   - Binds to 0.0.0.0 by default; change BindAddress below to restrict.
+//   - Multiple clients supported (list of TcpClient; one sender thread
+//     writes to all of them — NinjaTrader's own threads never block on a
+//     socket).
+//   - Binds 127.0.0.1 unless SocketTraderBridge.bind (next to the token)
+//     says "any": SocketTrader writes "any" when it runs under WSL or
+//     reaches NinjaTrader over the LAN, "loopback" otherwise.
 //   - Default port 36984 to sit alongside NT's built-in ATI on 36973
 //     (SocketTraderBridge.port next to the token overrides it)
 //     without colliding with VSCode's auto-port-forwarder (which claims
@@ -61,7 +65,14 @@ namespace NinjaTrader.NinjaScript.AddOns
         // already sits on 36984 moves the bridge without editing this file.
         private const string PortFileName = "SocketTraderBridge.port";
         private int listenPort = DefaultListenPort;
-        private static readonly IPAddress BindAddress = IPAddress.Any;
+        // Loopback unless SocketTraderBridge.bind says "any". This socket
+        // streams balances and accepts a FLATTEN, so it is not offered to
+        // the LAN by default; SocketTrader under WSL (classic NAT reaches
+        // the host over the vEthernet subnet) or on another machine writes
+        // "any" and the Windows Firewall rule for NinjaTrader is then the
+        // boundary, as before.
+        private const string BindFileName = "SocketTraderBridge.bind";
+        private IPAddress bindAddress = IPAddress.Loopback;
 
         // Heartbeat snapshot while idle so stale-detection on the client side
         // has something to see. NT may go minutes without events when flat.
@@ -100,6 +111,31 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return Path.Combine(NinjaTrader.Core.Globals.UserDataDir, TokenFileName);
             }
             catch { return null; }
+        }
+
+        private IPAddress ResolveBindAddress()
+        {
+            try
+            {
+                var path = Path.Combine(NinjaTrader.Core.Globals.UserDataDir, BindFileName);
+                if (!File.Exists(path))
+                    return IPAddress.Loopback;
+                var text = File.ReadAllText(path).Trim().ToLowerInvariant();
+                if (text == "any" || text == "all" || text == "0.0.0.0")
+                    return IPAddress.Any;
+                if (text == "loopback" || text == "local" || text == "127.0.0.1")
+                    return IPAddress.Loopback;
+                NinjaTrader.Code.Output.Process(
+                    $"SocketTraderBridge: ignoring {path} ('{text}' is not 'any' or 'loopback') — binding 127.0.0.1",
+                    PrintTo.OutputTab1);
+            }
+            catch (Exception ex)
+            {
+                NinjaTrader.Code.Output.Process(
+                    $"SocketTraderBridge: could not read bind file: {ex.Message} — binding 127.0.0.1",
+                    PrintTo.OutputTab1);
+            }
+            return IPAddress.Loopback;
         }
 
         private int ResolveListenPort()
@@ -173,6 +209,93 @@ namespace NinjaTrader.NinjaScript.AddOns
             return diff == 0;
         }
 
+        // ---------- Failed-auth backoff ----------
+        // A peer that keeps offering wrong tokens is refused on sight for a
+        // while, and written to the Output tab once a minute instead of once
+        // per attempt: the 256-bit token is not guessable, but a scanner or
+        // a misconfigured client (2026-10-29: NinjaTrader's own ATI polling
+        // this port) could otherwise fill the tab and cost a thread per try.
+        private const int AuthFailuresBeforeBackoff = 3;
+        private static readonly TimeSpan AuthFailureWindow = TimeSpan.FromSeconds(60);
+        private static readonly TimeSpan AuthBackoff = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan AuthLogEvery = TimeSpan.FromSeconds(60);
+        private sealed class AuthFailures { public int Count; public DateTime First; public DateTime Until; public DateTime LastLogged; }
+        private readonly Dictionary<string, AuthFailures> authFailures = new Dictionary<string, AuthFailures>();
+        private readonly object authLock = new object();
+
+        private static string PeerAddress(TcpClient client)
+        {
+            try
+            {
+                var ep = client.Client.RemoteEndPoint as IPEndPoint;
+                return ep != null ? ep.Address.ToString() : "?";
+            }
+            catch { return "?"; }
+        }
+
+        /// <summary>True when this peer is inside its backoff window.</summary>
+        private bool AuthBackedOff(string peer)
+        {
+            lock (authLock)
+            {
+                AuthFailures f;
+                if (!authFailures.TryGetValue(peer, out f)) return false;
+                if (DateTime.UtcNow < f.Until) return true;
+                if (DateTime.UtcNow - f.First > AuthFailureWindow) authFailures.Remove(peer);
+                return false;
+            }
+        }
+
+        /// <summary>Record a failed auth; returns true when it should be logged.</summary>
+        private bool NoteAuthFailure(string peer)
+        {
+            lock (authLock)
+            {
+                AuthFailures f;
+                var now = DateTime.UtcNow;
+                if (!authFailures.TryGetValue(peer, out f) || now - f.First > AuthFailureWindow)
+                {
+                    f = new AuthFailures { Count = 0, First = now, Until = DateTime.MinValue, LastLogged = DateTime.MinValue };
+                    authFailures[peer] = f;
+                }
+                f.Count++;
+                if (f.Count >= AuthFailuresBeforeBackoff)
+                    f.Until = now + AuthBackoff;
+                if (authFailures.Count > 256)      // bound the table under a scan
+                    authFailures.Clear();
+                if (now - f.LastLogged < AuthLogEvery) return false;
+                f.LastLogged = now;
+                return true;
+            }
+        }
+
+        // A command line longer than this is not a command. The reader stops
+        // feeding a StringBuilder past it and drops the connection, so a peer
+        // cannot grow memory by never sending a newline.
+        private const int MaxCommandLineBytes = 4096;
+
+        /// <summary>
+        /// Read one newline-terminated command line, byte by byte (nothing
+        /// buffered past the newline, nothing kept past MaxCommandLineBytes).
+        /// Returns null when the peer closed, timed out, or overran the cap.
+        /// </summary>
+        private static string ReadCommandLine(NetworkStream stream)
+        {
+            var buf = new List<byte>(128);
+            var one = new byte[1];
+            while (true)
+            {
+                int n;
+                try { n = stream.Read(one, 0, 1); }
+                catch { return null; }
+                if (n <= 0) return null;
+                if (one[0] == (byte)'\n')
+                    return Encoding.UTF8.GetString(buf.ToArray()).Trim();
+                if (buf.Count >= MaxCommandLineBytes) return null;
+                buf.Add(one[0]);
+            }
+        }
+
         /// <summary>
         /// Read one newline-terminated line with a hard deadline, without
         /// consuming anything past it (a StreamReader would buffer ahead
@@ -203,6 +326,14 @@ namespace NinjaTrader.NinjaScript.AddOns
         private Timer heartbeatTimer;
         private readonly List<TcpClient> clients = new List<TcpClient>();
         private readonly object clientsLock = new object();
+        // Broadcasts happen on this thread, never on the NinjaTrader thread
+        // that raised the account, position or tick event: a socket write
+        // can block for WriteTimeoutMs per client, and before 1.0.4 that
+        // happened on NT's own event threads under clientsLock. Events only
+        // set the signal; a burst of ticks collapses into one snapshot.
+        private Thread senderThread;
+        private readonly AutoResetEvent broadcastSignal = new AutoResetEvent(false);
+        private volatile bool senderRunning;
 
         // Instruments we've subscribed to market data for (with open positions)
         private readonly Dictionary<Instrument, double> lastPrice =
@@ -229,7 +360,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // read as if the port were open (2026-10-29, port held by
                 // NinjaTrader's own ATI).
                 NinjaTrader.Code.Output.Process(listening
-                    ? $"SocketTraderBridge listening on {BindAddress}:{listenPort}"
+                    ? $"SocketTraderBridge listening on {bindAddress}:{listenPort}" +
+                      (bindAddress.Equals(IPAddress.Loopback)
+                          ? " (this machine only; SocketTraderBridge.bind = any opens it to the network)"
+                          : " (all interfaces, per SocketTraderBridge.bind)")
                     : $"SocketTraderBridge NOT listening — port {listenPort} is in use " +
                       "(NinjaTrader's AT Interface on the same port?). Change the Live Monitor " +
                       "port in SocketTrader (Setup > 9 > 4) and press F5.",
@@ -241,6 +375,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 UnhookAccounts();
                 UnsubscribeAllMarketData();
                 StopListener();
+                StopSender();
             }
         }
 
@@ -258,8 +393,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                         $"Expected at {TokenPath()}",
                         PrintTo.OutputTab1);
                 listenPort = ResolveListenPort();
-                listener = new TcpListener(BindAddress, listenPort);
+                bindAddress = ResolveBindAddress();
+                listener = new TcpListener(bindAddress, listenPort);
                 listener.Start();
+                StartSender();
                 acceptThread = new Thread(AcceptLoop) { IsBackground = true, Name = "STB-Accept" };
                 acceptThread.Start();
                 return true;
@@ -270,6 +407,35 @@ namespace NinjaTrader.NinjaScript.AddOns
                     $"SocketTraderBridge: failed to start listener: {ex.Message}",
                     PrintTo.OutputTab1);
                 return false;
+            }
+        }
+
+        private void StartSender()
+        {
+            if (senderRunning) return;
+            senderRunning = true;
+            senderThread = new Thread(SenderLoop) { IsBackground = true, Name = "STB-Send" };
+            senderThread.Start();
+        }
+
+        private void StopSender()
+        {
+            senderRunning = false;
+            try { broadcastSignal.Set(); } catch { }
+        }
+
+        private void SenderLoop()
+        {
+            while (senderRunning)
+            {
+                try { broadcastSignal.WaitOne(); } catch { return; }
+                if (!senderRunning) return;
+                try { BroadcastNow(); }
+                catch (Exception ex)
+                {
+                    NinjaTrader.Code.Output.Process(
+                        $"SocketTraderBridge: broadcast error: {ex.Message}", PrintTo.OutputTab1);
+                }
             }
         }
 
@@ -356,6 +522,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                     try { client.Close(); } catch { }
                     return;
                 }
+                string peer = PeerAddress(client);
+                if (AuthBackedOff(peer))
+                {
+                    try { client.Close(); } catch { }   // refused on sight, nothing logged
+                    return;
+                }
                 var hello = ReadLineWithTimeout(client, AuthTimeoutMs);
                 var offered = ExtractJsonString(hello ?? "", "auth");
                 if (!TokensMatch(offered, sharedToken))
@@ -364,11 +536,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                 }
                 if (!TokensMatch(offered, sharedToken))
                 {
-                    string peer = "?";
-                    try { peer = client.Client.RemoteEndPoint.ToString(); } catch { }
-                    NinjaTrader.Code.Output.Process(
-                        $"SocketTraderBridge: rejected unauthenticated client {peer}",
-                        PrintTo.OutputTab1);
+                    if (NoteAuthFailure(peer))
+                        NinjaTrader.Code.Output.Process(
+                            $"SocketTraderBridge: rejected unauthenticated client {peer} " +
+                            $"(further attempts from it are refused quietly for {AuthBackoff.TotalSeconds:0}s " +
+                            $"after {AuthFailuresBeforeBackoff} failures)",
+                            PrintTo.OutputTab1);
                     try { client.Close(); } catch { }
                     return;
                 }
@@ -436,14 +609,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // SafeBroadcast continues pushing data from the writer side.
                 client.ReceiveTimeout = 0;  // block indefinitely on read
                 var stream = client.GetStream();
-                var reader = new StreamReader(stream, Encoding.UTF8);
                 string line;
-                while ((line = reader.ReadLine()) != null)
+                while ((line = ReadCommandLine(stream)) != null)
                 {
-                    line = line.Trim();
                     if (line.Length == 0) continue;
                     HandleCommand(line, client);
                 }
+                // null: the peer closed, or sent more than MaxCommandLineBytes
+                // without a newline — either way this connection is done.
+                try { client.Close(); } catch { }
             }
             catch (Exception)
             {
@@ -498,7 +672,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 }
                 else if (cmd == "close_position")
                 {
-                    string inst = ExtractJsonString(jsonLine, "instrument");
+                    string inst = (ExtractJsonString(jsonLine, "instrument") ?? "").Trim();
                     if (string.IsNullOrEmpty(inst))
                     {
                         SendAck(client, false, "close_position missing instrument");
@@ -547,17 +721,16 @@ namespace NinjaTrader.NinjaScript.AddOns
             {
                 if (pos == null || pos.Instrument == null) continue;
                 if (pos.MarketPosition == MarketPosition.Flat) continue;
-                // Match any alias: FullName, MasterInstrument.Name, or a
-                // case-insensitive substring so "NQ JUN26" lookups hit an
-                // instrument registered as "NQ 06-26" and vice-versa.
-                var full = pos.Instrument.FullName ?? "";
+                // Exact match on the contract ("NQ 12-26", NT's FullName) or
+                // the product ("NQ", MasterInstrument.Name), case-insensitive.
+                // The substring match this used to allow let "instrument":" "
+                // close the first open position found.
+                var full = (pos.Instrument.FullName ?? "").Trim();
                 var master = pos.Instrument.MasterInstrument != null
-                    ? pos.Instrument.MasterInstrument.Name
+                    ? (pos.Instrument.MasterInstrument.Name ?? "").Trim()
                     : "";
-                if (full.Equals(instName, StringComparison.OrdinalIgnoreCase)
-                    || master.Equals(instName, StringComparison.OrdinalIgnoreCase)
-                    || full.IndexOf(instName, StringComparison.OrdinalIgnoreCase) >= 0
-                    || instName.IndexOf(master, StringComparison.OrdinalIgnoreCase) >= 0)
+                if ((full.Length > 0 && full.Equals(instName, StringComparison.OrdinalIgnoreCase))
+                    || (master.Length > 0 && master.Equals(instName, StringComparison.OrdinalIgnoreCase)))
                 {
                     acct.Flatten(new[] { pos.Instrument });
                     NinjaTrader.Code.Output.Process(
@@ -664,7 +837,15 @@ namespace NinjaTrader.NinjaScript.AddOns
             return null;
         }
 
+        /// <summary>Ask the sender thread for a broadcast. Cheap; safe on any thread.</summary>
         private void SafeBroadcast()
+        {
+            if (!senderRunning) return;
+            try { broadcastSignal.Set(); } catch { }
+        }
+
+        /// <summary>Build one snapshot and write it to every client (sender thread only).</summary>
+        private void BroadcastNow()
         {
             string json;
             try { json = BuildSnapshotJson(); }

@@ -1,26 +1,97 @@
 # Changelog
 
-## Unreleased
+## 1.0.4 — 2026-10-31
 
-### Changed
-- The installer always shows the destination page — on an upgrade too, pre-filled
-  with the current folder — so the app can be put on another drive. A silent
-  upgrade (the in-app update) keeps the existing folder.
+The hardening pass after the first day with outside users: every finding of
+the 2026-10-30 security review that is this app's to fix, the four items
+deferred from the 1.0.0 review, and two defects found while verifying them.
+Executed, not only read: the update handover now runs for real under cmd.exe
+on the Windows CI runners, the websocket connection is proven against a live
+server, the installer is built and smoke-installed on a clean runner, and the
+P&L archive loader was fuzzed with 2,500 hand-edited month files.
 
-### Security (from the 2026-10-30 review of the installed app)
+### Fixed
+- **The AddOn's token, port and bind files were not being written at
+  start-up.** `main()` published them before it had read the NinjaTrader
+  folder and the port from the config: on a normal start the writes were
+  skipped without a word (the token file on the operator's PC was dated five
+  days back), and when they did run they carried the built-in port 36984,
+  not the configured one — the collision with NinjaTrader's AT Interface seen
+  on the second PC. The settings are loaded first now (`bridge_startup`),
+  then the files are written.
+- **A hand-edited P&L month file could stop the app from starting.** A day
+  whose record was not an object (`"2026-10-04": -2.5`) raised out of the
+  loader, which nothing caught. Bad days, non-date keys and malformed
+  `accounts` / `trades` fields are now set aside with a log line and the rest
+  of the month loads and serves. Found by fuzzing; 2,500 generated files pass.
+- Hand-edited config values come back typed: a bare string in
+  `follower_accounts` is one account (it used to iterate as six one-letter
+  accounts), ports are ints in range or the default, `account_limits` are
+  finite numbers with valid modes (a `"500"` string used to raise on every
+  balance poll, leaving the limit dead), the account name is sanitised.
+- **Web limits follow the terminal's sign rules.** A negative target is made
+  positive; a positive stop is profit protection only — needs a positive
+  session P&L and is capped at 90% of it — otherwise refused with the reason.
+  Before, a positive stop saved from the web page tripped the moment it was
+  saved, a hard one flattening the account.
+- **Replay guard:** a publisher that closed, re-entered and closed again
+  inside the post-reconnect window no longer loses the second close — a
+  close is only a replay when no entry of ours on that root was fired after
+  the first one (a replayed entry is stopped by id dedup and never fired, so
+  a real replay still is one).
+- **Deferred legs stop on a role change.** A delayed or staggered entry
+  checks, before every write, that its account still has the role it was
+  planned for (leader / follower / round-robin); re-roled or dropped
+  mid-flight, it aborts with the reason logged.
+- The `CLOSESTRATEGY` / `CANCEL` fan-out after a staggered entry addresses
+  every tranche id exactly once (verified; a regression test now proves it
+  with the same id used as order id and strategy id).
+
+### Security (2026-10-30 review)
+- **Bridge AddOn** (`addon/SocketTraderBridge.cs`, recompile with F5):
+  binds **127.0.0.1** unless `SocketTraderBridge.bind` says `any` —
+  SocketTrader writes `any` when it runs under WSL or reaches NinjaTrader on
+  another machine, `loopback` otherwise; repeated wrong tokens from one
+  address are refused quietly for 30 s after three failures and logged once a
+  minute; command lines are capped at 4 KB; `close_position` matches the
+  contract or product name exactly (a blank instrument used to close the
+  first open position found); and every broadcast is written from one sender
+  thread — NinjaTrader's account, position and tick event threads only
+  signal it, they never block on a socket.
+- **Signal path:** `max_signal_contracts` (default **25**, `0` = off) caps
+  the quantity any one signal may carry; `allowed_roots`, when set, is the
+  only markets an entry may trade. Closes are never blocked. Both rejected
+  signals show as `REJECTED` with the reason.
 - The updater fetches the installer and its `.sha256` only from
-  `https://github.com/42U/socket-trader/releases/download/…`; any other
-  URL in GitHub's release document is refused before a byte is fetched.
+  `https://github.com/42U/socket-trader/releases/download/…`.
 - A `ws://` server URL to anything but this machine is logged as
   `UNENCRYPTED SERVER URL` on every connection and shown once in the alert
-  line (the token travels in the URL, every signal in cleartext). The token
-  is also sent as an `Authorization: Bearer` header, so a server can stop
-  reading it from the query string without a client change.
+  line; the token is also sent as an `Authorization: Bearer` header so the
+  server can stop reading it from the URL.
 - What the server sends is data: a non-string `signal` or a non-numeric
   `ts` is a rejected frame, not an exception that dropped the connection
-  into reconnect backoff; the raw text of a rejected signal and the
-  server's self-declared name are scrubbed of escape sequences before the
-  dashboard prints them.
+  into reconnect backoff; rejected raw text and the server's name are
+  scrubbed of escape sequences before the dashboard prints them.
+
+### Changed
+- The installer always shows the destination page — on an upgrade too,
+  pre-filled with the current folder — so the app can be put on another
+  drive. A silent upgrade (the in-app update) keeps the existing folder.
+
+### Verified
+- The update handover script is executed by cmd.exe in the Windows test
+  matrix with stub Setup/exe for both outcomes: result and history files,
+  restart of the new or old version, self-delete on success only, and the
+  next start's report of the result.
+- The websocket connection is made against a real server in the suite: the
+  token arrives in the URL and as the bearer header.
+
+Not in this release, by decision: an account allow-list inside the AddOn
+(a stale list would refuse a legitimate flatten — the wrong failure mode for
+a risk control) and moving the bridge token out of the OneDrive-synced
+NinjaTrader folder (both sides of the bridge would have to agree on the new
+place; a NinjaTrader folder under OneDrive is better excluded from sync
+altogether). Code signing of the releases waits on a signing identity.
 
 ## 1.0.3 — 2026-10-31
 
