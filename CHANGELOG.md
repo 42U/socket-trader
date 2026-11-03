@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.5rc1 — 2026-11-03 (pre-release)
 
 Findings of the 2026-11-03 review of a live install (ten accounts, one
 funded), each confirmed against NinjaTrader's own log before it was fixed.
