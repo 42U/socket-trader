@@ -46,21 +46,23 @@ funded), each confirmed against NinjaTrader's own log before it was fixed.
 ### AddOn (`addon/SocketTraderBridge.cs`)
 - A snapshot whose account or position list could not be read was
   published as an empty — flat — book. It is now skipped (or marked
-  `partial`), collections are read under NinjaTrader's lock.
-- One broadcaster thread builds and writes every snapshot, so a client can
-  no longer receive a pre-fill heartbeat after the fill's own snapshot; a
-  new client is registered before its first snapshot; tick storms coalesce
-  and no socket I/O runs on NinjaTrader's event threads.
+  `partial`); collections are read under NinjaTrader's lock.
+- A new client is registered before its first snapshot is built, and that
+  snapshot comes from the sender thread like every other one, so a fill
+  can no longer land between "snapshot built" and "client registered".
 - Closing an instrument on one account no longer drops market data for the
   same instrument on every other account (unrealized P&L went to 0 for the
-  rest of their trade).
-- `close_position` matched by substring (`MES` closed `ES`) and acked
-  success when nothing matched; it matches the contract exactly now, in
-  either NinjaTrader spelling, and acks false on no match.
+  rest of their trade); the last price is seeded from NinjaTrader's last
+  known trade on subscribe.
+- `close_position` acked success when nothing matched; it acks false now,
+  and also accepts NinjaTrader's "NQ DEC26" spelling of a contract.
 - Accounts created by a connection that comes up after start-up are hooked
-  on every status update; each account carries its connection `status`;
-  the accept loop survives transient socket errors and a failed bind is
-  retried; `\uXXXX` in commands is decoded; `qty` is culture-invariant.
+  on every status update (hooks tracked, never attached twice); each
+  account carries its connection `status`; the accept loop survives
+  transient socket errors and a failed bind is retried on every heartbeat;
+  acks and broadcasts to one client are serialised; a failing command no
+  longer ends the client's reader; `\uXXXX` in commands is decoded;
+  `qty` is culture-invariant; cash is read in the account's denomination.
 
 ## 1.0.4 — 2026-10-31
 

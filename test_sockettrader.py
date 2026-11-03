@@ -9533,8 +9533,9 @@ class TestResetVerifySetting:
         assert st._coerce_rule({"reset_verify": "inherit"})["reset_verify"] == "inherit"
         assert "reset_verify" not in st._coerce_rule({"reset_verify": "maybe"})
         assert "reset_verify" not in st._coerce_rule({"reset_verify": 1})
-        # scoped rules carry it too
-        assert st._coerce_rule({"reset_verify": "on"}, scoped=True)["reset_verify"] == "on"
+        # scoped rules carry it too (a scoped rule needs a scope to be one)
+        assert st._coerce_rule({"reset_verify": "on", "strategies": ["NQ_Med"]},
+                               scoped=True)["reset_verify"] == "on"
 
     def test_global_policy_defaults_on(self, tmp_config):
         st.save_config({})
