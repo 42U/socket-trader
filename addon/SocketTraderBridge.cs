@@ -14,24 +14,56 @@
 //
 // WIRE FORMAT
 //   Each line is a standalone JSON object (newline-delimited). Example:
-//     {"t":1713885600.123,"acct":"Sim101","cash":27462.14,"realized":-2.18,
-//      "unrealized":-125.50,"positions":[
-//        {"inst":"NQ JUN26","qty":-1,"avg":27068.25,"last":27074.50,"pl":-125.50}
-//      ]}
+//     {"t":1713885600.123,"accounts":[
+//       {"name":"Sim101","status":"Connected","cash":27462.14,"realized":-2.18,
+//        "positions":[{"inst":"NQ 06-26","qty":-1,"avg":27068.25,"last":27074.50,"pl":-125.50}],
+//        "unrealized":-125.50,"equity":27336.64}]}
+//   `partial:true` is added when an account could not be read; a client
+//   must not treat such a line as proof that anything is flat.
 //
 // PROTOCOL
 //   - Pure push: clients connect, receive a full snapshot immediately,
 //     then receive updates whenever account / position / price changes.
-//   - Multiple clients supported (list of TcpClient; one sender thread
-//     writes to all of them — NinjaTrader's own threads never block on a
-//     socket).
-//   - Binds 127.0.0.1 unless SocketTraderBridge.bind (next to the token)
-//     says "any": SocketTrader writes "any" when it runs under WSL or
-//     reaches NinjaTrader over the LAN, "loopback" otherwise.
+//   - Multiple clients supported (list of TcpClient, broadcast on each event).
+//   - Binds to 0.0.0.0 by default; change BindAddress below to restrict.
 //   - Default port 36984 to sit alongside NT's built-in ATI on 36973
 //     (SocketTraderBridge.port next to the token overrides it)
 //     without colliding with VSCode's auto-port-forwarder (which claims
 //     36974 on loopback if your terminal session is using it).
+//
+// CHANGES 2026-11-03 (review fixes; each site is tagged [FIX-x])
+//   A  Account.All / acct.Positions are read under NinjaTrader's lock; a read
+//      that still fails ABORTS the broadcast (or marks the line partial)
+//      instead of publishing an empty — i.e. "flat" — book.
+//   B  One broadcaster thread builds and writes every snapshot, so lines can
+//      never reach a client out of order; a new client is registered before
+//      its first snapshot is built, so nothing is lost in between.
+//   C  Market data is unsubscribed only when NO account still holds the
+//      instrument (one account closing NQ no longer zeroes everyone's NQ P&L).
+//   D  close_position matches the contract exactly (either "NQ 12-26" or
+//      "NQ DEC26" spelling); no more substring hits (MES vs ES, SIL vs SI);
+//      acks false when nothing matched.
+//   E  Accounts that appear after start-up (connections that come up later)
+//      are hooked on every AccountStatusUpdate; hooks are tracked so they are
+//      never attached twice.
+//   F  Each account carries its connection "status".
+//   G  Snapshot building and socket writes moved off NinjaTrader's event and
+//      market-data threads onto the broadcaster thread; tick storms coalesce.
+//   H  Accept loop survives transient socket errors; a listener that failed
+//      to bind at start-up is retried every heartbeat.
+//   I  Acks and broadcasts to one client are serialised by a per-client lock.
+//   J  Last price seeded from NT's last known trade when subscribing.
+//   K  qty serialised culture-invariant.
+//   L  Terminated flag checked by every callback; subscribe/unsubscribe
+//      serialised; broadcaster joined on shutdown.
+//   M  \uXXXX escapes decoded in incoming commands.
+//   N  Rejected-connection log line rate-limited; concurrent unauthenticated
+//      handshakes capped.
+//   O  Any exception in a command only fails that command; a client whose
+//      reader loop ends is closed and evicted immediately.
+//   P  A position event is treated as "closed" on Operation.Remove as well
+//      as on MarketPosition.Flat.
+//   Q  Cash / realized read in the account's own denomination.
 
 #region Using declarations
 using System;
@@ -65,18 +97,16 @@ namespace NinjaTrader.NinjaScript.AddOns
         // already sits on 36984 moves the bridge without editing this file.
         private const string PortFileName = "SocketTraderBridge.port";
         private int listenPort = DefaultListenPort;
-        // Loopback unless SocketTraderBridge.bind says "any". This socket
-        // streams balances and accepts a FLATTEN, so it is not offered to
-        // the LAN by default; SocketTrader under WSL (classic NAT reaches
-        // the host over the vEthernet subnet) or on another machine writes
-        // "any" and the Windows Firewall rule for NinjaTrader is then the
-        // boundary, as before.
-        private const string BindFileName = "SocketTraderBridge.bind";
-        private IPAddress bindAddress = IPAddress.Loopback;
+        private static readonly IPAddress BindAddress = IPAddress.Any;
 
         // Heartbeat snapshot while idle so stale-detection on the client side
         // has something to see. NT may go minutes without events when flat.
         private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(5);
+
+        // [FIX-G] Minimum gap between two broadcasts. Events arriving inside
+        // the gap collapse into the next snapshot, so a tick storm costs one
+        // build per gap instead of one per tick. 40 ms = 25 snapshots/s max.
+        private const int MinBroadcastGapMs = 40;
 
         // Per-write deadline. Windows default TCP keepalive on a half-open
         // connection is ~2h — without this, one dead peer can wedge the
@@ -100,9 +130,15 @@ namespace NinjaTrader.NinjaScript.AddOns
         // Re-read the token at most this often when one does not match, so
         // a rotated secret recovers without restarting NinjaTrader.
         private const int TokenRefreshMs = 5000;
+        // [FIX-N] A scanner on the LAN must not be able to tie up the pool
+        // or flood the Output window.
+        private const int MaxPendingHandshakes = 8;
+        private const int RejectLogIntervalMs = 10000;
         private volatile string sharedToken;
         private DateTime lastTokenRead = DateTime.MinValue;
         private readonly object tokenLock = new object();
+        private int pendingHandshakes;
+        private long lastRejectLogTicks;
 
         private string TokenPath()
         {
@@ -111,31 +147,6 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return Path.Combine(NinjaTrader.Core.Globals.UserDataDir, TokenFileName);
             }
             catch { return null; }
-        }
-
-        private IPAddress ResolveBindAddress()
-        {
-            try
-            {
-                var path = Path.Combine(NinjaTrader.Core.Globals.UserDataDir, BindFileName);
-                if (!File.Exists(path))
-                    return IPAddress.Loopback;
-                var text = File.ReadAllText(path).Trim().ToLowerInvariant();
-                if (text == "any" || text == "all" || text == "0.0.0.0")
-                    return IPAddress.Any;
-                if (text == "loopback" || text == "local" || text == "127.0.0.1")
-                    return IPAddress.Loopback;
-                NinjaTrader.Code.Output.Process(
-                    $"SocketTraderBridge: ignoring {path} ('{text}' is not 'any' or 'loopback') — binding 127.0.0.1",
-                    PrintTo.OutputTab1);
-            }
-            catch (Exception ex)
-            {
-                NinjaTrader.Code.Output.Process(
-                    $"SocketTraderBridge: could not read bind file: {ex.Message} — binding 127.0.0.1",
-                    PrintTo.OutputTab1);
-            }
-            return IPAddress.Loopback;
         }
 
         private int ResolveListenPort()
@@ -209,93 +220,6 @@ namespace NinjaTrader.NinjaScript.AddOns
             return diff == 0;
         }
 
-        // ---------- Failed-auth backoff ----------
-        // A peer that keeps offering wrong tokens is refused on sight for a
-        // while, and written to the Output tab once a minute instead of once
-        // per attempt: the 256-bit token is not guessable, but a scanner or
-        // a misconfigured client (2026-10-29: NinjaTrader's own ATI polling
-        // this port) could otherwise fill the tab and cost a thread per try.
-        private const int AuthFailuresBeforeBackoff = 3;
-        private static readonly TimeSpan AuthFailureWindow = TimeSpan.FromSeconds(60);
-        private static readonly TimeSpan AuthBackoff = TimeSpan.FromSeconds(30);
-        private static readonly TimeSpan AuthLogEvery = TimeSpan.FromSeconds(60);
-        private sealed class AuthFailures { public int Count; public DateTime First; public DateTime Until; public DateTime LastLogged; }
-        private readonly Dictionary<string, AuthFailures> authFailures = new Dictionary<string, AuthFailures>();
-        private readonly object authLock = new object();
-
-        private static string PeerAddress(TcpClient client)
-        {
-            try
-            {
-                var ep = client.Client.RemoteEndPoint as IPEndPoint;
-                return ep != null ? ep.Address.ToString() : "?";
-            }
-            catch { return "?"; }
-        }
-
-        /// <summary>True when this peer is inside its backoff window.</summary>
-        private bool AuthBackedOff(string peer)
-        {
-            lock (authLock)
-            {
-                AuthFailures f;
-                if (!authFailures.TryGetValue(peer, out f)) return false;
-                if (DateTime.UtcNow < f.Until) return true;
-                if (DateTime.UtcNow - f.First > AuthFailureWindow) authFailures.Remove(peer);
-                return false;
-            }
-        }
-
-        /// <summary>Record a failed auth; returns true when it should be logged.</summary>
-        private bool NoteAuthFailure(string peer)
-        {
-            lock (authLock)
-            {
-                AuthFailures f;
-                var now = DateTime.UtcNow;
-                if (!authFailures.TryGetValue(peer, out f) || now - f.First > AuthFailureWindow)
-                {
-                    f = new AuthFailures { Count = 0, First = now, Until = DateTime.MinValue, LastLogged = DateTime.MinValue };
-                    authFailures[peer] = f;
-                }
-                f.Count++;
-                if (f.Count >= AuthFailuresBeforeBackoff)
-                    f.Until = now + AuthBackoff;
-                if (authFailures.Count > 256)      // bound the table under a scan
-                    authFailures.Clear();
-                if (now - f.LastLogged < AuthLogEvery) return false;
-                f.LastLogged = now;
-                return true;
-            }
-        }
-
-        // A command line longer than this is not a command. The reader stops
-        // feeding a StringBuilder past it and drops the connection, so a peer
-        // cannot grow memory by never sending a newline.
-        private const int MaxCommandLineBytes = 4096;
-
-        /// <summary>
-        /// Read one newline-terminated command line, byte by byte (nothing
-        /// buffered past the newline, nothing kept past MaxCommandLineBytes).
-        /// Returns null when the peer closed, timed out, or overran the cap.
-        /// </summary>
-        private static string ReadCommandLine(NetworkStream stream)
-        {
-            var buf = new List<byte>(128);
-            var one = new byte[1];
-            while (true)
-            {
-                int n;
-                try { n = stream.Read(one, 0, 1); }
-                catch { return null; }
-                if (n <= 0) return null;
-                if (one[0] == (byte)'\n')
-                    return Encoding.UTF8.GetString(buf.ToArray()).Trim();
-                if (buf.Count >= MaxCommandLineBytes) return null;
-                buf.Add(one[0]);
-            }
-        }
-
         /// <summary>
         /// Read one newline-terminated line with a hard deadline, without
         /// consuming anything past it (a StreamReader would buffer ahead
@@ -321,24 +245,49 @@ namespace NinjaTrader.NinjaScript.AddOns
         }
 
         // ---------- State ----------
+        // [FIX-I] A connection plus the lock that serialises every write to
+        // it: broadcasts come from the broadcaster thread, acks from the
+        // client's own reader thread, and NetworkStream allows one writer.
+        private sealed class ClientConn
+        {
+            public readonly TcpClient Tcp;
+            public readonly object WriteLock = new object();
+            public ClientConn(TcpClient tcp) { Tcp = tcp; }
+        }
+
         private TcpListener listener;
         private Thread acceptThread;
-        private Timer heartbeatTimer;
-        private readonly List<TcpClient> clients = new List<TcpClient>();
+        private readonly List<ClientConn> clients = new List<ClientConn>();
         private readonly object clientsLock = new object();
-        // Broadcasts happen on this thread, never on the NinjaTrader thread
-        // that raised the account, position or tick event: a socket write
-        // can block for WriteTimeoutMs per client, and before 1.0.4 that
-        // happened on NT's own event threads under clientsLock. Events only
-        // set the signal; a burst of ticks collapses into one snapshot.
-        private Thread senderThread;
+
+        // [FIX-G] Broadcaster: events only signal; the thread builds and
+        // writes. [FIX-L] `terminated` is checked by every callback so
+        // nothing runs on a torn-down instance after F5.
+        private Thread broadcastThread;
         private readonly AutoResetEvent broadcastSignal = new AutoResetEvent(false);
-        private volatile bool senderRunning;
+        private volatile bool terminated;
+
+        // Work handed from NinjaTrader's callbacks to the broadcaster thread,
+        // so no callback ever takes Account.All / Positions locks while NT
+        // may be holding its own (lock-order safety): instruments whose
+        // subscription may now be unused ([FIX-C]) and a request to look for
+        // new accounts ([FIX-E]).
+        private readonly HashSet<Instrument> pendingRelease = new HashSet<Instrument>();
+        private readonly object pendingLock = new object();
+        private int rehookRequested;
 
         // Instruments we've subscribed to market data for (with open positions)
         private readonly Dictionary<Instrument, double> lastPrice =
             new Dictionary<Instrument, double>();
         private readonly object subsLock = new object();
+        // [FIX-L] Serialises subscribe/unsubscribe decisions. Never taken by
+        // OnMarketDataUpdate, so it cannot invert with NT's dispatch lock.
+        private readonly object subOpLock = new object();
+
+        // [FIX-E] Accounts whose events we are attached to. += is not
+        // idempotent, so hooking is tracked rather than repeated.
+        private readonly HashSet<Account> hooked = new HashSet<Account>();
+        private readonly object hookedLock = new object();
 
         // ---------- Lifecycle ----------
         protected override void OnStateChange()
@@ -350,32 +299,39 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             else if (State == State.Active)
             {
+                terminated = false;
                 bool listening = StartListener();
                 HookAccounts();
                 SubscribeExistingPositions();
-                heartbeatTimer = new Timer(_ => SafeBroadcast(), null,
-                    HeartbeatInterval, HeartbeatInterval);
+                broadcastThread = new Thread(BroadcastLoop) { IsBackground = true, Name = "STB-Broadcast" };
+                broadcastThread.Start();
                 // Say "listening" only when the bind succeeded: after a
                 // failed start this line used to follow the failure and
                 // read as if the port were open (2026-10-29, port held by
                 // NinjaTrader's own ATI).
                 NinjaTrader.Code.Output.Process(listening
-                    ? $"SocketTraderBridge listening on {bindAddress}:{listenPort}" +
-                      (bindAddress.Equals(IPAddress.Loopback)
-                          ? " (this machine only; SocketTraderBridge.bind = any opens it to the network)"
-                          : " (all interfaces, per SocketTraderBridge.bind)")
+                    ? $"SocketTraderBridge listening on {BindAddress}:{listenPort}"
                     : $"SocketTraderBridge NOT listening — port {listenPort} is in use " +
                       "(NinjaTrader's AT Interface on the same port?). Change the Live Monitor " +
-                      "port in SocketTrader (Setup > 9 > 4) and press F5.",
+                      "port in SocketTrader (Setup > 9 > 4) and press F5. Retrying every " +
+                      $"{HeartbeatInterval.TotalSeconds:0}s.",
                     PrintTo.OutputTab1);
             }
             else if (State == State.Terminated)
             {
-                heartbeatTimer?.Dispose();
+                // [FIX-L] Flag first so callbacks already in flight bail out,
+                // then wake the broadcaster so it can exit and be joined.
+                terminated = true;
+                try { broadcastSignal.Set(); } catch { }
+                try
+                {
+                    if (broadcastThread != null && broadcastThread.IsAlive)
+                        broadcastThread.Join(2000);
+                }
+                catch { }
                 UnhookAccounts();
                 UnsubscribeAllMarketData();
                 StopListener();
-                StopSender();
             }
         }
 
@@ -393,10 +349,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                         $"Expected at {TokenPath()}",
                         PrintTo.OutputTab1);
                 listenPort = ResolveListenPort();
-                bindAddress = ResolveBindAddress();
-                listener = new TcpListener(bindAddress, listenPort);
-                listener.Start();
-                StartSender();
+                var l = new TcpListener(BindAddress, listenPort);
+                l.Start();
+                listener = l;
                 acceptThread = new Thread(AcceptLoop) { IsBackground = true, Name = "STB-Accept" };
                 acceptThread.Start();
                 return true;
@@ -406,48 +361,21 @@ namespace NinjaTrader.NinjaScript.AddOns
                 NinjaTrader.Code.Output.Process(
                     $"SocketTraderBridge: failed to start listener: {ex.Message}",
                     PrintTo.OutputTab1);
+                listener = null;
                 return false;
-            }
-        }
-
-        private void StartSender()
-        {
-            if (senderRunning) return;
-            senderRunning = true;
-            senderThread = new Thread(SenderLoop) { IsBackground = true, Name = "STB-Send" };
-            senderThread.Start();
-        }
-
-        private void StopSender()
-        {
-            senderRunning = false;
-            try { broadcastSignal.Set(); } catch { }
-        }
-
-        private void SenderLoop()
-        {
-            while (senderRunning)
-            {
-                try { broadcastSignal.WaitOne(); } catch { return; }
-                if (!senderRunning) return;
-                try { BroadcastNow(); }
-                catch (Exception ex)
-                {
-                    NinjaTrader.Code.Output.Process(
-                        $"SocketTraderBridge: broadcast error: {ex.Message}", PrintTo.OutputTab1);
-                }
             }
         }
 
         private void StopListener()
         {
-            try { listener?.Stop(); } catch { }
+            var l = listener;
             listener = null;
+            try { l?.Stop(); } catch { }
             lock (clientsLock)
             {
                 foreach (var c in clients)
                 {
-                    try { c.Close(); } catch { }
+                    try { c.Tcp.Close(); } catch { }
                 }
                 clients.Clear();
             }
@@ -455,11 +383,26 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void AcceptLoop()
         {
-            while (listener != null)
+            while (!terminated)
             {
+                var l = listener;
+                if (l == null) return;
                 TcpClient client;
-                try { client = listener.AcceptTcpClient(); }
-                catch { return; }
+                try { client = l.AcceptTcpClient(); }
+                catch (ObjectDisposedException) { return; }
+                catch (Exception ex)
+                {
+                    // [FIX-H] A reset during the handshake (a port scan does
+                    // this on Windows) used to end the accept loop for good
+                    // while the port stayed bound — every later client then
+                    // hung in the backlog. Log it and keep accepting.
+                    if (terminated || listener == null) return;
+                    NinjaTrader.Code.Output.Process(
+                        $"SocketTraderBridge: accept error (continuing): {ex.Message}",
+                        PrintTo.OutputTab1);
+                    Thread.Sleep(200);
+                    continue;
+                }
 
                 // Hand the client off immediately. Authentication, the
                 // initial snapshot build and its write all take real time
@@ -468,13 +411,24 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // peer that connects and stays silent would stall every
                 // other connection, including the trading client's, until
                 // it timed out. A worker per client keeps accept free.
+                // [FIX-N] Dedicated thread (not the pool, which NT also
+                // uses), and a cap on how many may sit unauthenticated.
                 var c = client;
+                if (Interlocked.Increment(ref pendingHandshakes) > MaxPendingHandshakes)
+                {
+                    Interlocked.Decrement(ref pendingHandshakes);
+                    LogRejectRateLimited("too many pending connections");
+                    try { c.Close(); } catch { }
+                    continue;
+                }
                 try
                 {
-                    ThreadPool.QueueUserWorkItem(_ => HandleNewClient(c));
+                    var t = new Thread(() => HandleNewClient(c)) { IsBackground = true, Name = "STB-Handshake" };
+                    t.Start();
                 }
                 catch (Exception ex)
                 {
+                    Interlocked.Decrement(ref pendingHandshakes);
                     NinjaTrader.Code.Output.Process(
                         $"SocketTraderBridge: could not start client worker: {ex.Message}",
                         PrintTo.OutputTab1);
@@ -483,20 +437,33 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
         }
 
+        // [FIX-N] One line per RejectLogIntervalMs, whatever the LAN does.
+        private void LogRejectRateLimited(string why)
+        {
+            long now = DateTime.UtcNow.Ticks;
+            long last = Interlocked.Read(ref lastRejectLogTicks);
+            if ((now - last) < RejectLogIntervalMs * TimeSpan.TicksPerMillisecond) return;
+            if (Interlocked.CompareExchange(ref lastRejectLogTicks, now, last) != last) return;
+            NinjaTrader.Code.Output.Process(
+                $"SocketTraderBridge: refusing connection — {why} (further refusals muted for {RejectLogIntervalMs / 1000}s)",
+                PrintTo.OutputTab1);
+        }
+
         /// <summary>
-        /// Authenticate one client, send it the first snapshot, register it
-        /// for broadcasts and then serve its commands. Runs on a pool
-        /// thread — never on the accept thread. Wrapped so an unexpected
-        /// throw kills only this connection, not the listener.
+        /// Authenticate one client, register it, then serve its commands.
+        /// Its first snapshot is produced by the broadcaster right after
+        /// registration ([FIX-B]), so there is no window in which a fill can
+        /// slip between "snapshot built" and "client registered".
+        /// Wrapped so an unexpected throw kills only this connection.
         /// </summary>
         private void HandleNewClient(TcpClient client)
         {
+            bool registered = false;
             try
             {
-
-                // Configure the socket: disable Nagle so the first-snapshot
+                // Configure the socket: disable Nagle so the first snapshot
                 // reaches the client immediately, and cap write time so a
-                // half-open peer can't wedge the accept thread on the next
+                // half-open peer can't wedge the broadcaster on the next
                 // broadcast.
                 try { client.NoDelay = true; } catch { }
                 try { client.SendTimeout = WriteTimeoutMs; } catch { }
@@ -515,17 +482,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                     RefreshTokenIfStale();
                 if (string.IsNullOrEmpty(sharedToken))
                 {
-                    NinjaTrader.Code.Output.Process(
-                        "SocketTraderBridge: refusing connection — no token file. " +
-                        "Enable the live monitor in SocketTrader (Setup > 9) to create it.",
-                        PrintTo.OutputTab1);
+                    LogRejectRateLimited("no token file. Enable the live monitor in SocketTrader (Setup > 9) to create it");
                     try { client.Close(); } catch { }
-                    return;
-                }
-                string peer = PeerAddress(client);
-                if (AuthBackedOff(peer))
-                {
-                    try { client.Close(); } catch { }   // refused on sight, nothing logged
                     return;
                 }
                 var hello = ReadLineWithTimeout(client, AuthTimeoutMs);
@@ -536,55 +494,28 @@ namespace NinjaTrader.NinjaScript.AddOns
                 }
                 if (!TokensMatch(offered, sharedToken))
                 {
-                    if (NoteAuthFailure(peer))
-                        NinjaTrader.Code.Output.Process(
-                            $"SocketTraderBridge: rejected unauthenticated client {peer} " +
-                            $"(further attempts from it are refused quietly for {AuthBackoff.TotalSeconds:0}s " +
-                            $"after {AuthFailuresBeforeBackoff} failures)",
-                            PrintTo.OutputTab1);
+                    string peer = "?";
+                    try { peer = client.Client.RemoteEndPoint.ToString(); } catch { }
+                    LogRejectRateLimited($"unauthenticated client {peer}");
                     try { client.Close(); } catch { }
                     return;
                 }
+                if (terminated) { try { client.Close(); } catch { } return; }
 
-                // Build + send the initial snapshot DIRECTLY to the new
-                // client. Doing this here (before adding to `clients`) means
-                // a hang on an existing dead peer can't block a new client
-                // from getting its first payload.
-                string initialJson = null;
-                try { initialJson = BuildSnapshotJson(); }
-                catch (Exception ex)
-                {
-                    NinjaTrader.Code.Output.Process(
-                        $"SocketTraderBridge: initial snapshot error: {ex.Message}",
-                        PrintTo.OutputTab1);
-                }
-                if (initialJson != null)
-                {
-                    try
-                    {
-                        var bytes = Encoding.UTF8.GetBytes(initialJson + "\n");
-                        var stream = client.GetStream();
-                        stream.WriteTimeout = WriteTimeoutMs;
-                        stream.Write(bytes, 0, bytes.Length);
-                    }
-                    catch (Exception ex)
-                    {
-                        NinjaTrader.Code.Output.Process(
-                            $"SocketTraderBridge: initial write to new client failed: {ex.Message}",
-                            PrintTo.OutputTab1);
-                        try { client.Close(); } catch { }
-                        return;  // don't register a client we couldn't even snapshot
-                    }
-                }
-
-                lock (clientsLock) { clients.Add(client); }
+                // [FIX-B] Register first, then ask the broadcaster for a
+                // snapshot: the new client's first line is built after it is
+                // in the list, and every later event lands after that line.
+                var conn = new ClientConn(client);
+                lock (clientsLock) { clients.Add(conn); }
+                registered = true;
+                RequestBroadcast();
 
                 // Per-client reader thread: listens for newline-delimited
                 // JSON commands from the client and dispatches them.
                 // Commands let SocketTrader flatten positions via NT's
                 // own account.Flatten(...) API, bypassing the file-based
                 // ATI and its contract-name-format fragility.
-                var readerThread = new Thread(() => ClientReadLoop(client))
+                var readerThread = new Thread(() => ClientReadLoop(conn))
                 {
                     IsBackground = true,
                     Name = "STB-ClientRead"
@@ -596,37 +527,58 @@ namespace NinjaTrader.NinjaScript.AddOns
                 NinjaTrader.Code.Output.Process(
                     $"SocketTraderBridge: client handler error: {ex.Message}",
                     PrintTo.OutputTab1);
-                try { client.Close(); } catch { }
+                if (!registered) { try { client.Close(); } catch { } }
+            }
+            finally
+            {
+                Interlocked.Decrement(ref pendingHandshakes);
             }
         }
 
-        private void ClientReadLoop(TcpClient client)
+        private void ClientReadLoop(ClientConn conn)
         {
+            var client = conn.Tcp;
             try
             {
                 // Commands are expected to be infrequent; a larger read
                 // timeout here lets the client connection stay open while
-                // SafeBroadcast continues pushing data from the writer side.
+                // the broadcaster continues pushing data from the writer side.
                 client.ReceiveTimeout = 0;  // block indefinitely on read
                 var stream = client.GetStream();
+                var reader = new StreamReader(stream, Encoding.UTF8);
                 string line;
-                while ((line = ReadCommandLine(stream)) != null)
+                while (!terminated && (line = reader.ReadLine()) != null)
                 {
+                    line = line.Trim();
                     if (line.Length == 0) continue;
-                    HandleCommand(line, client);
+                    // [FIX-O] A failing command must never end the reader
+                    // loop — that left the client registered but deaf.
+                    try { HandleCommand(line, conn); }
+                    catch (Exception ex)
+                    {
+                        SendAck(conn, false, ex.Message);
+                        NinjaTrader.Code.Output.Process(
+                            $"SocketTraderBridge: command error: {ex.Message}",
+                            PrintTo.OutputTab1);
+                    }
                 }
-                // null: the peer closed, or sent more than MaxCommandLineBytes
-                // without a newline — either way this connection is done.
-                try { client.Close(); } catch { }
             }
             catch (Exception)
             {
-                // connection dropped; SafeBroadcast will evict the client
-                // on the next broadcast when the write fails.
+                // connection dropped
             }
+            // [FIX-O] The connection is gone (or unreadable): evict it now
+            // rather than waiting for a broadcast write to fail.
+            RemoveClient(conn);
         }
 
-        private void HandleCommand(string jsonLine, TcpClient client)
+        private void RemoveClient(ClientConn conn)
+        {
+            lock (clientsLock) { clients.Remove(conn); }
+            try { conn.Tcp.Close(); } catch { }
+        }
+
+        private void HandleCommand(string jsonLine, ClientConn conn)
         {
             // Tiny JSON parser — we only accept three shapes today:
             //   {"cmd":"flatten","account":"<name>"}
@@ -641,13 +593,13 @@ namespace NinjaTrader.NinjaScript.AddOns
                 // Account-independent: resolve each requested root against
                 // NT's instrument DB and reply with the contract NT itself
                 // considers current under its rollover schedule.
-                SendFrontMonths(client, ExtractJsonString(jsonLine, "roots"));
+                SendFrontMonths(conn, ExtractJsonString(jsonLine, "roots"));
                 return;
             }
             string accountName = ExtractJsonString(jsonLine, "account");
             if (string.IsNullOrEmpty(cmd) || string.IsNullOrEmpty(accountName))
             {
-                SendAck(client, false, "missing cmd or account");
+                SendAck(conn, false, "missing cmd or account");
                 return;
             }
             Account target = null;
@@ -660,88 +612,161 @@ namespace NinjaTrader.NinjaScript.AddOns
             }
             if (target == null)
             {
-                SendAck(client, false, "account not found: " + accountName);
+                SendAck(conn, false, "account not found: " + accountName);
                 return;
             }
             try
             {
                 if (cmd == "flatten")
                 {
-                    FlattenAccount(target);
-                    SendAck(client, true, "flattened " + accountName);
+                    int n = FlattenAccount(target);
+                    // Both acks mean "flatten submitted", not "flat":
+                    // Account.Flatten is asynchronous. The client confirms
+                    // against the position book.
+                    SendAck(conn, true, n > 0 ? $"flatten submitted for {n} position(s) on {accountName}"
+                                              : $"nothing to flatten on {accountName}");
                 }
                 else if (cmd == "close_position")
                 {
-                    string inst = (ExtractJsonString(jsonLine, "instrument") ?? "").Trim();
+                    string inst = ExtractJsonString(jsonLine, "instrument");
                     if (string.IsNullOrEmpty(inst))
                     {
-                        SendAck(client, false, "close_position missing instrument");
+                        SendAck(conn, false, "close_position missing instrument");
                         return;
                     }
-                    ClosePositionOnInstrument(target, inst);
-                    SendAck(client, true, "close_position " + inst);
+                    // [FIX-D] Exact match only, and an honest ack.
+                    string closed = ClosePositionOnInstrument(target, inst);
+                    if (closed != null)
+                        SendAck(conn, true, "close submitted for " + closed + " on " + accountName);
+                    else
+                        SendAck(conn, false, "no open position matching " + inst + " on " + accountName);
                 }
                 else
                 {
-                    SendAck(client, false, "unknown cmd: " + cmd);
+                    SendAck(conn, false, "unknown cmd: " + cmd);
                 }
             }
             catch (Exception ex)
             {
-                SendAck(client, false, ex.Message);
+                SendAck(conn, false, ex.Message);
                 NinjaTrader.Code.Output.Process(
                     $"SocketTraderBridge: command '{cmd}' error: {ex.Message}",
                     PrintTo.OutputTab1);
             }
         }
 
-        private void FlattenAccount(Account acct)
+        /// <summary>Submits a flatten for every open position; returns how many.</summary>
+        private int FlattenAccount(Account acct)
         {
             // Build the set of open-position instruments, then let NT flatten
             // each one via its own account.Flatten() API — handles ATM stop
             // cancellation and market-order exit in one call, no contract-name
             // format fragility, no file-based race.
             var toFlatten = new List<Instrument>();
-            foreach (var pos in acct.Positions)
+            lock (acct.Positions)   // [FIX-A]
             {
-                if (pos == null || pos.Instrument == null) continue;
-                if (pos.MarketPosition == MarketPosition.Flat) continue;
-                toFlatten.Add(pos.Instrument);
+                foreach (var pos in acct.Positions)
+                {
+                    if (pos == null || pos.Instrument == null) continue;
+                    if (pos.MarketPosition == MarketPosition.Flat) continue;
+                    toFlatten.Add(pos.Instrument);
+                }
             }
-            if (toFlatten.Count == 0) return;
+            if (toFlatten.Count == 0) return 0;
             acct.Flatten(toFlatten.ToArray());
             NinjaTrader.Code.Output.Process(
                 $"SocketTraderBridge: flattened {toFlatten.Count} position(s) on {acct.Name}",
                 PrintTo.OutputTab1);
+            return toFlatten.Count;
         }
 
-        private void ClosePositionOnInstrument(Account acct, string instName)
+        /// <summary>
+        /// [FIX-D] Closes the one open position whose contract IS the
+        /// requested one. Both spellings NinjaTrader uses are accepted —
+        /// "NQ 12-26" (Instrument.FullName) and "NQ DEC26" (the ATI dump) —
+        /// and a bare root ("NQ") closes that root's position. Nothing is
+        /// matched by substring any more: "MES 12-26" is not "ES 12-26".
+        /// Returns the FullName closed, or null when nothing matched.
+        /// </summary>
+        private string ClosePositionOnInstrument(Account acct, string instName)
         {
-            foreach (var pos in acct.Positions)
+            string want = NormalizeContract(instName);
+            Position hit = null;
+            lock (acct.Positions)   // [FIX-A]
             {
-                if (pos == null || pos.Instrument == null) continue;
-                if (pos.MarketPosition == MarketPosition.Flat) continue;
-                // Exact match on the contract ("NQ 12-26", NT's FullName) or
-                // the product ("NQ", MasterInstrument.Name), case-insensitive.
-                // The substring match this used to allow let "instrument":" "
-                // close the first open position found.
-                var full = (pos.Instrument.FullName ?? "").Trim();
-                var master = pos.Instrument.MasterInstrument != null
-                    ? (pos.Instrument.MasterInstrument.Name ?? "").Trim()
-                    : "";
-                if ((full.Length > 0 && full.Equals(instName, StringComparison.OrdinalIgnoreCase))
-                    || (master.Length > 0 && master.Equals(instName, StringComparison.OrdinalIgnoreCase)))
+                foreach (var pos in acct.Positions)
                 {
-                    acct.Flatten(new[] { pos.Instrument });
-                    NinjaTrader.Code.Output.Process(
-                        $"SocketTraderBridge: closed {pos.Instrument.FullName} on {acct.Name}",
-                        PrintTo.OutputTab1);
-                    return;
+                    if (pos == null || pos.Instrument == null) continue;
+                    if (pos.MarketPosition == MarketPosition.Flat) continue;
+                    var full = pos.Instrument.FullName ?? "";
+                    var master = pos.Instrument.MasterInstrument != null
+                        ? (pos.Instrument.MasterInstrument.Name ?? "")
+                        : "";
+                    if (NormalizeContract(full).Equals(want, StringComparison.OrdinalIgnoreCase)
+                        || (master.Length > 0 && master.Equals(instName.Trim(), StringComparison.OrdinalIgnoreCase)))
+                    {
+                        hit = pos;
+                        break;
+                    }
                 }
             }
+            if (hit == null) return null;
+            acct.Flatten(new[] { hit.Instrument });
+            NinjaTrader.Code.Output.Process(
+                $"SocketTraderBridge: closed {hit.Instrument.FullName} on {acct.Name}",
+                PrintTo.OutputTab1);
+            return hit.Instrument.FullName;
         }
 
-        private void SendFrontMonths(TcpClient client, string rootsCsv)
+        private static readonly string[] MonthCodes =
+            { "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC" };
+
+        /// <summary>
+        /// "NQ 12-26", "NQ DEC26", "nq dec-26", "NQ  12-2026" → "NQ 12-26".
+        /// Anything it cannot parse is returned trimmed and upper-cased, so
+        /// an exotic name still compares exactly against itself.
+        /// </summary>
+        internal static string NormalizeContract(string s)
+        {
+            if (s == null) return "";
+            s = s.Trim().ToUpperInvariant();
+            int sp = s.IndexOf(' ');
+            if (sp <= 0) return s;
+            string root = s.Substring(0, sp).Trim();
+            string tail = s.Substring(sp + 1).Trim().Replace("-", "").Replace(" ", "");
+            int month = 0;
+            string yy = null;
+            if (tail.Length >= 5 && tail.Length <= 7)
+            {
+                // MMMYY / MMMYYYY
+                string mon = tail.Substring(0, 3);
+                int idx = Array.IndexOf(MonthCodes, mon);
+                if (idx >= 0)
+                {
+                    month = idx + 1;
+                    yy = tail.Substring(3);
+                }
+            }
+            if (month == 0 && tail.Length >= 4 && tail.Length <= 6)
+            {
+                // MMYY / MMYYYY
+                int m;
+                if (int.TryParse(tail.Substring(0, 2), NumberStyles.None, CultureInfo.InvariantCulture, out m)
+                    && m >= 1 && m <= 12)
+                {
+                    month = m;
+                    yy = tail.Substring(2);
+                }
+            }
+            if (month == 0 || yy == null) return s;
+            if (yy.Length == 4) yy = yy.Substring(2);
+            int y;
+            if (yy.Length != 2 || !int.TryParse(yy, NumberStyles.None, CultureInfo.InvariantCulture, out y))
+                return s;
+            return root + " " + month.ToString("00", CultureInfo.InvariantCulture) + "-" + yy;
+        }
+
+        private void SendFrontMonths(ClientConn conn, string rootsCsv)
         {
             // Reply: {"ack":true,"msg":"front_months","months":{"SI":"12-26",...}}
             // Instrument.GetInstrument on a bare root ("SI") resolves the
@@ -778,36 +803,39 @@ namespace NinjaTrader.NinjaScript.AddOns
                 }
             }
             sb.Append("}}\n");
-            try
-            {
-                var bytes = Encoding.UTF8.GetBytes(sb.ToString());
-                var stream = client.GetStream();
-                stream.WriteTimeout = WriteTimeoutMs;
-                stream.Write(bytes, 0, bytes.Length);
-            }
-            catch { /* client dropped — SafeBroadcast will evict */ }
+            WriteToClient(conn, sb.ToString());
         }
 
-        private void SendAck(TcpClient client, bool ok, string message)
+        private void SendAck(ClientConn conn, bool ok, string message)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"ack\":");
+            sb.Append(ok ? "true" : "false");
+            sb.Append(",\"msg\":").Append(JsonString(message));
+            sb.Append("}\n");
+            WriteToClient(conn, sb.ToString());
+        }
+
+        /// <summary>[FIX-I] The only place bytes go to a client socket.</summary>
+        private static bool WriteToClient(ClientConn conn, string text)
         {
             try
             {
-                var sb = new StringBuilder();
-                sb.Append("{\"ack\":");
-                sb.Append(ok ? "true" : "false");
-                sb.Append(",\"msg\":").Append(JsonString(message));
-                sb.Append("}\n");
-                var bytes = Encoding.UTF8.GetBytes(sb.ToString());
-                var stream = client.GetStream();
-                stream.WriteTimeout = WriteTimeoutMs;
-                stream.Write(bytes, 0, bytes.Length);
+                var bytes = Encoding.UTF8.GetBytes(text);
+                lock (conn.WriteLock)
+                {
+                    var stream = conn.Tcp.GetStream();
+                    stream.WriteTimeout = WriteTimeoutMs;
+                    stream.Write(bytes, 0, bytes.Length);
+                }
+                return true;
             }
-            catch { /* client dropped — SafeBroadcast will evict */ }
+            catch { return false; }   // caller evicts on false
         }
 
         private static string ExtractJsonString(string json, string key)
         {
-            // Locate "<key>":"<value>" and unescape \\ and \" inside the value.
+            // Locate "<key>":"<value>" and unescape the value.
             // Deliberately primitive — avoids a JSON dep and is sufficient for
             // the fixed-shape command messages this AddOn accepts.
             var needle = "\"" + key + "\"";
@@ -826,9 +854,24 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (c == '\\' && i + 1 < json.Length)
                 {
                     char n = json[i + 1];
-                    if (n == '"' || n == '\\') { val.Append(n); i += 2; continue; }
+                    if (n == '"' || n == '\\' || n == '/') { val.Append(n); i += 2; continue; }
                     if (n == 'n') { val.Append('\n'); i += 2; continue; }
                     if (n == 't') { val.Append('\t'); i += 2; continue; }
+                    if (n == 'r') { val.Append('\r'); i += 2; continue; }
+                    if (n == 'b') { val.Append('\b'); i += 2; continue; }
+                    if (n == 'f') { val.Append('\f'); i += 2; continue; }
+                    // [FIX-M] \uXXXX — Python's json.dumps escapes every
+                    // non-ASCII character this way by default, so an
+                    // account name with an accent never matched before.
+                    if (n == 'u' && i + 5 < json.Length)
+                    {
+                        int code;
+                        if (int.TryParse(json.Substring(i + 2, 4), NumberStyles.HexNumber,
+                                         CultureInfo.InvariantCulture, out code))
+                        {
+                            val.Append((char)code); i += 6; continue;
+                        }
+                    }
                 }
                 if (c == '"') return val.ToString();
                 val.Append(c);
@@ -837,168 +880,351 @@ namespace NinjaTrader.NinjaScript.AddOns
             return null;
         }
 
-        /// <summary>Ask the sender thread for a broadcast. Cheap; safe on any thread.</summary>
-        private void SafeBroadcast()
+        // ---------- Broadcasting ----------
+        /// <summary>
+        /// [FIX-G] Called from NT's event/market-data threads: cheap, never
+        /// blocks, never touches a socket.
+        /// </summary>
+        private void RequestBroadcast()
         {
-            if (!senderRunning) return;
+            if (terminated) return;
             try { broadcastSignal.Set(); } catch { }
         }
 
-        /// <summary>Build one snapshot and write it to every client (sender thread only).</summary>
-        private void BroadcastNow()
+        /// <summary>Deferred housekeeping, run on the broadcaster thread only.</summary>
+        private void RunDeferredWork()
         {
-            string json;
-            try { json = BuildSnapshotJson(); }
-            catch (Exception ex)
+            if (Interlocked.Exchange(ref rehookRequested, 0) == 1)
             {
-                NinjaTrader.Code.Output.Process(
-                    $"SocketTraderBridge: snapshot error: {ex.Message}", PrintTo.OutputTab1);
-                return;
-            }
-            var bytes = Encoding.UTF8.GetBytes(json + "\n");
-            lock (clientsLock)
-            {
-                var dead = new List<TcpClient>();
-                foreach (var c in clients)
+                try { HookAccounts(); }
+                catch (Exception ex)
                 {
-                    try
-                    {
-                        var stream = c.GetStream();
-                        stream.WriteTimeout = WriteTimeoutMs;
-                        stream.Write(bytes, 0, bytes.Length);
-                    }
-                    catch { dead.Add(c); }
+                    NinjaTrader.Code.Output.Process(
+                        $"SocketTraderBridge: hook error: {ex.Message}", PrintTo.OutputTab1);
                 }
-                foreach (var d in dead)
+            }
+            Instrument[] maybeFree = null;
+            lock (pendingLock)
+            {
+                if (pendingRelease.Count > 0)
                 {
-                    try { d.Close(); } catch { }
-                    clients.Remove(d);
+                    maybeFree = new Instrument[pendingRelease.Count];
+                    pendingRelease.CopyTo(maybeFree);
+                    pendingRelease.Clear();
+                }
+            }
+            if (maybeFree == null) return;
+            foreach (var inst in maybeFree)
+            {
+                try { ReleaseMarketDataIfUnused(inst); }
+                catch (Exception ex)
+                {
+                    NinjaTrader.Code.Output.Process(
+                        $"SocketTraderBridge: release error: {ex.Message}", PrintTo.OutputTab1);
+                }
+            }
+        }
+
+        /// <summary>
+        /// [FIX-B][FIX-G] The single producer of snapshot lines. Builds and
+        /// writes under one thread, so the order clients see is the order
+        /// snapshots were built; coalesces bursts; doubles as the heartbeat;
+        /// retries a listener that failed to bind ([FIX-H]).
+        /// </summary>
+        private void BroadcastLoop()
+        {
+            while (!terminated)
+            {
+                try
+                {
+                    bool signalled = broadcastSignal.WaitOne(HeartbeatInterval);
+                    if (terminated) return;
+                    if (signalled) Thread.Sleep(MinBroadcastGapMs);   // let a burst settle into one build
+
+                    RunDeferredWork();
+
+                    if (listener == null && !terminated)
+                    {
+                        if (StartListener())
+                            NinjaTrader.Code.Output.Process(
+                                $"SocketTraderBridge listening on {BindAddress}:{listenPort} (retry succeeded)",
+                                PrintTo.OutputTab1);
+                    }
+
+                    ClientConn[] targets;
+                    lock (clientsLock) { targets = clients.ToArray(); }
+                    if (targets.Length == 0) continue;   // nobody listening: no build
+
+                    string json;
+                    try { json = BuildSnapshotJson(); }
+                    catch (Exception ex)
+                    {
+                        // [FIX-A] A snapshot that could not be read is NOT
+                        // sent. The next event or the next heartbeat (≤5 s)
+                        // produces a complete one; a client that wants to
+                        // act on the book must wait for a line it can trust.
+                        NinjaTrader.Code.Output.Process(
+                            $"SocketTraderBridge: snapshot skipped: {ex.Message}", PrintTo.OutputTab1);
+                        continue;
+                    }
+                    var line = json + "\n";
+                    foreach (var c in targets)
+                    {
+                        if (!WriteToClient(c, line)) RemoveClient(c);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (terminated) return;
+                    NinjaTrader.Code.Output.Process(
+                        $"SocketTraderBridge: broadcaster error: {ex.Message}", PrintTo.OutputTab1);
+                    Thread.Sleep(200);
                 }
             }
         }
 
         // ---------- Account / position hooks ----------
+        // [FIX-E] Attach to every account not yet hooked. Runs at start-up
+        // and on every AccountStatusUpdate, so accounts created by a
+        // connection that came up later are picked up.
         private void HookAccounts()
         {
+            var fresh = new List<Account>();
             lock (Account.All)
             {
                 foreach (var acct in Account.All)
                 {
+                    if (acct == null) continue;
+                    lock (hookedLock)
+                    {
+                        if (!hooked.Add(acct)) continue;
+                    }
                     acct.AccountItemUpdate += OnAccountItemUpdate;
                     acct.PositionUpdate += OnPositionUpdate;
+                    fresh.Add(acct);
                 }
             }
-            // Watch for accounts added/removed after startup.
-            Account.AccountStatusUpdate += OnAccountStatusUpdate;
+            foreach (var acct in fresh)
+            {
+                try { SubscribeAccountPositions(acct); } catch { }
+            }
+            // Watch for accounts added/removed after startup (attached once).
+            lock (hookedLock)
+            {
+                if (!statusHooked)
+                {
+                    Account.AccountStatusUpdate += OnAccountStatusUpdate;
+                    statusHooked = true;
+                }
+            }
         }
+        private bool statusHooked;
 
         private void UnhookAccounts()
         {
-            Account.AccountStatusUpdate -= OnAccountStatusUpdate;
-            lock (Account.All)
+            lock (hookedLock)
             {
-                foreach (var acct in Account.All)
+                if (statusHooked)
                 {
-                    acct.AccountItemUpdate -= OnAccountItemUpdate;
-                    acct.PositionUpdate -= OnPositionUpdate;
+                    try { Account.AccountStatusUpdate -= OnAccountStatusUpdate; } catch { }
+                    statusHooked = false;
                 }
+                foreach (var acct in hooked)
+                {
+                    try
+                    {
+                        acct.AccountItemUpdate -= OnAccountItemUpdate;
+                        acct.PositionUpdate -= OnPositionUpdate;
+                    }
+                    catch { }
+                }
+                hooked.Clear();
             }
         }
 
         private void OnAccountItemUpdate(object sender, AccountItemEventArgs e)
         {
-            // Fires on CashValue / RealizedPnL / BuyingPower changes.
-            SafeBroadcast();
+            if (terminated) return;
+            // Fires on CashValue / RealizedPnL / BuyingPower / … changes.
+            RequestBroadcast();
         }
 
         private void OnPositionUpdate(object sender, PositionEventArgs e)
         {
+            if (terminated) return;
             // Fires on any position change — open, size change, close.
-            EnsureMarketDataSubscription(e.Position);
-            SafeBroadcast();
+            // [FIX-P] A removal is a close even if the Position object
+            // still reads non-flat at this instant.
+            bool closed = e.Operation == Operation.Remove
+                || (e.Position != null && e.Position.MarketPosition == MarketPosition.Flat);
+            if (closed)
+            {
+                // [FIX-C] Decide on the broadcaster thread whether anyone
+                // still holds it — never take account locks in NT's callback.
+                var inst = e.Position != null ? e.Position.Instrument : null;
+                if (inst != null) lock (pendingLock) { pendingRelease.Add(inst); }
+            }
+            else
+            {
+                EnsureMarketDataSubscription(e.Position);
+            }
+            RequestBroadcast();
         }
 
         private void OnAccountStatusUpdate(object sender, AccountStatusEventArgs e)
         {
-            // Re-hook all accounts (cheap, idempotent since += on already-hooked is noop-ish).
-            // NT fires Connected / Disconnected / etc.; just rebroadcast.
-            SafeBroadcast();
+            if (terminated) return;
+            // [FIX-E] A connection coming up creates accounts after start-up:
+            // have the broadcaster hook whatever is new, then rebroadcast
+            // (the status itself changed too).
+            Interlocked.Exchange(ref rehookRequested, 1);
+            RequestBroadcast();
         }
 
         // ---------- Market data ----------
         private void SubscribeExistingPositions()
         {
+            Account[] all;
             lock (Account.All)
             {
-                foreach (var acct in Account.All)
-                {
-                    foreach (var pos in acct.Positions)
-                    {
-                        if (pos.MarketPosition != MarketPosition.Flat)
-                            EnsureMarketDataSubscription(pos);
-                    }
-                }
+                all = new Account[Account.All.Count];
+                Account.All.CopyTo(all, 0);
+            }
+            foreach (var acct in all)
+            {
+                try { SubscribeAccountPositions(acct); } catch { }
+            }
+        }
+
+        private void SubscribeAccountPositions(Account acct)
+        {
+            if (acct == null) return;
+            Position[] snapshot;
+            lock (acct.Positions)   // [FIX-A]
+            {
+                snapshot = new Position[acct.Positions.Count];
+                acct.Positions.CopyTo(snapshot, 0);
+            }
+            foreach (var pos in snapshot)
+            {
+                if (pos != null && pos.MarketPosition != MarketPosition.Flat)
+                    EnsureMarketDataSubscription(pos);
             }
         }
 
         private void EnsureMarketDataSubscription(Position pos)
         {
-            if (pos == null || pos.Instrument == null) return;
+            if (pos == null || pos.Instrument == null || terminated) return;
             var inst = pos.Instrument;
-
             if (pos.MarketPosition == MarketPosition.Flat)
             {
-                UnsubscribeMarketData(inst);
+                lock (pendingLock) { pendingRelease.Add(inst); }
+                RequestBroadcast();
                 return;
             }
 
-            lock (subsLock)
+            lock (subOpLock)   // [FIX-L]
             {
-                if (lastPrice.ContainsKey(inst)) return;
-                lastPrice[inst] = 0;
+                lock (subsLock)
+                {
+                    if (lastPrice.ContainsKey(inst)) return;
+                    lastPrice[inst] = 0;
+                }
+                try
+                {
+                    inst.MarketData.Update += OnMarketDataUpdate;
+                }
+                catch (Exception ex)
+                {
+                    lock (subsLock) { lastPrice.Remove(inst); }
+                    NinjaTrader.Code.Output.Process(
+                        $"SocketTraderBridge: market data subscribe failed for " +
+                        $"{inst.FullName}: {ex.Message}", PrintTo.OutputTab1);
+                    return;
+                }
+                // [FIX-J] Seed from the last trade NT already knows so the
+                // position does not read as zero exposure until the next
+                // tick (minutes, overnight in a micro).
+                try
+                {
+                    var last = inst.MarketData != null ? inst.MarketData.Last : null;
+                    if (last != null && last.Price > 0)
+                        lock (subsLock) { if (lastPrice.ContainsKey(inst)) lastPrice[inst] = last.Price; }
+                }
+                catch { }
             }
-            try
+        }
+
+        /// <summary>
+        /// [FIX-C] Drop the subscription only when no account — not just
+        /// the one that closed — still holds the instrument.
+        /// </summary>
+        private void ReleaseMarketDataIfUnused(Instrument inst)
+        {
+            if (inst == null) return;
+            if (AnyOpenPositionOn(inst)) return;
+            UnsubscribeMarketData(inst);
+        }
+
+        private static bool AnyOpenPositionOn(Instrument inst)
+        {
+            Account[] all;
+            lock (Account.All)
             {
-                inst.MarketData.Update += OnMarketDataUpdate;
+                all = new Account[Account.All.Count];
+                Account.All.CopyTo(all, 0);
             }
-            catch (Exception ex)
+            foreach (var a in all)
             {
-                NinjaTrader.Code.Output.Process(
-                    $"SocketTraderBridge: market data subscribe failed for " +
-                    $"{inst.FullName}: {ex.Message}", PrintTo.OutputTab1);
+                if (a == null) continue;
+                lock (a.Positions)   // [FIX-A]
+                {
+                    foreach (var p in a.Positions)
+                    {
+                        if (p != null && p.Instrument == inst && p.MarketPosition != MarketPosition.Flat)
+                            return true;
+                    }
+                }
             }
+            return false;
         }
 
         private void UnsubscribeMarketData(Instrument inst)
         {
             if (inst == null) return;
-            lock (subsLock)
+            lock (subOpLock)   // [FIX-L]
             {
-                if (!lastPrice.ContainsKey(inst)) return;
-                lastPrice.Remove(inst);
+                lock (subsLock)
+                {
+                    if (!lastPrice.ContainsKey(inst)) return;
+                    lastPrice.Remove(inst);
+                }
+                try { inst.MarketData.Update -= OnMarketDataUpdate; } catch { }
             }
-            try { inst.MarketData.Update -= OnMarketDataUpdate; } catch { }
         }
 
         private void UnsubscribeAllMarketData()
         {
-            Instrument[] all;
-            lock (subsLock)
+            lock (subOpLock)
             {
-                all = new Instrument[lastPrice.Count];
-                lastPrice.Keys.CopyTo(all, 0);
-                lastPrice.Clear();
-            }
-            foreach (var inst in all)
-            {
-                try { inst.MarketData.Update -= OnMarketDataUpdate; } catch { }
+                Instrument[] all;
+                lock (subsLock)
+                {
+                    all = new Instrument[lastPrice.Count];
+                    lastPrice.Keys.CopyTo(all, 0);
+                    lastPrice.Clear();
+                }
+                foreach (var inst in all)
+                {
+                    try { inst.MarketData.Update -= OnMarketDataUpdate; } catch { }
+                }
             }
         }
 
         private void OnMarketDataUpdate(object sender, MarketDataEventArgs e)
         {
+            if (terminated) return;
             if (e.MarketDataType != MarketDataType.Last) return;
-            var md = sender as MarketDataEventArgs;  // type-safe cast below
             var inst = e.Instrument;
             if (inst == null) return;
 
@@ -1007,7 +1233,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 if (!lastPrice.ContainsKey(inst)) return;
                 lastPrice[inst] = e.Price;
             }
-            SafeBroadcast();
+            RequestBroadcast();   // [FIX-G] no build, no socket, on NT's thread
         }
 
         // ---------- JSON ----------
@@ -1017,33 +1243,28 @@ namespace NinjaTrader.NinjaScript.AddOns
             double ts = (DateTime.UtcNow - new DateTime(1970, 1, 1,
                 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
             sb.Append("{\"t\":").Append(ts.ToString("F3", CultureInfo.InvariantCulture));
-            sb.Append(",\"accounts\":[");
 
-            // Snapshot the collection so NT can mutate it during our
-            // iteration without throwing InvalidOperationException.
+            // [FIX-A] Copy the collection under NT's own lock. If that still
+            // throws, the exception propagates and the broadcast is skipped —
+            // an empty list here used to be published as "every account flat".
             Account[] accountsSnapshot;
-            try
+            lock (Account.All)
             {
-                var list = new List<Account>();
-                foreach (var a in Account.All) list.Add(a);
-                accountsSnapshot = list.ToArray();
-            }
-            catch (Exception ex)
-            {
-                NinjaTrader.Code.Output.Process(
-                    $"SocketTraderBridge: Account.All snapshot failed: {ex.Message}",
-                    PrintTo.OutputTab1);
-                accountsSnapshot = new Account[0];
+                accountsSnapshot = new Account[Account.All.Count];
+                Account.All.CopyTo(accountsSnapshot, 0);
             }
 
-            bool firstAcct = true;
+            bool firstAcct = true, partial = false;
+            var body = new StringBuilder(256 * Math.Max(1, accountsSnapshot.Length));
             foreach (var acct in accountsSnapshot)
             {
                 string accountFragment;
                 try { accountFragment = BuildAccountFragment(acct); }
                 catch (Exception ex)
                 {
-                    // One rogue account must not kill the whole response.
+                    // One rogue account must not kill the whole response —
+                    // but the line must say that it is incomplete.
+                    partial = true;
                     NinjaTrader.Code.Output.Process(
                         $"SocketTraderBridge: skipping account " +
                         $"'{(acct == null ? "<null>" : acct.Name)}': {ex.Message}",
@@ -1051,11 +1272,12 @@ namespace NinjaTrader.NinjaScript.AddOns
                     continue;
                 }
                 if (accountFragment == null) continue;
-                if (!firstAcct) sb.Append(',');
+                if (!firstAcct) body.Append(',');
                 firstAcct = false;
-                sb.Append(accountFragment);
+                body.Append(accountFragment);
             }
-            sb.Append("]}");
+            if (partial) sb.Append(",\"partial\":true");
+            sb.Append(",\"accounts\":[").Append(body).Append("]}");
             return sb.ToString();
         }
 
@@ -1064,64 +1286,70 @@ namespace NinjaTrader.NinjaScript.AddOns
             if (acct == null) return null;
             var sb = new StringBuilder(256);
 
+            // [FIX-Q] The account's own currency, not a USD assumption.
+            Currency denom = Currency.UsDollar;
+            try { denom = acct.Denomination; } catch { }
             double cash = 0, realized = 0;
-            try { cash = acct.Get(AccountItem.CashValue, Currency.UsDollar); } catch { }
-            try { realized = acct.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar); } catch { }
+            try { cash = acct.Get(AccountItem.CashValue, denom); } catch { }
+            try { realized = acct.Get(AccountItem.RealizedProfitLoss, denom); } catch { }
+
+            // [FIX-F] Connection status, so a frozen book from a dropped
+            // connection is recognisable as such.
+            string status = "";
+            try
+            {
+                var conn = acct.Connection;
+                status = conn != null ? conn.Status.ToString() : "Disconnected";
+            }
+            catch { status = ""; }
 
             sb.Append("{\"name\":").Append(JsonString(acct.Name ?? ""));
+            sb.Append(",\"status\":").Append(JsonString(status));
             sb.Append(",\"cash\":").Append(D(cash));
             sb.Append(",\"realized\":").Append(D(realized));
 
             double unrealizedSum = 0;
             sb.Append(",\"positions\":[");
 
+            // [FIX-A] Under NT's lock; a failure here propagates (the
+            // account is then reported missing and the line marked partial)
+            // instead of being written out as "no positions".
             Position[] posSnapshot;
-            try
+            lock (acct.Positions)
             {
-                var list = new List<Position>();
-                foreach (var p in acct.Positions) list.Add(p);
-                posSnapshot = list.ToArray();
+                posSnapshot = new Position[acct.Positions.Count];
+                acct.Positions.CopyTo(posSnapshot, 0);
             }
-            catch { posSnapshot = new Position[0]; }
 
             bool firstPos = true;
             foreach (var pos in posSnapshot)
             {
-                try
+                if (pos == null || pos.Instrument == null) continue;
+                if (pos.MarketPosition == MarketPosition.Flat) continue;
+                double last;
+                lock (subsLock)
                 {
-                    if (pos == null || pos.Instrument == null) continue;
-                    if (pos.MarketPosition == MarketPosition.Flat) continue;
-                    double last;
-                    lock (subsLock)
-                    {
-                        lastPrice.TryGetValue(pos.Instrument, out last);
-                    }
-                    int qty = pos.Quantity;
-                    if (pos.MarketPosition == MarketPosition.Short) qty = -qty;
-                    double avg = pos.AveragePrice;
-                    double pl = 0;
-                    if (last > 0)
-                    {
-                        try { pl = pos.GetUnrealizedProfitLoss(PerformanceUnit.Currency, last); }
-                        catch { pl = 0; }
-                    }
-                    unrealizedSum += pl;
+                    lastPrice.TryGetValue(pos.Instrument, out last);
+                }
+                int qty = pos.Quantity;
+                if (pos.MarketPosition == MarketPosition.Short) qty = -qty;
+                double avg = pos.AveragePrice;
+                double pl = 0;
+                if (last > 0)
+                {
+                    try { pl = pos.GetUnrealizedProfitLoss(PerformanceUnit.Currency, last); }
+                    catch { pl = 0; }
+                }
+                unrealizedSum += pl;
 
-                    if (!firstPos) sb.Append(',');
-                    firstPos = false;
-                    sb.Append("{\"inst\":").Append(JsonString(pos.Instrument.FullName ?? ""));
-                    sb.Append(",\"qty\":").Append(qty);
-                    sb.Append(",\"avg\":").Append(D(avg));
-                    sb.Append(",\"last\":").Append(D(last));
-                    sb.Append(",\"pl\":").Append(D(pl));
-                    sb.Append('}');
-                }
-                catch (Exception ex)
-                {
-                    NinjaTrader.Code.Output.Process(
-                        $"SocketTraderBridge: skipping position on " +
-                        $"{acct.Name}: {ex.Message}", PrintTo.OutputTab1);
-                }
+                if (!firstPos) sb.Append(',');
+                firstPos = false;
+                sb.Append("{\"inst\":").Append(JsonString(pos.Instrument.FullName ?? ""));
+                sb.Append(",\"qty\":").Append(qty.ToString(CultureInfo.InvariantCulture));   // [FIX-K]
+                sb.Append(",\"avg\":").Append(D(avg));
+                sb.Append(",\"last\":").Append(D(last));
+                sb.Append(",\"pl\":").Append(D(pl));
+                sb.Append('}');
             }
             sb.Append(']');
             sb.Append(",\"unrealized\":").Append(D(unrealizedSum));
@@ -1151,7 +1379,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     case '\r': sb.Append("\\r"); break;
                     case '\t': sb.Append("\\t"); break;
                     default:
-                        if (c < 0x20) sb.AppendFormat("\\u{0:x4}", (int)c);
+                        if (c < 0x20) sb.AppendFormat(CultureInfo.InvariantCulture, "\\u{0:x4}", (int)c);
                         else sb.Append(c);
                         break;
                 }
