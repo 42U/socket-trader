@@ -5903,8 +5903,19 @@ class TestStrategyFilterChoices:
     def test_orphaned_filter_key_still_editable(self):
         st.strategy_symbols["deleted_strat"] = ["GC"]
         choices = st.strategy_filter_choices()
-        assert {"name": "deleted_strat", "kind": "filter",
-                "base": "deletedstrat"} in choices
+        mine = [c for c in choices if c["name"] == "deleted_strat"]
+        assert mine and mine[0]["kind"] == "filter" and mine[0]["base"] == "deletedstrat"
+        assert mine[0]["full"] == "deletedstrat" and mine[0]["prefixed"] is False
+
+    def test_per_market_templates_are_separate_choices(self, monkeypatch):
+        # ES-ChopFade / GC-ChopFade / NQ-ChopFade are three strategies with
+        # three templates; folding them onto the first offered no way to
+        # filter the other two (2026-11-03 review).
+        monkeypatch.setattr(st, "list_atm_strategies",
+                            lambda: ["ES-ChopFade", "GC-ChopFade", "NQ-ChopFade", "ChopFade"])
+        names = [c["name"] for c in st.strategy_filter_choices()]
+        assert names[:3] == ["ES-ChopFade", "GC-ChopFade", "NQ-ChopFade"]
+        assert "ChopFade" not in names     # the unprefixed spelling is covered by any prefixed one
 
     def test_web_state_exposes_choices(self):
         assert isinstance(st.web_state()["strategy_choices"], list)
@@ -9522,8 +9533,9 @@ class TestResetVerifySetting:
         assert st._coerce_rule({"reset_verify": "inherit"})["reset_verify"] == "inherit"
         assert "reset_verify" not in st._coerce_rule({"reset_verify": "maybe"})
         assert "reset_verify" not in st._coerce_rule({"reset_verify": 1})
-        # scoped rules carry it too
-        assert st._coerce_rule({"reset_verify": "on"}, scoped=True)["reset_verify"] == "on"
+        # scoped rules carry it too (a scoped rule needs a scope to be one)
+        assert st._coerce_rule({"reset_verify": "on", "strategies": ["NQ_Med"]},
+                               scoped=True)["reset_verify"] == "on"
 
     def test_global_policy_defaults_on(self, tmp_config):
         st.save_config({})
@@ -12803,3 +12815,179 @@ class TestHandEditedConfigValues:
         assert 'nt_port = cfg_port(cfg.get("nt_port", 36973), 36973)' in src
         assert 'active_account = sanitize_ati(str(cfg.get("account") or "").strip())' in src
         assert 'live_bridge_port = cfg_port(' in inspect.getsource(st.bridge_startup)
+
+
+
+# ── 2026-11-03 review fixes ───────────────────────────────────────────
+
+
+class TestNtLogFileIsTheOneBeingWritten:
+    """NinjaTrader opens a new roll number for a one-line 'Session Break'
+    stub (a second launch attempt, its own shutdown) and keeps logging to
+    the old file. The guard must tail the file NT is writing, never the
+    stub — 2026-11-02 it tailed a 61-byte stub for twelve hours and then
+    closed two correctly protected stacks for 'having 2 contracts of stop'."""
+
+    STUB = "2026-11-02 11:22:10:183|2|4|Session Break (Version 8.1.8.4)\r\n"
+
+    def _touch(self, path, text, mtime):
+        path.write_text(text, encoding="utf-8")
+        os.utime(path, (mtime, mtime))
+
+    def test_a_newer_named_stub_does_not_outrank_the_live_log(self, tmp_path):
+        live = tmp_path / "log.20261102.00000.txt"
+        stub = tmp_path / "log.20261102.00001.txt"
+        self._touch(live, "x" * 5000, 1_700_000_100)
+        self._touch(stub, self.STUB, 1_700_000_200)          # newer by name AND by mtime
+        assert st._nt_log_file(str(tmp_path)) == str(live)
+
+    def test_the_next_days_file_wins_once_it_is_real(self, tmp_path):
+        old = tmp_path / "log.20261102.00000.txt"
+        new = tmp_path / "log.20261103.00000.txt"
+        self._touch(old, "x" * 5000, 1_700_000_100)
+        self._touch(new, self.STUB, 1_700_000_200)            # just opened: one line so far
+        assert st._nt_log_file(str(tmp_path)) == str(old)
+        self._touch(new, "x" * 5000, 1_700_000_300)           # now being written to
+        assert st._nt_log_file(str(tmp_path)) == str(new)
+
+    def test_among_real_logs_the_last_written_wins(self, tmp_path):
+        a = tmp_path / "log.20261029.00003.txt"
+        b = tmp_path / "log.20261030.00000.txt"
+        self._touch(b, "x" * 5000, 1_700_000_100)
+        self._touch(a, "x" * 5000, 1_700_000_900)            # NT went back to writing this one
+        assert st._nt_log_file(str(tmp_path)) == str(a)
+        (tmp_path / "log.20261030.00000.en.txt").write_text("x" * 9000, encoding="utf-8")
+        assert st._nt_log_file(str(tmp_path)) == str(a)      # .en. duplicates are never picked
+
+    def test_only_stubs_falls_back_to_the_newest_name(self, tmp_path):
+        for n in ("log.20261008.00000.txt", "log.20261008.00001.txt"):
+            (tmp_path / n).write_text("", encoding="utf-8")
+        assert st._nt_log_file(str(tmp_path)).endswith("log.20261008.00001.txt")
+
+    def test_tail_resumes_where_it_left_a_file(self, tmp_path):
+        a = tmp_path / "log.20261102.00000.txt"
+        b = tmp_path / "log.20261103.00000.txt"
+        a.write_text("a1\n", encoding="utf-8")
+        tail = st._LogTail()
+        assert tail.read(str(a)) == []                         # joined at the end
+        with a.open("a", encoding="utf-8") as f:
+            f.write("a2\n")
+        assert tail.read(str(a)) == ["a2"]
+        b.write_text("b1\n", encoding="utf-8")
+        assert tail.read(str(b)) == ["b1"]                     # a new file is read from its start
+        with a.open("a", encoding="utf-8") as f:
+            f.write("a3\n")
+        assert tail.read(str(a)) == ["a3"]                     # back to a: only what is new, no replay
+        assert tail.read(str(b)) == []
+
+
+class TestScopelessRulesAreNotRules:
+    """A scoped rule with neither symbols nor strategies is a second default
+    that shadows every rule after it — on an ENTRIES-OFF profile with
+    Entries ON it turned 1632306 back into 'take everything' (2026-11-03)."""
+
+    def test_coerce_drops_a_rule_with_settings_but_no_scope(self):
+        assert st._coerce_rule({"enabled": True, "direction": "normal"}, scoped=True) == {}
+        assert st._coerce_rule({"enabled": True, "strategies": ["Gooping"]}, scoped=True) == {
+            "enabled": True, "strategies": ["Gooping"]}
+        assert st._coerce_rule({"symbols": "NQ ES", "qty_mode": "fixed"}, scoped=True) == {
+            "symbols": ["NQ", "ES"], "qty_mode": "fixed"}
+        # the default rule is not scoped and keeps working as before
+        assert st._coerce_rule({"enabled": False})["enabled"] is False
+
+    def test_rule_lacks_scope(self):
+        assert st.rule_lacks_scope({"enabled": True}) is True
+        assert st.rule_lacks_scope({"enabled": True, "strategies": []}) is True
+        assert st.rule_lacks_scope({"enabled": True, "strategies": ["x"]}) is False
+        assert st.rule_lacks_scope({"_ai_idx": -1}) is False          # nothing set: not a rule either
+        assert st.rule_lacks_scope("junk") is False
+
+    def test_loader_drops_it_and_keeps_the_rest(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            out = st.load_account_profiles({"account_profiles": {"1632306": {
+                "default": {"enabled": False},
+                "rules": [
+                    {"direction": "invert", "enabled": True, "strategies": ["Gooping"]},
+                    {"direction": "normal", "enabled": True},                       # the catch-all
+                    {"enabled": True, "qty_mode": "fixed", "qty_value": 3,
+                     "size": "micros", "strategies": ["NQ-XRetest"]},
+                ]}}})
+        rules = out["1632306"]["rules"]
+        assert [r.get("strategies") for r in rules] == [["Gooping"], ["NQ-XRetest"]]
+        assert "scoped rule 2 has no symbols and no strategies" in caplog.text
+
+    def test_resolver_never_matches_one_that_slipped_in(self):
+        st.account_profiles["X"] = {
+            "default": {"enabled": False},
+            "rules": [{"enabled": True, "direction": "normal"},                     # hand-injected
+                      {"enabled": True, "strategies": ["NQ-XRetest"], "qty_mode": "fixed",
+                       "qty_value": 3}]}
+        assert st.resolve_rule("X", "NQ 12-26", "NQ-MSSComp")["enabled"] is False
+        got = st.resolve_rule("X", "MNQ 12-26", "NQ-XRetest")
+        assert got["enabled"] is True and got["qty_mode"] == "fixed"
+        # the scope-less rule's own keys never count as "set by a rule"
+        assert "direction" not in st.explicit_rule_keys("X", "NQ 12-26", "NQ-MSSComp")
+
+    def test_web_save_refuses_and_changes_nothing(self, tmp_config, fresh_cfg_cache):
+        st.account_profiles.clear()
+        st.account_profiles.update({"1632306": {"default": {"enabled": False},
+                                                "rules": [{"enabled": True, "strategies": ["Gooping"]}]}})
+        before = json.loads(json.dumps(st.account_profiles))
+        ok, msg = asyncio.run(st._web_set_profiles({"1632306": {
+            "default": {"enabled": False},
+            "rules": [{"enabled": True, "strategies": ["Gooping"], "_ai_idx": 0},
+                      {"enabled": True, "direction": "normal", "_ai_idx": -1}]}}, only="1632306"))
+        assert ok is False
+        assert "1632306 rule 2" in msg and "every signal" in msg
+        assert st.account_profiles == before
+        # a save without `only` is checked across every account it carries
+        ok, msg = asyncio.run(st._web_set_profiles({"B": {"rules": [{"direction": "invert"}]}}))
+        assert ok is False and "B rule 1" in msg
+        st.account_profiles.clear()
+
+    def test_web_save_message_names_the_one_account_it_saved(self, tmp_config, fresh_cfg_cache):
+        st.account_profiles.clear()
+        st.account_profiles.update({"A": {"prop": True}, "B": {"symbols_allowed": ["NQ"]}})
+        ok, msg = asyncio.run(st._web_set_profiles(
+            {"A": {"prop": True}, "B": {"symbols_allowed": ["NQ"]},
+             "C": {"rules": [{"enabled": True, "strategies": ["Gooping"]}]}}, only="C"))
+        assert ok and msg == "profile saved for C"
+        ok, msg = asyncio.run(st._web_set_profiles({"A": {"prop": True}}, only="B"))
+        assert ok and msg == "profile reset for B (back to default)"
+        assert set(st.account_profiles) == {"A", "C"}
+        st.account_profiles.clear()
+
+
+class TestPerMarketStrategyIdentity:
+    """'ES-ChopFade', 'GC-ChopFade' and 'NQ-ChopFade' are three strategies.
+    A filter on one must not gag the others on their own markets; the
+    template ↔ wire link ('GC-MacroZoneB' ↔ 'macro_zone_b') still holds."""
+
+    def test_names_match_table(self):
+        m = st.strategy_names_match
+        assert m("ES-ChopFade", "es-chopfade")            # exact, any case
+        assert m("GC-MacroZoneB", "macro_zone_b")         # template ↔ wire id
+        assert m("macro_zone_b", "NQ-MacroZoneB")         # unprefixed key covers every market
+        assert m("MacroZoneB", "GC-MacroZoneB")
+        assert not m("ES-ChopFade", "NQ-ChopFade")        # two markets, two strategies
+        assert not m("GC-MacroZoneB", "NQ-MacroZoneB")
+        assert not m("ES-ChopFade", "bread_n_butter")
+        assert not m("", "NQ-ChopFade") and not m("NQ-ChopFade", "")
+        assert st.atm_root_prefix("GC-MacroZoneB") == "GC"
+        assert st.atm_root_prefix("macro_zone_b") == ""
+        assert st.atm_root_prefix("FOO-Bar") == ""        # not a known root: no prefix
+
+    def test_filter_on_one_market_leaves_the_others_alone(self):
+        st.strategy_symbols["es-chopfade"] = ["ES"]
+        assert st.strategy_filter_symbols("ES-ChopFade") == ["ES"]
+        assert st.strategy_filter_symbols("chop_fade") == ["ES"]            # unprefixed wire id
+        assert st.strategy_filter_symbols("NQ-ChopFade") is None
+        assert st.strategy_filter_symbols("GC-ChopFade") is None
+        assert st.strategy_symbol_block("NQ-ChopFade", "NQ 12-26") is None
+        assert st.strategy_symbol_block("ES-ChopFade", "NQ 12-26") is not None
+
+    def test_unprefixed_filter_still_covers_every_market(self):
+        st.strategy_symbols["chopfade"] = ["ES"]
+        assert st.strategy_filter_symbols("NQ-ChopFade") == ["ES"]
+        assert st.strategy_symbol_block("NQ-ChopFade", "NQ 12-26") is not None
+        assert st.strategy_symbol_block("GC-ChopFade", "ES 12-26") is None

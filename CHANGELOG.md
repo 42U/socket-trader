@@ -1,5 +1,69 @@
 # Changelog
 
+## 1.0.5rc1 — 2026-11-03 (pre-release)
+
+Findings of the 2026-11-03 review of a live install (ten accounts, one
+funded), each confirmed against NinjaTrader's own log before it was fixed.
+
+### Fixed
+- **The bracket guard tailed the wrong NinjaTrader log and closed two
+  correctly protected positions.** `_nt_log_file` picked the lexically
+  greatest `log.<date>.<roll>.txt`, but NinjaTrader also opens a new roll
+  number for a one-line "Session Break" stub (a second launch attempt, its
+  own shutdown) and keeps logging to the old file. On 2026-11-02 the guard
+  tailed a 61-byte `.00001` stub from 11:22 until midnight, then read the
+  new day's file from its start: at 00:20 it knew the stop placed after
+  midnight but not the one from 23:58, reported "SHORT 4 has 2 contracts of
+  stop working", and flattened both strategies' legs on two accounts. The
+  guard now tails the file NinjaTrader is actually writing (newest write,
+  stubs never chosen while a real log exists) and the tail resumes a file
+  where it left it instead of replaying it.
+- **A scoped rule with no symbols and no strategies applied to every
+  signal.** On an ENTRIES-OFF profile, one such rule with Entries ON — an
+  ADD RULE saved before a strategy chip was picked — turned an account back
+  into "take everything" and shadowed every rule after it (1632306,
+  2026-11-03: four strategies it was meant to ignore). Such a rule now
+  coerces to nothing: dropped on load with a log line, never matched, and
+  refused — with the rule number — by the web editor, the terminal editor
+  and `/api/profiles`. The editors label it "NO SCOPE" while it is being
+  built.
+- **The global strategy → symbol filter treated `ES-ChopFade`,
+  `GC-ChopFade` and `NQ-ChopFade` as one strategy.** Filter identity
+  stripped any known-root prefix, so a filter on one would have gagged the
+  other two on their own markets, and the picker offered only the first of
+  each family (156 templates → 132 choices). Names now match when at most
+  one side carries an instrument prefix: `GC-MacroZoneB` still catches
+  `macro_zone_b`, but two prefixed names must agree on the prefix. The
+  pickers list every per-market template.
+- The web editor's save reply named every account in the map it carried
+  along ("profiles saved for A, B, C…") when exactly one had been saved;
+  it now names the one account (`profile saved for X` / `profile reset for X`).
+- A signal that fanned out to exactly one account showed only "N skip" in
+  the feed, which read as a total skip; it now shows the account it went to.
+- README: a **soft** limit flattens the account too (both modes do; soft
+  is the one you can resume) — the text said it only paused.
+
+### AddOn (`addon/SocketTraderBridge.cs`)
+- A snapshot whose account or position list could not be read was
+  published as an empty — flat — book. It is now skipped (or marked
+  `partial`); collections are read under NinjaTrader's lock.
+- A new client is registered before its first snapshot is built, and that
+  snapshot comes from the sender thread like every other one, so a fill
+  can no longer land between "snapshot built" and "client registered".
+- Closing an instrument on one account no longer drops market data for the
+  same instrument on every other account (unrealized P&L went to 0 for the
+  rest of their trade); the last price is seeded from NinjaTrader's last
+  known trade on subscribe.
+- `close_position` acked success when nothing matched; it acks false now,
+  and also accepts NinjaTrader's "NQ DEC26" spelling of a contract.
+- Accounts created by a connection that comes up after start-up are hooked
+  on every status update (hooks tracked, never attached twice); each
+  account carries its connection `status`; the accept loop survives
+  transient socket errors and a failed bind is retried on every heartbeat;
+  acks and broadcasts to one client are serialised; a failing command no
+  longer ends the client's reader; `\uXXXX` in commands is decoded;
+  `qty` is culture-invariant; cash is read in the account's denomination.
+
 ## 1.0.4 — 2026-10-31
 
 The hardening pass after the first day with outside users: every finding of

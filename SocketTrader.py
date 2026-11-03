@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-__version__ = "1.0.4"
+__version__ = "1.0.5rc1"
 
 # `SocketTrader.exe --version` / `python SocketTrader.py --version`: answered
 # before any import so installers and build checks get it in milliseconds.
@@ -1844,6 +1844,40 @@ def atm_base_key(name: str) -> str:
     return _norm_atm_name(name)
 
 
+def atm_root_prefix(name: str) -> str:
+    """The '<known root>-' prefix a strategy name carries ('GC' for
+    'GC-MacroZoneB'), or '' when it carries none ('macro_zone_b')."""
+    head, sep, tail = name.strip().partition("-")
+    if sep and tail.strip() and head.strip().upper() in _known_roots():
+        return head.strip().upper()
+    return ""
+
+
+def strategy_names_match(key: str, wire: str) -> bool:
+    """Does a filter key apply to a publisher strategy name?
+
+    Exact (case-insensitive) first. Then by identity: names that collapse
+    to the same `atm_base_key` are the same strategy — PROVIDED at most
+    one of them carries an instrument prefix. 'GC-MacroZoneB' still
+    catches 'macro_zone_b' (the template-to-wire link the filter was
+    built for), but 'ES-ChopFade', 'GC-ChopFade' and 'NQ-ChopFade' are
+    three strategies: a publisher that names its strategies per market
+    (this user's whole template set) must be able to filter one without
+    gagging the other two on their own markets (2026-11-03 review: a
+    filter 'ES-ChopFade → ES' would have blocked NQ-ChopFade on NQ).
+    """
+    k, w = key.strip(), wire.strip()
+    if not k or not w:
+        return False
+    if k.lower() == w.lower():
+        return True
+    kp, wp = atm_root_prefix(k), atm_root_prefix(w)
+    if kp and wp and kp != wp:
+        return False
+    base = atm_base_key(k)
+    return bool(base) and base == atm_base_key(w)
+
+
 def load_strategy_symbols(cfg: dict) -> dict[str, list[str]]:
     """Sanitize the config "strategy_symbols" map.
 
@@ -1904,13 +1938,12 @@ def strategy_filter_symbols(pub_strategy: str) -> list[str] | None:
         return None
     exact = strategy_symbols.get(strat.lower())
     merged: list[str] = list(exact) if exact else []
-    bases = {atm_base_key(strat)}
+    names = [strat]
     alias = atm_aliases.get(strat) or atm_aliases.get(strat.lower())
     if alias:
-        bases.add(atm_base_key(alias))
-    bases.discard("")
+        names.append(alias)
     for key, roots in sorted(strategy_symbols.items()):
-        if key != strat.lower() and atm_base_key(key) in bases:
+        if key != strat.lower() and any(strategy_names_match(key, n) for n in names):
             for root in roots:
                 if root not in merged:
                     merged.append(root)
@@ -2069,6 +2102,16 @@ def _coerce_rule(raw: dict, scoped: bool = False) -> dict:
                 cleaned = [str(v).strip() for v in vals if str(v).strip()]
                 if cleaned:
                     out[key] = cleaned
+        if not out:
+            # A scoped rule with no symbols and no strategies is not a rule,
+            # it is a second default that shadows every rule after it — on
+            # an ENTRIES-OFF profile with Entries ON it silently turns the
+            # account back into "take everything" (1632306, 2026-11-03:
+            # an ADD RULE saved before a strategy chip was picked, and the
+            # account traded four strategies it was meant to ignore). It
+            # coerces to nothing, like a rule with no keys at all: dropped
+            # on load, refused by the editors, never matched.
+            return out
     if "enabled" in raw:
         out["enabled"] = bool(raw["enabled"])
     size = str(raw.get("size", "")).strip().lower()
@@ -2104,6 +2147,37 @@ def _coerce_rule(raw: dict, scoped: bool = False) -> dict:
     return out
 
 
+def rule_lacks_scope(raw) -> bool:
+    """A scoped rule that carries settings but neither `symbols` nor
+    `strategies` — the shape that matched every signal before 2026-11-03.
+    False for junk that is not a rule at all (nothing to warn about)."""
+    if not isinstance(raw, dict):
+        return False
+    for key in ("symbols", "strategies"):
+        vals = raw.get(key)
+        if isinstance(vals, str):
+            vals = vals.replace(",", " ").split()
+        if isinstance(vals, list) and any(str(v).strip() for v in vals):
+            return False
+    return any(k in raw for k in DEFAULT_RULE)
+
+
+def scopeless_rules(raw_profiles: dict) -> list[tuple[str, int]]:
+    """(account, 1-based rule number) of every scope-less rule in a raw
+    profiles payload — what an editor must refuse to save."""
+    out: list[tuple[str, int]] = []
+    if not isinstance(raw_profiles, dict):
+        return out
+    for acct, prof in raw_profiles.items():
+        rules = prof.get("rules") if isinstance(prof, dict) else None
+        if not isinstance(rules, list):
+            continue
+        for i, rule in enumerate(rules, 1):
+            if rule_lacks_scope(rule):
+                out.append((str(acct), i))
+    return out
+
+
 def load_account_profiles(cfg: dict) -> dict[str, dict]:
     """Load and sanitize the "account_profiles" config section."""
     out: dict[str, dict] = {}
@@ -2120,10 +2194,15 @@ def load_account_profiles(cfg: dict) -> dict[str, dict]:
         rules = []
         raw_rules = prof.get("rules", [])
         if isinstance(raw_rules, list):
-            for raw_rule in raw_rules:
+            for i, raw_rule in enumerate(raw_rules, 1):
                 rule = _coerce_rule(raw_rule, scoped=True)
                 if rule:
                     rules.append(rule)
+                elif rule_lacks_scope(raw_rule):
+                    logger.warning(
+                        f"PROFILES  {acct}: scoped rule {i} has no symbols and no "
+                        "strategies — it would apply to EVERY signal; dropped. Give it "
+                        "a scope (or move its settings into the DEFAULT rule)")
         if rules:
             entry["rules"] = rules
         allowed = prof.get("symbols_allowed")
@@ -2666,6 +2745,8 @@ def resolve_rule(account: str, instrument: str = "", pub_strategy: str = "") -> 
     for scoped in prof.get("rules", []):
         symbols = scoped.get("symbols") or []
         strategies = scoped.get("strategies") or []
+        if not symbols and not strategies:
+            continue        # no scope = no rule (the loader drops these; belt and braces)
         if symbols and not _symbol_matches(symbols, root):
             continue
         if strategies and strat not in {str(s).strip().lower() for s in strategies}:
@@ -2691,6 +2772,8 @@ def explicit_rule_keys(account: str, instrument: str = "", pub_strategy: str = "
     for scoped in prof.get("rules", []):
         symbols = scoped.get("symbols") or []
         strategies = scoped.get("strategies") or []
+        if not symbols and not strategies:
+            continue
         if symbols and not _symbol_matches(symbols, root):
             continue
         if strategies and strat not in {str(s).strip().lower() for s in strategies}:
@@ -5528,31 +5611,43 @@ def strategy_filter_choices(templates: list[str] | None = None) -> list[dict]:
     installed template (directly or through an `atm_aliases` redirect),
     then existing filter keys not otherwise covered, so a saved filter is
     always editable even if its template was deleted. Each entry:
-    {"name", "kind": "atm"|"seen"|"filter", "base": atm_base_key(name)}.
+    {"name", "kind": "atm"|"seen"|"filter", "base": atm_base_key(name),
+    "full": the full normalized name, "prefixed": carries a '<root>-'}.
     Pass `templates` when the caller already globbed the ATM directory
     (web_state does, twice a second) to avoid a second disk scan.
     """
+    # Identity is the FULL normalized name: 'ES-ChopFade', 'GC-ChopFade'
+    # and 'NQ-ChopFade' are three choices (three strategies, three
+    # templates), not one — a picker that folded them onto the first
+    # offered no way to filter the other two (2026-11-03 review). A name
+    # without an instrument prefix still covers every prefixed spelling of
+    # its base, which is what strategy_names_match does at match time.
     out: list[dict] = []
-    covered: set[str] = set()
+    covered: list[str] = []
+
+    def entry(name: str, kind: str) -> dict:
+        return {"name": name, "kind": kind, "base": atm_base_key(name),
+                "full": _norm_atm_name(name), "prefixed": bool(atm_root_prefix(name))}
+
+    def is_covered(name: str) -> bool:
+        return any(strategy_names_match(c, name) for c in covered)
+
     for tmpl in (templates if templates is not None else list_atm_strategies()):
-        base = atm_base_key(tmpl)
-        if base in covered:
+        if is_covered(tmpl):
             continue
-        out.append({"name": tmpl, "kind": "atm", "base": base})
-        covered.add(base)
+        out.append(entry(tmpl, "atm"))
+        covered.append(tmpl)
     for pub in pub_strategies_seen:
-        base = atm_base_key(pub)
         alias = atm_aliases.get(pub) or atm_aliases.get(pub.lower())
-        if base in covered or (alias and atm_base_key(alias) in covered):
+        if is_covered(pub) or (alias and is_covered(alias)):
             continue
-        out.append({"name": pub, "kind": "seen", "base": base})
-        covered.add(base)
+        out.append(entry(pub, "seen"))
+        covered.append(pub)
     for key in sorted(strategy_symbols):
-        base = atm_base_key(key)
-        if base in covered:
+        if is_covered(key):
             continue
-        out.append({"name": key, "kind": "filter", "base": base})
-        covered.add(base)
+        out.append(entry(key, "filter"))
+        covered.append(key)
     return out
 
 
@@ -9394,14 +9489,24 @@ async def _edit_scoped_rules(account: str):
         if raw == "a":
             rule: dict = {}
             await _edit_rule_scope(rule)
+            if not rule.get("symbols") and not rule.get("strategies"):
+                # ENTER on both scope prompts: that is the DEFAULT rule, and
+                # a scoped rule without a scope would apply to every signal.
+                print(Fore.YELLOW + "  ⚠  A scoped rule needs symbols or strategies — "
+                      "for every signal, edit the DEFAULT rule instead. Nothing added."
+                      + Style.RESET_ALL)
+                continue
             await _edit_rule_menu(rule, f"NEW RULE — {account}", scoped=True)
-            if rule:
+            if rule.get("symbols") or rule.get("strategies"):
                 rules.append(rule)
                 print(Fore.GREEN + "  ✔  Rule added." + Style.RESET_ALL)
                 if rule_never_enters(prof, rule):
                     print(Fore.YELLOW + "  ⚠  This rule never enters: the account default is "
                           "ENTRIES OFF and the rule's Entries is INHERIT. Edit it and set "
                           "Entries ON if it should trade." + Style.RESET_ALL)
+            else:
+                print(Fore.YELLOW + "  ⚠  Rule has no symbols or strategies — not added."
+                      + Style.RESET_ALL)
             _save_profiles_tty()
         elif raw.startswith("d") and raw[1:].strip().isdigit():
             idx = int(raw[1:].strip())
@@ -9410,7 +9515,13 @@ async def _edit_scoped_rules(account: str):
                 print(Fore.GREEN + f"  ✔  Rule {idx} deleted." + Style.RESET_ALL)
             _save_profiles_tty()
         elif raw.isdigit() and 1 <= int(raw) <= len(rules):
-            await _edit_rule_menu(rules[int(raw) - 1], f"RULE {raw} — {account}", scoped=True)
+            rule = rules[int(raw) - 1]
+            await _edit_rule_menu(rule, f"RULE {raw} — {account}", scoped=True)
+            if not rule.get("symbols") and not rule.get("strategies"):
+                rules.remove(rule)
+                print(Fore.YELLOW + f"  ⚠  Rule {raw} lost its symbols and strategies — a rule "
+                      "with no scope would apply to every signal, so it was deleted. Add it "
+                      "again with a scope, or use the DEFAULT rule." + Style.RESET_ALL)
             _save_profiles_tty()
 
 
@@ -9683,9 +9794,8 @@ async def _edit_strategy_symbols():
         # spellings included): editing consolidates them under the picked
         # name and removing drops them ALL — leaving one behind would keep
         # gating the strategy after a "filter removed" message.
-        base = atm_base_key(name)
         matching = [k for k in sorted(strategy_symbols)
-                    if k == name or (base and atm_base_key(k) == base)]
+                    if k == name or strategy_names_match(k, name)]
         current = ", ".join(strategy_filter_symbols(name) or [])
         cat = [p["root"] for p in instrument_catalog()]
         sym_lines, row = [], []
@@ -11260,16 +11370,40 @@ def _nt_log_dir() -> str | None:
     return d if os.path.isdir(d) else None
 
 
+NT_LOG_STUB_BYTES = 128   # a roll NinjaTrader opened and abandoned holds one "Session Break" line (61 bytes)
+
+
 def _nt_log_file(log_dir: str) -> str | None:
-    """The newest NinjaTrader log. NT keeps `log.<date>.<roll>.txt` and an
-    identical `.en.txt` beside it; one copy is enough, and the lexically
-    greatest name is the latest date and roll."""
+    """The NinjaTrader log being written NOW. NT keeps `log.<date>.<roll>.txt`
+    and an identical `.en.txt` beside it; one copy is enough.
+
+    The file is the one most recently WRITTEN — not the lexically greatest
+    name. NinjaTrader also opens a new roll number for a one-line "Session
+    Break" stub (a second launch attempt, its own shutdown) and keeps
+    logging to the old file. 2026-11-02 11:22: log.20261102.00001.txt (61
+    bytes) outranked the 166 KB .00000 the session was logging to, the
+    guard tailed the stub for twelve hours, and at midnight — reading the
+    new day's file from its start — it knew the stop placed at 00:20 but
+    not the one from 23:58: "SHORT 4 has 2 contracts of stop working",
+    both strategies' legs closed at market. A stub-sized file is never
+    chosen while a real one exists; among real files the newest write
+    wins, the name breaking ties."""
     try:
         names = [n for n in os.listdir(log_dir)
                  if n.startswith("log.") and n.endswith(".txt") and ".en." not in n]
     except OSError:
         return None
-    return os.path.join(log_dir, max(names)) if names else None
+    best: tuple[tuple[bool, float, str], str] | None = None
+    for n in names:
+        path = os.path.join(log_dir, n)
+        try:
+            stt = os.stat(path)
+        except OSError:
+            continue
+        key = (stt.st_size > NT_LOG_STUB_BYTES, stt.st_mtime, n)
+        if best is None or key > best[0]:
+            best = (key, path)
+    return best[1] if best else None
 
 
 def _nt_log_stamp_ms(line: str) -> float | None:
@@ -11300,17 +11434,26 @@ class _LogTail:
         self.path: str | None = None
         self.offset = 0
         self.buf = b""
+        # Where each file was left: coming back to one (NinjaTrader wrote a
+        # stub, the newest-write pick wandered and returned) resumes there
+        # instead of replaying the whole file as news.
+        self.offsets: dict[str, int] = {}
 
     def read(self, path: str | None) -> list[str]:
         if not path:
             return []
         if path != self.path:
             first = self.path is None
+            if self.path is not None:
+                self.offsets[self.path] = self.offset
             self.path, self.buf = path, b""
-            try:
-                self.offset = os.path.getsize(path) if first else 0
-            except OSError:
-                self.offset = 0
+            if path in self.offsets:
+                self.offset = self.offsets[path]
+            else:
+                try:
+                    self.offset = os.path.getsize(path) if first else 0
+                except OSError:
+                    self.offset = 0
             if first:
                 return []
         try:
@@ -12891,7 +13034,12 @@ async def listen(token: str):
                             _register_confirms(plans, written, sig_id, pre)
                             total_legs = len(written) + len(scheduled)
                             note_bits = []
-                            if total_legs > 1:
+                            # Always say where it went: a single leg used to
+                            # show only "N skip", which read as a total skip
+                            # ("#23 … 8 skip" while 1632306 had filled).
+                            if total_legs == 1:
+                                note_bits.append(f"→ {(written or scheduled)[0]}")
+                            else:
                                 note_bits.append(f"→ {total_legs} accts")
                             rr_account = next(
                                 (p["account"] for p in plans if p.get("rr_pick")), None)
@@ -13783,14 +13931,25 @@ async def _web_set_profiles(raw, only=None) -> tuple[bool, str]:
         return False, "session hard-locked — settings are frozen"
     if not isinstance(raw, dict):
         return False, "profiles must be a JSON object keyed by account"
-    previous = {a: json.loads(json.dumps(p)) for a, p in account_profiles.items()}
-    hints = _extract_ai_hints(raw)
-    cleaned = load_account_profiles({"account_profiles": _strip_ai_config(raw)})
-    cleaned = _restore_ai_config(cleaned, previous, hints)
+    acct = None
     if only is not None:
         acct = sanitize_ati(str(only).strip())
         if not acct:
             return False, "account required"
+    # A rule with no symbols and no strategies would apply to EVERY signal.
+    # The loader drops such rules, but a save that silently loses a rule
+    # the editor showed is the other half of the same trap: refuse it and
+    # say which rule, before anything changes.
+    bad = [(a, i) for a, i in scopeless_rules(raw) if acct is None or a == acct]
+    if bad:
+        where = "; ".join(f"{a} rule {i}" for a, i in bad)
+        return False, (f"not saved — {where} has no symbols and no strategies, so it would "
+                       "apply to every signal. Pick a strategy or symbol for it, or delete it")
+    previous = {a: json.loads(json.dumps(p)) for a, p in account_profiles.items()}
+    hints = _extract_ai_hints(raw)
+    cleaned = load_account_profiles({"account_profiles": _strip_ai_config(raw)})
+    cleaned = _restore_ai_config(cleaned, previous, hints)
+    if acct is not None:
         merged = previous
         if acct in cleaned:
             merged[acct] = cleaned[acct]
@@ -13799,13 +13958,20 @@ async def _web_set_profiles(raw, only=None) -> tuple[bool, str]:
         cleaned = merged
     account_profiles.clear()
     account_profiles.update(cleaned)
+    # Say what this save changed: the one account the editor was open on,
+    # not the whole map it carried along (that read as "every profile
+    # saved" when exactly one had).
+    if acct is not None:
+        what = (f"profile saved for {acct}" if acct in cleaned
+                else f"profile reset for {acct} (back to default)")
+    else:
+        what = f"profiles saved for {', '.join(sorted(cleaned)) or 'no accounts'}"
     if save_account_profiles():
         refresh_terminal()
-        return True, f"profiles saved for {', '.join(sorted(cleaned)) or 'no accounts'}"
+        return True, what
     refresh_terminal()
-    return False, (f"profiles applied for {', '.join(sorted(cleaned)) or 'no accounts'} but "
-                   f"NOT written to disk ({_cfg_last_error}) — they stay live and the save "
-                   "is retried automatically; check the alert line")
+    return False, (f"{what} but NOT written to disk ({_cfg_last_error}) — it stays live "
+                   "and the save is retried automatically; check the alert line")
 
 
 def _web_export_profile(account) -> tuple[bool, object]:
@@ -17223,9 +17389,17 @@ function stratBase(n){
     Object.entries(S.micro_map||{}).forEach(([k,v])=>{roots.add(k);if(v)roots.add(v)});
     if(roots.has(n.slice(0,i).trim().toUpperCase()))n=n.slice(i+1)}
   return n.toLowerCase().replace(/[^a-z0-9]/g,"")}
+/* Mirror of Python strategy_names_match: same full name, or the same
+   base when at most ONE side carries an instrument prefix — 'GC-MacroZoneB'
+   covers 'macro_zone_b', but 'ES-ChopFade' is not 'NQ-ChopFade'. */
+function stratFull(n){return (""+n).toLowerCase().replace(/[^a-z0-9]/g,"")}
+function stratPrefixed(n){return stratFull(n)!==stratBase(n)}
+function stratMatch(k,n){
+  if((""+k).toLowerCase()===(""+n).toLowerCase())return true;
+  if(stratPrefixed(k)&&stratPrefixed(n)&&stratFull(k)!==stratFull(n))return false;
+  const b=stratBase(k);return !!b&&b===stratBase(n)}
 function stratLabel(k){
-  const b=stratBase(k);
-  const c=(S.strategy_choices||[]).find(c=>c.kind==="atm"&&c.base===b);
+  const c=(S.strategy_choices||[]).find(c=>c.kind==="atm"&&stratMatch(c.name,k));
   return c?c.name:k}
 
 function accountModal(a){
@@ -17303,7 +17477,12 @@ function accountModal(a){
     const lower=s=>(""+s).toLowerCase();
     function rsum(){rf.sum.textContent=rules.length
       ?rules.length+" rule"+(rules.length>1?"s":"")+" — first match wins":"none"}
+    /* A rule with neither symbols nor strategies has no scope: it is not
+       "any symbol · any strategy", it is a second default that shadows every
+       rule after it — the server refuses to save one. Say so in its title. */
+    const hasScope=r=>!!((r.symbols&&r.symbols.length)||(r.strategies&&r.strategies.length));
     function ruleScope(r){
+      if(!hasScope(r))return "\u26a0 NO SCOPE \u2014 pick symbols or strategies";
       return ((r.symbols||[]).join(", ")||"any symbol")+" · "+
              ((r.strategies||[]).join(", ")||"any strategy")}
     /* Entries INHERIT on an ENTRIES-OFF profile = the rule never enters
@@ -17312,6 +17491,7 @@ function accountModal(a){
     const neverEnters=r=>!("enabled"in r)&&en.value===false;
     function ruleBits(r){
       const b=[];
+      if(!hasScope(r))b.push("\u26a0 NO SCOPE \u2014 will not save");
       if(neverEnters(r))b.push("\u26a0 NEVER ENTERS (inherits entries OFF)");
       if(r.enabled===false)b.push("entries OFF");
       if(r.enabled===true)b.push("entries on");
@@ -17466,6 +17646,18 @@ function accountModal(a){
     const pcut=el("input");pcut.value=prof.prop_cutoff_et||"";P.appendChild(pcut);
 
     P.appendChild(btn("SAVE PROFILE","wide on",()=>{
+      /* Refuse a rule with no scope: it would apply to EVERY signal, and on
+         an ENTRIES-OFF profile with Entries ON it turns the account back
+         into "take everything" (1632306, 2026-11-03). A rule with no
+         settings at all is simply dropped below; one with settings but no
+         scope is a mistake the operator has to see. */
+      const noScope=rules.map((r,i)=>({r,i})).filter(x=>!hasScope(x.r)&&
+        Object.keys(x.r).some(k=>k!=="_ai_idx"&&k!=="ai"));
+      if(noScope.length){
+        alert("Not saved \u2014 rule "+noScope.map(x=>x.i+1).join(", ")+" has no symbols and no "+
+          "strategies, so it would apply to every signal.\n\nPick a strategy or symbol for it, "+
+          "or delete it (the DEFAULT rule above already covers every signal).");
+        return}
       const inert=rules.filter(r=>neverEnters(r)&&(r.strategies||r.symbols));
       if(inert.length&&!confirm(inert.length+" scoped rule"+(inert.length>1?"s":"")+
          " will NEVER enter (Entries INHERIT on an ENTRIES-OFF profile): "+
@@ -17634,8 +17826,8 @@ function strategyModal(){
     function redrawAdd(){
       addw.textContent="";
       addw.appendChild(el("label",null,"Add a strategy — ★ installed ATM template, others were seen from the server"));
-      const covered=new Set(Object.keys(map).map(stratBase));
-      const av=(S.strategy_choices||[]).filter(c=>!covered.has(c.base));
+      const keys=Object.keys(map);
+      const av=(S.strategy_choices||[]).filter(c=>!keys.some(k=>stratMatch(k,c.name)));
       if(av.length){
         const cw=el("div","chiplist");
         av.forEach(c=>{
@@ -17650,8 +17842,7 @@ function strategyModal(){
       ar.appendChild(btn("ADD","sm",()=>{
         const k=gi.value.trim().toLowerCase().replace(/;/g,"");
         if(!k)return;
-        const b=stratBase(k);
-        const dup=Object.keys(map).find(x=>x===k||(b&&stratBase(x)===b));
+        const dup=Object.keys(map).find(x=>x===k||stratMatch(x,k));
         if(dup){redraw(dup);return}   // already filtered under another spelling — open it
         map[k]=[];redraw(k);redrawAdd()}));
       addw.appendChild(ar)}

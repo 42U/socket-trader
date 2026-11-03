@@ -692,10 +692,12 @@ Each limit (target and stop) can independently be set to **soft** or **hard** mo
 
 | Mode | Action | Recovery |
 |------|--------|----------|
-| **Soft** | Pauses signals · press `P` to resume | Resume any time with `P` |
-| **Hard** | Flattens all positions · signals off for the session | Press `Shift+X` to exit — cannot resume |
+| **Soft** | Flattens that account's positions · its entries pause · press `P` to resume | Resume any time with `P` |
+| **Hard** | Flattens that account's positions · its entries off for the session | Press `Shift+X` to exit — cannot resume |
 
-When a **hard** limit fires, SocketTrader writes a `CLOSEPOSITION;{account};{contract};;;;;;;;;;` file to the `incoming/` folder for every instrument traded during the session. This tells NinjaTrader to flatten all positions immediately.
+Both modes flatten the tripped account (and confirm the flatten against NinjaTrader); the difference is whether it can trade again this session. The alert's `Closed:` list is every instrument the flatten was sent for — an account already flat at the moment it trips shows the same list.
+
+When a limit fires, SocketTrader flattens the account through the bridge AddOn when it is connected (NinjaTrader's own `Account.Flatten`), otherwise by writing a `CLOSEPOSITION;{account};{contract};;;;;;;;;;` file to the `incoming/` folder for every instrument traded during the session.
 
 **Defaults:** Target defaults to **soft**, stop defaults to **hard** — but you can set any combination:
 
