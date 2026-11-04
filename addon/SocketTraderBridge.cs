@@ -372,6 +372,16 @@ namespace NinjaTrader.NinjaScript.AddOns
         // be holding its own: instruments whose subscription may now be
         // unused ([FIX-C]) and a request to look for new accounts ([FIX-E]).
         private readonly HashSet<Instrument> pendingRelease = new HashSet<Instrument>();
+        // [FIX-R] Instruments a position just opened on. The subscription
+        // itself (inst.MarketData.Update +=) is made on the sender thread,
+        // never inside OnPositionUpdate: that call re-enters NinjaTrader's
+        // connection and market-data locks from an account/adapter thread
+        // that may already hold them. 2026-11-03 23:35:01 — an NQ fill on
+        // the live account and a sim partial fill one millisecond apart,
+        // during a 200-point spike — left NT's order and market-data
+        // pipeline dead (bracket never acknowledged, sim fills stopped,
+        // every close timed out, File > Exit hung) until it was killed.
+        private readonly HashSet<Instrument> pendingSubscribe = new HashSet<Instrument>();
         private readonly object pendingLock = new object();
         private int rehookRequested;
         // [FIX-E] Accounts whose events we are attached to. += is not
@@ -1058,14 +1068,36 @@ namespace NinjaTrader.NinjaScript.AddOns
                         $"SocketTraderBridge: hook error: {ex.Message}", PrintTo.OutputTab1);
                 }
             }
+            Instrument[] wanted = null;
             Instrument[] maybeFree = null;
             lock (pendingLock)
             {
+                if (pendingSubscribe.Count > 0)
+                {
+                    wanted = new Instrument[pendingSubscribe.Count];
+                    pendingSubscribe.CopyTo(wanted);
+                    pendingSubscribe.Clear();
+                }
                 if (pendingRelease.Count > 0)
                 {
                     maybeFree = new Instrument[pendingRelease.Count];
                     pendingRelease.CopyTo(maybeFree);
                     pendingRelease.Clear();
+                }
+            }
+            // [FIX-R] Subscribes first, then releases: an instrument that
+            // opened and closed between two broadcasts ends up in both sets,
+            // and the release decides on the live book (AnyOpenPositionOn).
+            if (wanted != null)
+            {
+                foreach (var inst in wanted)
+                {
+                    try { EnsureMarketDataSubscription(inst); }
+                    catch (Exception ex)
+                    {
+                        NinjaTrader.Code.Output.Process(
+                            $"SocketTraderBridge: subscribe error: {ex.Message}", PrintTo.OutputTab1);
+                    }
                 }
             }
             if (maybeFree == null) return;
@@ -1153,16 +1185,19 @@ namespace NinjaTrader.NinjaScript.AddOns
             // reads non-flat at this instant. [FIX-C] Whether anyone else
             // still holds the instrument is decided on the sender thread —
             // never take account locks inside NT's callback.
+            // [FIX-R] Neither branch calls into NinjaTrader: the callback
+            // only records the instrument and wakes the sender thread,
+            // which subscribes or releases outside NT's locks.
             bool closed = e.Operation == Operation.Remove
                 || (e.Position != null && e.Position.MarketPosition == MarketPosition.Flat);
-            if (closed)
+            var inst = e.Position != null ? e.Position.Instrument : null;
+            if (inst != null)
             {
-                var inst = e.Position != null ? e.Position.Instrument : null;
-                if (inst != null) lock (pendingLock) { pendingRelease.Add(inst); }
-            }
-            else
-            {
-                EnsureMarketDataSubscription(e.Position);
+                lock (pendingLock)
+                {
+                    if (closed) pendingRelease.Add(inst);
+                    else pendingSubscribe.Add(inst);
+                }
             }
             SafeBroadcast();
         }
@@ -1219,6 +1254,17 @@ namespace NinjaTrader.NinjaScript.AddOns
                 SafeBroadcast();
                 return;
             }
+            EnsureMarketDataSubscription(inst);
+        }
+
+        /// <summary>
+        /// Subscribe to the instrument's ticks. [FIX-R] Sender thread (and
+        /// the start-up scan) only — never a NinjaTrader callback: the +=
+        /// re-enters NT's connection and market-data locks.
+        /// </summary>
+        private void EnsureMarketDataSubscription(Instrument inst)
+        {
+            if (inst == null || terminated) return;
 
             lock (subOpLock)   // [FIX-L]
             {

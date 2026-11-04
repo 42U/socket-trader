@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-__version__ = "1.0.5rc1"
+__version__ = "1.0.5rc2"
 
 # `SocketTrader.exe --version` / `python SocketTrader.py --version`: answered
 # before any import so installers and build checks get it in milliseconds.
@@ -11252,6 +11252,18 @@ _NT_BRACKET_FILL_RE = re.compile(
 _NT_UNKNOWN_SID_RE = re.compile(
     r"\|3\|1\|OIF, 'CLOSESTRATEGY;[^']*;(?P<sid>[^;']+)' unknown strategy")
 _nt_unknown_sids: dict[str, float] = {}   # strategy id -> NT's stamp on that answer
+# NinjaTrader's own word that it could not close a position: an error-level
+# (|0|) position-category (|64|) line. 2026-11-03 23:35:17 "Close operation
+# failed. Operation timed out. Manually close your position" — NT's order
+# pipeline had hung after a fill, the ATM bracket never went out, Chart
+# Trader's closes went nowhere and this app's CLOSEPOSITION met the same
+# wall. The operator found out by watching the chart; this says it out loud.
+_NT_CLOSE_FAILED_RE = re.compile(r"\|0\|64\|(?P<msg>Close operation failed[^\r\n]*)")
+# A close this process wrote that NinjaTrader has neither executed nor even
+# logged a Close order for after this long is NinjaTrader not working, not
+# NinjaTrader being slow (it logs the Close within a second of the file).
+CLOSE_ACK_S = 12.0
+_close_ack_alerted: dict[tuple[str, str, float], float] = {}
 # Every order line NinjaTrader logs, by account and root: the reset asks
 # whether a Close is still working before it dares a second close, whether
 # an Entry is still working before it dares a REVERSEPOSITION, and the naked
@@ -11519,6 +11531,24 @@ def _bracket_guard_event(line: str, now: float | None = None) -> str | None:
         if len(_nt_unknown_sids) > 256:
             _nt_unknown_sids.pop(min(_nt_unknown_sids, key=_nt_unknown_sids.get), None)
         return None
+    cf = _NT_CLOSE_FAILED_RE.search(line)
+    if cf:
+        stamp = _nt_log_stamp(line)
+        if stamp is not None and now - stamp > BRACKET_GUARD_MAX_AGE_S:
+            return None
+        key = f"ntclosefail:{line[:23]}"
+        if key in _bracket_guard_seen:
+            return None
+        _bracket_guard_seen[key] = now
+        msg = cf["msg"].strip().rstrip(".")
+        _dash_set_alert(
+            Fore.RED + Style.BRIGHT +
+            f"  ⛔  NinjaTrader: {msg} — NinjaTrader is not executing closes. "
+            "Close the position at the broker (web/mobile) and restart NinjaTrader." +
+            Style.RESET_ALL, sticky=True)
+        logger.error(f"NT CLOSE FAILED  {msg} — NinjaTrader is not executing closes; "
+                     "close at the broker and restart NinjaTrader")
+        return "alert"
     o = _NT_ORDER_STATE_RE.search(line)
     if o:
         book = _nt_orders.setdefault((o["acct"], _alias_root(o["instr"]).upper()), {})
@@ -11657,6 +11687,48 @@ def _naked_watch(now: float | None = None) -> list[str]:
     return done
 
 
+def _close_ack_watch(now: float | None = None) -> list[str]:
+    """A close this process wrote (a signal's exit, the naked watch, the
+    web UI) that NinjaTrader has not proven done after CLOSE_ACK_S, while
+    its log — in view and current — shows NO Close order on that root since
+    the file went out, is a NinjaTrader that is not acting on orders.
+    2026-11-03 23:35: the ATM bracket never left NT, Chart Trader's closes
+    produced no order, and this app's CLOSEPOSITION "timed out" — the only
+    way out was the broker's own web page. Say so, once per close, in red.
+    Returns the (account, root) pairs flagged."""
+    now = time.time() if now is None else now
+    if not _nt_tail_alive(now):
+        return []
+    flagged: list[str] = []
+    for (acct, root), (stamp, shown, targeted, sids) in list(_closes_dispatched.items()):
+        age = now - stamp
+        if age < CLOSE_ACK_S or not shown:
+            continue
+        key = (acct, root, stamp)
+        if key in _close_ack_alerted:
+            continue
+        if not _close_pending(acct, root, now):          # proven done meanwhile
+            continue
+        if _nt_close_in_flight(acct, root, stamp - 2.0) is not False:
+            continue                                     # NT has a Close in hand, or no log view
+        logged = _nt_orders.get((acct, root)) or {}
+        if any(name.startswith("Close") and seen >= stamp - 2.0
+               for name, _state, seen, _qty, _action in list(logged.values())):
+            continue                                     # NT logged a Close (any state) for it
+        _close_ack_alerted[key] = now
+        if len(_close_ack_alerted) > 64:
+            _close_ack_alerted.pop(min(_close_ack_alerted, key=_close_ack_alerted.get), None)
+        _dash_set_alert(
+            Fore.RED + Style.BRIGHT +
+            f"  ⛔  {acct} {root}: NinjaTrader has not acted on the close sent {age:.0f}s ago "
+            "(no Close order in its log). If NinjaTrader is frozen, close the position at "
+            "the broker (web/mobile) and restart NinjaTrader." + Style.RESET_ALL, sticky=True)
+        logger.error(f"CLOSE UNACKNOWLEDGED  account={acct}  {root}  sent {age:.0f}s ago — "
+                     "NinjaTrader logged no Close order; close at the broker, restart NinjaTrader")
+        flagged.append(f"{acct}:{root}")
+    return flagged
+
+
 async def bracket_guard_task():
     """Tail NinjaTrader's log for rejected ATM bracket orders.
 
@@ -11688,6 +11760,7 @@ async def bracket_guard_task():
             finally:
                 _nt_tail_seen = time.time()
             _naked_watch()
+            _close_ack_watch()
         except Exception as exc:
             logger.error(f"BRACKET GUARD  {exc}")
 

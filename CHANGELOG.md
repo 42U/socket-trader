@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.0.5rc2 — 2026-11-04 (pre-release)
+
+2026-11-03 23:35:01: an NQ-MacroZoneB entry filled on the funded account and
+on two sims one millisecond apart, during a 200-point move. NinjaTrader's
+ATM created the stop and target and handed them to the broker adapter — and
+from that instant NinjaTrader's order and market-data pipeline on that
+connection was dead: no acknowledgement for the bracket, the sim's 3-lot
+market order stuck 1-of-3 filled for fourteen minutes, every Chart Trader
+close produced no order, this app's CLOSEPOSITION (the 15-second naked-leg
+guard, which fired correctly) answered "Close operation failed. Operation
+timed out", File > Exit hung and NinjaTrader had to be killed; the position
+was closed at the broker's web page. NinjaTrader's trace shows the bridge
+AddOn running then was the previous build, which did heavy work inside
+NinjaTrader's own callbacks (a full snapshot of every account and a
+synchronous socket write under one lock on every tick, position and balance
+event, and a market-data subscribe from inside the position callback) —
+a lock-ordering deadlock between NinjaTrader's market-data and adapter
+threads is the one explanation that fits every symptom.
+
+### Fixed
+- **AddOn: NinjaTrader's callbacks never call back into NinjaTrader.**
+  1.0.5rc1 had already moved snapshots and socket writes to the bridge's
+  sender thread, but the market-data subscribe was still made from inside
+  `OnPositionUpdate`, on NinjaTrader's adapter thread. The callback now only
+  records the instrument (`pendingSubscribe`) and wakes the sender, which
+  subscribes — and releases — outside NinjaTrader's locks. Verified in the
+  bridge harness: the subscribe runs on `STB-Send`, and the callback returns
+  at once even when the subscribe itself takes 400 ms.
+
+### Added
+- **"NinjaTrader is not executing closes" alarms.** NinjaTrader's own
+  error line (`|0|64|Close operation failed …`) in its log now raises a
+  sticky red alert, and so does a close this app wrote that NinjaTrader has
+  neither executed nor even logged a Close order for after `CLOSE_ACK_S`
+  (12 s) while its log is in view. Both say the same thing: close the
+  position at the broker (web/mobile) and restart NinjaTrader. Tonight the
+  operator found out by watching the chart.
+
 ## 1.0.5rc1 — 2026-11-03 (pre-release)
 
 Findings of the 2026-11-03 review of a live install (ten accounts, one
