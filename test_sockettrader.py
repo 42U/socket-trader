@@ -10368,6 +10368,90 @@ class TestNakedWatch:
         assert "stop-old" in book and len(book) == 48
 
 
+class TestNinjaTraderNotActingOnCloses:
+    """2026-11-03 23:35: after an NQ fill on the live account NinjaTrader's
+    order pipeline hung — the ATM bracket never went out, Chart Trader's
+    closes produced no order, this app's CLOSEPOSITION met "Close operation
+    failed. Operation timed out", and the operator found out by watching
+    the chart. Two nets: NT's own error line, and a close of ours that NT
+    has not even logged a Close order for after CLOSE_ACK_S."""
+
+    FAILED = ("2026-11-03 23:35:17:729|0|64|Close operation failed. Operation timed out. "
+              "Manually close your position")
+    SHORT1 = ("2026-11-03 23:35:01:211|1|64|Instrument='NQ DEC26' Account='1632306' "
+              "Average price=27645 Quantity=1 Market position=Short Operation=Operation_Add")
+    CLOSE_SUB = ("2026-11-03 23:35:18:068|1|32|Order='a5e48415b0934ab3b1fd5bde44e27a80/1632306' "
+                 "Name='Close' New state='Submitted' Instrument='NQ DEC26' Action='Buy to cover' "
+                 "Limit price=0 Stop price=0 Quantity=1 Type='Market' Time in force=DAY Oco='' "
+                 "Filled=0 Fill price=0 Error='No error' Native error=''")
+
+    @pytest.fixture(autouse=True)
+    def _arm(self, monkeypatch):
+        st._nt_orders.clear(); st._nt_positions.clear(); st._bracket_guard_seen.clear()
+        st._closes_dispatched.clear(); st._close_ack_alerted.clear()
+        self.alerts = []
+        monkeypatch.setattr(st, "_dash_set_alert",
+                            lambda text, **kw: self.alerts.append((text, kw.get("sticky", False))))
+        monkeypatch.setattr(st, "_read_since", lambda a, i, s: -1)   # the book still shows the short
+        yield
+        st._nt_orders.clear(); st._nt_positions.clear(); st._bracket_guard_seen.clear()
+        st._closes_dispatched.clear(); st._close_ack_alerted.clear()
+
+    def test_nt_close_failed_line_raises_one_sticky_alert(self, caplog):
+        now = st._nt_log_stamp(self.FAILED) + 1
+        with caplog.at_level(logging.ERROR):
+            assert st._bracket_guard_event(self.FAILED, now=now) == "alert"
+        assert len(self.alerts) == 1 and self.alerts[0][1] is True
+        assert "Close operation failed. Operation timed out" in self.alerts[0][0]
+        assert "not executing closes" in self.alerts[0][0]
+        assert "NT CLOSE FAILED" in caplog.text
+        assert st._bracket_guard_event(self.FAILED, now=now) is None       # once per line
+        assert len(self.alerts) == 1
+
+    def test_nt_close_failed_line_from_long_ago_is_history(self):
+        now = st._nt_log_stamp(self.FAILED) + st.BRACKET_GUARD_MAX_AGE_S + 1
+        assert st._bracket_guard_event(self.FAILED, now=now) is None
+        assert self.alerts == []
+
+    def test_close_nt_never_logged_is_flagged_after_close_ack_s(self, monkeypatch, caplog):
+        t0 = st._nt_log_stamp(self.SHORT1)
+        st._bracket_guard_event(self.SHORT1, now=t0)
+        st._note_close_dispatched("1632306", "NQ", -1, -1)
+        sent = st._closes_dispatched[("1632306", "NQ")][0]
+        monkeypatch.setattr(st, "_nt_tail_seen", sent + 5)                 # log in view
+        assert st._close_ack_watch(now=sent + 5) == []                     # NT gets CLOSE_ACK_S
+        monkeypatch.setattr(st, "_nt_tail_seen", sent + st.CLOSE_ACK_S + 1)
+        with caplog.at_level(logging.ERROR):
+            assert st._close_ack_watch(now=sent + st.CLOSE_ACK_S + 1) == ["1632306:NQ"]
+        assert len(self.alerts) == 1 and self.alerts[0][1] is True
+        assert "has not acted on the close" in self.alerts[0][0]
+        assert "CLOSE UNACKNOWLEDGED" in caplog.text
+        monkeypatch.setattr(st, "_nt_tail_seen", sent + st.CLOSE_ACK_S + 2)
+        assert st._close_ack_watch(now=sent + st.CLOSE_ACK_S + 2) == []    # once per close
+        assert len(self.alerts) == 1
+
+    def test_a_close_nt_logged_is_not_flagged(self, monkeypatch):
+        t0 = st._nt_log_stamp(self.SHORT1)
+        st._bracket_guard_event(self.SHORT1, now=t0)
+        st._note_close_dispatched("1632306", "NQ", -1, -1)
+        sent = st._closes_dispatched[("1632306", "NQ")][0]
+        st._closes_dispatched[("1632306", "NQ")] = (st._nt_log_stamp(self.CLOSE_SUB) - 1, -1, -1, ())
+        sent = st._closes_dispatched[("1632306", "NQ")][0]
+        st._bracket_guard_event(self.CLOSE_SUB, now=sent + 1)
+        monkeypatch.setattr(st, "_nt_tail_seen", sent + st.CLOSE_ACK_S + 1)
+        assert st._close_ack_watch(now=sent + st.CLOSE_ACK_S + 1) == []
+        assert self.alerts == []
+
+    def test_no_verdict_without_the_log_in_view(self, monkeypatch):
+        t0 = st._nt_log_stamp(self.SHORT1)
+        st._bracket_guard_event(self.SHORT1, now=t0)
+        st._note_close_dispatched("1632306", "NQ", -1, -1)
+        sent = st._closes_dispatched[("1632306", "NQ")][0]
+        monkeypatch.setattr(st, "_nt_tail_seen", 0.0)                      # tail not running
+        assert st._close_ack_watch(now=sent + st.CLOSE_ACK_S + 5) == []
+        assert self.alerts == []
+
+
 class TestWebReverseButton:
     """The Rev button goes through the same flip as the publisher reset: the
     position's own ATM template, a strategy id the ledger can target, and
@@ -12700,6 +12784,26 @@ class TestBridgeAddOnSource:
             h = self.SRC[self.SRC.index(f"private void {handler}("):]
             h = h[:h.index("\n        }\n")]
             assert "SafeBroadcast();" in h and "GetStream" not in h, handler
+
+    def test_callbacks_never_call_back_into_ninjatrader(self):
+        # 2026-11-03 23:35: a market-data subscribe made from inside the
+        # position callback (NT's adapter thread) left NinjaTrader's order and
+        # market-data pipeline dead. Callbacks may only record work for the
+        # sender thread and signal it.
+        for handler in ("OnAccountItemUpdate", "OnPositionUpdate",
+                        "OnAccountStatusUpdate", "OnMarketDataUpdate"):
+            h = self.SRC[self.SRC.index(f"private void {handler}("):]
+            h = h[:h.index("\n        }\n")]
+            for forbidden in ("MarketData.Update", "EnsureMarketDataSubscription(",
+                              "ReleaseMarketDataIfUnused(", "UnsubscribeMarketData(",
+                              "lock (Account.All)", "lock (subOpLock)", "lock (clientsLock)",
+                              "HookAccounts(", "Output.Process("):
+                assert forbidden not in h, (handler, forbidden)
+        assert "pendingSubscribe.Add(inst)" in self.SRC
+        deferred = self.SRC[self.SRC.index("private void RunDeferredWork()"):]
+        deferred = deferred[:deferred.index("private void HookAccounts()")]
+        assert "EnsureMarketDataSubscription(inst)" in deferred
+        assert "ReleaseMarketDataIfUnused(inst)" in deferred
 
     def test_commands_are_bounded_and_exactly_matched(self):
         assert "private const int MaxCommandLineBytes = 4096;" in self.SRC
