@@ -18337,6 +18337,7 @@ try{showHiddenAccts=sessionStorage.getItem("st-show-hidden")==="1"}catch(e){}
 function acctEmpty(a){return !(a.positions&&a.positions.length)&&!a.working&&
   (a.cash==null||Math.abs(a.cash)<0.005)&&(a.realized==null||Math.abs(a.realized)<0.005)}
 function acctFolded(a){return !a.managed&&(a.hidden||(a.status&&a.status!=="Connected")||acctEmpty(a))}
+function liveAcct(name){return (L&&L.accounts||[]).find(x=>x.name===name)}
 function acctStructure(){
   return [L&&L.ok,S&&S.profiles,showHiddenAccts,(L&&L.accounts||[]).map(a=>[a.name,a.role,a.managed,
     a.stop,a.profile,a.sync,a.sync_detail,a.status,a.hidden,acctEmpty(a),
@@ -18379,7 +18380,11 @@ function renderAccounts(){
     const nameTd=td(null,a.name);
     nameTd.style.cursor="pointer";
     nameTd.title="edit limits and profile";
-    nameTd.onclick=()=>accountModal(a);
+    /* Look the account up afresh at click time: this row is rebuilt only
+       when acctStructure() changes, and limits are not part of that — so
+       the `a` captured here still carried the limits from the last rebuild
+       and the modal reopened on "0 / 0" after a SAVE LIMITS had saved. */
+    nameTd.onclick=()=>accountModal(liveAcct(a.name)||a);
     tr.appendChild(nameTd);
 
     const rt=el("td");const rs=el("div","roleset");

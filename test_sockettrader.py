@@ -9673,6 +9673,20 @@ class TestTradeRowRole:
         assert 'el("span","tag rtag",roleOf(x))' in js
 
 
+class TestAccountModalReadsLiveLimits:
+    """2026-11-05: SAVE LIMITS on SimTEST saved 1100 / -750 (the API said
+    so) but the modal reopened on 0 / 0. The account row is rebuilt only
+    when acctStructure() changes, and limits are not part of it, so the
+    click handler's captured row still carried the limits from the last
+    rebuild. The modal must open on the account as the live feed has it now."""
+
+    def test_the_name_click_looks_the_account_up_afresh(self):
+        js = st.WEB_UI_HTML
+        assert "function liveAcct(name){return (L&&L.accounts||[]).find(x=>x.name===name)}" in js
+        assert "nameTd.onclick=()=>accountModal(liveAcct(a.name)||a);" in js
+        assert "nameTd.onclick=()=>accountModal(a);" not in js
+
+
 class TestBracketGuard:
     """NinjaTrader attaches the ATM bracket after the fill; when it is slow
     the stop is rejected "below the market", the target dies with the OCO

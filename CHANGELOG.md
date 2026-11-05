@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **The account modal reopened on stale limits.** SAVE LIMITS saved (the
+  API and the balance monitor had the new target and stop at once), but
+  clicking the account again showed the old numbers — "0 / 0" when that
+  is what the page had loaded with. The account row is rebuilt only when
+  its structure changes and limits are not part of that, so the click
+  handler's captured row still carried the limits from the last rebuild.
+  The modal now opens on the account as the live feed has it now.
+
 ## 1.0.5rc4 — 2026-11-05 (pre-release)
 
 ### Fixed
