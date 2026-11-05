@@ -17322,6 +17322,29 @@ def _web_allowed_hosts() -> set[str]:
     return hosts | {f"{h}:{port}" for h in hosts}
 
 
+class _WebServer(http.server.ThreadingHTTPServer):
+    """ThreadingHTTPServer whose handle_error keeps the terminal clean.
+
+    The stdlib's prints forty dashes and a traceback to stderr — over the
+    TUI — every time a request thread dies, and a browser tab closing or
+    reloading mid-poll kills one: the keep-alive socket ends in
+    ConnectionResetError (WinError 10054, "forcibly closed by the remote
+    host") inside handle_one_request. That is the client leaving, not an
+    error here. Anything else goes to the log."""
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
+                            socket.timeout, TimeoutError)):
+            return
+        try:
+            where = client_address[0]
+        except (TypeError, IndexError):
+            where = "?"
+        logger.warning(f"WEB UI  request from {where} failed: {exc!r}")
+
+
 class _WebHandler(http.server.BaseHTTPRequestHandler):
     server_version = "SocketTrader"
     sys_version = ""
@@ -17573,11 +17596,11 @@ def start_web_ui(loop: asyncio.AbstractEventLoop, cfg: dict) -> str | None:
     _web_loop = loop
     _web_token = secrets.token_urlsafe(32)
     try:
-        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), _WebHandler)
+        httpd = _WebServer(("127.0.0.1", port), _WebHandler)
     except OSError as exc:
         logger.warning(f"WEB UI  port {port} busy ({exc}) — trying an ephemeral port")
         try:
-            httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _WebHandler)
+            httpd = _WebServer(("127.0.0.1", 0), _WebHandler)
         except OSError as exc2:
             logger.error(f"WEB UI  failed to start: {exc2}")
             return None

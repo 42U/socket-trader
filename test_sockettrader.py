@@ -3344,6 +3344,28 @@ class TestWebServer(_WebClient):
             self._get(web + "/api/nope")
         assert e.value.code == 404
 
+    def test_a_client_dropping_its_connection_is_not_a_traceback(self, web, capsys, caplog):
+        """A browser tab reloading mid-poll ends the keep-alive socket with
+        ConnectionResetError (WinError 10054); the stdlib server used to
+        print forty dashes and a traceback over the TUI for each one."""
+        assert isinstance(st._web_httpd, st._WebServer)
+        for exc in (ConnectionResetError(10054, "forcibly closed"), BrokenPipeError(),
+                    ConnectionAbortedError(), TimeoutError()):
+            try:
+                raise exc
+            except Exception:
+                st._web_httpd.handle_error(None, ("127.0.0.1", 50000))
+        out = capsys.readouterr()
+        assert "Traceback" not in out.err and "----" not in out.err and not out.out
+        assert not [r for r in caplog.records if "WEB UI" in r.getMessage()]
+        with caplog.at_level(logging.WARNING):
+            try:
+                raise RuntimeError("boom")
+            except Exception:
+                st._web_httpd.handle_error(None, ("127.0.0.1", 50000))
+        assert any("WEB UI" in r.getMessage() and "boom" in r.getMessage() for r in caplog.records)
+        assert "Traceback" not in capsys.readouterr().err
+
 
 class TestWebSecurity(_WebClient):
     """The web API controls real money — loopback is not the boundary."""

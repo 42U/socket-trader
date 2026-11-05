@@ -34,6 +34,12 @@
   day's net and then dropped some of them, leaving the account short.
 - Without a realized figure (ATI alone) the fills engine takes the cash
   move as the row's dollars, as the snapshot engine always did.
+- **No more tracebacks over the TUI when a browser tab drops.** A tab
+  reloading or closing mid-poll ends the web UI's keep-alive socket with
+  `ConnectionResetError: [WinError 10054]`, and the stdlib server printed
+  forty dashes and a traceback to the terminal for every one. That is the
+  client leaving; it is now ignored, and any other request failure goes to
+  the log instead of the screen.
 
 ## 1.0.5rc3 — 2026-11-05 (pre-release)
 
