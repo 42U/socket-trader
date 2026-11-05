@@ -46,8 +46,10 @@
   gap is the commissions; money the fills cannot explain — a position
   closed at the broker's own site, say — becomes an unseen row so the day
   still adds up). Accounts the log has no fills for keep their recorded
-  rows; the live session is left to the live engine; the month file is
-  backed up first (`YYYY-MM.json.bak-rebuild-…`). Dry run over 2026-11-02
+  rows; in the session in progress the rows the live engine cut itself
+  are kept (a rebuilt twin is dropped in their favour) and only the
+  snapshot engine's leftovers are replaced; the month file is backed up
+  first (`YYYY-MM.json.bak-rebuild-…`). Dry run over 2026-11-02
   … 11-05 of a live record: 123 rows, every account's rows summing to its
   day net.
 - **The engine says which way it is working.** `/api/pnl` carries
