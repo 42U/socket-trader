@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.0.5rc4 — 2026-11-05 (pre-release)
+
+### Fixed
+- **A stop-out's dollars no longer land on the previous trade.** The
+  bridge pushes NinjaTrader's realized P&L the instant a fill books; the
+  fill's own log line is read by the tail up to a second later. When the
+  money arrived first it found no row to take it and was handed to the
+  account's previous close as `late` money — then the end-of-poll
+  settle-up, seeing the account already explained, zeroed the real row.
+  2026-11-05 12:40: three NQ-MacroZoneB stop-outs (+$133, +$420, +$440)
+  read `+$0.00 ≈` while the 12:05 rows quietly grew by the same amounts.
+  Realized that has nothing to take it now waits for its row (or its
+  entry) for the 8 s window, matched on a later poll; only money that has
+  waited the whole window goes to the late path as before. The same race
+  on the way in — an entry's commission booked before its Entry line is
+  read — was the source of the stray "$2.64" rows; it now parks on the lot
+  as it should. A dip too big to be a commission (> $50/contract) is a
+  loss whose row is on its way, never parked as cost. The settle-up holds
+  off while a row is still due its dollars or dollars their row.
+- **Money landing long after the last row is its own row.** After a
+  restart, late-settling money fell back onto the account's last recorded
+  close however old it was: 13:05, −$1,349 of manual trading during a
+  blind spot was glued onto a 12:14 row. The fallback now takes money
+  landing within 3 minutes of that row; anything later is recorded as an
+  unseen row, which REBUILD then replaces from the log.
+- **REBUILD of the live session reconciles what it keeps.** A row the live
+  engine cut and settled exactly stays and its rebuilt twin is dropped
+  (as in 1.0.5rc3+#4), but a live row whose dollars came `late` or split
+  (≈) now yields to the log's version, and the dollars the kept rows
+  already account for are taken out of what the rebuilt rows must
+  explain — the previous logic reconciled the rebuilt rows to the whole
+  day's net and then dropped some of them, leaving the account short.
+- Without a realized figure (ATI alone) the fills engine takes the cash
+  move as the row's dollars, as the snapshot engine always did.
+
 ## 1.0.5rc3 — 2026-11-05 (pre-release)
 
 ### Changed
