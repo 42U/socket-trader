@@ -185,7 +185,15 @@ def isolate_pnl_history(tmp_path_factory):
     st._pnl_last_save = 0.0
     st._pnl_written_stat.clear()
     st._pnl_unflushed.clear()
+    st._fills_lots.clear(); st._fills_wait.clear(); st._fills_entries.clear()
+    st._fills_comm.clear(); st._fills_seen_xids.clear(); st._fills_mismatch.clear()
+    st._fills_pv_seen.clear(); st._fills_last_row.clear(); st._fills_dirty = False
+    st._fills_oif_pending.clear(); st._fills_oid_label.clear()
     yield
+    st._fills_lots.clear(); st._fills_wait.clear(); st._fills_entries.clear()
+    st._fills_comm.clear(); st._fills_seen_xids.clear(); st._fills_mismatch.clear()
+    st._fills_pv_seen.clear(); st._fills_last_row.clear(); st._fills_dirty = False
+    st._fills_oif_pending.clear(); st._fills_oid_label.clear()
     st.PNL_HISTORY_FILE = original
     st._pnl_history = None
     st._pnl_hot_month = None
@@ -7095,6 +7103,357 @@ class TestPnlObserve:
         assert len(hits) == 1          # said out loud, but only once
 
 
+class TestFillsEngine:
+    """2026-11-05 11:00:02: one NQ-MacroZoneB signal, four legs, every one
+    stopped out within 1.0 s of filling. The 2 s snapshot diff saw one leg
+    whole, one as a third of itself and two not at all. Cut from
+    NinjaTrader's execution lines instead, every leg is a row with its
+    exact entry, exit, size and strategy."""
+
+    D = "2026-11-05"
+    # Verbatim NinjaTrader log lines (SimTEST = leader, SimAI = follower).
+    OIF_TEST = ("2026-11-05 11:00:02:280|1|1|OIF, 'PLACE;SimTEST;NQ 12-26;SELL;1;MARKET;;;DAY;;;"
+                "NQ-MacroZoneB;ent:nq_macro_zone_b:Nasdaq:2026-11-05T11:00:00-05:00' processing")
+    AI_ENTRY_PART = ("2026-11-05 11:00:02:459|1|32|Order='b97e74015deb4ecd88f38736288c6bf0/SimAI' Name='Entry' "
+                     "New state='Partially filled' Instrument='MNQ DEC26' Action='Sell' Limit price=0 Stop price=0 "
+                     "Quantity=3 Type='Market' Time in force=DAY Oco='' Filled=1 Fill price=26977.75 Error='No error' Native error=''")
+    AI_X1 = ("2026-11-05 11:00:02:466|1|8|Execution='10a0ec596c26498daf87ad3c62b1ac2d' Instrument='MNQ DEC26' Account='SimAI' "
+             "Exchange=Default Price=26977.75 Quantity=1 Market position=Short Operation=Operation_Add "
+             "Order='b97e74015deb4ecd88f38736288c6bf0' Time='11/05/2026 11:00:02'")
+    AI_POS1 = ("2026-11-05 11:00:02:466|1|64|Instrument='MNQ DEC26' Account='SimAI' Average price=26977.75 "
+               "Quantity=1 Market position=Short Operation=Operation_Add")
+    TEST_ENTRY = ("2026-11-05 11:00:02:498|1|32|Order='15b83b9e21af4820a387b5b1b60b6264/SimTEST' Name='Entry' "
+                  "New state='Filled' Instrument='NQ DEC26' Action='Sell' Limit price=0 Stop price=0 Quantity=1 "
+                  "Type='Market' Time in force=DAY Oco='' Filled=1 Fill price=26978.5 Error='No error' Native error=''")
+    TEST_X = ("2026-11-05 11:00:02:514|1|8|Execution='94b5aec0f6184d4abdd2b32e6223674a' Instrument='NQ DEC26' Account='SimTEST' "
+              "Exchange=Default Price=26978.5 Quantity=1 Market position=Short Operation=Operation_Add "
+              "Order='15b83b9e21af4820a387b5b1b60b6264' Time='11/05/2026 11:00:02'")
+    TEST_POS = ("2026-11-05 11:00:02:514|1|64|Instrument='NQ DEC26' Account='SimTEST' Average price=26978.5 "
+                "Quantity=1 Market position=Short Operation=Operation_Add")
+    AI_ENTRY_FULL = ("2026-11-05 11:00:02:519|1|32|Order='b97e74015deb4ecd88f38736288c6bf0/SimAI' Name='Entry' "
+                     "New state='Filled' Instrument='MNQ DEC26' Action='Sell' Limit price=0 Stop price=0 Quantity=3 "
+                     "Type='Market' Time in force=DAY Oco='' Filled=3 Fill price=26977.583333333332 Error='No error' Native error=''")
+    AI_X2 = ("2026-11-05 11:00:02:540|1|8|Execution='053531402acf406f95dba3de13dc1c2b' Instrument='MNQ DEC26' Account='SimAI' "
+             "Exchange=Default Price=26977.5 Quantity=2 Market position=Short Operation=Operation_Add "
+             "Order='b97e74015deb4ecd88f38736288c6bf0' Time='11/05/2026 11:00:02'")
+    AI_POS3 = ("2026-11-05 11:00:02:540|1|64|Instrument='MNQ DEC26' Account='SimAI' Average price=26977.583333333332 "
+               "Quantity=3 Market position=Short Operation=Update")
+    AI_STOP_PART = ("2026-11-05 11:00:03:302|1|32|Order='ba68c504caca49e59b927ece1e6563f4/SimAI' Name='Stop1' "
+                    "New state='Partially filled' Instrument='MNQ DEC26' Action='Buy to cover' Limit price=0 Stop price=26989.25 "
+                    "Quantity=3 Type='Stop Market' Time in force=GTC Oco='30e243bd084a46b79dfd0054b31daeb2' Filled=2 Fill price=26989.5 Error='No error' Native error=''")
+    TEST_STOP = ("2026-11-05 11:00:03:320|1|32|Order='652eb616f5fe4236bebcd9f2c18250c5/SimTEST' Name='Stop1' "
+                 "New state='Filled' Instrument='NQ DEC26' Action='Buy to cover' Limit price=0 Stop price=26990 Quantity=1 "
+                 "Type='Stop Market' Time in force=GTC Oco='7d66039bf5f442daa8adcf6b5315dd23' Filled=1 Fill price=26991.25 Error='No error' Native error=''")
+    AI_X3 = ("2026-11-05 11:00:03:341|1|8|Execution='6c4ce6277d9747fca9134da1c45d1da8' Instrument='MNQ DEC26' Account='SimAI' "
+             "Exchange=Default Price=26989.5 Quantity=2 Market position=Long Operation=Operation_Add "
+             "Order='ba68c504caca49e59b927ece1e6563f4' Time='11/05/2026 11:00:03'")
+    TEST_X_OUT = ("2026-11-05 11:00:03:350|1|8|Execution='244ea6f8b1264e45ad2d749383cb27ea' Instrument='NQ DEC26' Account='SimTEST' "
+                  "Exchange=Default Price=26991.25 Quantity=1 Market position=Long Operation=Operation_Add "
+                  "Order='652eb616f5fe4236bebcd9f2c18250c5' Time='11/05/2026 11:00:03'")
+    TEST_FLAT = ("2026-11-05 11:00:03:373|1|64|Instrument='NQ DEC26' Account='SimTEST' Average price=0 Quantity=0 "
+                 "Market position=Flat Operation=Remove")
+    AI_X4 = ("2026-11-05 11:00:03:408|1|8|Execution='ce851c3293ae4fceafcf6cb599f73801' Instrument='MNQ DEC26' Account='SimAI' "
+             "Exchange=Default Price=26989.75 Quantity=1 Market position=Long Operation=Operation_Add "
+             "Order='ba68c504caca49e59b927ece1e6563f4' Time='11/05/2026 11:00:03'")
+    AI_FLAT = ("2026-11-05 11:00:03:408|1|64|Instrument='MNQ DEC26' Account='SimAI' Average price=0 Quantity=0 "
+               "Market position=Flat Operation=Remove")
+
+    @pytest.fixture(autouse=True)
+    def _arm(self, monkeypatch):
+        st.active_account = "SimTEST"
+        st.follower_accounts = ["SimAI", "SimWhop", "PTLOP2546341754"]
+        st._nt_orders.clear(); st._nt_positions.clear(); st._bracket_guard_seen.clear()
+        self.t0 = st._nt_log_stamp(self.OIF_TEST)
+        monkeypatch.setattr(st, "_nt_tail_seen", self.t0 + 5)      # log in view
+        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: self.D)
+        yield
+        st._nt_orders.clear(); st._nt_positions.clear()
+
+    def feed(self, *lines):
+        for l in lines:
+            st._bracket_guard_event(l, now=st._nt_log_stamp_ms(l) + 0.5)
+
+    def day(self):
+        return st._pnl_month(self.D[:7])["days"].get(self.D) or {"trades": []}
+
+    def rows(self, acct):
+        return [t for t in self.day()["trades"] if t["account"] == acct]
+
+    def stage(self):
+        # What the dispatch path records when it fires the legs.
+        st._pnl_note_open("SimTEST", "NQ 12-26", ("nq_macro_zone_b", "NQ-MacroZoneB"),
+                          now=self.t0, action="SELL")
+        st._pnl_note_open("SimAI", "MNQ 12-26", ("nq_macro_zone_b", "NQ-MacroZoneB"),
+                          now=self.t0, role="follower", action="SELL")
+
+    def test_leader_stopped_out_in_one_second_is_one_exact_row(self):
+        self.stage()
+        self.feed(self.OIF_TEST, self.TEST_ENTRY, self.TEST_X, self.TEST_POS,
+                  self.TEST_STOP, self.TEST_X_OUT, self.TEST_FLAT)
+        (t,) = self.rows("SimTEST")
+        assert t["symbol"] == "NQ" and t["side"] == "SHORT" and t["qty"] == 1
+        assert t["strategy"] == "NQ-MacroZoneB" and "role" not in t
+        assert t["entry"] == 26978.5 and t["exit"] == 26991.25
+        assert t["exit_kind"] == "stop" and t["fills"] is True
+        assert t["opened_ts"] == st._nt_log_stamp_ms(self.TEST_X)
+        assert t["pnl"] == -255.0                       # 12.75 pts x $20, estimate before NT's realized
+        assert t["approx"] is False
+        assert ("SimTEST", "NQ") not in st._fills_lots
+
+    def test_three_lot_filled_and_stopped_in_partials_is_one_row_of_three(self):
+        self.stage()
+        self.feed(self.AI_ENTRY_PART, self.AI_X1, self.AI_POS1, self.AI_ENTRY_FULL, self.AI_X2, self.AI_POS3)
+        lots = st._fills_lots[("SimAI", "MNQ")]
+        assert [l["qty"] for l in lots] == [-1, -2]
+        assert all(l["strategy"] == "NQ-MacroZoneB" and l["role"] == "follower" for l in lots)
+        self.feed(self.AI_STOP_PART, self.AI_X3)
+        (t,) = self.rows("SimAI")
+        assert t["qty"] == 2                               # first partial of the stop
+        self.feed(self.AI_X4, self.AI_FLAT)
+        (t,) = self.rows("SimAI")                          # the second partial joined it
+        assert t["qty"] == 3 and t["side"] == "SHORT" and t["symbol"] == "MNQ"
+        assert t["strategy"] == "NQ-MacroZoneB" and t["role"] == "follower"
+        assert abs(t["entry"] - 26977.5833) < 0.001 and abs(t["exit"] - 26989.5833) < 0.001
+        assert t["pnl"] == -72.0                          # 12.0 pts x $2 x 3
+        assert ("SimAI", "MNQ") not in st._fills_lots
+
+    def test_ninjatraders_realized_puts_the_exact_dollars_on_the_row(self):
+        self.stage()
+        self.feed(self.OIF_TEST, self.TEST_ENTRY, self.TEST_X, self.TEST_POS,
+                  self.TEST_STOP, self.TEST_X_OUT, self.TEST_FLAT)
+        x = st._nt_log_stamp_ms(self.TEST_X_OUT)
+        before = _plive(_prow("SimTEST", 92_000.0, [], realized=0.0))
+        st._pnl_observe(before, now=self.t0 - 2)
+        after = _plive(_prow("SimTEST", 91_740.64, [], realized=-259.36))
+        st._pnl_observe(after, now=x + 1.5)
+        (t,) = self.rows("SimTEST")
+        assert t["pnl"] == -259.36 and t["approx"] is False
+        assert not any(r.get("unseen") for r in self.day()["trades"])
+
+    def test_entry_commission_is_learned_and_parked_on_the_lot(self):
+        self.stage()
+        st._pnl_observe(_plive(_prow("SimTEST", 92_000.0, [], realized=0.0)), now=self.t0 - 2)
+        self.feed(self.OIF_TEST, self.TEST_ENTRY, self.TEST_X, self.TEST_POS)
+        x = st._nt_log_stamp_ms(self.TEST_X)
+        held = _plive(_prow("SimTEST", 91_997.82, [_ppos("NQ 12-26", -1, 26978.5)], realized=-2.18))
+        st._pnl_observe(held, now=x + 1.0)
+        lot = st._fills_lots[("SimTEST", "NQ")][0]
+        assert lot["cost"] == -2.18
+        assert st._fills_comm[("SimTEST", "NQ")] == 2.18
+        assert not any(r.get("unseen") for r in self.day()["trades"])
+        # The exit's money lands on the row together with the parked entry cost.
+        self.feed(self.TEST_STOP, self.TEST_X_OUT, self.TEST_FLAT)
+        xo = st._nt_log_stamp_ms(self.TEST_X_OUT)
+        st._pnl_observe(_plive(_prow("SimTEST", 91_740.64, [], realized=-259.36)), now=xo + 1.0)
+        (t,) = self.rows("SimTEST")
+        assert t["pnl"] == round(-257.18 - 2.18, 2) and t["approx"] is False
+
+    def test_chart_trader_fill_with_nothing_staged_is_manual(self):
+        self.feed(self.TEST_ENTRY, self.TEST_X, self.TEST_POS, self.TEST_STOP, self.TEST_X_OUT, self.TEST_FLAT)
+        (t,) = self.rows("SimTEST")
+        assert t["strategy"] == "" and "role" not in t and t["opened_ts"] is not None
+
+    def test_unmanaged_account_fills_are_ignored(self):
+        line = self.TEST_X.replace("Account='SimTEST'", "Account='Playback101'")
+        self.feed(line)
+        assert ("Playback101", "NQ") not in st._fills_lots
+
+    def test_snapshot_diff_does_not_cut_a_second_row(self):
+        self.stage()
+        st._pnl_observe(_plive(_prow("SimTEST", 92_000.0, [], realized=0.0)), now=self.t0 - 2)
+        self.feed(self.OIF_TEST, self.TEST_ENTRY, self.TEST_X, self.TEST_POS)
+        x = st._nt_log_stamp_ms(self.TEST_X)
+        st._pnl_observe(_plive(_prow("SimTEST", 92_000.0, [_ppos("NQ 12-26", -1, 26978.5)], realized=0.0)), now=x + 1)
+        self.feed(self.TEST_STOP, self.TEST_X_OUT, self.TEST_FLAT)
+        xo = st._nt_log_stamp_ms(self.TEST_X_OUT)
+        st._pnl_observe(_plive(_prow("SimTEST", 91_740.64, [], realized=-259.36)), now=xo + 1)
+        assert len(self.rows("SimTEST")) == 1
+
+    def test_reversal_closes_the_old_lots_and_opens_the_rest(self):
+        self.feed(self.TEST_ENTRY, self.TEST_X, self.TEST_POS)             # short 1
+        rev = ("2026-11-05 11:00:05:000|1|8|Execution='rev1' Instrument='NQ DEC26' Account='SimTEST' "
+               "Exchange=Default Price=26980 Quantity=3 Market position=Long Operation=Operation_Add "
+               "Order='revorder' Time='11/05/2026 11:00:05'")
+        self.feed(rev)
+        (t,) = self.rows("SimTEST")
+        assert t["side"] == "SHORT" and t["qty"] == 1 and t["exit"] == 26980.0 and t["pnl"] == -30.0
+        lots = st._fills_lots[("SimTEST", "NQ")]
+        assert [l["qty"] for l in lots] == [2] and lots[0]["price"] == 26980.0
+
+    def test_duplicate_execution_lines_apply_once(self):
+        self.feed(self.TEST_ENTRY, self.TEST_X, self.TEST_X, self.TEST_POS)
+        assert [l["qty"] for l in st._fills_lots[("SimTEST", "NQ")]] == [-1]
+
+    def test_lots_survive_a_restart_with_their_labels(self, tmp_path):
+        self.stage()
+        self.feed(self.OIF_TEST, self.TEST_ENTRY, self.TEST_X, self.TEST_POS)
+        st._fills_save(force=True)
+        st._fills_lots.clear(); st._pnl_open_meta.clear()
+        assert st._fills_load() == 1
+        lot = st._fills_lots[("SimTEST", "NQ")][0]
+        assert lot["qty"] == -1 and lot["price"] == 26978.5 and lot["strategy"] == "NQ-MacroZoneB"
+        assert st._pnl_open_meta[("SimTEST", "NQ")]["strategies"] == ["NQ-MacroZoneB"]
+        # ...and the close after the restart is still attributed.
+        self.feed(self.TEST_STOP, self.TEST_X_OUT, self.TEST_FLAT)
+        (t,) = self.rows("SimTEST")
+        assert t["strategy"] == "NQ-MacroZoneB" and t["entry"] == 26978.5
+
+    def test_boot_drops_lots_the_book_no_longer_holds(self):
+        self.stage()
+        self.feed(self.OIF_TEST, self.TEST_ENTRY, self.TEST_X, self.TEST_POS)
+        st._pnl_prev.clear()                                          # a fresh process
+        with patch.object(st, "_nt_tail_seen", self.t0 + 60):
+            st._pnl_observe(_plive(_prow("SimTEST", 91_740.64, [], realized=-259.36)), now=self.t0 + 60)
+        assert ("SimTEST", "NQ") not in st._fills_lots
+
+    def test_point_values_come_from_the_bridge_first(self):
+        assert st._point_value("NQ") == 20.0 and st._point_value("MNQ") == 2.0
+        st._fills_note_point_values({"accounts": [], "pv": {"NQ": 20, "XYZ": 7.5, "bad": "x"}})
+        assert st._fills_pv_seen == {"NQ": 20.0, "XYZ": 7.5}
+        assert st._point_value("xyz") == 7.5 and st._point_value("ZZZ") is None
+        st._fills_note_point_values({"pv": {"NQ": 25}})        # NinjaTrader's word wins the table
+        assert st._point_value("NQ") == 25.0
+
+    def test_snapshot_disagreement_is_tolerated_for_the_grace_then_resolved(self):
+        self.stage()
+        st._pnl_observe(_plive(_prow("SimTEST", 92_000.0, [], realized=0.0)), now=self.t0 - 2)
+        self.feed(self.OIF_TEST, self.TEST_ENTRY, self.TEST_X, self.TEST_POS)
+        x = st._nt_log_stamp_ms(self.TEST_X)
+        flat = _plive(_prow("SimTEST", 92_000.0, [], realized=0.0))
+        st._pnl_observe(flat, now=x + 1)                              # the tail is 1 s behind: fine
+        assert ("SimTEST", "NQ") in st._fills_lots
+        st._pnl_observe(flat, now=x + 1 + st.FILLS_BOOK_GRACE_S + 1)   # still flat: no exit was logged
+        assert ("SimTEST", "NQ") not in st._fills_lots
+
+
+class TestFillsAttributionFromOrderFile:
+    """The strategy a lot wears comes from NinjaTrader's echo of the order
+    file this app wrote ("OIF, 'PLACE;...;NQ-MacroZoneB;ent:...' processing"),
+    bound to the Entry order NinjaTrader submits for it — so it never
+    depends on what this process remembers."""
+
+    OIF = ("2026-11-05 11:00:02:281|1|1|OIF, 'PLACE;SimAI;MNQ 12-26;SELL;3;MARKET;;;DAY;;;"
+           "NQ-MacroZoneB;ent:nq_macro_zone_b:Nasdaq:2026-11-05T11:00:00-05:00~SimAI' processing")
+    ENTRY = ("2026-11-05 11:00:02:317|1|32|Order='b97e74015deb4ecd88f38736288c6bf0/SimAI' Name='Entry' "
+             "New state='Submitted' Instrument='MNQ DEC26' Action='Sell' Limit price=0 Stop price=0 "
+             "Quantity=3 Type='Market' Time in force=DAY Oco='' Filled=0 Fill price=0 Error='No error' Native error=''")
+
+    @pytest.fixture(autouse=True)
+    def _arm(self, monkeypatch):
+        st.active_account = "SimTEST"; st.follower_accounts = ["SimAI"]
+        st._nt_orders.clear()
+        monkeypatch.setattr(st, "_nt_tail_seen", st._nt_log_stamp(self.OIF) + 5)
+        yield
+        st._nt_orders.clear()
+
+    def feed(self, *lines):
+        for l in lines:
+            st._bracket_guard_event(l, now=st._nt_log_stamp_ms(l) + 0.5)
+
+    def test_order_file_binds_the_entry_order_to_its_strategy(self):
+        self.feed(self.OIF, self.ENTRY)
+        assert st._fills_oid_label[("SimAI", "b97e74015deb4ecd88f38736288c6bf0")] == ("NQ-MacroZoneB", "follower")
+        assert st._fills_oif_pending.get(("SimAI", "MNQ")) == []          # consumed
+
+    def test_leaders_file_carries_no_role(self):
+        oif = self.OIF.replace("SimAI;MNQ 12-26;SELL;3", "SimTEST;NQ 12-26;SELL;1").replace("~SimAI", "")
+        entry = self.ENTRY.replace("/SimAI'", "/SimTEST'").replace("MNQ DEC26", "NQ DEC26").replace("Quantity=3", "Quantity=1")
+        self.feed(oif, entry)
+        assert st._fills_oid_label[("SimTEST", "b97e74015deb4ecd88f38736288c6bf0")] == ("NQ-MacroZoneB", "")
+
+    def test_an_entry_with_another_side_or_size_is_not_that_file(self):
+        self.feed(self.OIF, self.ENTRY.replace("Quantity=3", "Quantity=2"))
+        assert ("SimAI", "b97e74015deb4ecd88f38736288c6bf0") not in st._fills_oid_label
+        self.feed(self.ENTRY.replace("Action='Sell'", "Action='Buy'"))
+        assert ("SimAI", "b97e74015deb4ecd88f38736288c6bf0") not in st._fills_oid_label
+
+    def test_a_file_older_than_the_bind_window_is_not_that_order(self):
+        late = self.ENTRY.replace("11:00:02:317", "11:00:30:000")
+        self.feed(self.OIF, late)
+        assert ("SimAI", "b97e74015deb4ecd88f38736288c6bf0") not in st._fills_oid_label
+
+
+class TestPnlRebuildFromNinjaTraderLog:
+    """A day re-cut from the log: every fill a row, labelled from the order
+    file, dollars reconciled to what the record knows the account made."""
+
+    D = "2026-11-05"
+    LINES = TestFillsEngine.__dict__   # the verbatim 11:00:02 lines
+
+    def _log_dir(self, tmp_path, lines):
+        out = tmp_path / "NinjaTrader 8" / "incoming"; out.mkdir(parents=True)
+        log = tmp_path / "NinjaTrader 8" / "log"; log.mkdir()
+        (log / "log.20261105.00000.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        (log / "log.20261105.00000.en.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return out
+
+    @pytest.fixture(autouse=True)
+    def _arm(self, tmp_path, monkeypatch):
+        L = self.LINES
+        lines = [L["OIF_TEST"], L["TEST_ENTRY"], L["TEST_X"], L["TEST_POS"],
+                 L["TEST_STOP"], L["TEST_X_OUT"], L["TEST_FLAT"]]
+        st.output_directory = str(self._log_dir(tmp_path, lines))
+        monkeypatch.setattr(st, "_session_date_of", lambda stamp: self.D)
+        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: "2026-11-06")   # today is another day
+        # The record as the snapshot engine left it: an "unobserved fill"
+        # and a balance that says what SimTEST really made.
+        with st._pnl_lock:
+            days = st._pnl_hot(self.D[:7])
+            days[self.D] = {"accounts": {"SimTEST": {"start": 92_119.32, "last": 91_859.96, "adj": 0.0},
+                                         "SimAI": {"start": 10_000.0, "last": 10_000.0, "adj": 0.0}},
+                            "trades": [{"ts": 1793876524.0, "account": "SimTEST", "symbol": "", "side": "",
+                                        "qty": 0, "strategy": "", "entry": None, "opened_ts": None,
+                                        "pnl": -259.36, "approx": True, "unseen": True},
+                                       {"ts": 1793876600.0, "account": "SimAI", "symbol": "MGC", "side": "LONG",
+                                        "qty": 3, "strategy": "GC-ExhaustM", "entry": 4094.0,
+                                        "opened_ts": 1793876500.0, "pnl": 140.35, "approx": False}]}
+        yield
+        st.output_directory = ""
+
+    def day(self):
+        return st._pnl_month(self.D[:7])["days"][self.D]
+
+    def test_rebuilt_day_has_exact_rows_reconciled_to_the_balance(self):
+        rep = st._pnl_rebuild_day(self.D)
+        assert rep["rows"] == 1 and rep["replaced"] == ["SimTEST"] and rep["kept"] == ["SimAI"]
+        rows = [t for t in self.day()["trades"] if t["account"] == "SimTEST"]
+        assert len(rows) == 1 and not rows[0].get("unseen")
+        t = rows[0]
+        assert t["symbol"] == "NQ" and t["side"] == "SHORT" and t["qty"] == 1
+        assert t["strategy"] == "NQ-MacroZoneB" and t["exit_kind"] == "stop"
+        assert t["entry"] == 26978.5 and t["exit"] == 26991.25 and t["gross"] == -255.0
+        assert t["pnl"] == -259.36 and t["approx"] is False      # the $4.36 is the commission
+        # Rows for an account the log had no fills for are kept as recorded.
+        kept = [t for t in self.day()["trades"] if t["account"] == "SimAI"]
+        assert kept and kept[0]["strategy"] == "GC-ExhaustM"
+
+    def test_money_the_fills_do_not_explain_becomes_an_unseen_row(self):
+        with st._pnl_lock:
+            st._pnl_hot(self.D[:7])[self.D]["accounts"]["SimTEST"]["last"] = 92_619.32   # +$500 the log never saw
+        rep = st._pnl_rebuild_day(self.D)
+        rows = [t for t in self.day()["trades"] if t["account"] == "SimTEST"]
+        assert rep["unseen"] == 1 and len(rows) == 2
+        assert rows[0]["pnl"] == -255.0 and rows[0]["approx"] is True
+        assert rows[1]["unseen"] is True and rows[1]["pnl"] == 755.0
+        assert round(sum(t["pnl"] for t in rows), 2) == 500.0
+
+    def test_range_backs_up_the_month_and_skips_the_live_session(self, monkeypatch):
+        st._pnl_save(force=True)
+        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: self.D)   # today IS the day
+        ok, msg, reports = st._pnl_rebuild_range(self.D, self.D)
+        assert not ok and "live session" in msg
+        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: "2026-11-06")
+        ok, msg, reports = st._pnl_rebuild_range("2026-11-04", self.D)
+        assert ok and "rebuilt 1 trade row" in msg
+        assert any(p.name.startswith("2026-11.json.bak-rebuild-") for p in st.PNL_DIR.iterdir())
+        assert [r["rows"] for r in reports] == [0, 1]
+
+    def test_no_log_folder_is_said_plainly(self):
+        st.output_directory = "/nonexistent/incoming"
+        ok, msg, _ = st._pnl_rebuild_range(self.D, self.D)
+        assert not ok and "log folder is not reachable" in msg
+
+
 class TestPnlEntryCommission:
     """NinjaTrader books an entry's commission into RealizedPnL as the
     order fills — routinely a poll or more before the position reaches the
@@ -12784,6 +13143,11 @@ class TestBridgeAddOnSource:
             h = self.SRC[self.SRC.index(f"private void {handler}("):]
             h = h[:h.index("\n        }\n")]
             assert "SafeBroadcast();" in h and "GetStream" not in h, handler
+
+    def test_snapshot_carries_point_values(self):
+        # [FIX-S] the fills engine takes NinjaTrader's PointValue over its table
+        assert "mi.PointValue" in self.SRC
+        assert '"pv\\":{' in self.SRC or "\\\"pv\\\":{" in self.SRC
 
     def test_callbacks_never_call_back_into_ninjatrader(self):
         # 2026-11-03 23:35: a market-data subscribe made from inside the

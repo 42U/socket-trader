@@ -1,5 +1,65 @@
 # Changelog
 
+## 1.0.5rc3 — 2026-11-05 (pre-release)
+
+### Changed
+- **Trade rows are cut from NinjaTrader's fills, not from snapshot
+  diffs.** The trade log used to be rebuilt by comparing position
+  snapshots every 2 s and handing whatever RealizedPnL moved in that
+  window to whatever position change was noticed in it. 2026-11-05
+  11:00:02: one NQ-MacroZoneB signal, four legs, every one stopped out
+  within 1.0 s of filling — the diff saw one leg whole, one as a third of
+  itself (a 1-lot row plus an "unobserved fill" for the other two) and two
+  not at all ("unobserved fill", no market, no side). The same lottery
+  minted $0.00 / ±commission rows when the money landed a poll before the
+  position left (the dollars went `late` onto the previous trade), and
+  "Manual" rows after every restart (attribution lived in memory only).
+  bracket_guard_task already tails NinjaTrader's log every second; each
+  `Execution=` line now opens or closes lots FIFO per (account, root).
+  A closing fill cuts a row with the exact entry and exit, the size, the
+  strategy the dispatch path staged when it fired the entry, whether the
+  stop, the target, a close or a reversal took it out, and a P&L from the
+  prices and the contract's point value (NinjaTrader's own PointValue,
+  sent by the bridge as "pv"; a built-in table otherwise). NinjaTrader's
+  realized, when it lands within 8 s, replaces the estimate with the exact
+  dollars; an entry's commission is learned from the dip it books and
+  parked on the lot until the exit. Partial fills of one closing order
+  join one row. Open lots and their labels persist in
+  `.voidorigin_pnl/open_lots.json`, so a restart keeps them; at the first
+  snapshot after boot the lots are checked against the book, and every
+  poll after that (a root flat in the snapshot for 6 s with lots still
+  open, or held with none, is re-seeded). A fill nobody here fired — a
+  Chart Trader trade — has no staged label and stays "Manual". The
+  snapshot diff remains the engine when NinjaTrader's log is not in view.
+- **Attribution comes from NinjaTrader's echo of the order file.** The
+  log line `OIF, 'PLACE;SimAI;MNQ 12-26;SELL;3;...;NQ-MacroZoneB;ent:...~SimAI'
+  processing` names the strategy this app wrote the file for (a `~Account`
+  id suffix marks a follower's copy); the Entry order NinjaTrader submits
+  next for that account, side and size is that file's order, and every
+  fill of it — including a partial that lands after a NinjaTrader restart
+  — wears its strategy. What the dispatch path staged in memory is only
+  the fallback now.
+- **Rebuild past days from NinjaTrader's log** — the REBUILD button on
+  the P&L page (`POST /api/pnl_rebuild {from, to}`): every session in the
+  month is re-cut from the fills NinjaTrader logged, labelled from the
+  order files, and reconciled to each account's recorded day result (the
+  gap is the commissions; money the fills cannot explain — a position
+  closed at the broker's own site, say — becomes an unseen row so the day
+  still adds up). Accounts the log has no fills for keep their recorded
+  rows; the live session is left to the live engine; the month file is
+  backed up first (`YYYY-MM.json.bak-rebuild-…`). Dry run over 2026-11-02
+  … 11-05 of a live record: 123 rows, every account's rows summing to its
+  day net.
+- **The engine says which way it is working.** `/api/pnl` carries
+  `engine` ("fills" while NinjaTrader's log is in view, "snapshot" when it
+  is not — an ATI-only setup, or NinjaTrader on another machine) and the
+  trade log's heading says so; the switch is automatic, per poll, and the
+  snapshot diff keeps working exactly as before when the log is not there.
+- Web trade log: "Entry → Exit" shows both prices; a tag says what took
+  the trade out (stop / target / close / reverse).
+- Bridge AddOn: each snapshot carries `"pv": {root: PointValue}` for every
+  root a position has been seen on ([FIX-S]).
+
 ## 1.0.5rc2 — 2026-11-04 (pre-release)
 
 2026-11-03 23:35:01: an NQ-MacroZoneB entry filled on the funded account and

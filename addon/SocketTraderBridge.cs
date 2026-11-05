@@ -401,6 +401,9 @@ namespace NinjaTrader.NinjaScript.AddOns
         // Instruments we've subscribed to market data for (with open positions)
         private readonly Dictionary<Instrument, double> lastPrice =
             new Dictionary<Instrument, double>();
+        // [FIX-S] Root -> NinjaTrader's PointValue, for every root a
+        // position has been seen on; sent with each snapshot as "pv".
+        private readonly Dictionary<string, double> pointValues = new Dictionary<string, double>();
         private readonly object subsLock = new object();
         // [FIX-L] Serialises subscribe/unsubscribe. Never taken by
         // OnMarketDataUpdate, so it cannot invert with NT's dispatch lock.
@@ -1420,7 +1423,28 @@ namespace NinjaTrader.NinjaScript.AddOns
                 body.Append(accountFragment);
             }
             if (partial) sb.Append(",\"partial\":true");
-            sb.Append(",\"accounts\":[").Append(body).Append("]}");
+            sb.Append(",\"accounts\":[").Append(body).Append(']');
+            // [FIX-S] Point values of every root seen with a position.
+            KeyValuePair<string, double>[] pvs;
+            lock (pointValues)
+            {
+                pvs = new KeyValuePair<string, double>[pointValues.Count];
+                int i = 0;
+                foreach (var kv in pointValues) pvs[i++] = kv;
+            }
+            if (pvs.Length > 0)
+            {
+                sb.Append(",\"pv\":{");
+                bool firstPv = true;
+                foreach (var kv in pvs)
+                {
+                    if (!firstPv) sb.Append(',');
+                    firstPv = false;
+                    sb.Append(JsonString(kv.Key)).Append(':').Append(D(kv.Value));
+                }
+                sb.Append('}');
+            }
+            sb.Append('}');
             return sb.ToString();
         }
 
@@ -1488,6 +1512,15 @@ namespace NinjaTrader.NinjaScript.AddOns
 
                 if (!firstPos) sb.Append(',');
                 firstPos = false;
+                // [FIX-S] NinjaTrader's own dollars-per-point for the root,
+                // so SocketTrader's fills engine never guesses a multiplier.
+                try
+                {
+                    var mi = pos.Instrument.MasterInstrument;
+                    if (mi != null && !string.IsNullOrEmpty(mi.Name) && mi.PointValue > 0)
+                        lock (pointValues) { pointValues[mi.Name] = mi.PointValue; }
+                }
+                catch { }
                 sb.Append("{\"inst\":").Append(JsonString(pos.Instrument.FullName ?? ""));
                 sb.Append(",\"qty\":").Append(qty.ToString(CultureInfo.InvariantCulture));   // [FIX-K]
                 sb.Append(",\"avg\":").Append(D(avg));
