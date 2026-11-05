@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-__version__ = "1.0.5rc2"
+__version__ = "1.0.5rc3"
 
 # `SocketTrader.exe --version` / `python SocketTrader.py --version`: answered
 # before any import so installers and build checks get it in milliseconds.
@@ -11289,6 +11289,14 @@ BRACKET_ATTACH_S = 15.0       # a position older than this with less Stop
 _NT_POSITION_RE = re.compile(
     r"\|1\|64\|Instrument='(?P<instr>[^']+)' Account='(?P<acct>[^']+)' Average price=[0-9.]+ "
     r"Quantity=(?P<qty>\d+) Market position=(?P<mp>\w+) Operation=(?P<op>\w+)")
+# One fill, as NinjaTrader logs it the instant it happens: the price and
+# size of THIS execution (a partial fill is its own line), which way it
+# went (Market position=Long bought, Short sold) and the order it filled.
+# The fills engine (_fills_on_execution) cuts trade rows from these.
+_NT_EXECUTION_RE = re.compile(
+    r"\|1\|8\|Execution='(?P<xid>[^']+)' Instrument='(?P<instr>[^']+)' Account='(?P<acct>[^']+)' "
+    r"Exchange=\S+ Price=(?P<price>[0-9.]+) Quantity=(?P<qty>\d+) "
+    r"Market position=(?P<mp>Long|Short) Operation=\w+ Order='(?P<oid>[^']*)'")
 BRACKET_GUARD_FILL_WINDOW_S = 5.0   # the position line that explains a bracket fill comes this soon after
 _bracket_fills: dict[tuple[str, str], tuple[float, str, str]] = {}   # (acct, NT name) -> (stamp, order id, name)
 
@@ -11549,6 +11557,16 @@ def _bracket_guard_event(line: str, now: float | None = None) -> str | None:
         logger.error(f"NT CLOSE FAILED  {msg} — NinjaTrader is not executing closes; "
                      "close at the broker and restart NinjaTrader")
         return "alert"
+    x = _NT_EXECUTION_RE.search(line)
+    if x:
+        stamp = _nt_log_stamp_ms(line) or now
+        if now - stamp <= FILLS_MAX_AGE_S:          # history is not news
+            try:
+                _fills_on_execution(x["acct"], x["instr"], float(x["price"]), int(x["qty"]),
+                                    x["mp"], x["oid"], stamp, xid=x["xid"])
+            except Exception as exc:
+                logger.error(f"FILLS  execution line skipped: {exc}")
+        return None
     o = _NT_ORDER_STATE_RE.search(line)
     if o:
         book = _nt_orders.setdefault((o["acct"], _alias_root(o["instr"]).upper()), {})
@@ -12445,6 +12463,7 @@ async def live_bridge_task():
                 if not accts:
                     continue
                 _bridge_ingest_book(accts)
+                _fills_note_point_values(obj)
                 for a in accts:
                     name = a.get("name")
                     if not name:
@@ -15522,6 +15541,558 @@ def _pnl_settle_session(name: str, acct_day: dict, cash: float,
     return _pnl_settle_late(name, gap, date, trades, ts, shape)
 
 
+# ---------- Fills engine ----------
+# Trade rows cut from NinjaTrader's own execution lines, not from the
+# difference between two position snapshots.
+#
+# 2026-11-05 11:00:02: one NQ-MacroZoneB signal fanned out to four
+# accounts and every leg was stopped out within 1.0 s of filling. The 2 s
+# snapshot diff saw SimWhop's leg (labelled right), caught SimAI's 3-lot
+# mid-partial as 1 contract (a 1-lot row, the other two "unobserved"), and
+# never saw SimTEST's or PTLOP's at all ("unobserved fill", no market, no
+# side). The same poll-timing lottery is what minted $0.00 rows (the
+# position left the snapshot a poll after its money moved, so the money
+# went `late` onto the previous trade) and "Manual" rows after a restart
+# (the attribution lived in memory only).
+#
+# NinjaTrader logs every fill the instant it happens — price, size, side,
+# account, the order it filled — and bracket_guard_task already tails that
+# log every second. So: each fill opens or closes lots on (account, root),
+# FIFO; a closing fill cuts a row with the exact entry and exit, the lots'
+# strategy labels (staged by the dispatch path when it fired the entry),
+# and a P&L from the prices and the contract's point value. NinjaTrader's
+# realized, when it lands within FILLS_MONEY_WINDOW_S, replaces the
+# estimate with the exact dollars; the day-end settle-up stays as the
+# backstop. Open lots and their labels persist across restarts.
+#
+# The snapshot diff remains the engine when NinjaTrader's log is not in
+# view (no output directory, log not readable, the tail not running).
+FILLS_MAX_AGE_S = 120.0        # an execution line older than this is history
+FILLS_MONEY_WINDOW_S = 8.0     # realized landing within this of a row is that row's
+FILLS_ENTRY_COMM_WINDOW_S = 8.0  # realized dipping within this of an entry is its commission
+FILLS_OPEN_FILE = "open_lots.json"   # in PNL_DIR: open lots + labels, for restarts
+_fills_lots: dict[tuple[str, str], list[dict]] = {}   # (account, ROOT) -> open lots, FIFO
+_fills_wait: dict[str, list[tuple[float, dict]]] = {}  # account -> rows awaiting NT's dollars
+_fills_entries: dict[str, list[tuple[float, str, int]]] = {}  # account -> recent (ts, ROOT, qty) opens
+_fills_comm: dict[tuple[str, str], float] = {}         # (account, ROOT) -> $/contract/side, learned
+_fills_dirty = False
+_fills_seen_xids: "OrderedDict[str, float]" = OrderedDict()   # execution ids already applied
+_fills_last_row: dict[tuple[str, str], tuple[str, dict]] = {}  # (account, ROOT) -> (closing order id, its row)
+FILLS_MERGE_S = 60.0           # partial fills of one closing order land in one row
+# Dollars per 1.00 of price, by root. The bridge reports NinjaTrader's own
+# PointValue per position (snapshot "pv"), which wins; this table is the
+# fallback for the roots a futures account is likely to trade.
+_POINT_VALUE: dict[str, float] = {
+    "NQ": 20.0, "MNQ": 2.0, "ES": 50.0, "MES": 5.0, "RTY": 50.0, "M2K": 5.0,
+    "YM": 5.0, "MYM": 0.5, "NKD": 5.0, "EMD": 100.0,
+    "GC": 100.0, "MGC": 10.0, "SI": 5000.0, "SIL": 1000.0, "HG": 25000.0, "MHG": 2500.0,
+    "PL": 50.0, "PA": 100.0,
+    "CL": 1000.0, "MCL": 100.0, "QM": 500.0, "NG": 10000.0, "QG": 2500.0, "MNG": 1000.0,
+    "RB": 42000.0, "HO": 42000.0, "BZ": 1000.0,
+    "ZB": 1000.0, "ZN": 1000.0, "ZF": 1000.0, "ZT": 2000.0, "UB": 1000.0, "TN": 1000.0,
+    "ZC": 50.0, "ZS": 50.0, "ZW": 50.0, "ZM": 100.0, "ZL": 600.0, "KE": 50.0,
+    "HE": 400.0, "LE": 400.0, "GF": 500.0,
+    "6E": 125000.0, "6B": 62500.0, "6J": 12500000.0, "6A": 100000.0, "6C": 100000.0,
+    "6S": 125000.0, "6N": 100000.0, "M6E": 12500.0, "M6B": 6250.0, "M6A": 10000.0, "DX": 1000.0,
+    "BTC": 5.0, "MBT": 0.1, "ETH": 50.0, "MET": 0.1,
+    "VX": 1000.0, "VXM": 100.0,
+}
+_fills_pv_seen: dict[str, float] = {}     # ROOT -> point value NinjaTrader reported
+
+
+def _point_value(root: str) -> float | None:
+    r = (root or "").upper()
+    pv = _fills_pv_seen.get(r)
+    if pv:
+        return pv
+    return _POINT_VALUE.get(r)
+
+
+def _fills_note_point_values(doc: dict) -> None:
+    """Remember NinjaTrader's own point value per root when a bridge line
+    carries them ({"pv": {"NQ": 20, ...}}) or a position row does."""
+    global _fills_dirty
+    if not isinstance(doc, dict):
+        return
+    pvs = doc.get("pv")
+    if isinstance(pvs, dict):
+        for root, pv in pvs.items():
+            try:
+                v = float(pv)
+            except (TypeError, ValueError):
+                continue
+            r = str(root or "").strip().upper()
+            if r and v > 0 and _fills_pv_seen.get(r) != v:
+                _fills_pv_seen[r] = v
+                _fills_dirty = True
+    for row in doc.get("accounts") or []:
+        if not isinstance(row, dict):
+            continue
+        for p in row.get("positions") or []:
+            if not isinstance(p, dict):
+                continue
+            try:
+                pv = float(p.get("pv") or 0)
+            except (TypeError, ValueError):
+                continue
+            if pv > 0:
+                root = _alias_root(str(p.get("instrument") or p.get("inst") or "")).upper()
+                if root and _fills_pv_seen.get(root) != pv:
+                    _fills_pv_seen[root] = pv
+                    _fills_dirty = True
+
+
+def _fills_active(now: float | None = None) -> bool:
+    """Is the fills engine the one cutting rows right now? True while
+    NinjaTrader's log is in view (the tail read it within NT_TAIL_FRESH_S)."""
+    return _nt_tail_alive(now)
+
+
+def _fills_net(key: tuple[str, str]) -> int:
+    return sum(int(l.get("qty") or 0) for l in _fills_lots.get(key) or [])
+
+
+def _fills_label(account: str, root: str, side: int, stamp: float,
+                 oid: str = "", lots: list[dict] | None = None) -> tuple[str, str]:
+    """(strategy label, role) for a lot opening on (account, root) in
+    `side` (+1 long, -1 short): what the dispatch path staged for this
+    root — the strategies it fired entries for, their sides — or nothing
+    for a fill nobody here fired (a Chart Trader trade: "Manual").
+
+    One staged label goes to one order: a second partial fill of the same
+    order wears the first partial's label, a second order on the root
+    takes the next label still unclaimed, and an order with nothing left
+    to claim wears the last label fired that way (an add-on)."""
+    for lot in lots or []:
+        if oid and lot.get("oid") == oid:
+            return lot.get("strategy") or "", lot.get("role") or ""
+    meta = _pnl_open_meta.get((account, root)) or {}
+    nxt = meta.get("next") if isinstance(meta.get("next"), dict) else None
+    source = meta
+    labels = list(meta.get("strategies") or [])
+    sides = meta.get("sides") or {}
+    same = [s for s in labels if sides.get(s, side) == side]
+    if not same and nxt:
+        source = nxt
+        same = [s for s in (nxt.get("strategies") or [])
+                if (nxt.get("sides") or {}).get(s, side) == side]
+    if not same:
+        return "", ""
+    staged = source.get("staged_ts")
+    if staged is not None and stamp - staged > PNL_STAGED_TTL_S and meta.get("ts") is None:
+        return "", ""                      # the staged entry is stale: not this fill
+    claimed = source.setdefault("lotted", [])
+    fresh = [s for s in same if s not in claimed]
+    pick = fresh[0] if fresh else same[-1]
+    if pick not in claimed:
+        claimed.append(pick)
+    return pick, source.get("role") or ""
+
+
+def _fills_on_execution(account: str, instrument: str, price: float, qty: int,
+                        mp: str, oid: str, stamp: float, xid: str = "") -> list[dict]:
+    """Apply one NinjaTrader fill to the lots of (account, root). A fill in
+    the direction of what is held (or onto a flat root) opens lots; one
+    against it closes lots FIFO and cuts a trade row; more than is held
+    closes everything and opens the rest the other way (a reversal).
+    Returns the rows cut (usually none or one)."""
+    if qty <= 0 or not math.isfinite(price) or price <= 0:
+        return []
+    if account not in target_accounts():
+        return []
+    xid = xid or f"{account}|{oid}|{stamp:.3f}|{price}|{qty}"
+    if xid in _fills_seen_xids:
+        return []
+    _fills_seen_xids[xid] = stamp
+    while len(_fills_seen_xids) > 2048:
+        _fills_seen_xids.popitem(last=False)
+    global _fills_dirty
+    root = _alias_root(instrument).upper()
+    if not root:
+        return []
+    key = (account, root)
+    signed = qty if mp == "Long" else -qty
+    lots = _fills_lots.setdefault(key, [])
+    net = sum(int(l["qty"]) for l in lots)
+    rows: list[dict] = []
+    remaining = abs(signed)
+    direction = 1 if signed > 0 else -1
+    if net and (net > 0) != (signed > 0):
+        # Closing against what is held, oldest lots first.
+        pieces: list[dict] = []
+        while remaining and lots and (lots[0]["qty"] > 0) != (signed > 0):
+            lot = lots[0]
+            held = abs(int(lot["qty"]))
+            take = min(remaining, held)
+            share_cost = float(lot.get("cost") or 0.0) * take / held
+            pieces.append({"qty": take, "price": float(lot["price"]), "ts": lot["ts"],
+                           "strategy": lot.get("strategy") or "", "role": lot.get("role") or "",
+                           "cost": share_cost, "side": 1 if lot["qty"] > 0 else -1})
+            if take == held:
+                lots.pop(0)
+            else:
+                lot["qty"] = (held - take) * (1 if lot["qty"] > 0 else -1)
+                lot["cost"] = float(lot.get("cost") or 0.0) - share_cost
+            remaining -= take
+        if pieces:
+            rows.append(_fills_cut_row(account, root, instrument, pieces, price, oid, stamp))
+    if remaining:
+        # Opening (or the far side of a reversal).
+        label, role = _fills_label(account, root, direction, stamp, oid, lots)
+        lots.append({"qty": remaining * direction, "price": price, "ts": stamp,
+                     "strategy": label, "role": role, "cost": 0.0, "oid": oid})
+        _fills_entries.setdefault(account, []).append((stamp, root, remaining))
+        _fills_entries[account] = _fills_entries[account][-32:]
+        meta = _pnl_open_meta.setdefault(
+            key, {"strategies": [], "ts": None, "avg": None, "cost": 0.0})
+        if meta.get("ts") is None:
+            meta["ts"] = stamp
+        meta["side"] = direction
+        meta["avg"] = _fills_avg(lots)
+        if label and label not in meta.get("strategies", []):
+            meta.setdefault("strategies", []).append(label)
+        if role and not meta.get("role"):
+            meta["role"] = role
+    if not lots:
+        _fills_lots.pop(key, None)
+        _ledger_prune_flat(account, root)
+        gone = _pnl_open_meta.pop(key, None)
+        nxt = _pnl_next_slot(gone, stamp) if gone else None
+        if nxt is not None:
+            _pnl_open_meta[key] = _pnl_meta_from_next(nxt)
+    _fills_dirty = True
+    return rows
+
+
+def _fills_avg(lots: list[dict]) -> float | None:
+    tot = sum(abs(int(l["qty"])) for l in lots)
+    if not tot:
+        return None
+    return sum(abs(int(l["qty"])) * float(l["price"]) for l in lots) / tot
+
+
+def _fills_exit_kind(account: str, root: str, oid: str) -> str:
+    """stop / target / close / entry (a reversal) / manual — from the name
+    NinjaTrader gave the order that filled, per its log."""
+    book = _nt_orders.get((account, root)) or {}
+    rec = book.get(oid)
+    name = (rec[0] if rec else "") or ""
+    if _nt_is_stop_name(name):
+        return "stop"
+    low = name.lower()
+    if low.startswith("target"):
+        return "target"
+    if low.startswith("close") or low.startswith("exit"):
+        return "close"
+    if low.startswith("entry"):
+        return "reverse"
+    return "manual" if not name else low
+
+
+def _fills_cut_row(account: str, root: str, instrument: str, pieces: list[dict],
+                   exit_price: float, oid: str, stamp: float) -> dict:
+    """One trade row for the lots a closing fill just took out. A later
+    partial fill of the SAME closing order (NinjaTrader fills a 3-lot stop
+    as 2 then 1) joins the row it started instead of cutting another."""
+    global _pnl_dirty
+    qty = sum(p["qty"] for p in pieces)
+    side = pieces[0]["side"]
+    cost = sum(p["cost"] for p in pieces)                 # entry commissions parked on the lots
+    labels: list[str] = []
+    for p in pieces:
+        for s in (p["strategy"] or "").split(" + "):
+            if s and s not in labels:
+                labels.append(s)
+    role = next((p["role"] for p in pieces if p["role"]), "")
+    prior = _fills_last_row.get((account, root))
+    if prior and oid and prior[0] == oid and stamp - float(prior[1]["ts"]) <= FILLS_MERGE_S:
+        row = prior[1]
+        q0 = int(row["qty"])
+        entry = (float(row["entry"]) * q0 + sum(p["qty"] * p["price"] for p in pieces)) / (q0 + qty)
+        exit_vwap = (float(row["exit"]) * q0 + exit_price * qty) / (q0 + qty)
+        for s in labels:
+            if s not in (row["strategy"].split(" + ") if row["strategy"] else []):
+                row["strategy"] = (row["strategy"] + " + " + s) if row["strategy"] else s
+        if role and not row.get("role"):
+            row["role"] = role
+        row["qty"] = q0 + qty
+        row["opened_ts"] = min(row["opened_ts"], min(p["ts"] for p in pieces))
+        row["cost"] = round(float(row.get("cost") or 0.0) + cost, 4)
+        qty, cost = row["qty"], row["cost"]
+    else:
+        entry = sum(p["qty"] * p["price"] for p in pieces) / qty
+        exit_vwap = exit_price
+        row = None
+    pv = _point_value(root)
+    gross = ((exit_vwap - entry) * side * qty * pv) if pv else None
+    rate = _fills_comm.get((account, root))
+    exit_comm = (rate * qty) if rate else 0.0
+    est = (gross + cost - exit_comm) if gross is not None else cost - exit_comm
+    if row is not None:
+        row["entry"], row["exit"] = round(entry, 6), round(exit_vwap, 6)
+        row["pnl"], row["approx"] = round(est, 2), gross is None
+        _pnl_dirty = True
+        logger.info(f"FILLS  {account} {root} {row['side']} +{sum(p['qty'] for p in pieces)} "
+                    f"(same order) -> {qty} @ {entry:g} -> {exit_vwap:g} est ${est:+,.2f}")
+        return row
+    date = get_session_id() or time.strftime("%Y-%m-%d", time.localtime(stamp))
+    row = {
+        "ts": round(stamp, 3),
+        "account": account,
+        "symbol": root,
+        "side": "LONG" if side > 0 else "SHORT",
+        "qty": qty,
+        "strategy": " + ".join(labels),
+        "entry": round(entry, 6),
+        "exit": round(exit_vwap, 6),
+        "opened_ts": min(p["ts"] for p in pieces),
+        "pnl": round(est, 2),
+        "approx": gross is None,
+        "fills": True,
+        "exit_kind": _fills_exit_kind(account, root, oid),
+        "cost": round(cost, 4),
+    }
+    if role:
+        row["role"] = role
+    with _pnl_lock:
+        days = _pnl_hot(date[:7])
+        day = days.setdefault(date, {"accounts": {}, "trades": []})
+        if len(day["trades"]) < PNL_TRADES_PER_DAY_CAP:
+            day["trades"].append(row)
+            _pnl_dirty = True
+    _pnl_recent[account] = (date, [row])
+    _fills_wait.setdefault(account, []).append((stamp, row))
+    _fills_wait[account] = _fills_wait[account][-16:]
+    _fills_last_row[(account, root)] = (oid, row)
+    if len(_fills_last_row) > 512:
+        _fills_last_row.pop(next(iter(_fills_last_row)))
+    logger.info(f"FILLS  {account} {root} {row['side']} {qty} @ {entry:g} -> {exit_vwap:g} "
+                f"({row['exit_kind']}) {row['strategy'] or 'manual'} est ${est:+,.2f}")
+    return row
+
+
+def _fills_assign_money(account: str, dreal: float | None, ts: float, date: str,
+                        trades: list, shape: dict[str, int]) -> bool:
+    """Put NinjaTrader's realized change on the rows it belongs to.
+
+    Realized moves for two reasons: an exit filled (its P&L net of the
+    exit commission) or an entry filled (its commission). Rows cut from
+    fills within FILLS_MONEY_WINDOW_S take the money — one row takes it
+    exactly, several split it by their estimates; an entry with no exit
+    in the window parks the dip on its lots as cost (and teaches the
+    commission rate); money with neither is handed to the late path as
+    before. Returns True when something was written."""
+    global _pnl_dirty, _fills_dirty
+    if dreal is None or abs(dreal) < 0.005:
+        return False
+    waiting = [(t, r) for t, r in _fills_wait.get(account) or [] if ts - t <= FILLS_MONEY_WINDOW_S]
+    _fills_wait[account] = waiting
+    opened = [(t, root, q) for t, root, q in _fills_entries.get(account) or []
+              if ts - t <= FILLS_ENTRY_COMM_WINDOW_S]
+    if waiting:
+        # An entry in the same window whose lots are STILL open paid its
+        # commission out of this delta too: take the known rate back out
+        # and park it on that lot, so the rows share only what the exits
+        # made. An entry that already closed inside the window (a
+        # one-second stop-out) is part of a row here, and its commission
+        # belongs in that row.
+        pool = dreal
+        for t, root, q in opened:
+            rate = _fills_comm.get((account, root))
+            lot = next((l for l in _fills_lots.get((account, root)) or []
+                        if abs(l["ts"] - t) < 0.5), None)
+            if lot is not None and rate:
+                pool += rate * q
+                lot["cost"] = round(float(lot.get("cost") or 0.0) - rate * q, 4)
+        rows = [r for _, r in waiting]
+        if len(rows) == 1:
+            r = rows[0]
+            r["pnl"] = round(pool + float(r.get("cost") or 0.0), 2)
+            r["approx"] = False
+        else:
+            weights = [abs(float(r.get("pnl") or 0.0)) or float(r.get("qty") or 1) for r in rows]
+            total = sum(weights) or 1.0
+            for r, w in zip(rows, weights):
+                r["pnl"] = round(pool * w / total + float(r.get("cost") or 0.0), 2)
+                r["approx"] = True
+        _fills_wait[account] = []
+        _fills_entries[account] = [e for e in _fills_entries.get(account) or [] if e not in opened]
+        _pnl_dirty = True
+        _fills_dirty = True
+        return True
+    if opened and dreal < 0:
+        # Nothing closed: this is what the entries cost. Park it on their
+        # lots so the row at exit carries it, and learn the rate.
+        total_q = sum(q for _, _, q in opened) or 1
+        for t, root, q in opened:
+            share = dreal * q / total_q
+            for lot in _fills_lots.get((account, root)) or []:
+                if abs(lot["ts"] - t) < 0.5:
+                    lot["cost"] = round(float(lot.get("cost") or 0.0) + share, 4)
+                    break
+            per = abs(share) / q
+            if 0 < per <= 50:
+                old = _fills_comm.get((account, root))
+                _fills_comm[(account, root)] = round(per if old is None else (old * 0.7 + per * 0.3), 4)
+        _fills_entries[account] = [e for e in _fills_entries.get(account) or [] if e not in opened]
+        _fills_dirty = True
+        return False
+    return _pnl_settle_late(account, dreal, date, trades, ts, shape)
+
+
+def _fills_shape(account: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for (acct, root), lots in _fills_lots.items():
+        if acct == account:
+            n = sum(int(l["qty"]) for l in lots)
+            if n:
+                out[root] = n
+    return out
+
+
+def _fills_reconcile_book(account: str, shape: dict[str, int], row: dict, ts: float) -> None:
+    """At the first snapshot after boot, bring the persisted lots into
+    line with what NinjaTrader actually holds, at once: lots for a root
+    the book no longer shows closed while this app was down (their money
+    reaches the record through the settle-up, as an unseen row, as
+    before); a root held in a size the lots do not match is re-seeded
+    from the snapshot, keeping the labels."""
+    mine = _fills_shape(account)
+    for root in set(mine) | set(shape):
+        if mine.get(root, 0) != shape.get(root, 0):
+            _fills_mismatch[(account, root)] = ts - FILLS_BOOK_GRACE_S - 1
+    _fills_sync_book(account, shape, row, ts)
+
+
+FILLS_BOOK_GRACE_S = 6.0       # lots and the snapshot may disagree this long (tail lag)
+_fills_mismatch: dict[tuple[str, str], float] = {}   # (account, ROOT) -> since when they disagree
+
+
+def _fills_sync_book(account: str, shape: dict[str, int], row: dict, ts: float) -> None:
+    """Every poll: keep the lots honest against the snapshot. The log is
+    the source of truth for fills, but a line can be missed (the tail
+    was down for a moment, NinjaTrader wrote it late), so a root the
+    snapshot shows flat while lots say open — or held while lots say
+    flat — for longer than FILLS_BOOK_GRACE_S is re-seeded from the
+    snapshot. Lots that came from a snapshot in the first place (no
+    order id) follow the snapshot at once."""
+    global _fills_dirty
+    mine = _fills_shape(account)
+    for root in set(mine) | set(shape):
+        key = (account, root)
+        have, want = mine.get(root, 0), shape.get(root, 0)
+        if have == want:
+            _fills_mismatch.pop(key, None)
+            continue
+        lots = _fills_lots.get(key) or []
+        snapshot_sourced = bool(lots) and all(not l.get("oid") for l in lots)
+        since = _fills_mismatch.setdefault(key, ts)
+        if not snapshot_sourced and ts - since < FILLS_BOOK_GRACE_S:
+            continue
+        _fills_mismatch.pop(key, None)
+        if not want:
+            _fills_lots.pop(key, None)
+            _ledger_prune_flat(account, root)
+            gone = _pnl_open_meta.pop(key, None)
+            nxt = _pnl_next_slot(gone, ts) if gone else None
+            if nxt is not None:
+                _pnl_open_meta[key] = _pnl_meta_from_next(nxt)
+            if not snapshot_sourced:
+                logger.info(f"FILLS  {account} {root}: snapshot flat for {ts - since:.0f}s with "
+                            f"{abs(have)} lot(s) open and no exit logged — lots dropped")
+        else:
+            labels = [l.get("strategy") for l in lots if l.get("strategy")]
+            role = next((l.get("role") for l in lots if l.get("role")), "")
+            if not labels:
+                lab, role2 = _fills_label(account, root, 1 if want > 0 else -1, ts)
+                if lab:
+                    labels, role = [lab], role2
+            avg = _pnl_avg_price(row, root) or (lots[0]["price"] if lots else 0.0)
+            _fills_lots[key] = [{"qty": want, "price": float(avg or 0.0), "ts": ts,
+                                 "strategy": " + ".join(dict.fromkeys(labels)), "role": role,
+                                 "cost": sum(float(l.get("cost") or 0.0) for l in lots),
+                                 "oid": ""}]
+            meta = _pnl_open_meta.setdefault(
+                key, {"strategies": [], "ts": None, "avg": None, "cost": 0.0})
+            if meta.get("ts") is None:
+                meta["ts"] = ts
+            meta["avg"], meta["side"] = float(avg or 0.0) or None, (1 if want > 0 else -1)
+            logger.info(f"FILLS  {account} {root}: snapshot shows {want:+d}, lots had {have:+d} — "
+                        "re-seeded from the snapshot")
+        _fills_dirty = True
+
+
+def _fills_save(force: bool = False) -> None:
+    """Persist open lots (and their labels) so a restart keeps them."""
+    global _fills_dirty
+    if not _fills_dirty and not force:
+        return
+    if not _pnl_dir_ready():
+        return
+    payload = {
+        "v": 1,
+        "lots": [{"account": a, "root": r, "lots": lots}
+                 for (a, r), lots in _fills_lots.items() if lots],
+        "comm": [{"account": a, "root": r, "rate": v} for (a, r), v in _fills_comm.items()],
+        "pv": dict(_fills_pv_seen),
+    }
+    path = PNL_DIR / FILLS_OPEN_FILE
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
+        _fills_dirty = False
+    except OSError as exc:
+        logger.warning(f"FILLS  open lots not saved: {exc}")
+
+
+def _fills_load() -> int:
+    """Restore open lots saved by the previous run. Returns how many."""
+    path = PNL_DIR / FILLS_OPEN_FILE
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    n = 0
+    for ent in doc.get("lots") or []:
+        try:
+            key = (str(ent["account"]), str(ent["root"]).upper())
+            lots = [{"qty": int(l["qty"]), "price": float(l["price"]), "ts": float(l["ts"]),
+                     "strategy": str(l.get("strategy") or ""), "role": str(l.get("role") or ""),
+                     "cost": float(l.get("cost") or 0.0), "oid": str(l.get("oid") or "")}
+                    for l in ent["lots"] if int(l["qty"])]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if lots:
+            _fills_lots[key] = lots
+            n += len(lots)
+            meta = _pnl_open_meta.setdefault(
+                key, {"strategies": [], "ts": None, "avg": None, "cost": 0.0})
+            meta["ts"] = min(l["ts"] for l in lots)
+            meta["avg"] = _fills_avg(lots)
+            meta["side"] = 1 if lots[0]["qty"] > 0 else -1
+            for l in lots:
+                for s in (l["strategy"] or "").split(" + "):
+                    if s and s not in meta["strategies"]:
+                        meta["strategies"].append(s)
+                if l["role"] and not meta.get("role"):
+                    meta["role"] = l["role"]
+    for ent in doc.get("comm") or []:
+        try:
+            _fills_comm[(str(ent["account"]), str(ent["root"]).upper())] = float(ent["rate"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    for root, pv in (doc.get("pv") or {}).items():
+        try:
+            if float(pv) > 0:
+                _fills_pv_seen[str(root).upper()] = float(pv)
+        except (TypeError, ValueError):
+            continue
+    if n:
+        logger.info(f"FILLS  restored {n} open lot(s) from the previous run")
+    return n
+
+
 def _pnl_observe(live: dict, now: float | None = None,
                  session_date: str | None = None):
     """Feed one /api/live view into the daily history.
@@ -15539,6 +16110,8 @@ def _pnl_observe(live: dict, now: float | None = None,
     if not date:
         return
     ts = now if now is not None else time.time()
+    _fills_note_point_values(live)
+    fills = _fills_active(ts)
     with _pnl_lock:
         # The live month, flushing any previous one on the way in.
         hist_days = _pnl_hot(date[:7])
@@ -15610,6 +16183,8 @@ def _pnl_observe(live: dict, now: float | None = None,
             _pnl_prev[name] = {"cash": cash, "shape": shape,
                                "realized": realized, "date": date}
             if prev is None:
+                if fills:
+                    _fills_reconcile_book(name, shape, row, ts)
                 # First sight after boot: adopt what is already open as
                 # unattributed rather than pretending it just happened.
                 for root, qty in shape.items():
@@ -15640,6 +16215,18 @@ def _pnl_observe(live: dict, now: float | None = None,
             dreal = (realized - pr
                      if realized is not None and isinstance(pr, (int, float))
                      else None)
+            if fills:
+                # NinjaTrader's log is in view: the fills engine has cut
+                # the rows already, from the executions themselves. All
+                # the snapshot contributes here is the dollars — and a
+                # check that the lots still agree with the book.
+                _fills_sync_book(name, shape, row, ts)
+                if _fills_assign_money(name, dreal, ts, date, day["trades"], shape):
+                    _pnl_dirty = True
+                if _pnl_settle_session(name, acct_day, cash, shape,
+                                       day["trades"], date, ts, settled):
+                    _pnl_dirty = True
+                continue
             # Money moved this poll: the only evidence a snapshot has that
             # a leg left and another arrived while the quantity held still.
             moved = (abs(dreal) >= 0.005 if dreal is not None
@@ -15943,6 +16530,14 @@ async def pnl_tracker_task():
     the same class of load as balance_monitor. Purely observational:
     nothing here can touch an order."""
     try:
+        # Open lots from the previous run, so a restart keeps every open
+        # position's entry price and strategy label (2026-11-03 23:49: the
+        # two MNQ that filled after NinjaTrader's restart closed as
+        # "Manual" because the attribution lived in memory only).
+        try:
+            await asyncio.to_thread(_fills_load)
+        except Exception as exc:
+            logger.error(f"FILLS  restore failed: {exc}")
         while not shutdown.is_set():
             try:
                 await asyncio.sleep(PNL_TRACK_INTERVAL)
@@ -15961,6 +16556,7 @@ async def pnl_tracker_task():
                 live = await asyncio.to_thread(web_live)
                 _pnl_observe(live)
                 await asyncio.to_thread(_pnl_save)
+                await asyncio.to_thread(_fills_save)
             except Exception as exc:
                 logger.error(f"pnl_tracker error: {exc}")
     finally:
@@ -15968,6 +16564,7 @@ async def pnl_tracker_task():
         # save is at most a few seconds of bookkeeping.
         try:
             _pnl_save(force=True)
+            _fills_save(force=True)
         except Exception:
             pass
 
@@ -18422,7 +19019,7 @@ function renderDayPanel(day,date){
     "no round-trips recorded — the day net came from balance changes"));return}
   const t=el("table"),th=el("thead"),hr=el("tr");
   [["Time",""],["Account",""],["Symbol",""],["Side",""],["Qty","num"],
-   ["Strategy",""],["Entry","num"],["Held","num"],["P&L","num"]]
+   ["Strategy",""],["Entry \u2192 Exit","num"],["Held","num"],["P&L","num"]]
     .forEach(([x,c])=>hr.appendChild(el("th",c,x)));
   th.appendChild(hr);t.appendChild(th);
   const tb=el("tbody");
@@ -18439,8 +19036,10 @@ function renderDayPanel(day,date){
     r.appendChild(td("num"+(x.unseen?" dim":""),x.unseen?"—":x.qty));
     const sc=td("dim",stratOf(x)||(x.unseen?"unobserved fill":"unattributed"));
     if(x.strategy&&x.role)sc.appendChild(el("span","tag rtag",roleOf(x)));
+    /* A row cut from NinjaTrader's fills says what took it out. */
+    if(x.exit_kind&&x.exit_kind!=="manual")sc.appendChild(el("span","tag",x.exit_kind));
     r.appendChild(sc);
-    r.appendChild(td("num dim",x.entry!=null?fmt(x.entry):"—"));
+    r.appendChild(td("num dim",x.entry!=null?fmt(x.entry)+(x.exit!=null?" \u2192 "+fmt(x.exit):""):"—"));
     r.appendChild(td("num dim",
       !x.unseen&&x.opened_ts!=null?held(x.ts-x.opened_ts):"—"));
     const pc=td("num "+pnlCls(x.pnl),

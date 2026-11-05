@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.0.5rc3 — 2026-11-05 (pre-release)
+
+### Changed
+- **Trade rows are cut from NinjaTrader's fills, not from snapshot
+  diffs.** The trade log used to be rebuilt by comparing position
+  snapshots every 2 s and handing whatever RealizedPnL moved in that
+  window to whatever position change was noticed in it. 2026-11-05
+  11:00:02: one NQ-MacroZoneB signal, four legs, every one stopped out
+  within 1.0 s of filling — the diff saw one leg whole, one as a third of
+  itself (a 1-lot row plus an "unobserved fill" for the other two) and two
+  not at all ("unobserved fill", no market, no side). The same lottery
+  minted $0.00 / ±commission rows when the money landed a poll before the
+  position left (the dollars went `late` onto the previous trade), and
+  "Manual" rows after every restart (attribution lived in memory only).
+  bracket_guard_task already tails NinjaTrader's log every second; each
+  `Execution=` line now opens or closes lots FIFO per (account, root).
+  A closing fill cuts a row with the exact entry and exit, the size, the
+  strategy the dispatch path staged when it fired the entry, whether the
+  stop, the target, a close or a reversal took it out, and a P&L from the
+  prices and the contract's point value (NinjaTrader's own PointValue,
+  sent by the bridge as "pv"; a built-in table otherwise). NinjaTrader's
+  realized, when it lands within 8 s, replaces the estimate with the exact
+  dollars; an entry's commission is learned from the dip it books and
+  parked on the lot until the exit. Partial fills of one closing order
+  join one row. Open lots and their labels persist in
+  `.voidorigin_pnl/open_lots.json`, so a restart keeps them; at the first
+  snapshot after boot the lots are checked against the book, and every
+  poll after that (a root flat in the snapshot for 6 s with lots still
+  open, or held with none, is re-seeded). A fill nobody here fired — a
+  Chart Trader trade — has no staged label and stays "Manual". The
+  snapshot diff remains the engine when NinjaTrader's log is not in view.
+- Web trade log: "Entry → Exit" shows both prices; a tag says what took
+  the trade out (stop / target / close / reverse).
+- Bridge AddOn: each snapshot carries `"pv": {root: PointValue}` for every
+  root a position has been seen on ([FIX-S]).
+
 ## 1.0.5rc2 — 2026-11-04 (pre-release)
 
 2026-11-03 23:35:01: an NQ-MacroZoneB entry filled on the funded account and
