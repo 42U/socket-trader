@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-__version__ = "1.0.5rc3"
+__version__ = "1.0.5rc4"
 
 # `SocketTrader.exe --version` / `python SocketTrader.py --version`: answered
 # before any import so installers and build checks get it in milliseconds.
@@ -14571,6 +14571,7 @@ PNL_TRACK_INTERVAL = 2.0        # seconds between live-view observations
 PNL_SAVE_MIN_GAP_S = 10.0       # batch disk writes; data loss window is tiny
 PNL_TRADES_PER_DAY_CAP = 2000   # runaway guard — a real day is nowhere close
 PNL_SETTLE_POLLS = 3            # quiet polls before the transfer identity is trusted
+PNL_LATE_FALLBACK_S = 180.0     # after a restart, late money joins the last row only this soon after it
 PNL_MONTH_CACHE = 6             # past months held in memory while paging
 # How long a dispatched entry may sit unfilled before the record stops
 # believing in it. NinjaTrader books an entry's commission into RealizedPnL
@@ -15359,9 +15360,15 @@ def _pnl_settle_late(account: str, amount: float, date: str,
         # the account's last close is still the trade this money came
         # from. Falling back to it is what puts a late-settling winner
         # back on the trade that earned it instead of somewhere else.
+        # Only a RECENT close, though: money landing long after the last
+        # row is trading nobody here saw (2026-11-05 13:05: −$1,349 of
+        # manual trades during a 40-minute blind spot was glued onto a
+        # 12:14 row), and that belongs in a row of its own.
         mine = [t for t in trades if t.get("account") == account
                 and not t.get("unseen")]
         rows = mine[-1:] if mine else None
+        if rows and ts - float(rows[0].get("ts") or 0) > PNL_LATE_FALLBACK_S:
+            rows = None
     if not rows:
         return _pnl_unseen_row(account, amount, date, trades, ts, shape)
     total = sum(abs(r.get("qty") or 0) for r in rows)
@@ -16007,6 +16014,21 @@ def _fills_cut_row(account: str, root: str, instrument: str, pieces: list[dict],
     return row
 
 
+FILLS_MAX_COMM_PER_SIDE = 50.0   # a realized dip per contract above this is a loss, not a commission
+_fills_money: dict[str, list[tuple[float, float]]] = {}   # account -> (ts, $) realized moves with nothing to take them yet
+
+
+def _fills_in_flight(account: str, ts: float) -> bool:
+    """Is money or a row still inside its matching window? While it is, the
+    settle-up must not read the gap between them as P&L nobody saw."""
+    if any(ts - t <= FILLS_MONEY_WINDOW_S for t, _ in _fills_money.get(account) or []):
+        return True
+    if any(ts - t <= FILLS_MONEY_WINDOW_S for t, _ in _fills_wait.get(account) or []):
+        return True
+    return any(ts - t <= FILLS_ENTRY_COMM_WINDOW_S
+               for t, _, _ in _fills_entries.get(account) or [])
+
+
 def _fills_assign_money(account: str, dreal: float | None, ts: float, date: str,
                         trades: list, shape: dict[str, int]) -> bool:
     """Put NinjaTrader's realized change on the rows it belongs to.
@@ -16016,15 +16038,30 @@ def _fills_assign_money(account: str, dreal: float | None, ts: float, date: str,
     fills within FILLS_MONEY_WINDOW_S take the money — one row takes it
     exactly, several split it by their estimates; an entry with no exit
     in the window parks the dip on its lots as cost (and teaches the
-    commission rate); money with neither is handed to the late path as
+    commission rate).
+
+    Money with neither WAITS. The bridge pushes NinjaTrader's realized the
+    instant a fill books; the fill's own log line is read by the tail up
+    to a second later. 2026-11-05 12:40: three stop-outs' winnings
+    (+$133, +$420, +$440) reached the snapshot a poll before their rows
+    existed, were handed to the previous trade as `late` money, and the
+    settle-up then zeroed the real rows to make each account add up. So
+    realized that has nothing to take it is held for the window and
+    matched on a later poll — this runs every poll, dollars or not — and
+    only what has waited the whole window goes to the late path as
     before. Returns True when something was written."""
     global _pnl_dirty, _fills_dirty
-    if dreal is None or abs(dreal) < 0.005:
+    pend = _fills_money.get(account) or []
+    if dreal is not None and abs(dreal) >= 0.005:
+        pend.append((ts, dreal))
+    if not pend:
+        _fills_money.pop(account, None)
         return False
     waiting = [(t, r) for t, r in _fills_wait.get(account) or [] if ts - t <= FILLS_MONEY_WINDOW_S]
     _fills_wait[account] = waiting
     opened = [(t, root, q) for t, root, q in _fills_entries.get(account) or []
               if ts - t <= FILLS_ENTRY_COMM_WINDOW_S]
+    dreal = round(sum(d for _, d in pend), 2)
     if waiting:
         # An entry in the same window whose lots are STILL open paid its
         # commission out of this delta too: take the known rate back out
@@ -16032,6 +16069,7 @@ def _fills_assign_money(account: str, dreal: float | None, ts: float, date: str,
         # made. An entry that already closed inside the window (a
         # one-second stop-out) is part of a row here, and its commission
         # belongs in that row.
+        _fills_money.pop(account, None)
         pool = dreal
         for t, root, q in opened:
             rate = _fills_comm.get((account, root))
@@ -16056,10 +16094,13 @@ def _fills_assign_money(account: str, dreal: float | None, ts: float, date: str,
         _pnl_dirty = True
         _fills_dirty = True
         return True
-    if opened and dreal < 0:
+    total_q = sum(q for _, _, q in opened) or 1
+    if opened and dreal < 0 and abs(dreal) / total_q <= FILLS_MAX_COMM_PER_SIDE:
         # Nothing closed: this is what the entries cost. Park it on their
-        # lots so the row at exit carries it, and learn the rate.
-        total_q = sum(q for _, _, q in opened) or 1
+        # lots so the row at exit carries it, and learn the rate. A dip
+        # too big to be a commission is a loss whose row is still on its
+        # way (or an entry's commission plus that loss), and waits below.
+        _fills_money.pop(account, None)
         for t, root, q in opened:
             share = dreal * q / total_q
             for lot in _fills_lots.get((account, root)) or []:
@@ -16067,13 +16108,23 @@ def _fills_assign_money(account: str, dreal: float | None, ts: float, date: str,
                     lot["cost"] = round(float(lot.get("cost") or 0.0) + share, 4)
                     break
             per = abs(share) / q
-            if 0 < per <= 50:
+            if 0 < per <= FILLS_MAX_COMM_PER_SIDE:
                 old = _fills_comm.get((account, root))
                 _fills_comm[(account, root)] = round(per if old is None else (old * 0.7 + per * 0.3), 4)
         _fills_entries[account] = [e for e in _fills_entries.get(account) or [] if e not in opened]
         _fills_dirty = True
         return False
-    return _pnl_settle_late(account, dreal, date, trades, ts, shape)
+    # Nothing to take it yet: hold what is still inside the window for the
+    # row (or entry) the tail is about to read; hand the rest on.
+    keep = [(t, d) for t, d in pend if ts - t <= FILLS_MONEY_WINDOW_S]
+    stale = round(sum(d for t, d in pend if ts - t > FILLS_MONEY_WINDOW_S), 2)
+    if keep:
+        _fills_money[account] = keep[-16:]
+    else:
+        _fills_money.pop(account, None)
+    if abs(stale) < 0.005:
+        return False
+    return _pnl_settle_late(account, stale, date, trades, ts, shape)
 
 
 def _fills_shape(account: str) -> dict[str, int]:
@@ -16241,11 +16292,16 @@ def _pnl_rebuild_day(date: str, lines: list[str] | None = None, live: bool = Fal
     report; writes the record only when at least one row was rebuilt.
 
     `live`: this is the session in progress. Rows the live fills engine
-    cut itself are already exact and are kept (a rebuilt twin — same
+    cut itself and settled exactly are kept (a rebuilt twin — same
     account, market, side, size and exit second — is dropped in its
-    favour); only the rows the snapshot engine left behind earlier in the
-    session are replaced. Rows younger than FILLS_REBUILD_LIVE_KEEP_S are
-    never touched: they may still be waiting for NinjaTrader's dollars."""
+    favour); a live row whose dollars came `late` or were split (≈) did
+    not get them cleanly and yields to its twin. Only the rows the
+    snapshot engine left behind earlier in the session are replaced
+    otherwise. Rows younger than FILLS_REBUILD_LIVE_KEEP_S are never
+    touched: they may still be waiting for NinjaTrader's dollars. The
+    dollars are reconciled over the rows that end up in the record, so a
+    kept live row's exact P&L is taken out of what the rebuilt rows must
+    explain."""
     global _pnl_dirty
     report = {"date": date, "rows": 0, "replaced": [], "kept": [], "unseen": 0, "note": ""}
     if lines is None:
@@ -16283,12 +16339,42 @@ def _pnl_rebuild_day(date: str, lines: list[str] | None = None, live: bool = Fal
     by_acct: dict[str, list[dict]] = {}
     for r in rebuilt:
         by_acct.setdefault(r["account"], []).append(r)
+    kept = [t for t in old_rows if t.get("account") not in by_acct]
+    own: list[dict] = []
+    if live:
+        now = time.time()
+
+        def twin(a: dict, b: dict) -> bool:
+            return (a.get("account") == b.get("account") and a.get("symbol") == b.get("symbol")
+                    and a.get("side") == b.get("side") and int(a.get("qty") or 0) == int(b.get("qty") or 0)
+                    and abs(float(a.get("ts") or 0) - float(b.get("ts") or 0)) < 1.5)
+        for t in old_rows:
+            if t.get("account") not in by_acct:
+                continue
+            young = now - float(t.get("ts") or 0) <= FILLS_REBUILD_LIVE_KEEP_S
+            # A live row is exact only when its dollars came in cleanly:
+            # one that got them `late` (handed on by the settle-up) or
+            # split (≈) is what a rebuild is for, and yields to its twin
+            # — unless it is young enough to still be waiting for them.
+            exact = t.get("fills") and not t.get("late") and not t.get("approx")
+            if young or exact:
+                own.append(t)
+        for acct, rows in list(by_acct.items()):
+            rows[:] = [r for r in rows if not any(twin(r, o) for o in own)]
+            if not rows:
+                del by_acct[acct]
+        kept.extend(own)
     final: list[dict] = []
     for acct, rows in by_acct.items():
         a = acct_days.get(acct) or {}
         start, last, adj = a.get("start"), a.get("last"), float(a.get("adj") or 0.0)
         net = (round(last - start - adj, 2)
                if isinstance(start, (int, float)) and isinstance(last, (int, float)) else None)
+        if net is not None:
+            # What the kept live rows already account for is not for the
+            # rebuilt rows to explain.
+            net = round(net - sum(float(o.get("pnl") or 0.0) for o in own
+                                  if o.get("account") == acct), 2)
         contracts = sum(int(r["qty"]) for r in rows)
         gross_sum = sum(float(r["gross"] if r.get("gross") is not None else r["pnl"]) for r in rows)
         for r in rows:
@@ -16319,18 +16405,6 @@ def _pnl_rebuild_day(date: str, lines: list[str] | None = None, live: bool = Fal
                     report["unseen"] += 1
         final.extend(rows)
         report["replaced"].append(acct)
-    kept = [t for t in old_rows if t.get("account") not in by_acct]
-    if live:
-        now = time.time()
-        own = [t for t in old_rows if t.get("account") in by_acct
-               and (t.get("fills") or now - float(t.get("ts") or 0) <= FILLS_REBUILD_LIVE_KEEP_S)]
-
-        def twin(a: dict, b: dict) -> bool:
-            return (a.get("account") == b.get("account") and a.get("symbol") == b.get("symbol")
-                    and a.get("side") == b.get("side") and int(a.get("qty") or 0) == int(b.get("qty") or 0)
-                    and abs(float(a.get("ts") or 0) - float(b.get("ts") or 0)) < 1.5)
-        final = [r for r in final if not any(twin(r, o) for o in own)]
-        kept.extend(own)
     report["kept"] = sorted({t.get("account") for t in kept if t.get("account")})
     final.extend(kept)
     final.sort(key=lambda t: float(t.get("ts") or 0))
@@ -16595,12 +16669,19 @@ def _pnl_observe(live: dict, now: float | None = None,
                 # NinjaTrader's log is in view: the fills engine has cut
                 # the rows already, from the executions themselves. All
                 # the snapshot contributes here is the dollars — and a
-                # check that the lots still agree with the book.
+                # check that the lots still agree with the book. Without
+                # a realized figure (ATI alone reports none) the cash
+                # move is the dollars, as it is for the snapshot engine.
                 _fills_sync_book(name, shape, row, ts)
-                if _fills_assign_money(name, dreal, ts, date, day["trades"], shape):
+                money = dreal if dreal is not None else (dcash if realized is None else None)
+                if _fills_assign_money(name, money, ts, date, day["trades"], shape):
                     _pnl_dirty = True
-                if _pnl_settle_session(name, acct_day, cash, shape,
-                                       day["trades"], date, ts, settled):
+                # The settle-up waits while a row is still due its dollars
+                # or dollars their row: that gap is a second of tail lag,
+                # not P&L nobody saw.
+                if (not _fills_in_flight(name, ts)
+                        and _pnl_settle_session(name, acct_day, cash, shape,
+                                                day["trades"], date, ts, settled)):
                     _pnl_dirty = True
                 continue
             # Money moved this poll: the only evidence a snapshot has that
@@ -17241,6 +17322,29 @@ def _web_allowed_hosts() -> set[str]:
     return hosts | {f"{h}:{port}" for h in hosts}
 
 
+class _WebServer(http.server.ThreadingHTTPServer):
+    """ThreadingHTTPServer whose handle_error keeps the terminal clean.
+
+    The stdlib's prints forty dashes and a traceback to stderr — over the
+    TUI — every time a request thread dies, and a browser tab closing or
+    reloading mid-poll kills one: the keep-alive socket ends in
+    ConnectionResetError (WinError 10054, "forcibly closed by the remote
+    host") inside handle_one_request. That is the client leaving, not an
+    error here. Anything else goes to the log."""
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError,
+                            socket.timeout, TimeoutError)):
+            return
+        try:
+            where = client_address[0]
+        except (TypeError, IndexError):
+            where = "?"
+        logger.warning(f"WEB UI  request from {where} failed: {exc!r}")
+
+
 class _WebHandler(http.server.BaseHTTPRequestHandler):
     server_version = "SocketTrader"
     sys_version = ""
@@ -17492,11 +17596,11 @@ def start_web_ui(loop: asyncio.AbstractEventLoop, cfg: dict) -> str | None:
     _web_loop = loop
     _web_token = secrets.token_urlsafe(32)
     try:
-        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), _WebHandler)
+        httpd = _WebServer(("127.0.0.1", port), _WebHandler)
     except OSError as exc:
         logger.warning(f"WEB UI  port {port} busy ({exc}) — trying an ephemeral port")
         try:
-            httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _WebHandler)
+            httpd = _WebServer(("127.0.0.1", 0), _WebHandler)
         except OSError as exc2:
             logger.error(f"WEB UI  failed to start: {exc2}")
             return None
