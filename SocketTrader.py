@@ -16233,9 +16233,19 @@ def _nt_log_lines_for(date: str) -> list[str] | None:
     return [ln for _, _, ln in lines]
 
 
-def _pnl_rebuild_day(date: str, lines: list[str] | None = None) -> dict:
+FILLS_REBUILD_LIVE_KEEP_S = 120.0   # live rows younger than this may still be waiting for their dollars
+
+
+def _pnl_rebuild_day(date: str, lines: list[str] | None = None, live: bool = False) -> dict:
     """Rebuild one session's trade rows from NinjaTrader's log. Returns a
-    report; writes the record only when at least one row was rebuilt."""
+    report; writes the record only when at least one row was rebuilt.
+
+    `live`: this is the session in progress. Rows the live fills engine
+    cut itself are already exact and are kept (a rebuilt twin — same
+    account, market, side, size and exit second — is dropped in its
+    favour); only the rows the snapshot engine left behind earlier in the
+    session are replaced. Rows younger than FILLS_REBUILD_LIVE_KEEP_S are
+    never touched: they may still be waiting for NinjaTrader's dollars."""
     global _pnl_dirty
     report = {"date": date, "rows": 0, "replaced": [], "kept": [], "unseen": 0, "note": ""}
     if lines is None:
@@ -16310,6 +16320,17 @@ def _pnl_rebuild_day(date: str, lines: list[str] | None = None) -> dict:
         final.extend(rows)
         report["replaced"].append(acct)
     kept = [t for t in old_rows if t.get("account") not in by_acct]
+    if live:
+        now = time.time()
+        own = [t for t in old_rows if t.get("account") in by_acct
+               and (t.get("fills") or now - float(t.get("ts") or 0) <= FILLS_REBUILD_LIVE_KEEP_S)]
+
+        def twin(a: dict, b: dict) -> bool:
+            return (a.get("account") == b.get("account") and a.get("symbol") == b.get("symbol")
+                    and a.get("side") == b.get("side") and int(a.get("qty") or 0) == int(b.get("qty") or 0)
+                    and abs(float(a.get("ts") or 0) - float(b.get("ts") or 0)) < 1.5)
+        final = [r for r in final if not any(twin(r, o) for o in own)]
+        kept.extend(own)
     report["kept"] = sorted({t.get("account") for t in kept if t.get("account")})
     final.extend(kept)
     final.sort(key=lambda t: float(t.get("ts") or 0))
@@ -16360,17 +16381,10 @@ def _pnl_rebuild_range(frm: str, to: str) -> tuple[bool, str, list[dict]]:
     d = d0
     while d <= d1:
         date = d.strftime("%Y-%m-%d")
-        if date == live_date:
-            # Today's rows are being cut live from the same log; replacing
-            # them would strand the ones still waiting for their dollars.
-            reports.append({"date": date, "rows": 0, "replaced": [], "kept": [], "unseen": 0,
-                            "note": "the live session is not rebuilt (its rows are already cut from fills)"})
-            d += timedelta(days=1)
-            continue
         if date[:7] not in backed:
             _pnl_backup_shard(date[:7])
             backed.add(date[:7])
-        rep = _pnl_rebuild_day(date)
+        rep = _pnl_rebuild_day(date, live=(date == live_date))
         reports.append(rep)
         rebuilt += rep["rows"]
         d += timedelta(days=1)

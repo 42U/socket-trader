@@ -7437,16 +7437,36 @@ class TestPnlRebuildFromNinjaTraderLog:
         assert rows[1]["unseen"] is True and rows[1]["pnl"] == 755.0
         assert round(sum(t["pnl"] for t in rows), 2) == 500.0
 
-    def test_range_backs_up_the_month_and_skips_the_live_session(self, monkeypatch):
+    def test_range_backs_up_the_month(self, monkeypatch):
         st._pnl_save(force=True)
-        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: self.D)   # today IS the day
-        ok, msg, reports = st._pnl_rebuild_range(self.D, self.D)
-        assert not ok and "live session" in msg
-        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: "2026-11-06")
         ok, msg, reports = st._pnl_rebuild_range("2026-11-04", self.D)
         assert ok and "rebuilt 1 trade row" in msg
         assert any(p.name.startswith("2026-11.json.bak-rebuild-") for p in st.PNL_DIR.iterdir())
         assert [r["rows"] for r in reports] == [0, 1]
+
+    def test_live_session_keeps_the_live_engines_own_rows(self, monkeypatch):
+        """Today: the snapshot engine's leftovers are replaced, a row the
+        live fills engine cut itself stays and its rebuilt twin is dropped,
+        and a row still young enough to be waiting for its dollars is left
+        alone."""
+        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: self.D)   # today IS the day
+        x_out = st._nt_log_stamp_ms(self.LINES["TEST_X_OUT"])
+        with st._pnl_lock:
+            day = st._pnl_hot(self.D[:7])[self.D]
+            day["trades"].append({"ts": round(x_out, 3), "account": "SimTEST", "symbol": "NQ",
+                                  "side": "SHORT", "qty": 1, "strategy": "NQ-MacroZoneB",
+                                  "entry": 26978.5, "exit": 26991.25, "opened_ts": x_out - 1,
+                                  "pnl": -259.36, "approx": False, "fills": True, "exit_kind": "stop"})
+            day["trades"].append({"ts": round(time.time(), 3), "account": "SimTEST", "symbol": "ES",
+                                  "side": "LONG", "qty": 1, "strategy": "ES-X", "entry": 1.0,
+                                  "opened_ts": time.time() - 5, "pnl": 0.0, "approx": True, "fills": True})
+        ok, msg, reports = st._pnl_rebuild_range(self.D, self.D)
+        assert ok and reports[0]["rows"] == 1
+        rows = [t for t in self.day()["trades"] if t["account"] == "SimTEST"]
+        assert not any(t.get("unseen") for t in rows)                      # the leftover went
+        nq = [t for t in rows if t["symbol"] == "NQ"]
+        assert len(nq) == 1 and nq[0]["pnl"] == -259.36 and nq[0]["fills"]  # one row, the live one
+        assert any(t["symbol"] == "ES" for t in rows)                        # the young one untouched
 
     def test_no_log_folder_is_said_plainly(self):
         st.output_directory = "/nonexistent/incoming"
