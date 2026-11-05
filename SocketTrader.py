@@ -11297,6 +11297,15 @@ _NT_EXECUTION_RE = re.compile(
     r"\|1\|8\|Execution='(?P<xid>[^']+)' Instrument='(?P<instr>[^']+)' Account='(?P<acct>[^']+)' "
     r"Exchange=\S+ Price=(?P<price>[0-9.]+) Quantity=(?P<qty>\d+) "
     r"Market position=(?P<mp>Long|Short) Operation=\w+ Order='(?P<oid>[^']*)'")
+# The order file NinjaTrader read, echoed into its log as it processes it:
+# "OIF, 'PLACE;SimAI;MNQ 12-26;SELL;3;MARKET;;;DAY;;;NQ-MacroZoneB;ent:...~SimAI' processing".
+# Field 12 is the strategy this app named when it wrote the file, field 13
+# its id (a "~Account" suffix marks a follower's copy). The Entry order
+# NinjaTrader submits next for that account, side and size is that file's
+# order, and every fill of it wears the file's strategy. The fills engine
+# reads attribution from here first — live and when rebuilding a day from
+# the log — so a label never depends on what this process remembers.
+_NT_OIF_RE = re.compile(r"\|1\|1\|OIF, '(?P<oif>(?:PLACE|REVERSEPOSITION);[^']*)' processing")
 BRACKET_GUARD_FILL_WINDOW_S = 5.0   # the position line that explains a bracket fill comes this soon after
 _bracket_fills: dict[tuple[str, str], tuple[float, str, str]] = {}   # (acct, NT name) -> (stamp, order id, name)
 
@@ -11557,6 +11566,10 @@ def _bracket_guard_event(line: str, now: float | None = None) -> str | None:
         logger.error(f"NT CLOSE FAILED  {msg} — NinjaTrader is not executing closes; "
                      "close at the broker and restart NinjaTrader")
         return "alert"
+    w = _NT_OIF_RE.search(line)
+    if w:
+        _fills_note_oif(w["oif"], _nt_log_stamp_ms(line) or now)
+        return None
     x = _NT_EXECUTION_RE.search(line)
     if x:
         stamp = _nt_log_stamp_ms(line) or now
@@ -11568,6 +11581,10 @@ def _bracket_guard_event(line: str, now: float | None = None) -> str | None:
                 logger.error(f"FILLS  execution line skipped: {exc}")
         return None
     o = _NT_ORDER_STATE_RE.search(line)
+    if o and o["name"] == "Entry" and o["state"] in ("Submitted", "Accepted", "Working",
+                                                      "Filled", "Partially filled"):
+        _fills_bind_order(o["acct"], o["oid"], o["instr"], o["action"], int(o["qty"]),
+                          _nt_log_stamp_ms(line) or now)
     if o:
         book = _nt_orders.setdefault((o["acct"], _alias_root(o["instr"]).upper()), {})
         book[o["oid"]] = (o["name"], o["state"], _nt_log_stamp_ms(line) or now, int(o["qty"]), o["action"])
@@ -15642,6 +15659,16 @@ def _fills_note_point_values(doc: dict) -> None:
                     _fills_dirty = True
 
 
+def _session_date_of(stamp: float) -> str | None:
+    """Session id (close date) of a wall-clock moment — the machine's local
+    time, as NinjaTrader stamps its log, read in Eastern time."""
+    try:
+        local = datetime.fromtimestamp(stamp).astimezone()
+        return get_session_id(local.astimezone(ET))
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _fills_active(now: float | None = None) -> bool:
     """Is the fills engine the one cutting rows right now? True while
     NinjaTrader's log is in view (the tail read it within NT_TAIL_FRESH_S)."""
@@ -15652,8 +15679,98 @@ def _fills_net(key: tuple[str, str]) -> int:
     return sum(int(l.get("qty") or 0) for l in _fills_lots.get(key) or [])
 
 
+# OIF lines seen but not yet matched to the order NinjaTrader submitted
+# for them, and order id -> (strategy, role) once matched.
+_fills_oif_pending: dict[tuple[str, str], list[dict]] = {}   # (account, ROOT) -> [{ts, side, qty, label, role}]
+_fills_oid_label: "OrderedDict[tuple[str, str], tuple[str, str]]" = OrderedDict()
+FILLS_OIF_BIND_S = 15.0        # the Entry for a file is submitted within this of the file
+
+
+class _FillsState:
+    """Everything the fills engine keeps between lines. The LIVE state's
+    attributes are the module-level dicts themselves (same objects), so
+    the engine and the rest of the app share them; a rebuild from an old
+    log gets a state of its own and never touches the live one."""
+
+    def __init__(self, live: bool = False):
+        if live:
+            self.lots, self.wait, self.entries = _fills_lots, _fills_wait, _fills_entries
+            self.comm, self.seen, self.last_row = _fills_comm, _fills_seen_xids, _fills_last_row
+            self.oif_pending, self.oid_label = _fills_oif_pending, _fills_oid_label
+            self.orders, self.meta, self.recent = _nt_orders, _pnl_open_meta, _pnl_recent
+            self.sink: list | None = None          # rows go to the record
+            self.accounts: set[str] | None = None  # target_accounts() decides
+        else:
+            self.lots, self.wait, self.entries, self.comm = {}, {}, {}, {}
+            self.seen, self.last_row = OrderedDict(), {}
+            self.oif_pending, self.oid_label = {}, OrderedDict()
+            self.orders, self.meta, self.recent = {}, {}, {}
+            self.sink = []
+            self.accounts = set()
+        self.live = live
+
+
+_LIVE: "_FillsState | None" = None
+
+
+def _fills_state(state: "_FillsState | None") -> "_FillsState":
+    global _LIVE
+    if state is not None:
+        return state
+    if _LIVE is None:
+        _LIVE = _FillsState(live=True)
+    return _LIVE
+
+
+def _fills_note_oif(oif: str, stamp: float, state: "_FillsState | None" = None) -> None:
+    """Remember what this app asked for, from NinjaTrader's echo of the file."""
+    S = _fills_state(state)
+    parts = oif.split(";")
+    if len(parts) < 13:
+        return
+    cmd, account, instr, action, qty = parts[0].strip().upper(), parts[1].strip(), parts[2].strip(), \
+        parts[3].strip().upper(), parts[4].strip()
+    label, sid = parts[11].strip(), parts[12].strip()
+    if cmd not in ("PLACE", "REVERSEPOSITION") or not account or not instr:
+        return
+    try:
+        q = int(qty)
+    except ValueError:
+        return
+    side = 1 if action == "BUY" else -1 if action == "SELL" else 0
+    if not side:
+        return
+    role = "follower" if sid.endswith("~" + account) else ""
+    key = (account, _alias_root(instr).upper())
+    rows = [r for r in S.oif_pending.get(key) or [] if stamp - r["ts"] <= FILLS_OIF_BIND_S]
+    rows.append({"ts": stamp, "side": side, "qty": q, "label": label, "role": role})
+    S.oif_pending[key] = rows[-8:]
+
+
+def _fills_bind_order(account: str, oid: str, instr: str, action: str, qty: int,
+                      stamp: float, state: "_FillsState | None" = None) -> None:
+    """The Entry order NinjaTrader submitted for a file this app wrote:
+    same account, root, side and size, within FILLS_OIF_BIND_S of the
+    file. Its id now carries the file's strategy."""
+    S = _fills_state(state)
+    if not oid or (account, oid) in S.oid_label:
+        return
+    act = (action or "").strip().lower()
+    side = 1 if act.startswith("buy") else -1 if act.startswith("sell") else 0
+    key = (account, _alias_root(instr).upper())
+    rows = S.oif_pending.get(key) or []
+    for i, r in enumerate(rows):
+        if r["side"] == side and r["qty"] == qty and 0 <= stamp - r["ts"] <= FILLS_OIF_BIND_S:
+            S.oid_label[(account, oid)] = (r["label"], r["role"])
+            del rows[i]
+            break
+    while len(S.oid_label) > 1024:
+        S.oid_label.popitem(last=False)
+
+
 def _fills_label(account: str, root: str, side: int, stamp: float,
-                 oid: str = "", lots: list[dict] | None = None) -> tuple[str, str]:
+                 oid: str = "", lots: list[dict] | None = None,
+                 state: "_FillsState | None" = None) -> tuple[str, str]:
     """(strategy label, role) for a lot opening on (account, root) in
     `side` (+1 long, -1 short): what the dispatch path staged for this
     root — the strategies it fired entries for, their sides — or nothing
@@ -15663,10 +15780,14 @@ def _fills_label(account: str, root: str, side: int, stamp: float,
     order wears the first partial's label, a second order on the root
     takes the next label still unclaimed, and an order with nothing left
     to claim wears the last label fired that way (an add-on)."""
+    S = _fills_state(state)
     for lot in lots or []:
         if oid and lot.get("oid") == oid:
             return lot.get("strategy") or "", lot.get("role") or ""
-    meta = _pnl_open_meta.get((account, root)) or {}
+    bound = S.oid_label.get((account, oid)) if oid else None
+    if bound is not None:
+        return bound
+    meta = S.meta.get((account, root)) or {}
     nxt = meta.get("next") if isinstance(meta.get("next"), dict) else None
     source = meta
     labels = list(meta.get("strategies") or [])
@@ -15690,29 +15811,32 @@ def _fills_label(account: str, root: str, side: int, stamp: float,
 
 
 def _fills_on_execution(account: str, instrument: str, price: float, qty: int,
-                        mp: str, oid: str, stamp: float, xid: str = "") -> list[dict]:
+                        mp: str, oid: str, stamp: float, xid: str = "",
+                        state: "_FillsState | None" = None) -> list[dict]:
     """Apply one NinjaTrader fill to the lots of (account, root). A fill in
     the direction of what is held (or onto a flat root) opens lots; one
     against it closes lots FIFO and cuts a trade row; more than is held
     closes everything and opens the rest the other way (a reversal).
     Returns the rows cut (usually none or one)."""
+    S = _fills_state(state)
     if qty <= 0 or not math.isfinite(price) or price <= 0:
         return []
-    if account not in target_accounts():
+    managed = S.accounts if S.accounts is not None else target_accounts()
+    if account not in managed:
         return []
     xid = xid or f"{account}|{oid}|{stamp:.3f}|{price}|{qty}"
-    if xid in _fills_seen_xids:
+    if xid in S.seen:
         return []
-    _fills_seen_xids[xid] = stamp
-    while len(_fills_seen_xids) > 2048:
-        _fills_seen_xids.popitem(last=False)
+    S.seen[xid] = stamp
+    while len(S.seen) > 2048:
+        S.seen.popitem(last=False)
     global _fills_dirty
     root = _alias_root(instrument).upper()
     if not root:
         return []
     key = (account, root)
     signed = qty if mp == "Long" else -qty
-    lots = _fills_lots.setdefault(key, [])
+    lots = S.lots.setdefault(key, [])
     net = sum(int(l["qty"]) for l in lots)
     rows: list[dict] = []
     remaining = abs(signed)
@@ -15735,15 +15859,15 @@ def _fills_on_execution(account: str, instrument: str, price: float, qty: int,
                 lot["cost"] = float(lot.get("cost") or 0.0) - share_cost
             remaining -= take
         if pieces:
-            rows.append(_fills_cut_row(account, root, instrument, pieces, price, oid, stamp))
+            rows.append(_fills_cut_row(account, root, instrument, pieces, price, oid, stamp, S))
     if remaining:
         # Opening (or the far side of a reversal).
-        label, role = _fills_label(account, root, direction, stamp, oid, lots)
+        label, role = _fills_label(account, root, direction, stamp, oid, lots, S)
         lots.append({"qty": remaining * direction, "price": price, "ts": stamp,
                      "strategy": label, "role": role, "cost": 0.0, "oid": oid})
-        _fills_entries.setdefault(account, []).append((stamp, root, remaining))
-        _fills_entries[account] = _fills_entries[account][-32:]
-        meta = _pnl_open_meta.setdefault(
+        S.entries.setdefault(account, []).append((stamp, root, remaining))
+        S.entries[account] = S.entries[account][-32:]
+        meta = S.meta.setdefault(
             key, {"strategies": [], "ts": None, "avg": None, "cost": 0.0})
         if meta.get("ts") is None:
             meta["ts"] = stamp
@@ -15754,13 +15878,15 @@ def _fills_on_execution(account: str, instrument: str, price: float, qty: int,
         if role and not meta.get("role"):
             meta["role"] = role
     if not lots:
-        _fills_lots.pop(key, None)
-        _ledger_prune_flat(account, root)
-        gone = _pnl_open_meta.pop(key, None)
+        S.lots.pop(key, None)
+        if S.live:
+            _ledger_prune_flat(account, root)
+        gone = S.meta.pop(key, None)
         nxt = _pnl_next_slot(gone, stamp) if gone else None
         if nxt is not None:
-            _pnl_open_meta[key] = _pnl_meta_from_next(nxt)
-    _fills_dirty = True
+            S.meta[key] = _pnl_meta_from_next(nxt)
+    if S.live:
+        _fills_dirty = True
     return rows
 
 
@@ -15771,10 +15897,11 @@ def _fills_avg(lots: list[dict]) -> float | None:
     return sum(abs(int(l["qty"])) * float(l["price"]) for l in lots) / tot
 
 
-def _fills_exit_kind(account: str, root: str, oid: str) -> str:
+def _fills_exit_kind(account: str, root: str, oid: str,
+                     state: "_FillsState | None" = None) -> str:
     """stop / target / close / entry (a reversal) / manual — from the name
     NinjaTrader gave the order that filled, per its log."""
-    book = _nt_orders.get((account, root)) or {}
+    book = _fills_state(state).orders.get((account, root)) or {}
     rec = book.get(oid)
     name = (rec[0] if rec else "") or ""
     if _nt_is_stop_name(name):
@@ -15790,11 +15917,13 @@ def _fills_exit_kind(account: str, root: str, oid: str) -> str:
 
 
 def _fills_cut_row(account: str, root: str, instrument: str, pieces: list[dict],
-                   exit_price: float, oid: str, stamp: float) -> dict:
+                   exit_price: float, oid: str, stamp: float,
+                   state: "_FillsState | None" = None) -> dict:
     """One trade row for the lots a closing fill just took out. A later
     partial fill of the SAME closing order (NinjaTrader fills a 3-lot stop
     as 2 then 1) joins the row it started instead of cutting another."""
     global _pnl_dirty
+    S = _fills_state(state)
     qty = sum(p["qty"] for p in pieces)
     side = pieces[0]["side"]
     cost = sum(p["cost"] for p in pieces)                 # entry commissions parked on the lots
@@ -15804,7 +15933,7 @@ def _fills_cut_row(account: str, root: str, instrument: str, pieces: list[dict],
             if s and s not in labels:
                 labels.append(s)
     role = next((p["role"] for p in pieces if p["role"]), "")
-    prior = _fills_last_row.get((account, root))
+    prior = S.last_row.get((account, root))
     if prior and oid and prior[0] == oid and stamp - float(prior[1]["ts"]) <= FILLS_MERGE_S:
         row = prior[1]
         q0 = int(row["qty"])
@@ -15825,17 +15954,20 @@ def _fills_cut_row(account: str, root: str, instrument: str, pieces: list[dict],
         row = None
     pv = _point_value(root)
     gross = ((exit_vwap - entry) * side * qty * pv) if pv else None
-    rate = _fills_comm.get((account, root))
+    rate = S.comm.get((account, root))
     exit_comm = (rate * qty) if rate else 0.0
     est = (gross + cost - exit_comm) if gross is not None else cost - exit_comm
     if row is not None:
         row["entry"], row["exit"] = round(entry, 6), round(exit_vwap, 6)
         row["pnl"], row["approx"] = round(est, 2), gross is None
-        _pnl_dirty = True
-        logger.info(f"FILLS  {account} {root} {row['side']} +{sum(p['qty'] for p in pieces)} "
-                    f"(same order) -> {qty} @ {entry:g} -> {exit_vwap:g} est ${est:+,.2f}")
+        row["gross"] = round(gross, 2) if gross is not None else None
+        if S.live:
+            _pnl_dirty = True
+            logger.info(f"FILLS  {account} {root} {row['side']} +{sum(p['qty'] for p in pieces)} "
+                        f"(same order) -> {qty} @ {entry:g} -> {exit_vwap:g} est ${est:+,.2f}")
         return row
-    date = get_session_id() or time.strftime("%Y-%m-%d", time.localtime(stamp))
+    date = (get_session_id() if S.live else _session_date_of(stamp)) \
+        or time.strftime("%Y-%m-%d", time.localtime(stamp))
     row = {
         "ts": round(stamp, 3),
         "account": account,
@@ -15849,25 +15981,29 @@ def _fills_cut_row(account: str, root: str, instrument: str, pieces: list[dict],
         "pnl": round(est, 2),
         "approx": gross is None,
         "fills": True,
-        "exit_kind": _fills_exit_kind(account, root, oid),
+        "exit_kind": _fills_exit_kind(account, root, oid, S),
         "cost": round(cost, 4),
+        "gross": round(gross, 2) if gross is not None else None,
     }
     if role:
         row["role"] = role
-    with _pnl_lock:
-        days = _pnl_hot(date[:7])
-        day = days.setdefault(date, {"accounts": {}, "trades": []})
-        if len(day["trades"]) < PNL_TRADES_PER_DAY_CAP:
-            day["trades"].append(row)
-            _pnl_dirty = True
-    _pnl_recent[account] = (date, [row])
-    _fills_wait.setdefault(account, []).append((stamp, row))
-    _fills_wait[account] = _fills_wait[account][-16:]
-    _fills_last_row[(account, root)] = (oid, row)
-    if len(_fills_last_row) > 512:
-        _fills_last_row.pop(next(iter(_fills_last_row)))
-    logger.info(f"FILLS  {account} {root} {row['side']} {qty} @ {entry:g} -> {exit_vwap:g} "
-                f"({row['exit_kind']}) {row['strategy'] or 'manual'} est ${est:+,.2f}")
+    if S.sink is not None:
+        S.sink.append(row)
+    else:
+        with _pnl_lock:
+            days = _pnl_hot(date[:7])
+            day = days.setdefault(date, {"accounts": {}, "trades": []})
+            if len(day["trades"]) < PNL_TRADES_PER_DAY_CAP:
+                day["trades"].append(row)
+                _pnl_dirty = True
+        S.recent[account] = (date, [row])
+        S.wait.setdefault(account, []).append((stamp, row))
+        S.wait[account] = S.wait[account][-16:]
+        logger.info(f"FILLS  {account} {root} {row['side']} {qty} @ {entry:g} -> {exit_vwap:g} "
+                    f"({row['exit_kind']}) {row['strategy'] or 'manual'} est ${est:+,.2f}")
+    S.last_row[(account, root)] = (oid, row)
+    if len(S.last_row) > 512:
+        S.last_row.pop(next(iter(S.last_row)))
     return row
 
 
@@ -16020,6 +16156,232 @@ def _fills_sync_book(account: str, shape: dict[str, int], row: dict, ts: float) 
             logger.info(f"FILLS  {account} {root}: snapshot shows {want:+d}, lots had {have:+d} — "
                         "re-seeded from the snapshot")
         _fills_dirty = True
+
+
+# ---------- Rebuilding a day from NinjaTrader's log ----------
+# The same engine, run over an old log in a state of its own: every fill
+# NinjaTrader logged that session becomes a row, labelled from the order
+# file echo. The day's dollars are then reconciled to what the record
+# already knows the account made (last - start - transfers), the gap
+# being the commissions NinjaTrader charged; rows that cannot be explained
+# that way keep their price-based estimate and the gap is recorded as an
+# unseen row, so the day still adds up.
+FILLS_REBUILD_MAX_DAYS = 62
+FILLS_REBUILD_MAX_COMM = 10.0   # $/contract/side: a larger "commission" is not one
+
+
+def _fills_replay_line(line: str, S: "_FillsState") -> None:
+    stamp = _nt_log_stamp_ms(line)
+    if stamp is None:
+        return
+    w = _NT_OIF_RE.search(line)
+    if w:
+        _fills_note_oif(w["oif"], stamp, S)
+        return
+    o = _NT_ORDER_STATE_RE.search(line)
+    if o:
+        book = S.orders.setdefault((o["acct"], _alias_root(o["instr"]).upper()), {})
+        book[o["oid"]] = (o["name"], o["state"], stamp, int(o["qty"]), o["action"])
+        if o["name"] == "Entry":
+            _fills_bind_order(o["acct"], o["oid"], o["instr"], o["action"], int(o["qty"]), stamp, S)
+        return
+    x = _NT_EXECUTION_RE.search(line)
+    if x:
+        _fills_on_execution(x["acct"], x["instr"], float(x["price"]), int(x["qty"]),
+                            x["mp"], x["oid"], stamp, xid=x["xid"], state=S)
+
+
+def _nt_log_files_for(log_dir: str, date: str) -> list[str]:
+    """NinjaTrader log files that can hold session `date`: the calendar
+    day before (the evening open) and the day itself, every roll, the
+    plain copies only (the .en.txt beside each is identical)."""
+    try:
+        d = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        return []
+    names = []
+    for day in (d - timedelta(days=1), d):
+        tag = day.strftime("%Y%m%d")
+        for f in sorted(os.listdir(log_dir)):
+            if f.startswith(f"log.{tag}.") and f.endswith(".txt") and not f.endswith(".en.txt"):
+                names.append(os.path.join(log_dir, f))
+    return names
+
+
+def _nt_log_lines_for(date: str) -> list[str] | None:
+    """Every NinjaTrader log line of session `date`, in time order; None
+    when the log folder is not reachable."""
+    log_dir = _nt_log_dir()
+    if not log_dir:
+        return None
+    lines: list[tuple[float, int, str]] = []
+    n = 0
+    for path in _nt_log_files_for(log_dir, date):
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        for ln in raw.decode("utf-8", "replace").splitlines():
+            ln = ln.lstrip("\ufeff")
+            stamp = _nt_log_stamp_ms(ln)
+            if stamp is None or _session_date_of(stamp) != date:
+                continue
+            lines.append((stamp, n, ln))
+            n += 1
+    lines.sort()
+    return [ln for _, _, ln in lines]
+
+
+def _pnl_rebuild_day(date: str, lines: list[str] | None = None) -> dict:
+    """Rebuild one session's trade rows from NinjaTrader's log. Returns a
+    report; writes the record only when at least one row was rebuilt."""
+    global _pnl_dirty
+    report = {"date": date, "rows": 0, "replaced": [], "kept": [], "unseen": 0, "note": ""}
+    if lines is None:
+        lines = _nt_log_lines_for(date)
+    if lines is None:
+        report["note"] = "NinjaTrader's log folder is not reachable (set the output directory)"
+        return report
+    if not lines:
+        report["note"] = "no NinjaTrader log lines for this session"
+        return report
+    with _pnl_lock:
+        days = _pnl_hot(date[:7])
+        rec = days.get(date) or {}
+        tracked = set((rec.get("accounts") or {}).keys())
+        acct_days = {k: dict(v) for k, v in (rec.get("accounts") or {}).items()}
+        old_rows = list(rec.get("trades") or [])
+    for ln in lines:
+        w = _NT_OIF_RE.search(ln)
+        if w:
+            parts = w["oif"].split(";")
+            if len(parts) > 1 and parts[1].strip():
+                tracked.add(parts[1].strip())
+    S = _FillsState(live=False)
+    S.accounts = tracked
+    for ln in lines:
+        try:
+            _fills_replay_line(ln, S)
+        except Exception as exc:
+            logger.warning(f"PNL REBUILD  {date}: line skipped — {exc}")
+    rebuilt = S.sink
+    if not rebuilt:
+        report["note"] = "no fills for a tracked account in this session's log"
+        report["kept"] = sorted({t.get("account") for t in old_rows if t.get("account")})
+        return report
+    by_acct: dict[str, list[dict]] = {}
+    for r in rebuilt:
+        by_acct.setdefault(r["account"], []).append(r)
+    final: list[dict] = []
+    for acct, rows in by_acct.items():
+        a = acct_days.get(acct) or {}
+        start, last, adj = a.get("start"), a.get("last"), float(a.get("adj") or 0.0)
+        net = (round(last - start - adj, 2)
+               if isinstance(start, (int, float)) and isinstance(last, (int, float)) else None)
+        contracts = sum(int(r["qty"]) for r in rows)
+        gross_sum = sum(float(r["gross"] if r.get("gross") is not None else r["pnl"]) for r in rows)
+        for r in rows:
+            r.pop("cost", None)
+        if net is not None and contracts and all(r.get("gross") is not None for r in rows):
+            comm_total = round(gross_sum - net, 2)
+            if -1.0 <= comm_total <= FILLS_REBUILD_MAX_COMM * contracts * 2:
+                rate = max(comm_total, 0.0) / (contracts * 2)
+                for r in rows:
+                    r["pnl"] = round(float(r["gross"]) - rate * int(r["qty"]) * 2, 2)
+                    r["approx"] = False
+                residual = round(net - sum(r["pnl"] for r in rows), 2)
+                if abs(residual) >= 0.005:
+                    rows[-1]["pnl"] = round(rows[-1]["pnl"] + residual, 2)
+            else:
+                # The fills do not explain the money: commissions at the
+                # learned rate, the rest as an unseen row.
+                for r in rows:
+                    rate = _fills_comm.get((acct, r["symbol"])) or 0.0
+                    r["pnl"] = round(float(r["gross"]) - rate * int(r["qty"]) * 2, 2)
+                    r["approx"] = True
+                gap = round(net - sum(r["pnl"] for r in rows), 2)
+                if abs(gap) >= 0.005:
+                    rows.append({"ts": round(rows[-1]["ts"] + 0.001, 3), "account": acct,
+                                 "symbol": "", "side": "", "qty": 0, "strategy": "",
+                                 "entry": None, "opened_ts": None, "pnl": gap,
+                                 "approx": True, "unseen": True})
+                    report["unseen"] += 1
+        final.extend(rows)
+        report["replaced"].append(acct)
+    kept = [t for t in old_rows if t.get("account") not in by_acct]
+    report["kept"] = sorted({t.get("account") for t in kept if t.get("account")})
+    final.extend(kept)
+    final.sort(key=lambda t: float(t.get("ts") or 0))
+    report["rows"] = len(rebuilt)
+    with _pnl_lock:
+        days = _pnl_hot(date[:7])
+        day = days.setdefault(date, {"accounts": {}, "trades": []})
+        day["trades"] = final[:PNL_TRADES_PER_DAY_CAP]
+        _pnl_dirty = True
+    logger.info(f"PNL REBUILD  {date}: {len(rebuilt)} row(s) from NinjaTrader's log for "
+                f"{', '.join(sorted(by_acct))}" + (f"; kept as recorded: {', '.join(report['kept'])}"
+                                                    if report["kept"] else ""))
+    return report
+
+
+def _pnl_backup_shard(month: str) -> str | None:
+    src = _pnl_shard(month)
+    if not src.exists():
+        return None
+    dst = src.with_name(f"{src.name}.bak-rebuild-{time.strftime('%Y%m%d-%H%M%S')}")
+    try:
+        shutil.copy2(src, dst)
+        return str(dst)
+    except OSError as exc:
+        logger.warning(f"PNL REBUILD  backup of {src.name} failed: {exc}")
+        return None
+
+
+def _pnl_rebuild_range(frm: str, to: str) -> tuple[bool, str, list[dict]]:
+    """Rebuild every session from `frm` to `to` (inclusive) from
+    NinjaTrader's log. The month files are backed up first."""
+    try:
+        d0 = datetime.strptime(frm, "%Y-%m-%d").date()
+        d1 = datetime.strptime(to, "%Y-%m-%d").date()
+    except ValueError:
+        return False, "dates must be YYYY-MM-DD", []
+    if d1 < d0:
+        d0, d1 = d1, d0
+    if (d1 - d0).days + 1 > FILLS_REBUILD_MAX_DAYS:
+        return False, f"at most {FILLS_REBUILD_MAX_DAYS} days per rebuild", []
+    if not _nt_log_dir():
+        return False, ("NinjaTrader's log folder is not reachable from here — the output "
+                       "directory must be NinjaTrader's incoming folder on this machine"), []
+    backed: set[str] = set()
+    reports: list[dict] = []
+    rebuilt = 0
+    live_date = get_session_id()
+    d = d0
+    while d <= d1:
+        date = d.strftime("%Y-%m-%d")
+        if date == live_date:
+            # Today's rows are being cut live from the same log; replacing
+            # them would strand the ones still waiting for their dollars.
+            reports.append({"date": date, "rows": 0, "replaced": [], "kept": [], "unseen": 0,
+                            "note": "the live session is not rebuilt (its rows are already cut from fills)"})
+            d += timedelta(days=1)
+            continue
+        if date[:7] not in backed:
+            _pnl_backup_shard(date[:7])
+            backed.add(date[:7])
+        rep = _pnl_rebuild_day(date)
+        reports.append(rep)
+        rebuilt += rep["rows"]
+        d += timedelta(days=1)
+    _pnl_save(force=True)
+    days_done = sum(1 for r in reports if r["rows"])
+    unseen = sum(r["unseen"] for r in reports)
+    msg = (f"rebuilt {rebuilt} trade row(s) over {days_done} session(s) from NinjaTrader's log"
+           + (f"; {unseen} gap(s) recorded as unseen" if unseen else ""))
+    if not rebuilt:
+        msg = "nothing rebuilt — " + "; ".join(sorted({r["note"] for r in reports if r["note"]}))
+    return bool(rebuilt), msg, reports
 
 
 def _fills_save(force: bool = False) -> None:
@@ -16512,6 +16874,10 @@ def _pnl_month(month: str) -> dict:
         oldest = _pnl_days(months[0]) if months else {}
         first = min(oldest) if oldest else None
     return {"ok": True, "month": month, "days": days, "first": first,
+            # Which engine is cutting rows right now: NinjaTrader's fills
+            # (its log in view) or the snapshot diff (log not reachable).
+            "engine": "fills" if _fills_active() else "snapshot",
+            "nt_log": bool(_nt_log_dir()),
             # Oldest month on record, so the UI can stop paging back at the
             # beginning instead of into empty months forever.
             "first_month": months[0] if months else None,
@@ -17029,6 +17395,9 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
                     data.get("account"), data.get("instrument")), timeout=30.0)
             elif path == "/api/reset_pnl":
                 ok, msg = _web_run(_web_reset_pnl())
+            elif path == "/api/pnl_rebuild":
+                frm, to = str(data.get("from") or ""), str(data.get("to") or "")
+                ok, msg, _reports = _pnl_rebuild_range(frm, to)
             elif path == "/api/reconnect":
                 _web_loop.call_soon_threadsafe(reconnect_event.set)
                 ok, msg = True, "reconnect requested"
@@ -17523,6 +17892,7 @@ box-shadow:var(--shadow);max-width:280px}
     <div class="pmonth" id="pmTitle">&mdash;</div>
     <button class="sm" id="pmNext" title="next month">&rsaquo;</button>
     <button class="sm ghost" id="pmToday">TODAY</button>
+    <button class="sm ghost" id="pmRebuild" title="Rebuild this month's trade rows from NinjaTrader's own log (fills, prices, strategies)">REBUILD</button>
     <div class="phero">
       <div class="k">Month net P&amp;L</div>
       <div class="v" id="pmNet">&mdash;</div>
@@ -19014,7 +19384,14 @@ function renderDayPanel(day,date){
   breakTable(grid,"By account",acctRows);
   box.appendChild(grid);
 
-  box.appendChild(el("div","psec","Trade log"));
+  /* Where the rows come from: NinjaTrader's own fills when its log is in
+     view, the 2 s snapshot diff when it is not (an ATI-only setup, or NT
+     on another machine). */
+  const d=P.data||{};
+  box.appendChild(el("div","psec","Trade log \u00b7 "+(d.engine==="fills"
+    ?"rows from NinjaTrader fills"
+    :d.nt_log?"rows from snapshots (NinjaTrader log not in view)"
+    :"rows from snapshots (no NinjaTrader log here)")));
   if(!tr.length){box.appendChild(el("div","empty",
     "no round-trips recorded — the day net came from balance changes"));return}
   const t=el("table"),th=el("thead"),hr=el("tr");
@@ -19251,6 +19628,14 @@ $("tabPnl").onclick=()=>showView("pnl");
 $("pmPrev").onclick=()=>pnlNav(-1);
 $("pmNext").onclick=()=>pnlNav(1);
 $("pmToday").onclick=()=>pnlNav(0);
+$("pmRebuild").onclick=async()=>{
+  const m=P.month||localMonth();
+  const last=new Date(Number(m.slice(0,4)),Number(m.slice(5,7)),0).getDate();
+  if(!confirm("Rebuild every trade row of "+monthLabel(m)+" from NinjaTrader's log?\n\n"+
+    "Rows are re-cut from the fills NinjaTrader logged (exact prices, sizes and strategies) "+
+    "and reconciled to each day's recorded balance. The month file is backed up first."))return;
+  const j=await api("/api/pnl_rebuild",{from:m+"-01",to:m+"-"+String(last).padStart(2,"0")},"rebuild");
+  if(j&&j.ok){P.data=null;invalidate("pnl");pnlLoad()}};
 addEventListener("resize",()=>{
   if(!$("viewPnl").classList.contains("hide")){invalidate("pnl");renderPnl()}});
 document.addEventListener("keydown",e=>{if(e.key==="Escape"&&modalOpen)closeModal()});

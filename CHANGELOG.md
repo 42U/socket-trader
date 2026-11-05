@@ -31,6 +31,30 @@
   open, or held with none, is re-seeded). A fill nobody here fired — a
   Chart Trader trade — has no staged label and stays "Manual". The
   snapshot diff remains the engine when NinjaTrader's log is not in view.
+- **Attribution comes from NinjaTrader's echo of the order file.** The
+  log line `OIF, 'PLACE;SimAI;MNQ 12-26;SELL;3;...;NQ-MacroZoneB;ent:...~SimAI'
+  processing` names the strategy this app wrote the file for (a `~Account`
+  id suffix marks a follower's copy); the Entry order NinjaTrader submits
+  next for that account, side and size is that file's order, and every
+  fill of it — including a partial that lands after a NinjaTrader restart
+  — wears its strategy. What the dispatch path staged in memory is only
+  the fallback now.
+- **Rebuild past days from NinjaTrader's log** — the REBUILD button on
+  the P&L page (`POST /api/pnl_rebuild {from, to}`): every session in the
+  month is re-cut from the fills NinjaTrader logged, labelled from the
+  order files, and reconciled to each account's recorded day result (the
+  gap is the commissions; money the fills cannot explain — a position
+  closed at the broker's own site, say — becomes an unseen row so the day
+  still adds up). Accounts the log has no fills for keep their recorded
+  rows; the live session is left to the live engine; the month file is
+  backed up first (`YYYY-MM.json.bak-rebuild-…`). Dry run over 2026-11-02
+  … 11-05 of a live record: 123 rows, every account's rows summing to its
+  day net.
+- **The engine says which way it is working.** `/api/pnl` carries
+  `engine` ("fills" while NinjaTrader's log is in view, "snapshot" when it
+  is not — an ATI-only setup, or NinjaTrader on another machine) and the
+  trade log's heading says so; the switch is automatic, per poll, and the
+  snapshot diff keeps working exactly as before when the log is not there.
 - Web trade log: "Entry → Exit" shows both prices; a tag says what took
   the trade out (stop / target / close / reverse).
 - Bridge AddOn: each snapshot carries `"pv": {root: PointValue}` for every

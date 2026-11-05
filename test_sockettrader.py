@@ -188,10 +188,12 @@ def isolate_pnl_history(tmp_path_factory):
     st._fills_lots.clear(); st._fills_wait.clear(); st._fills_entries.clear()
     st._fills_comm.clear(); st._fills_seen_xids.clear(); st._fills_mismatch.clear()
     st._fills_pv_seen.clear(); st._fills_last_row.clear(); st._fills_dirty = False
+    st._fills_oif_pending.clear(); st._fills_oid_label.clear()
     yield
     st._fills_lots.clear(); st._fills_wait.clear(); st._fills_entries.clear()
     st._fills_comm.clear(); st._fills_seen_xids.clear(); st._fills_mismatch.clear()
     st._fills_pv_seen.clear(); st._fills_last_row.clear(); st._fills_dirty = False
+    st._fills_oif_pending.clear(); st._fills_oid_label.clear()
     st.PNL_HISTORY_FILE = original
     st._pnl_history = None
     st._pnl_hot_month = None
@@ -7322,6 +7324,134 @@ class TestFillsEngine:
         assert ("SimTEST", "NQ") in st._fills_lots
         st._pnl_observe(flat, now=x + 1 + st.FILLS_BOOK_GRACE_S + 1)   # still flat: no exit was logged
         assert ("SimTEST", "NQ") not in st._fills_lots
+
+
+class TestFillsAttributionFromOrderFile:
+    """The strategy a lot wears comes from NinjaTrader's echo of the order
+    file this app wrote ("OIF, 'PLACE;...;NQ-MacroZoneB;ent:...' processing"),
+    bound to the Entry order NinjaTrader submits for it — so it never
+    depends on what this process remembers."""
+
+    OIF = ("2026-11-05 11:00:02:281|1|1|OIF, 'PLACE;SimAI;MNQ 12-26;SELL;3;MARKET;;;DAY;;;"
+           "NQ-MacroZoneB;ent:nq_macro_zone_b:Nasdaq:2026-11-05T11:00:00-05:00~SimAI' processing")
+    ENTRY = ("2026-11-05 11:00:02:317|1|32|Order='b97e74015deb4ecd88f38736288c6bf0/SimAI' Name='Entry' "
+             "New state='Submitted' Instrument='MNQ DEC26' Action='Sell' Limit price=0 Stop price=0 "
+             "Quantity=3 Type='Market' Time in force=DAY Oco='' Filled=0 Fill price=0 Error='No error' Native error=''")
+
+    @pytest.fixture(autouse=True)
+    def _arm(self, monkeypatch):
+        st.active_account = "SimTEST"; st.follower_accounts = ["SimAI"]
+        st._nt_orders.clear()
+        monkeypatch.setattr(st, "_nt_tail_seen", st._nt_log_stamp(self.OIF) + 5)
+        yield
+        st._nt_orders.clear()
+
+    def feed(self, *lines):
+        for l in lines:
+            st._bracket_guard_event(l, now=st._nt_log_stamp_ms(l) + 0.5)
+
+    def test_order_file_binds_the_entry_order_to_its_strategy(self):
+        self.feed(self.OIF, self.ENTRY)
+        assert st._fills_oid_label[("SimAI", "b97e74015deb4ecd88f38736288c6bf0")] == ("NQ-MacroZoneB", "follower")
+        assert st._fills_oif_pending.get(("SimAI", "MNQ")) == []          # consumed
+
+    def test_leaders_file_carries_no_role(self):
+        oif = self.OIF.replace("SimAI;MNQ 12-26;SELL;3", "SimTEST;NQ 12-26;SELL;1").replace("~SimAI", "")
+        entry = self.ENTRY.replace("/SimAI'", "/SimTEST'").replace("MNQ DEC26", "NQ DEC26").replace("Quantity=3", "Quantity=1")
+        self.feed(oif, entry)
+        assert st._fills_oid_label[("SimTEST", "b97e74015deb4ecd88f38736288c6bf0")] == ("NQ-MacroZoneB", "")
+
+    def test_an_entry_with_another_side_or_size_is_not_that_file(self):
+        self.feed(self.OIF, self.ENTRY.replace("Quantity=3", "Quantity=2"))
+        assert ("SimAI", "b97e74015deb4ecd88f38736288c6bf0") not in st._fills_oid_label
+        self.feed(self.ENTRY.replace("Action='Sell'", "Action='Buy'"))
+        assert ("SimAI", "b97e74015deb4ecd88f38736288c6bf0") not in st._fills_oid_label
+
+    def test_a_file_older_than_the_bind_window_is_not_that_order(self):
+        late = self.ENTRY.replace("11:00:02:317", "11:00:30:000")
+        self.feed(self.OIF, late)
+        assert ("SimAI", "b97e74015deb4ecd88f38736288c6bf0") not in st._fills_oid_label
+
+
+class TestPnlRebuildFromNinjaTraderLog:
+    """A day re-cut from the log: every fill a row, labelled from the order
+    file, dollars reconciled to what the record knows the account made."""
+
+    D = "2026-11-05"
+    LINES = TestFillsEngine.__dict__   # the verbatim 11:00:02 lines
+
+    def _log_dir(self, tmp_path, lines):
+        out = tmp_path / "NinjaTrader 8" / "incoming"; out.mkdir(parents=True)
+        log = tmp_path / "NinjaTrader 8" / "log"; log.mkdir()
+        (log / "log.20261105.00000.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        (log / "log.20261105.00000.en.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return out
+
+    @pytest.fixture(autouse=True)
+    def _arm(self, tmp_path, monkeypatch):
+        L = self.LINES
+        lines = [L["OIF_TEST"], L["TEST_ENTRY"], L["TEST_X"], L["TEST_POS"],
+                 L["TEST_STOP"], L["TEST_X_OUT"], L["TEST_FLAT"]]
+        st.output_directory = str(self._log_dir(tmp_path, lines))
+        monkeypatch.setattr(st, "_session_date_of", lambda stamp: self.D)
+        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: "2026-11-06")   # today is another day
+        # The record as the snapshot engine left it: an "unobserved fill"
+        # and a balance that says what SimTEST really made.
+        with st._pnl_lock:
+            days = st._pnl_hot(self.D[:7])
+            days[self.D] = {"accounts": {"SimTEST": {"start": 92_119.32, "last": 91_859.96, "adj": 0.0},
+                                         "SimAI": {"start": 10_000.0, "last": 10_000.0, "adj": 0.0}},
+                            "trades": [{"ts": 1793876524.0, "account": "SimTEST", "symbol": "", "side": "",
+                                        "qty": 0, "strategy": "", "entry": None, "opened_ts": None,
+                                        "pnl": -259.36, "approx": True, "unseen": True},
+                                       {"ts": 1793876600.0, "account": "SimAI", "symbol": "MGC", "side": "LONG",
+                                        "qty": 3, "strategy": "GC-ExhaustM", "entry": 4094.0,
+                                        "opened_ts": 1793876500.0, "pnl": 140.35, "approx": False}]}
+        yield
+        st.output_directory = ""
+
+    def day(self):
+        return st._pnl_month(self.D[:7])["days"][self.D]
+
+    def test_rebuilt_day_has_exact_rows_reconciled_to_the_balance(self):
+        rep = st._pnl_rebuild_day(self.D)
+        assert rep["rows"] == 1 and rep["replaced"] == ["SimTEST"] and rep["kept"] == ["SimAI"]
+        rows = [t for t in self.day()["trades"] if t["account"] == "SimTEST"]
+        assert len(rows) == 1 and not rows[0].get("unseen")
+        t = rows[0]
+        assert t["symbol"] == "NQ" and t["side"] == "SHORT" and t["qty"] == 1
+        assert t["strategy"] == "NQ-MacroZoneB" and t["exit_kind"] == "stop"
+        assert t["entry"] == 26978.5 and t["exit"] == 26991.25 and t["gross"] == -255.0
+        assert t["pnl"] == -259.36 and t["approx"] is False      # the $4.36 is the commission
+        # Rows for an account the log had no fills for are kept as recorded.
+        kept = [t for t in self.day()["trades"] if t["account"] == "SimAI"]
+        assert kept and kept[0]["strategy"] == "GC-ExhaustM"
+
+    def test_money_the_fills_do_not_explain_becomes_an_unseen_row(self):
+        with st._pnl_lock:
+            st._pnl_hot(self.D[:7])[self.D]["accounts"]["SimTEST"]["last"] = 92_619.32   # +$500 the log never saw
+        rep = st._pnl_rebuild_day(self.D)
+        rows = [t for t in self.day()["trades"] if t["account"] == "SimTEST"]
+        assert rep["unseen"] == 1 and len(rows) == 2
+        assert rows[0]["pnl"] == -255.0 and rows[0]["approx"] is True
+        assert rows[1]["unseen"] is True and rows[1]["pnl"] == 755.0
+        assert round(sum(t["pnl"] for t in rows), 2) == 500.0
+
+    def test_range_backs_up_the_month_and_skips_the_live_session(self, monkeypatch):
+        st._pnl_save(force=True)
+        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: self.D)   # today IS the day
+        ok, msg, reports = st._pnl_rebuild_range(self.D, self.D)
+        assert not ok and "live session" in msg
+        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: "2026-11-06")
+        ok, msg, reports = st._pnl_rebuild_range("2026-11-04", self.D)
+        assert ok and "rebuilt 1 trade row" in msg
+        assert any(p.name.startswith("2026-11.json.bak-rebuild-") for p in st.PNL_DIR.iterdir())
+        assert [r["rows"] for r in reports] == [0, 1]
+
+    def test_no_log_folder_is_said_plainly(self):
+        st.output_directory = "/nonexistent/incoming"
+        ok, msg, _ = st._pnl_rebuild_range(self.D, self.D)
+        assert not ok and "log folder is not reachable" in msg
 
 
 class TestPnlEntryCommission:
