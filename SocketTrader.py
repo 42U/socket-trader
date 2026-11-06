@@ -15474,6 +15474,95 @@ def _pnl_realized_restarted(name: str, acct_day: dict, prev: dict,
     return True
 
 
+def _pnl_tracks(name: str, managed: bool, day: dict | None = None) -> bool:
+    """Does the calendar follow this account?
+
+    Every account in the copy set, and every account the balance monitor
+    knows this session (it reports every account on the connection,
+    managed or not) that the operator has not folded away in the web UI.
+    The operator sets a follower to OFF while trading it by hand "so
+    trades don't interfere", and back on when done — or not, when done
+    for the day. Those are the trades they most want to see, and until
+    now they were exactly the ones dropped: PTLOP's 12:53–13:04 scalps
+    on Nov 5, 1632306's first two trades on Nov 6, each invisible until
+    the role came back and then glued onto an old row as a lump. An
+    account with a ~$0.00 balance never gets a record (the seeding rule),
+    so the dormant ones on the connection cost nothing."""
+    if managed:
+        return True
+    if name in hidden_accounts():
+        return False
+    if day and name in (day.get("accounts") or {}):
+        return True
+    return name in session_start_balances or name in session_current_balances
+
+
+def _pnl_seed_start(name: str, acct_day: dict, cash: float,
+                    realized: float | None, ts: float) -> None:
+    """Baseline for an account the calendar first sees this session.
+
+    The balance the SESSION opened with, not the cash at first sight. The
+    balance monitor keeps a session baseline for every account the dump
+    reports, managed or not, so an account that joins the copy set
+    mid-session carries its whole session: 1632306, 2026-11-06, traded
+    by hand from 23:18, added at 00:04 — its day read +$1,285.56 (the
+    six trades after it joined) against NinjaTrader's +$614.08 (all
+    eight), the two losses before 00:04 having come out of the balance
+    before the old baseline was taken. The dashboard tile already read
+    +$614.08 from the same session baseline; the calendar now agrees
+    with it. Transfers the monitor has already booked this session come
+    across too, and the realized baseline is set so the transfer
+    identity (cash − start − adj == realized − start_realized) holds
+    from the first poll. With no session baseline (an account the
+    monitor never saw) the first reading is the baseline, as before."""
+    base = session_start_balances.get(name)
+    adj = session_adjustments.get(name)
+    if (isinstance(base, (int, float)) and math.isfinite(base)
+            and abs(base) > BALANCE_ZERO_EPS):
+        start = float(base)
+        adj = round(float(adj), 2) if isinstance(adj, (int, float)) and math.isfinite(adj) else 0.0
+    else:
+        start, adj = cash, 0.0
+    acct_day["start"] = start
+    if adj:
+        acct_day["adj"] = adj
+    # Pinned together so the two always describe one window.
+    acct_day["start_realized"] = (round(realized - (cash - start - adj), 2)
+                                  if isinstance(realized, (int, float)) else realized)
+    acct_day["start_ts"] = round(ts, 3)
+    joined = round(cash - start - adj, 2)
+    if abs(joined) >= 0.005:
+        acct_day["joined_pnl"] = joined     # what the account had made before it joined
+        logger.info(f"PNL HISTORY  {name}: joins mid-session with ${joined:+,.2f} already "
+                    f"realized — baseline taken from the session open ({start:,.2f})")
+
+
+def _pnl_rebase_late_joiner(name: str, acct_day: dict) -> bool:
+    """One-time repair of a record seeded by the old rule (cash at first
+    sight) for an account that had joined mid-session. Recognised by its
+    signature: the realized baseline equals exactly the balance move
+    between the session baseline and that first reading — the pre-join
+    trades, which NinjaTrader's counter had and the calendar missed.
+    Rebases onto the session baseline; a record seeded at the open (the
+    two baselines agree) is only stamped. Returns True when changed."""
+    if "start" not in acct_day or "start_ts" in acct_day:
+        return False
+    acct_day["start_ts"] = 0.0                    # looked at; never again
+    base = session_start_balances.get(name)
+    start, sr = acct_day.get("start"), acct_day.get("start_realized")
+    if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (base, start, sr)):
+        return True
+    missed = round(float(start) - float(base), 2)
+    if abs(missed) < 1.0 or abs(float(sr) - missed) >= 1.0:
+        return True
+    acct_day["start"] = float(base)
+    acct_day["start_realized"] = round(float(sr) - missed, 2)
+    acct_day["joined_pnl"] = missed
+    logger.info(f"PNL HISTORY  {name}: rebased onto the session open — ${missed:+,.2f} "
+                "made before the account joined is now in its day")
+    return True
+
+
 def _pnl_reconcile(name: str, acct_day: dict, cash: float,
                    realized: float | None, shape: dict[str, int],
                    settled: bool) -> bool:
@@ -15817,6 +15906,19 @@ def _fills_label(account: str, root: str, side: int, stamp: float,
     return pick, source.get("role") or ""
 
 
+def _fills_follows(account: str) -> bool:
+    """Which accounts' fills the live engine turns into rows: the copy set,
+    and any account the balance monitor knows this session (it reports
+    every account on the connection, managed or not) that the operator
+    has not folded away — so an account traded by hand with its role OFF
+    gets its rows. Accounts the dump never showed are nobody's."""
+    if account in target_accounts():
+        return True
+    if account in hidden_accounts():
+        return False
+    return account in session_start_balances or account in session_current_balances
+
+
 def _fills_on_execution(account: str, instrument: str, price: float, qty: int,
                         mp: str, oid: str, stamp: float, xid: str = "",
                         state: "_FillsState | None" = None) -> list[dict]:
@@ -15828,8 +15930,10 @@ def _fills_on_execution(account: str, instrument: str, price: float, qty: int,
     S = _fills_state(state)
     if qty <= 0 or not math.isfinite(price) or price <= 0:
         return []
-    managed = S.accounts if S.accounts is not None else target_accounts()
-    if account not in managed:
+    if S.accounts is not None:
+        if account not in S.accounts:
+            return []
+    elif not _fills_follows(account):
         return []
     xid = xid or f"{account}|{oid}|{stamp:.3f}|{price}|{qty}"
     if xid in S.seen:
@@ -16165,6 +16269,16 @@ def _fills_sync_book(account: str, shape: dict[str, int], row: dict, ts: float) 
     order id) follow the snapshot at once."""
     global _fills_dirty
     mine = _fills_shape(account)
+    # A root flat on both sides is in agreement too — and it is the one
+    # that matters: a mismatch that began at an exit (the bridge shows
+    # flat a second before the tail reads the fill) ended with the lot
+    # closed, not with an equal poll, and its start time stayed behind.
+    # The next entry on that root then met a one-second-old snapshot and
+    # was judged "flat for 10 minutes" — dropped at once, no row when it
+    # closed (SimAI 2026-11-05 22:50, SimAlwaySummer 2026-11-06 08:12).
+    for key in [k for k in _fills_mismatch
+                if k[0] == account and k[1] not in mine and k[1] not in shape]:
+        _fills_mismatch.pop(key, None)
     for root in set(mine) | set(shape):
         key = (account, root)
         have, want = mine.get(root, 0), shape.get(root, 0)
@@ -16367,6 +16481,11 @@ def _pnl_rebuild_day(date: str, lines: list[str] | None = None, live: bool = Fal
     final: list[dict] = []
     for acct, rows in by_acct.items():
         a = acct_days.get(acct) or {}
+        if live:
+            # An account that joined mid-session under the old rule has
+            # its day short by what it made before it joined; its fills
+            # are in the log, so give the day its real baseline first.
+            _pnl_rebase_late_joiner(acct, a)
         start, last, adj = a.get("start"), a.get("last"), float(a.get("adj") or 0.0)
         net = (round(last - start - adj, 2)
                if isinstance(start, (int, float)) and isinstance(last, (int, float)) else None)
@@ -16413,6 +16532,14 @@ def _pnl_rebuild_day(date: str, lines: list[str] | None = None, live: bool = Fal
         days = _pnl_hot(date[:7])
         day = days.setdefault(date, {"accounts": {}, "trades": []})
         day["trades"] = final[:PNL_TRADES_PER_DAY_CAP]
+        if live:
+            # The baselines were reconciled on copies; a rebased one
+            # (joined mid-session) has to reach the record itself.
+            for acct, a in acct_days.items():
+                if acct in by_acct and acct in day["accounts"]:
+                    for k in ("start", "start_realized", "start_ts", "joined_pnl"):
+                        if k in a:
+                            day["accounts"][acct][k] = a[k]
         _pnl_dirty = True
     logger.info(f"PNL REBUILD  {date}: {len(rebuilt)} row(s) from NinjaTrader's log for "
                 f"{', '.join(sorted(by_acct))}" + (f"; kept as recorded: {', '.join(report['kept'])}"
@@ -16572,9 +16699,9 @@ def _pnl_observe(live: dict, now: float | None = None,
         if day_is_new:
             day = {"accounts": {}, "trades": []}
         for row in live.get("accounts") or []:
-            if not row.get("managed"):
-                continue
             name = row.get("name")
+            if not name or not _pnl_tracks(name, bool(row.get("managed")), day):
+                continue
             cash = row.get("cash")
             if (not name or not isinstance(cash, (int, float))
                     or not math.isfinite(cash)):
@@ -16591,9 +16718,9 @@ def _pnl_observe(live: dict, now: float | None = None,
             # Same seeding rule as every session baseline: a ~$0.00 first
             # reading is an outage artifact or an untradeable account.
             if "start" not in acct_day and abs(cash) > BALANCE_ZERO_EPS:
-                acct_day["start"] = cash
-                # Pinned together so the two always describe one window.
-                acct_day["start_realized"] = realized
+                _pnl_seed_start(name, acct_day, cash, realized, ts)
+                _pnl_dirty = True
+            elif _pnl_rebase_late_joiner(name, acct_day):
                 _pnl_dirty = True
             if acct_day.get("last") != cash and "start" in acct_day:
                 acct_day["last"] = cash

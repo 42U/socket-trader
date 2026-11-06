@@ -7492,6 +7492,68 @@ class TestFillsEngine:
         assert len(rows) == 1 and rows[0]["unseen"] and rows[0]["pnl"] == 300.0
         assert "SimTEST" not in st._fills_money
 
+    @staticmethod
+    def _later(line, seconds, ids):
+        """The same NinjaTrader line `seconds` later with fresh order and
+        execution ids: a second trade on the same account and root."""
+        m = re.match(r"2026-11-05 11:00:0(\d):(\d{3})\|", line)
+        t = 2 + int(m.group(1)) - 2 + int(m.group(2)) / 1000 + seconds
+        head = f"2026-11-05 11:00:{int(t):02d}:{int(round((t % 1) * 1000)):03d}|"
+        out = head + line[len(m.group(0)):]
+        for old, new in ids.items():
+            out = out.replace(old, new)
+        return out.replace("11/05/2026 11:00:02", "11/05/2026 11:00:32").replace(
+            "11/05/2026 11:00:03", "11/05/2026 11:00:33")
+
+    def test_a_mismatch_that_ended_with_the_lot_closed_does_not_outlive_it(self):
+        """SimAI 2026-11-05 22:50, SimAlwaySummer 2026-11-06 08:12: no row.
+        The bridge shows an exit a second before the tail reads it, so a
+        poll finds the lot open and the account flat — a mismatch, timed
+        from then. The tail then closes the lot; both sides are flat; the
+        root is in neither, and the mismatch is never cleared. The next
+        entry on that root meets a one-second-old (flat) snapshot and is
+        judged flat for ten minutes — dropped at once; its exit then has
+        nothing to close and the trade leaves no row."""
+        def obs(live, now):
+            st._nt_tail_seen = now                                    # the log stays in view all along
+            st._pnl_observe(live, now=now)
+        self.stage()
+        obs(_plive(_prow("SimTEST", 92_000.0, [], realized=0.0)), now=self.t0 - 2)
+        self.feed(self.OIF_TEST, self.TEST_ENTRY, self.TEST_X, self.TEST_POS)
+        x = st._nt_log_stamp_ms(self.TEST_X)
+        held = [_ppos("NQ 12-26", -1, 26978.5)]
+        obs(_plive(_prow("SimTEST", 92_000.0, held, realized=0.0)), now=x + 0.5)
+        xo = st._nt_log_stamp_ms(self.TEST_X_OUT)
+        flat = _plive(_prow("SimTEST", 91_745.0, [], realized=-255.0))
+        obs(flat, now=xo - 0.2)                           # bridge: flat; tail: not yet
+        assert ("SimTEST", "NQ") in st._fills_mismatch
+        self.feed(self.TEST_STOP, self.TEST_X_OUT, self.TEST_FLAT)   # the tail catches up
+        assert len(self.rows("SimTEST")) == 1
+        for k in range(1, 4):
+            obs(flat, now=xo + 2 * k)                     # flat on both sides
+        assert ("SimTEST", "NQ") not in st._fills_mismatch          # ...and no mismatch left behind
+        ids = {"15b83b9e21af4820a387b5b1b60b6264": "aaaa0000aaaa0000aaaa0000aaaa0002",
+               "94b5aec0f6184d4abdd2b32e6223674a": "bbbb0000bbbb0000bbbb0000bbbb0002",
+               "652eb616f5fe4236bebcd9f2c18250c5": "cccc0000cccc0000cccc0000cccc0002",
+               "244ea6f8b1264e45ad2d749383cb27ea": "dddd0000dddd0000dddd0000dddd0002",
+               "2026-11-05T11:00:00-05:00": "2026-11-05T11:00:30-05:00"}
+        oif2, entry2, x2, pos2, stop2, xout2, flat2 = (
+            self._later(ln, 30, ids) for ln in (self.OIF_TEST, self.TEST_ENTRY, self.TEST_X, self.TEST_POS,
+                                                self.TEST_STOP, self.TEST_X_OUT, self.TEST_FLAT))
+        self.feed(oif2, entry2, x2, pos2)                             # second trade's entry
+        x2s = st._nt_log_stamp_ms(x2)
+        stale = _plive(_prow("SimTEST", 91_745.0, [], realized=-255.0))   # a second-old snapshot: still flat
+        obs(stale, now=x2s + 0.3)
+        assert st._fills_lots.get(("SimTEST", "NQ")), "the fresh lot was dropped on a stale mismatch"
+        obs(_plive(_prow("SimTEST", 91_745.0, held, realized=-255.0)), now=x2s + 1.5)
+        self.feed(stop2, xout2, flat2)
+        xo2 = st._nt_log_stamp_ms(xout2)
+        obs(_plive(_prow("SimTEST", 91_490.0, [], realized=-510.0)), now=xo2 + 1.0)
+        rows = self.rows("SimTEST")
+        assert [(t.get("entry"), t.get("exit"), t["pnl"], bool(t.get("unseen"))) for t in rows] \
+            == [(26978.5, 26991.25, -255.0, False)] * 2
+        assert not any(t.get("late") or t.get("unseen") for t in rows)
+
     def test_without_realized_the_cash_move_is_the_dollars(self):
         """ATI alone reports no realized P&L: the balance change carries
         the row's dollars, as it does for the snapshot engine."""
@@ -7534,6 +7596,135 @@ class TestLateMoneyAfterARestart:
         assert st._pnl_settle_late("P", -1349.44, self.D, trades, t + 50 * 60, {})
         assert trades[0]["pnl"] == 657.13 and not trades[0].get("late")
         assert trades[1]["unseen"] and trades[1]["pnl"] == -1349.44
+
+
+class TestCalendarFollowsHandTradedAccounts:
+    """The operator sets a follower to OFF while trading it by hand and
+    back on when done (or not, when done for the day). Those trades are
+    the ones they most want in the calendar, and were exactly the ones
+    dropped (PTLOP 2026-11-05 12:53–13:04; 1632306 2026-11-06 23:18 and
+    23:39), then glued onto an old row as a lump when the role came back."""
+
+    D = TestFillsEngine.D
+    TEST_ENTRY, TEST_X, TEST_POS = TestFillsEngine.TEST_ENTRY, TestFillsEngine.TEST_X, TestFillsEngine.TEST_POS
+    TEST_STOP, TEST_X_OUT, TEST_FLAT = TestFillsEngine.TEST_STOP, TestFillsEngine.TEST_X_OUT, TestFillsEngine.TEST_FLAT
+
+    @pytest.fixture(autouse=True)
+    def _arm(self, monkeypatch):
+        st.active_account = "SimTEST"
+        st.follower_accounts = ["SimAI", "SimWhop", "PTLOP2546341754"]
+        st._nt_orders.clear(); st._nt_positions.clear(); st._bracket_guard_seen.clear()
+        self.t0 = st._nt_log_stamp(TestFillsEngine.OIF_TEST)
+        monkeypatch.setattr(st, "_nt_tail_seen", self.t0 + 5)
+        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: self.D)
+        yield
+        st._nt_orders.clear(); st._nt_positions.clear()
+
+    feed = TestFillsEngine.feed
+    day = TestFillsEngine.day
+    rows = TestFillsEngine.rows
+
+    @staticmethod
+    def _as(account, line):
+        return line.replace("SimTEST", account)
+
+    def test_an_account_with_its_role_off_still_gets_its_rows_and_its_day(self, monkeypatch):
+        monkeypatch.setattr(st, "hidden_accounts", lambda: ["Backtest"])
+        st.session_start_balances["1632306"] = 6_981.25         # the balance monitor knows it
+        st.session_start_balances["Backtest"] = 100_000.0
+        assert "1632306" not in st.target_accounts()
+        obs = lambda live, now: (setattr(st, "_nt_tail_seen", now), st._pnl_observe(live, now=now))
+        obs(_plive(_prow("1632306", 6_981.25, [], managed=False, realized=0.0)), self.t0 - 2)
+        rec = st._pnl_hot(self.D[:7])[self.D]["accounts"]["1632306"]
+        assert rec["start"] == 6_981.25 and rec["start_ts"] == self.t0 - 2   # followed, role OFF
+        self.feed(*[self._as("1632306", ln) for ln in (self.TEST_ENTRY, self.TEST_X, self.TEST_POS)])
+        x = st._nt_log_stamp_ms(self.TEST_X)
+        obs(_plive(_prow("1632306", 6_978.37, [_ppos("NQ 12-26", -1, 26978.5)], managed=False,
+                         realized=-2.88)), x + 0.6)                 # the entry's commission, parked
+        assert st._fills_lots[("1632306", "NQ")][0]["cost"] == -2.88
+        self.feed(*[self._as("1632306", ln) for ln in (self.TEST_STOP, self.TEST_X_OUT, self.TEST_FLAT)])
+        (t,) = self.rows("1632306")
+        assert t["strategy"] == "" and "role" not in t and t["exit_kind"] == "stop"
+        assert t["entry"] == 26978.5 and t["exit"] == 26991.25 and t["pnl"] == -260.76   # est at NT's rate
+        xo = st._nt_log_stamp_ms(self.TEST_X_OUT)
+        obs(_plive(_prow("1632306", 6_723.07, [], managed=False, realized=-258.18)), xo + 1.0)
+        rec = self.day()["accounts"]["1632306"]
+        assert rec["start"] == 6_981.25 and rec["last"] == 6_723.07
+        (t,) = self.rows("1632306")
+        assert t["pnl"] == -258.18 and t["approx"] is False and not t.get("late")
+        # Folded-away accounts stay out, in the copy set or not.
+        self.feed(*[self._as("Backtest", ln) for ln in (self.TEST_ENTRY, self.TEST_X, self.TEST_POS)])
+        assert ("Backtest", "NQ") not in st._fills_lots
+        obs(_plive(_prow("Backtest", 100_000.0, [], managed=False, realized=0.0)), xo + 3.0)
+        assert "Backtest" not in self.day().get("accounts", {})
+
+    def test_an_account_the_dump_never_showed_is_nobodys(self):
+        self.feed(*[self._as("Ghost", ln) for ln in (self.TEST_ENTRY, self.TEST_X, self.TEST_POS)])
+        assert ("Ghost", "NQ") not in st._fills_lots
+
+
+class TestLateJoinerBaseline:
+    """1632306, 2026-11-06: traded by hand from 23:18, added to the copy
+    set at 00:04 with −$671.48 already realized. Its day read +$1,285.56
+    (the six trades after) against NinjaTrader's +$614.08 (all eight)."""
+
+    D = "2026-11-06"
+
+    def obs(self, live, now):
+        st._pnl_observe(live, now=now, session_date=self.D)
+
+    def day(self):
+        return st._pnl_hot(self.D[:7]).get(self.D) or {"accounts": {}, "trades": []}
+
+    def test_a_late_joiner_starts_from_the_session_open(self):
+        st.session_start_balances["1632306"] = 6_981.25
+        self.obs(_plive(_prow("1632306", 6_309.77, [], realized=-671.48)), 1_000.0)
+        a = self.day()["accounts"]["1632306"]
+        assert a["start"] == 6_981.25 and a["start_realized"] == 0.0 and a["joined_pnl"] == -671.48
+        assert a["start_ts"] == 1_000.0 and "adj" not in a
+        self.obs(_plive(_prow("1632306", 7_595.33, [], realized=614.08)), 1_010.0)
+        a = self.day()["accounts"]["1632306"]
+        assert round(a["last"] - a["start"], 2) == 614.08           # NinjaTrader's number
+
+    def test_a_transfer_booked_before_the_join_comes_across(self):
+        st.session_start_balances["1632306"] = 6_981.25
+        st.session_adjustments["1632306"] = 1_000.0                 # a deposit the monitor booked
+        self.obs(_plive(_prow("1632306", 7_309.77, [], realized=-671.48)), 1_000.0)
+        a = self.day()["accounts"]["1632306"]
+        assert a["start"] == 6_981.25 and a["adj"] == 1_000.0 and a["start_realized"] == 0.0
+        assert round(a["last"] - a["start"] - a["adj"], 2) == -671.48
+
+    def test_without_a_session_baseline_the_first_reading_is_the_baseline(self):
+        self.obs(_plive(_prow("SimX", 5_000.0, [], realized=-100.0)), 1_000.0)
+        a = self.day()["accounts"]["SimX"]
+        assert a["start"] == 5_000.0 and a["start_realized"] == -100.0 and "joined_pnl" not in a
+
+    def test_an_old_record_of_a_late_joiner_is_rebased_once(self):
+        with st._pnl_lock:
+            days = st._pnl_hot(self.D[:7])
+            days[self.D] = {"accounts": {"1632306": {"start": 6_309.77, "start_realized": -671.48,
+                                                     "last": 7_595.33, "adj": 0.0}},
+                            "trades": []}
+        st.session_start_balances["1632306"] = 6_981.25
+        self.obs(_plive(_prow("1632306", 7_595.33, [], realized=614.08)), 2_000.0)
+        a = self.day()["accounts"]["1632306"]
+        assert a["start"] == 6_981.25 and a["start_realized"] == 0.0 and a["joined_pnl"] == -671.48
+        assert round(a["last"] - a["start"] - a["adj"], 2) == 614.08
+        assert a["start_ts"] == 0.0                                  # looked at; never again
+        st.session_start_balances["1632306"] = 1.0                   # a later, different baseline…
+        self.obs(_plive(_prow("1632306", 7_595.33, [], realized=614.08)), 2_010.0)
+        assert self.day()["accounts"]["1632306"]["start"] == 6_981.25   # …changes nothing
+
+    def test_a_record_seeded_at_the_open_is_only_stamped(self):
+        with st._pnl_lock:
+            days = st._pnl_hot(self.D[:7])
+            days[self.D] = {"accounts": {"Sim101": {"start": 30_306.42, "start_realized": 0.0,
+                                                    "last": 29_672.70}},
+                            "trades": []}
+        st.session_start_balances["Sim101"] = 30_306.42
+        self.obs(_plive(_prow("Sim101", 29_672.70, [], realized=-633.72)), 2_000.0)
+        a = self.day()["accounts"]["Sim101"]
+        assert a["start"] == 30_306.42 and a["start_ts"] == 0.0 and "joined_pnl" not in a
 
 
 class TestFillsAttributionFromOrderFile:
