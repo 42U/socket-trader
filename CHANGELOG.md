@@ -27,15 +27,24 @@ one per fix.
   on a row that is in the record, a row cut while the replay ran is kept
   rather than erased, rebuilding a past month no longer swaps the live
   month out and back in as new dicts, and a second REBUILD while one is
-  running is refused instead of racing it.
+  running is refused instead of racing it. A row the live engine cut
+  mid-replay for a fill the replay also saw is kept once, not twice.
 - **A small loss landing before its row became the next entry's
   "commission".** Realized dipping right after an entry was parked on
   the lot as its commission (and taught as the rate) whenever it was
   under $50 a contract — a one-tick stop-out with the fees (−$9.36 on
   NQ) qualified, its row then cut a second later with nothing to take
-  its dollars. The cap is now $10 a contract a side, and a dip waits one
-  poll for an exit row, and for the lots to agree with the snapshot,
-  before it is parked.
+  its dollars. The cap is now $10 a contract a side, and a dip waits out
+  a short hold (a poll or two) for an exit row, and for the lots to
+  agree with the snapshot, before it is parked — the entry it is parked
+  on is looked for over a window that covers the hold, so a dip that
+  reaches the snapshot late is still parked.
+- **A stop filled 2 then 1 across two tail passes left a $0.00 row.**
+  With a poll between the two lines and the snapshot already carrying
+  all three lots' money, the money went to the 2-lot row and the third
+  lot cut a row of its own that nothing paid. While the row's closing
+  order is still partially filled, its money waits a poll for the rest
+  of the order to join.
 - **A counter reset under an open position was booked as a trade.**
   NinjaTrader's RealizedPnL resetting to zero (18:00, or NinjaTrader
   restarted) while a swing trade was held was differenced like a fill:
@@ -43,8 +52,11 @@ one per fix.
   as a transfer. With the log in view the engine knows no execution was
   read for the account, so a zero landing under a position that sat
   still is a restart and is re-anchored. A mid-day "Reset P&L" also no
-  longer undoes itself: the session keeps its own realized anchor, so
-  the next poll no longer books the morning's realized as a withdrawal.
+  longer undoes itself: the session keeps its own realized anchor,
+  pinned so the transfer identity reads zero at the instant the baseline
+  is taken (the leader's baseline is equity), so the next poll no longer
+  books the morning's realized — or the open position's unrealized — as
+  a withdrawal.
 - **A later partial of a settled closing order was counted twice.** A
   stop filled 1 now and 1 later joined the first partial's row after that
   row had taken NinjaTrader's exact dollars, re-estimating it from prices

@@ -588,14 +588,24 @@ def _seed_start_balance(account: str, cash):
         session_start_balances[account] = cash
         # Anything transferred before this baseline is already inside it.
         session_adjustments.pop(account, None)
-        # NinjaTrader's counter as last polled is this baseline's anchor;
-        # with none polled yet the day's own baseline stands in (it is
-        # seeded from this balance when the account is first observed).
-        r = (_pnl_prev.get(account) or {}).get("realized")
-        if isinstance(r, (int, float)) and math.isfinite(r):
-            session_realized_anchor[account] = float(r)
-        else:
-            session_realized_anchor.pop(account, None)
+        _anchor_realized(account, cash)
+
+
+def _anchor_realized(account: str, baseline: float) -> None:
+    """Pin the session's realized anchor for a baseline just taken, so the
+    transfer identity (cash − baseline == realized − anchor) reads zero at
+    this instant: NinjaTrader's counter as last polled, less whatever the
+    last polled cash already stood from the baseline (the leader's
+    baseline is equity, a few seconds may separate the two readings).
+    With no poll yet the day's own realized baseline stands in — it is
+    seeded from this balance when the account is first observed."""
+    prev = _pnl_prev.get(account) or {}
+    r, c = prev.get("realized"), prev.get("cash")
+    if isinstance(r, (int, float)) and math.isfinite(r):
+        off = (c - baseline) if isinstance(c, (int, float)) and math.isfinite(c) else 0.0
+        session_realized_anchor[account] = round(float(r) - off, 2)
+    else:
+        session_realized_anchor.pop(account, None)
 
 
 def _held_balance(account: str, polled) -> float | None:
@@ -869,10 +879,8 @@ def reset_session_pnl():
     # the transfer identity (cash − baseline == realized − anchor) starts
     # from here too. Last polled is at most a poll old, as the balance is.
     session_realized_anchor.clear()
-    for name in session_start_balances:
-        r = (_pnl_prev.get(name) or {}).get("realized")
-        if isinstance(r, (int, float)) and math.isfinite(r):
-            session_realized_anchor[name] = float(r)
+    for name, sb in session_start_balances.items():
+        _anchor_realized(name, sb)
     _no_baseline_warned.clear()
     session_contracts.clear()
     account_stops.clear()
@@ -16213,6 +16221,21 @@ def _fills_in_flight(account: str, ts: float) -> bool:
                for t, _, _ in _fills_entries.get(account) or [])
 
 
+def _fills_row_order_still_filling(account: str, row: dict) -> bool:
+    """Is the closing order that cut `row` still partially filled, with
+    more contracts to come than the row holds? Judged from NinjaTrader's
+    own order-state lines."""
+    for (acct, root), (oid, r) in _fills_last_row.items():
+        if acct != account or r is not row or not oid:
+            continue
+        rec = (_nt_orders.get((acct, root)) or {}).get(oid)
+        if not rec:
+            return False
+        state, qty = rec[1], rec[3]
+        return state == "Partially filled" and int(row.get("qty") or 0) < int(qty or 0)
+    return False
+
+
 def _fills_assign_money(account: str, dreal: float | None, ts: float, date: str,
                         trades: list, shape: dict[str, int]) -> bool:
     """Put NinjaTrader's realized change on the rows it belongs to.
@@ -16246,6 +16269,17 @@ def _fills_assign_money(account: str, dreal: float | None, ts: float, date: str,
     opened = [(t, root, q) for t, root, q in _fills_entries.get(account) or []
               if ts - t <= FILLS_ENTRY_COMM_WINDOW_S]
     dreal = round(sum(d for _, d in pend), 2)
+    age = ts - min(t for t, _ in pend)
+    if (waiting and len(waiting) == 1 and age < FILLS_PARK_HOLD_S
+            and _fills_row_order_still_filling(account, waiting[0][1])):
+        # A stop filled 2 then 1, 67 ms apart, the two lines read by
+        # different tail passes with a poll between them: the snapshot
+        # already carries all three lots' money while the row holds two.
+        # Given to the row now, the row is closed to the third lot, which
+        # then cuts a row of its own that nothing pays — a $0.00 `late`
+        # row. Hold the money a poll so the rest of the order joins first.
+        _fills_money[account] = pend[-16:]
+        return False
     if waiting:
         # An entry in the same window whose lots are STILL open paid its
         # commission out of this delta too: take the known rate back out
@@ -16287,24 +16321,30 @@ def _fills_assign_money(account: str, dreal: float | None, ts: float, date: str,
         _pnl_dirty = True
         _fills_dirty = True
         return True
-    total_q = sum(q for _, _, q in opened) or 1
-    # A commission-sized dip is parked only once it has waited a poll with
-    # no exit row turning up AND the lots agree with the snapshot. The
-    # exit's own line is read by the tail up to a second after its money
-    # lands: parked at once, a small loss (one tick and the fees, $9 on
-    # NQ) became the next entry's "commission", was taught as the rate,
-    # and its row, cut a second later, never got its dollars. While the
-    # book disagrees with the snapshot an exit is in flight by definition.
-    held_long_enough = ts - min(t for t, _ in pend) >= FILLS_PARK_HOLD_S
+    # A commission-sized dip is parked only once it has waited out a short
+    # hold with no exit row turning up AND the lots agree with the
+    # snapshot. The exit's own line is read by the tail up to a second
+    # after its money lands: parked at once, a small loss (one tick and
+    # the fees, $9 on NQ) became the next entry's "commission", was taught
+    # as the rate, and its row, cut a second later, never got its dollars.
+    # While the book disagrees with the snapshot an exit is in flight by
+    # definition. The entries judged here are seen over a window that
+    # covers the hold and a poll, so a dip that reaches the snapshot late
+    # (a stale poll skipped, ATI's cash lagging) is still parked rather
+    # than minted as an unseen row under an open position.
+    parkable = [(t, root, q) for t, root, q in _fills_entries.get(account) or []
+                if ts - t <= FILLS_ENTRY_COMM_WINDOW_S + FILLS_PARK_HOLD_S + PNL_TRACK_INTERVAL]
+    total_q = sum(q for _, _, q in parkable) or 1
+    held_long_enough = age >= FILLS_PARK_HOLD_S
     book_quiet = not any(k[0] == account for k in _fills_mismatch)
-    if (opened and dreal < 0 and abs(dreal) / total_q <= FILLS_MAX_COMM_PER_SIDE
+    if (parkable and dreal < 0 and abs(dreal) / total_q <= FILLS_MAX_COMM_PER_SIDE
             and held_long_enough and book_quiet):
         # Nothing closed: this is what the entries cost. Park it on their
         # lots so the row at exit carries it, and learn the rate. A dip
         # too big to be a commission is a loss whose row is still on its
         # way (or an entry's commission plus that loss), and waits below.
         _fills_money.pop(account, None)
-        for t, root, q in opened:
+        for t, root, q in parkable:
             share = dreal * q / total_q
             for lot in _fills_lots.get((account, root)) or []:
                 if abs(lot["ts"] - t) < 0.5:
@@ -16314,7 +16354,7 @@ def _fills_assign_money(account: str, dreal: float | None, ts: float, date: str,
             if 0 < per <= FILLS_MAX_COMM_PER_SIDE:
                 old = _fills_comm.get((account, root))
                 _fills_comm[(account, root)] = round(per if old is None else (old * 0.7 + per * 0.3), 4)
-        _fills_entries[account] = [e for e in _fills_entries.get(account) or [] if e not in opened]
+        _fills_entries[account] = [e for e in _fills_entries.get(account) or [] if e not in parkable]
         _fills_dirty = True
         return False
     # Nothing to take it yet: hold what is still inside the window for the
@@ -16516,6 +16556,14 @@ def _pnl_rebuild_days(month: str) -> dict:
     return _pnl_days(month)
 
 
+def _pnl_rows_twin(a: dict, b: dict) -> bool:
+    """The same close seen twice (a live row and its rebuilt copy): same
+    account, market, side and size, exits within 1.5 s."""
+    return (a.get("account") == b.get("account") and a.get("symbol") == b.get("symbol")
+            and a.get("side") == b.get("side") and int(a.get("qty") or 0) == int(b.get("qty") or 0)
+            and abs(float(a.get("ts") or 0) - float(b.get("ts") or 0)) < 1.5)
+
+
 def _fills_repoint_rows(date: str, trades: list[dict]) -> None:
     """After the live day's rows were replaced: every reference the
     engine keeps to a row (the last close per account, rows waiting for
@@ -16526,12 +16574,14 @@ def _fills_repoint_rows(date: str, trades: list[dict]) -> None:
         for t in trades:
             if t is r:
                 return t
-        for t in trades:
-            if (t.get("account") == r.get("account") and t.get("symbol") == r.get("symbol")
-                    and t.get("side") == r.get("side") and int(t.get("qty") or 0) == int(r.get("qty") or 0)
-                    and abs(float(t.get("ts") or 0) - float(r.get("ts") or 0)) < 1.5):
-                return t
-        return None
+        twins = [t for t in trades if _pnl_rows_twin(t, r)]
+        if not twins:
+            return None
+        # Two one-lot stop-outs on one root within the second: the one at
+        # the same exit price, else the nearest in time.
+        same_exit = [t for t in twins if t.get("exit") == r.get("exit")]
+        pool = same_exit or twins
+        return min(pool, key=lambda t: abs(float(t.get("ts") or 0) - float(r.get("ts") or 0)))
     for acct, have in list(_pnl_recent.items()):
         if have[0] != date:
             continue
@@ -16611,11 +16661,7 @@ def _pnl_rebuild_day(date: str, lines: list[str] | None = None, live: bool = Fal
     own: list[dict] = []
     if live:
         now = time.time()
-
-        def twin(a: dict, b: dict) -> bool:
-            return (a.get("account") == b.get("account") and a.get("symbol") == b.get("symbol")
-                    and a.get("side") == b.get("side") and int(a.get("qty") or 0) == int(b.get("qty") or 0)
-                    and abs(float(a.get("ts") or 0) - float(b.get("ts") or 0)) < 1.5)
+        twin = _pnl_rows_twin
         for t in old_rows:
             if t.get("account") not in by_acct:
                 continue
@@ -16633,6 +16679,7 @@ def _pnl_rebuild_day(date: str, lines: list[str] | None = None, live: bool = Fal
                 del by_acct[acct]
         kept.extend(own)
     final: list[dict] = []
+    rebuilt_ids: set[int] = set()
     for acct, rows in by_acct.items():
         a = acct_days.get(acct) or {}
         if live:
@@ -16677,6 +16724,7 @@ def _pnl_rebuild_day(date: str, lines: list[str] | None = None, live: bool = Fal
                                  "approx": True, "unseen": True})
                     report["unseen"] += 1
         final.extend(rows)
+        rebuilt_ids.update(id(r) for r in rows)
         report["replaced"].append(acct)
     report["kept"] = sorted({t.get("account") for t in kept if t.get("account")})
     final.extend(kept)
@@ -16691,6 +16739,13 @@ def _pnl_rebuild_day(date: str, lines: list[str] | None = None, live: bool = Fal
         # REBUILD pressed during a trade would erase that trade.
         fresh = [t for t in day["trades"] if not any(t is o for o in old_rows)]
         if fresh:
+            # A fill whose line was already in the log when it was read,
+            # but whose live row was cut after `old_rows` was taken, is in
+            # both: the live row wins, as a young live row does above.
+            # Only a REBUILT row yields — a kept old row that happens to
+            # twin a fresh one is a second trade, not a copy.
+            final = [r for r in final
+                     if not (id(r) in rebuilt_ids and any(_pnl_rows_twin(r, f) for f in fresh))]
             final = sorted(final + fresh, key=lambda t: float(t.get("ts") or 0))
         day["trades"] = final[:PNL_TRADES_PER_DAY_CAP]
         if live:
