@@ -7658,6 +7658,25 @@ class TestCalendarFollowsHandTradedAccounts:
         obs(_plive(_prow("Backtest", 100_000.0, [], managed=False, realized=0.0)), xo + 3.0)
         assert "Backtest" not in self.day().get("accounts", {})
 
+    def test_a_dormant_account_at_zero_gets_no_record(self):
+        """The connection reports dozens of prop accounts at $0.00; rc5
+        minted an empty record for each and the ACCOUNT list grew by
+        seventy names. No baseline, no record — and one that slipped in
+        is dropped."""
+        st.session_current_balances["TDFYSL50152571304"] = 0.0
+        st.session_start_balances["1632306"] = 6_981.25
+        with st._pnl_lock:
+            days = st._pnl_hot(self.D[:7])
+            days[self.D] = {"accounts": {"GhostOfRc5": {}, "1632306": {"start": 6_981.25, "last": 6_981.25,
+                                                                        "start_realized": 0.0, "start_ts": 1.0}},
+                            "trades": []}
+        assert not st._pnl_tracks("TDFYSL50152571304", False, days[self.D])
+        st._pnl_observe(_plive(_prow("TDFYSL50152571304", 0.0, [], managed=False, realized=0.0),
+                               _prow("1632306", 6_981.25, [], managed=False, realized=0.0)), now=self.t0)
+        accts = st._pnl_hot(self.D[:7])[self.D]["accounts"]
+        assert "TDFYSL50152571304" not in accts and "GhostOfRc5" not in accts and "1632306" in accts
+        assert "GhostOfRc5" not in st._pnl_month(self.D[:7])["accounts"]
+
     def test_an_account_the_dump_never_showed_is_nobodys(self):
         self.feed(*[self._as("Ghost", ln) for ln in (self.TEST_ENTRY, self.TEST_X, self.TEST_POS)])
         assert ("Ghost", "NQ") not in st._fills_lots

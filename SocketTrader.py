@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-__version__ = "1.0.5rc5"
+__version__ = "1.0.5rc6"
 
 # `SocketTrader.exe --version` / `python SocketTrader.py --version`: answered
 # before any import so installers and build checks get it in milliseconds.
@@ -15494,7 +15494,11 @@ def _pnl_tracks(name: str, managed: bool, day: dict | None = None) -> bool:
         return False
     if day and name in (day.get("accounts") or {}):
         return True
-    return name in session_start_balances or name in session_current_balances
+    # Known to the monitor AND carrying money: the connection reports
+    # dozens of dormant prop accounts at $0.00, and a record for each of
+    # those is seventy empty names in the ACCOUNT list (1.0.5rc5, 11:03).
+    bal = session_current_balances.get(name, session_start_balances.get(name))
+    return isinstance(bal, (int, float)) and abs(bal) > BALANCE_ZERO_EPS
 
 
 def _pnl_seed_start(name: str, acct_day: dict, cash: float,
@@ -16714,10 +16718,19 @@ def _pnl_observe(live: dict, now: float | None = None,
             if not isinstance(realized, (int, float)) or not math.isfinite(realized):
                 realized = None
 
-            acct_day = day["accounts"].setdefault(name, {})
-            # Same seeding rule as every session baseline: a ~$0.00 first
-            # reading is an outage artifact or an untradeable account.
-            if "start" not in acct_day and abs(cash) > BALANCE_ZERO_EPS:
+            acct_day = day["accounts"].get(name)
+            if acct_day is None:
+                # Same seeding rule as every session baseline: a ~$0.00
+                # first reading is an outage artifact or an untradeable
+                # account — and no record at all until there is a baseline.
+                if abs(cash) <= BALANCE_ZERO_EPS:
+                    continue
+                acct_day = day["accounts"][name] = {}
+                _pnl_seed_start(name, acct_day, cash, realized, ts)
+                _pnl_dirty = True
+            elif "start" not in acct_day:
+                if abs(cash) <= BALANCE_ZERO_EPS:
+                    continue
                 _pnl_seed_start(name, acct_day, cash, realized, ts)
                 _pnl_dirty = True
             elif _pnl_rebase_late_joiner(name, acct_day):
@@ -17034,6 +17047,13 @@ def _pnl_observe(live: dict, now: float | None = None,
             if _pnl_settle_session(name, acct_day, cash, shape,
                                    day["trades"], date, ts, settled):
                 _pnl_dirty = True
+        # A record with no baseline says nothing and clutters the account
+        # list (1.0.5rc5 made seventy of them): drop any that slipped in.
+        empty = [k for k, v in day["accounts"].items()
+                 if not isinstance(v, dict) or "start" not in v]
+        for k in empty:
+            del day["accounts"][k]
+            _pnl_dirty = True
         if day_is_new and (day["accounts"] or day["trades"]):
             hist_days[date] = day
 
@@ -17106,6 +17126,8 @@ def _pnl_month(month: str) -> dict:
             net = 0.0
             adj_day = 0.0
             for name, a in (rec.get("accounts") or {}).items():
+                if not isinstance(a, dict) or "start" not in a:
+                    continue                    # no baseline: nothing to show
                 start, last = a.get("start"), a.get("last")
                 adj = a.get("adj") or 0.0
                 # The balance moved by P&L AND by money crossing the
