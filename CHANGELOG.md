@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+- **`GET /api/log`** — the last lines of SocketTrader's own log (`?n=`, up
+  to 5000; `?grep=` for a case-insensitive filter), token-protected like
+  the rest of the API, reaching back into the first rotated copy. "Why
+  did that account get no row" is in the `FILLS` lines and "why was that
+  leg skipped" in the `LEG SKIPPED` lines, and the file itself lives
+  where a helper cannot be handed it.
+
 ### Fixed
 - **The account modal reopened on stale limits.** SAVE LIMITS saved (the
   API and the balance monitor had the new target and stop at once), but

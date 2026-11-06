@@ -3344,6 +3344,33 @@ class TestWebServer(_WebClient):
             self._get(web + "/api/nope")
         assert e.value.code == 404
 
+    def test_the_log_tail_is_served_to_the_page(self, web, tmp_path, monkeypatch):
+        """GET /api/log: the app's own log, newest last, filtered on request,
+        token-protected — so "why did that account get no row" can be read
+        off the machine without someone finding the file."""
+        log = tmp_path / "signals.log"
+        log.write_text("".join(f"2026-11-06 08:12:{i:02d}  {'FILLS' if i % 2 else 'WEB'}  line {i}\n"
+                               for i in range(40)), encoding="utf-8")
+        monkeypatch.setattr(st, "LOG_FILE", log)
+        get = lambda q: json.loads(self._get(web + "/api/log" + q).read())
+        d = get("?n=5")
+        assert d["ok"] and d["total"] == 40 and d["truncated"]
+        assert d["lines"][-1].endswith("line 39") and len(d["lines"]) == 5
+        d = get("?n=100&grep=fills")
+        assert d["total"] == 20 and all("FILLS" in ln for ln in d["lines"]) and not d["truncated"]
+        self._expect_status(lambda: self._get(web + "/api/log", token=False), 403)
+        monkeypatch.setattr(st, "LOG_FILE", tmp_path / "missing.log")
+        d = get("")
+        assert d["ok"] and d["lines"] == [] and d["total"] == 0
+
+    def test_the_log_tail_reaches_back_into_the_rotated_copy(self, tmp_path, monkeypatch):
+        log = tmp_path / "signals.log"
+        (tmp_path / "signals.log.1").write_text("old 1\nold 2\n", encoding="utf-8")
+        log.write_text("new 1\n", encoding="utf-8")
+        monkeypatch.setattr(st, "LOG_FILE", log)
+        assert st._log_tail(10)["lines"] == ["old 1", "old 2", "new 1"]
+        assert st._log_tail(2)["lines"] == ["old 2", "new 1"]
+
     def test_a_client_dropping_its_connection_is_not_a_traceback(self, web, capsys, caplog):
         """A browser tab reloading mid-poll ends the keep-alive socket with
         ConnectionResetError (WinError 10054); the stdlib server used to

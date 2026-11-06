@@ -16911,6 +16911,52 @@ def _pnl_observe(live: dict, now: float | None = None,
             hist_days[date] = day
 
 
+LOG_TAIL_MAX_LINES = 5000
+LOG_TAIL_READ_BYTES = 4 * 1024 * 1024   # how far back into the file (and its .1 copy) the tail looks
+
+
+def _log_tail(n: int = 500, grep: str = "") -> dict:
+    """The last `n` lines of the app's own log, newest last, optionally only
+    those containing `grep` (case-insensitive). Reads the end of the current
+    file and, when that is short, the end of the first rotated copy, so a
+    rollover does not hide the minutes that matter.
+
+    The web UI serves this at GET /api/log so a problem can be read off the
+    machine without someone finding the file: "why did that account get no
+    row" is answered by the FILLS lines, "why was that leg skipped" by the
+    LEG SKIPPED lines, and the file lives in a folder a helper cannot be
+    handed."""
+    n = max(1, min(int(n or 500), LOG_TAIL_MAX_LINES))
+    needle = (grep or "").strip().lower()
+    chunks: list[str] = []
+    budget = LOG_TAIL_READ_BYTES
+    for path in (LOG_FILE, Path(str(LOG_FILE) + ".1")):
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        take = min(size, budget)
+        if take <= 0:
+            continue
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(size - take)
+                chunks.insert(0, fh.read(take).decode("utf-8", "replace"))
+        except OSError:
+            continue
+        budget -= take
+        if budget <= 0:
+            break
+    lines = "".join(chunks).splitlines()
+    if chunks and len("".join(chunks)) >= LOG_TAIL_READ_BYTES:
+        lines = lines[1:]                      # the first line is a torn one
+    if needle:
+        lines = [ln for ln in lines if needle in ln.lower()]
+    total = len(lines)
+    return {"ok": True, "file": str(LOG_FILE), "lines": lines[-n:],
+            "total": total, "truncated": total > n}
+
+
 def _pnl_month(month: str) -> dict:
     """One month of the calendar, rolled up for the web UI.
 
@@ -17430,6 +17476,18 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
                                 "message": "month must be YYYY-MM"}, 400)
                     return
                 self._json(_pnl_month(month))
+            elif path == "/api/log":
+                if not self._token_ok():
+                    self._json({"ok": False, "message": "forbidden"}, 403)
+                    return
+                query = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(self.path).query)
+                try:
+                    n = int((query.get("n") or ["500"])[0])
+                except ValueError:
+                    self._json({"ok": False, "message": "n must be a number"}, 400)
+                    return
+                self._json(_log_tail(n, (query.get("grep") or [""])[0]))
             elif path == "/api/profile_export":
                 if not self._token_ok():
                     self._json({"ok": False, "message": "forbidden"}, 403)
