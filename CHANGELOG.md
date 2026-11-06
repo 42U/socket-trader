@@ -2,12 +2,70 @@
 
 ## 1.0.5rc6 — 2026-11-06 (pre-release)
 
+One release for everything a cold review of rc4–rc5 turned up, instead of
+one per fix.
+
 ### Fixed
 - **Seventy empty names in the ACCOUNT list.** rc5's "follow every account
   the monitor knows" also minted an empty record for each dormant prop
   account the connection reports at $0.00. An account now needs money as
-  well as a name to be followed, no record exists until it has a
-  baseline, and any empty record that slipped in is dropped.
+  well as a name to be followed (the fills engine applies the same rule,
+  so no rows are cut for an account the calendar keeps no record of), no
+  record exists until it has a baseline, and any empty record that
+  slipped in is dropped.
+- **A position adopted at a restart lost its exit.** Lots re-seeded from
+  the snapshot (no order id) were dropped the instant the bridge showed
+  flat — a second before the tail read the exit — so the exit's fill had
+  nothing to close, opened a phantom lot, and the trade left no row.
+  Every lot now waits out the same grace.
+- **REBUILD of the live day cut the engine loose from the record.** The
+  rows a rebuild replaced were still the ones the live engine's "last
+  close" pointed at, so late money (a fee, a settle-up) was written to a
+  dead dict and the settle-up wrote it again every poll. A rebuild now
+  re-points the engine at the row that replaced each of its rows (same
+  account, market, side, size within 1.5 s), late money only ever lands
+  on a row that is in the record, a row cut while the replay ran is kept
+  rather than erased, rebuilding a past month no longer swaps the live
+  month out and back in as new dicts, and a second REBUILD while one is
+  running is refused instead of racing it. A row the live engine cut
+  mid-replay for a fill the replay also saw is kept once, not twice.
+- **A small loss landing before its row became the next entry's
+  "commission".** Realized dipping right after an entry was parked on
+  the lot as its commission (and taught as the rate) whenever it was
+  under $50 a contract — a one-tick stop-out with the fees (−$9.36 on
+  NQ) qualified, its row then cut a second later with nothing to take
+  its dollars. The cap is now $10 a contract a side, and a dip waits out
+  a short hold (a poll or two) for an exit row, and for the lots to
+  agree with the snapshot, before it is parked — the entry it is parked
+  on is looked for over a window that covers the hold, so a dip that
+  reaches the snapshot late is still parked.
+- **A stop filled 2 then 1 across two tail passes left a $0.00 row.**
+  With a poll between the two lines and the snapshot already carrying
+  all three lots' money, the money went to the 2-lot row and the third
+  lot cut a row of its own that nothing paid. While the row's closing
+  order is still partially filled, its money waits a poll for the rest
+  of the order to join.
+- **A counter reset under an open position was booked as a trade.**
+  NinjaTrader's RealizedPnL resetting to zero (18:00, or NinjaTrader
+  restarted) while a swing trade was held was differenced like a fill:
+  the whole previous session as a `late`/`unseen` row, then its negation
+  as a transfer. With the log in view the engine knows no execution was
+  read for the account, so a zero landing under a position that sat
+  still is a restart and is re-anchored. A mid-day "Reset P&L" also no
+  longer undoes itself: the session keeps its own realized anchor,
+  pinned so the transfer identity reads zero at the instant the baseline
+  is taken (the leader's baseline is equity), so the next poll no longer
+  books the morning's realized — or the open position's unrealized — as
+  a withdrawal.
+- **A later partial of a settled closing order was counted twice.** A
+  stop filled 1 now and 1 later joined the first partial's row after that
+  row had taken NinjaTrader's exact dollars, re-estimating it from prices
+  and leaving the second partial's money with no row — it went `late`
+  onto the same row. A row holding its dollars is closed; the later
+  partial cuts its own.
+- `GET /api/log` no longer leads with a torn half-line when the log
+  carries non-ASCII characters (the read budget is in bytes, the check
+  compared decoded text).
 
 ## 1.0.5rc5 — 2026-11-06 (pre-release)
 
