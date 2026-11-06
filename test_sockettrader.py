@@ -79,6 +79,7 @@ def reset_session_state():
     st.session_start_balances.clear()
     st.session_current_balances.clear()
     st.session_adjustments.clear()
+    st.session_realized_anchor.clear()
     st._balance_suspect_since.clear()
     st.session_contracts.clear()
     st.soft_stopped = False
@@ -189,11 +190,13 @@ def isolate_pnl_history(tmp_path_factory):
     st._fills_comm.clear(); st._fills_seen_xids.clear(); st._fills_mismatch.clear()
     st._fills_pv_seen.clear(); st._fills_last_row.clear(); st._fills_dirty = False
     st._fills_oif_pending.clear(); st._fills_oid_label.clear(); st._fills_money.clear()
+    st._fills_last_exec.clear()
     yield
     st._fills_lots.clear(); st._fills_wait.clear(); st._fills_entries.clear()
     st._fills_comm.clear(); st._fills_seen_xids.clear(); st._fills_mismatch.clear()
     st._fills_pv_seen.clear(); st._fills_last_row.clear(); st._fills_dirty = False
     st._fills_oif_pending.clear(); st._fills_oid_label.clear(); st._fills_money.clear()
+    st._fills_last_exec.clear()
     st.PNL_HISTORY_FILE = original
     st._pnl_history = None
     st._pnl_hot_month = None
@@ -3370,6 +3373,22 @@ class TestWebServer(_WebClient):
         monkeypatch.setattr(st, "LOG_FILE", log)
         assert st._log_tail(10)["lines"] == ["old 1", "old 2", "new 1"]
         assert st._log_tail(2)["lines"] == ["old 2", "new 1"]
+
+    def test_a_torn_first_line_is_dropped_even_when_the_log_is_not_ascii(self, tmp_path, monkeypatch):
+        """The read budget is in bytes; the torn-line check compared it
+        with the decoded text's length, which is shorter whenever a line
+        carries a multi-byte character (the TUI's "—" and "✔" are logged
+        too) — so a half line led the tail whenever the file was long."""
+        log = tmp_path / "signals.log"
+        lines = [f"line {i:03d} — ✔ {'ok' * (1 + i % 5)}" for i in range(40)]
+        log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        monkeypatch.setattr(st, "LOG_FILE", log)
+        monkeypatch.setattr(st, "LOG_TAIL_READ_BYTES", 300)
+        out = st._log_tail(100)["lines"]
+        assert out and all(ln in lines for ln in out)                  # no torn fragment
+        assert out[-1] == lines[-1]
+        monkeypatch.setattr(st, "LOG_TAIL_READ_BYTES", 1 << 20)
+        assert st._log_tail(100)["lines"] == lines                     # the whole file is whole
 
     def test_a_client_dropping_its_connection_is_not_a_traceback(self, web, capsys, caplog):
         """A browser tab reloading mid-poll ends the keep-alive socket with
@@ -7102,6 +7121,45 @@ class TestPnlObserve:
         self.settle(_plive(_prow("A", 1_498.0, realized=498.0)), 130.0)
         assert (self.day()["accounts"]["A"].get("adj") or 0.0) == 0.0
 
+    def test_a_mid_day_reset_pnl_stays_reset(self):
+        """"Reset P&L" at noon moves the session baseline to the current
+        cash. The day's realized baseline rightly stays where the day
+        began — so measuring the session's transfer identity against it
+        wrote the whole morning's realized back in as a withdrawal on the
+        next poll, and the tile read the morning's P&L again. The session
+        now anchors NinjaTrader's counter at the reset."""
+        st.session_start_balances["A"] = 1_000.0
+        self.settle(_plive(_prow("A", 1_000.0, realized=0.0)), 100.0)
+        self.settle(_plive(_prow("A", 1_300.0, realized=300.0)), 200.0)       # a $300 morning
+        assert st.session_adjustments.get("A", 0.0) == 0.0
+        assert st.session_pnl("A", 1_300.0) == 300.0
+        st.session_current_balances["A"] = 1_300.0                           # what the monitor holds
+        st.reset_session_pnl()
+        assert st.session_start_balances["A"] == 1_300.0
+        assert st.session_realized_anchor["A"] == 300.0
+        self.settle(_plive(_prow("A", 1_300.0, realized=300.0)), 210.0)
+        assert st.session_adjustments.get("A", 0.0) == 0.0                   # not −300
+        assert st.session_pnl("A", 1_300.0) == 0.0
+        self.settle(_plive(_prow("A", 1_400.0, realized=400.0)), 300.0)       # the afternoon's trade
+        assert st.session_adjustments.get("A", 0.0) == 0.0
+        assert st.session_pnl("A", 1_400.0) == 100.0                         # since the reset
+        rec = self.day()["accounts"]["A"]
+        assert (rec.get("adj") or 0.0) == 0.0 and rec["start"] == 1_000.0     # the day is still the whole day
+        # A deposit after the reset is still a deposit.
+        self.settle(_plive(_prow("A", 2_400.0, realized=400.0)), 400.0)
+        assert st.session_adjustments["A"] == 1_000.0
+        assert self.day()["accounts"]["A"]["adj"] == 1_000.0
+        assert st.session_pnl("A", 2_400.0) == 100.0
+
+    def test_the_session_anchor_survives_a_restart_of_the_app(self):
+        st.active_account = "A"
+        st.session_start_balances["A"] = 1_300.0
+        st.session_realized_anchor["A"] = 300.0
+        st.save_session_state()
+        st.session_start_balances.clear(); st.session_realized_anchor.clear()
+        assert st.restore_session_state()
+        assert st.session_realized_anchor["A"] == 300.0
+
     def test_reconciliation_is_derived_not_accumulated(self):
         # Polled every two seconds: an accumulator would stack the same
         # deposit over and over. Deriving it makes repolling a no-op.
@@ -7287,15 +7345,146 @@ class TestFillsEngine:
         held = _plive(_prow("SimTEST", 91_997.82, [_ppos("NQ 12-26", -1, 26978.5)], realized=-2.18))
         st._pnl_observe(held, now=x + 1.0)
         lot = st._fills_lots[("SimTEST", "NQ")][0]
+        assert lot["cost"] == 0.0 and st._fills_money["SimTEST"]   # held one poll for an exit row
+        st._pnl_observe(held, now=x + 1.0 + st.FILLS_PARK_HOLD_S)
         assert lot["cost"] == -2.18
         assert st._fills_comm[("SimTEST", "NQ")] == 2.18
+        assert "SimTEST" not in st._fills_money
         assert not any(r.get("unseen") for r in self.day()["trades"])
         # The exit's money lands on the row together with the parked entry cost.
         self.feed(self.TEST_STOP, self.TEST_X_OUT, self.TEST_FLAT)
-        xo = st._nt_log_stamp_ms(self.TEST_X_OUT)
-        st._pnl_observe(_plive(_prow("SimTEST", 91_740.64, [], realized=-259.36)), now=xo + 1.0)
+        st._pnl_observe(_plive(_prow("SimTEST", 91_740.64, [], realized=-259.36)), now=x + 5.0)
         (t,) = self.rows("SimTEST")
         assert t["pnl"] == round(-257.18 - 2.18, 2) and t["approx"] is False
+
+    def test_a_later_partial_of_a_settled_closing_order_cuts_its_own_row(self):
+        """A 2-lot stop filled 1 now and 1 four seconds later. The first
+        partial's row took NinjaTrader's exact dollars in between. Joining
+        the second partial onto it re-estimated the whole row from prices
+        (over the exact dollars) and left the row out of the wait list, so
+        the second partial's money had no row and went `late` — onto the
+        same row, counting the second contract twice."""
+        self.stage()
+        st._pnl_observe(_plive(_prow("SimTEST", 92_000.0, [], realized=0.0)), now=self.t0 - 2)
+        x2 = self.TEST_X.replace("Quantity=1", "Quantity=2")
+        pos2 = self.TEST_POS.replace("Quantity=1", "Quantity=2")
+        self.feed(self.OIF_TEST, self.TEST_ENTRY.replace("Quantity=1", "Quantity=2").replace("Filled=1", "Filled=2"),
+                  x2, pos2)
+        assert [l["qty"] for l in st._fills_lots[("SimTEST", "NQ")]] == [-2]
+        half = self.TEST_FLAT.replace("Average price=0 Quantity=0", "Average price=26978.5 Quantity=1") \
+            .replace("Market position=Flat Operation=Remove", "Market position=Short Operation=Update")
+        self.feed(self.TEST_STOP.replace("New state='Filled'", "New state='Partially filled'").replace("Quantity=1", "Quantity=2"),
+                  self.TEST_X_OUT, half)
+        xo = st._nt_log_stamp_ms(self.TEST_X_OUT)
+        (first,) = self.rows("SimTEST")
+        assert first["qty"] == 1 and first["pnl"] == -255.0
+        one_left = [_ppos("NQ 12-26", -1, 26978.5)]
+        st._pnl_observe(_plive(_prow("SimTEST", 91_742.82, one_left, realized=-257.18)), now=xo + 0.5)
+        assert first["pnl"] == -257.18 and first["approx"] is False      # exact dollars landed
+        # The rest of the same order, four seconds on, at a better price.
+        x_out2 = self.TEST_X_OUT.replace("244ea6f8b1264e45ad2d749383cb27ea", "2222222222222222222222222222aaaa") \
+            .replace("Price=26991.25", "Price=26990").replace("11:00:03:350", "11:00:07:350")
+        self.feed(x_out2, self.TEST_FLAT.replace("11:00:03:373", "11:00:07:373"))
+        rows = self.rows("SimTEST")
+        assert len(rows) == 2 and rows[0] is first
+        assert first["pnl"] == -257.18 and first["qty"] == 1            # untouched by the second partial
+        second = rows[1]
+        assert second["qty"] == 1 and second["exit"] == 26990 and second["pnl"] == -230.0
+        st._pnl_observe(_plive(_prow("SimTEST", 91_510.64, [], realized=-489.36)), now=xo + 4.5)
+        assert second["pnl"] == -232.18 and second["approx"] is False
+        assert first["pnl"] == -257.18
+        assert not any(r.get("late") or r.get("unseen") for r in self.day()["trades"])
+        assert ("SimTEST", "NQ") not in st._fills_lots
+
+    def test_realized_resetting_under_an_open_position_is_a_restart_not_a_trade(self):
+        """NinjaTrader's counter goes to zero at 18:00 (or when NinjaTrader
+        is restarted) with a swing trade still held. With the log in view
+        the engine knows no fill happened — no execution line for the
+        account — so the −$500 is a counter restart, re-anchored, and not
+        the whole previous session booked as a trade and then undone as a
+        transfer."""
+        self.stage()
+        st.session_realized_anchor["SimTEST"] = 100.0
+        st._pnl_observe(_plive(_prow("SimTEST", 92_500.0, [], realized=500.0)), now=self.t0 - 12)
+        shift = lambda line: line.replace("11:00:02:", "10:59:50:")
+        self.feed(shift(self.OIF_TEST), shift(self.TEST_ENTRY), shift(self.TEST_X), shift(self.TEST_POS))
+        x = st._nt_log_stamp_ms(shift(self.TEST_X))
+        held = [_ppos("NQ 12-26", -1, 26978.5)]
+        st._pnl_observe(_plive(_prow("SimTEST", 92_500.0, held, realized=500.0)), now=x + 1.0)
+        st._pnl_observe(_plive(_prow("SimTEST", 92_500.0, held, realized=0.0)), now=self.t0 + 2)
+        assert "SimTEST" not in st._fills_money                        # not money looking for a row
+        assert not self.day()["trades"]
+        with st._pnl_lock:
+            acct = st._pnl_hot(self.D[:7])[self.D]["accounts"]["SimTEST"]
+        assert acct["start_realized"] == 0.0                            # 500 booked on the old counter
+        assert st.session_realized_anchor["SimTEST"] == -400.0          # 100 on the old counter -> here
+        # The exit's money is read off the new counter, exactly.
+        self.feed(self.TEST_STOP, self.TEST_X_OUT, self.TEST_FLAT)
+        xo = st._nt_log_stamp_ms(self.TEST_X_OUT)
+        out = _plive(_prow("SimTEST", 92_242.82, [], realized=-257.18))
+        for k in range(3):
+            st._pnl_observe(out, now=xo + 1.0 + 2 * k)
+        (t,) = self.rows("SimTEST")
+        assert t["pnl"] == -257.18 and t["approx"] is False and not t.get("late")
+        assert acct.get("adj", 0.0) == 0.0                              # and no transfer invented
+        assert not any(r.get("unseen") for r in self.day()["trades"])
+
+    def test_a_zero_that_a_fill_just_made_is_still_a_fill(self):
+        """The relaxation only holds while the position sat still: a lot
+        closing to land the counter on exactly $0.00 changed the shape, and
+        is differenced like any fill."""
+        self.stage()
+        st._pnl_observe(_plive(_prow("SimTEST", 92_255.0, [], realized=255.0)), now=self.t0 - 2)
+        self.feed(self.OIF_TEST, self.TEST_ENTRY, self.TEST_X, self.TEST_POS)
+        x = st._nt_log_stamp_ms(self.TEST_X)
+        st._pnl_observe(_plive(_prow("SimTEST", 92_255.0, [_ppos("NQ 12-26", -1, 26978.5)], realized=255.0)), now=x + 0.3)
+        self.feed(self.TEST_STOP, self.TEST_X_OUT, self.TEST_FLAT)   # −$255 exactly: the counter lands on 0
+        xo = st._nt_log_stamp_ms(self.TEST_X_OUT)
+        st._pnl_observe(_plive(_prow("SimTEST", 92_000.0, [], realized=0.0)), now=xo + 1.0)
+        (t,) = self.rows("SimTEST")
+        assert t["pnl"] == -255.0 and t["approx"] is False
+        with st._pnl_lock:
+            assert st._pnl_hot(self.D[:7])[self.D]["accounts"]["SimTEST"]["start_realized"] == 255.0
+
+    def test_a_scratch_loss_landing_before_its_row_is_not_parked_as_the_next_entrys_commission(self):
+        """SimTEST holds NQ (lot A). A second NQ lot (B) is entered and lot
+        A is stopped out for one tick within the same second; realized moves
+        −$2.18 (B's commission) −$7.18 (A: −$5 and its exit commission) in
+        one snapshot, read a poll before the tail reads either line. −$9.36
+        on one contract was under the old $50 cap: parked on B as its
+        "commission", taught as the rate, and A's row got nothing."""
+        self.stage()
+        st._pnl_observe(_plive(_prow("SimTEST", 92_000.0, [], realized=0.0)), now=self.t0 - 2)
+        self.feed(self.OIF_TEST, self.TEST_ENTRY, self.TEST_X, self.TEST_POS)
+        x = st._nt_log_stamp_ms(self.TEST_X)
+        held = _plive(_prow("SimTEST", 91_997.82, [_ppos("NQ 12-26", -1, 26978.5)], realized=-2.18))
+        for k in (1.0, 3.6):
+            st._pnl_observe(held, now=x + k)                          # A's commission parked, rate 2.18
+        assert st._fills_comm[("SimTEST", "NQ")] == 2.18
+        # Lot B enters, lot A exits one tick against, inside one second.
+        b_in = self.TEST_ENTRY.replace("15b83b9e21af4820a387b5b1b60b6264", "b000000000000000000000000000000b") \
+            .replace("11:00:02:498", "11:00:06:100")
+        b_x = self.TEST_X.replace("94b5aec0f6184d4abdd2b32e6223674a", "b1111111111111111111111111111111") \
+            .replace("15b83b9e21af4820a387b5b1b60b6264", "b000000000000000000000000000000b") \
+            .replace("11:00:02:514", "11:00:06:120")
+        a_out = self.TEST_X_OUT.replace("Price=26991.25", "Price=26978.75").replace("11:00:03:350", "11:00:06:400")
+        a_stop = self.TEST_STOP.replace("11:00:03:320", "11:00:06:380")
+        xb = st._nt_log_stamp_ms(b_x)
+        self.feed(b_in, b_x)                                          # the tail has B's entry...
+        assert [l["qty"] for l in st._fills_lots[("SimTEST", "NQ")]] == [-1, -1]
+        both = _plive(_prow("SimTEST", 91_988.46, [_ppos("NQ 12-26", -1, 26978.5)], realized=-11.54))
+        st._pnl_observe(both, now=xb + 0.4)                           # ...when −$9.36 lands: no row yet
+        assert not self.rows("SimTEST")
+        self.feed(a_stop, a_out)                                      # A's exit, read a second later
+        (a,) = self.rows("SimTEST")
+        assert a["qty"] == 1 and a["exit"] == 26978.75
+        st._pnl_observe(both, now=xb + 2.4)
+        (a,) = self.rows("SimTEST")
+        assert a["pnl"] == -9.36 and a["approx"] is False            # A: −$5 gross and both its commissions
+        (b_lot,) = st._fills_lots[("SimTEST", "NQ")]
+        assert b_lot["cost"] == -2.18                                 # B's commission, at the learned rate
+        assert st._fills_comm[("SimTEST", "NQ")] == 2.18              # the rate was not taught a loss
+        assert not any(r.get("late") or r.get("unseen") for r in self.day()["trades"])
 
     def test_chart_trader_fill_with_nothing_staged_is_manual(self):
         self.feed(self.TEST_ENTRY, self.TEST_X, self.TEST_POS, self.TEST_STOP, self.TEST_X_OUT, self.TEST_FLAT)
@@ -7346,6 +7535,33 @@ class TestFillsEngine:
         self.feed(self.TEST_STOP, self.TEST_X_OUT, self.TEST_FLAT)
         (t,) = self.rows("SimTEST")
         assert t["strategy"] == "NQ-MacroZoneB" and t["entry"] == 26978.5
+
+    def test_an_adopted_lot_survives_the_second_the_bridge_is_ahead_of_the_tail(self):
+        """A position adopted from the snapshot at a restart (no order id)
+        used to follow the snapshot at once: the bridge showed flat a
+        second before the tail read the stop, the lot was dropped, and
+        the stop's fill then OPENED a phantom lot — no row for the trade."""
+        st._fills_lots[("SimTEST", "NQ")] = [{"qty": -1, "price": 26978.5, "ts": self.t0 - 600,
+                                              "strategy": "NQ-MacroZoneB", "role": "", "cost": 0.0, "oid": ""}]
+        st._pnl_open_meta[("SimTEST", "NQ")] = {"strategies": ["NQ-MacroZoneB"], "ts": self.t0 - 600,
+                                                "avg": 26978.5, "cost": 0.0, "side": -1}
+
+        def obs(live, now):
+            st._nt_tail_seen = now
+            st._pnl_observe(live, now=now)
+        held = _plive(_prow("SimTEST", 92_000.0, [_ppos("NQ 12-26", -1, 26978.5)], realized=0.0))
+        obs(held, self.t0 - 2)
+        xo = st._nt_log_stamp_ms(self.TEST_X_OUT)
+        flat = _plive(_prow("SimTEST", 91_745.0, [], realized=-255.0))
+        obs(flat, xo - 0.3)                                           # bridge first...
+        assert st._fills_lots.get(("SimTEST", "NQ")), "adopted lot dropped before the tail could close it"
+        self.feed(self.TEST_STOP, self.TEST_X_OUT, self.TEST_FLAT)   # ...the tail a second later
+        (t,) = self.rows("SimTEST")
+        assert t["entry"] == 26978.5 and t["exit"] == 26991.25 and t["strategy"] == "NQ-MacroZoneB"
+        assert ("SimTEST", "NQ") not in st._fills_lots
+        obs(flat, xo + 2.0)
+        (t,) = self.rows("SimTEST")
+        assert t["pnl"] == -255.0 and not any(r.get("unseen") for r in self.day()["trades"])
 
     def test_boot_drops_lots_the_book_no_longer_holds(self):
         self.stage()
@@ -7456,6 +7672,8 @@ class TestFillsEngine:
         self.feed(self.OIF_TEST, self.TEST_ENTRY, self.TEST_X, self.TEST_POS)   # the Entry, a second later
         st._pnl_observe(held, now=x + 2.2)
         lot = st._fills_lots[("SimTEST", "NQ")][0]
+        assert lot["cost"] == 0.0 and st._fills_money["SimTEST"]     # held a poll: an exit row may follow
+        st._pnl_observe(held, now=x + 4.2)
         assert lot["cost"] == -2.18 and st._fills_comm[("SimTEST", "NQ")] == 2.18
         assert "SimTEST" not in st._fills_money
         assert not any(r.get("unseen") or r.get("late") for r in self.day()["trades"])
@@ -7639,15 +7857,17 @@ class TestCalendarFollowsHandTradedAccounts:
         assert rec["start"] == 6_981.25 and rec["start_ts"] == self.t0 - 2   # followed, role OFF
         self.feed(*[self._as("1632306", ln) for ln in (self.TEST_ENTRY, self.TEST_X, self.TEST_POS)])
         x = st._nt_log_stamp_ms(self.TEST_X)
-        obs(_plive(_prow("1632306", 6_978.37, [_ppos("NQ 12-26", -1, 26978.5)], managed=False,
-                         realized=-2.88)), x + 0.6)                 # the entry's commission, parked
+        dip = _plive(_prow("1632306", 6_978.37, [_ppos("NQ 12-26", -1, 26978.5)], managed=False,
+                           realized=-2.88))
+        obs(dip, x + 0.6)                                           # the entry's commission...
+        obs(dip, x + 0.6 + st.FILLS_PARK_HOLD_S)                    # ...parked once no exit row followed
         assert st._fills_lots[("1632306", "NQ")][0]["cost"] == -2.88
         self.feed(*[self._as("1632306", ln) for ln in (self.TEST_STOP, self.TEST_X_OUT, self.TEST_FLAT)])
         (t,) = self.rows("1632306")
         assert t["strategy"] == "" and "role" not in t and t["exit_kind"] == "stop"
         assert t["entry"] == 26978.5 and t["exit"] == 26991.25 and t["pnl"] == -260.76   # est at NT's rate
         xo = st._nt_log_stamp_ms(self.TEST_X_OUT)
-        obs(_plive(_prow("1632306", 6_723.07, [], managed=False, realized=-258.18)), xo + 1.0)
+        obs(_plive(_prow("1632306", 6_723.07, [], managed=False, realized=-258.18)), x + 5.0)
         rec = self.day()["accounts"]["1632306"]
         assert rec["start"] == 6_981.25 and rec["last"] == 6_723.07
         (t,) = self.rows("1632306")
@@ -7680,6 +7900,16 @@ class TestCalendarFollowsHandTradedAccounts:
     def test_an_account_the_dump_never_showed_is_nobodys(self):
         self.feed(*[self._as("Ghost", ln) for ln in (self.TEST_ENTRY, self.TEST_X, self.TEST_POS)])
         assert ("Ghost", "NQ") not in st._fills_lots
+
+    def test_an_account_at_zero_gets_no_rows_either(self):
+        """The same rule as the calendar's records: a fill on an account
+        the monitor only ever saw at $0.00 would cut rows for an account
+        with no record to hold them."""
+        st.session_current_balances["TDFYSL50152571304"] = 0.0
+        st.session_start_balances["1632306"] = 6_981.25
+        assert not st._fills_follows("TDFYSL50152571304") and st._fills_follows("1632306")
+        self.feed(*[self._as("TDFYSL50152571304", ln) for ln in (self.TEST_ENTRY, self.TEST_X, self.TEST_POS)])
+        assert ("TDFYSL50152571304", "NQ") not in st._fills_lots
 
 
 class TestLateJoinerBaseline:
@@ -7908,6 +8138,85 @@ class TestPnlRebuildFromNinjaTraderLog:
         assert len(rows) == 1
         assert rows[0]["pnl"] == -259.36 and not rows[0].get("late") and rows[0]["approx"] is False
         assert not any(t.get("unseen") for t in self.day()["trades"])
+
+    def test_live_rebuild_repoints_the_engines_row_references(self, monkeypatch):
+        """A live row whose dollars came late is replaced by its twin; the
+        engine's "last close" for the account still pointed at the old
+        dict, so the next late settlement (a fee) was written to a row no
+        longer in the record — and the settle-up, finding the gap still
+        open, wrote it again every poll."""
+        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: self.D)
+        x_out = st._nt_log_stamp_ms(self.LINES["TEST_X_OUT"])
+        old = {"ts": round(x_out, 3), "account": "SimTEST", "symbol": "NQ", "side": "SHORT", "qty": 1,
+               "strategy": "NQ-MacroZoneB", "entry": 26978.5, "exit": 26991.25, "opened_ts": x_out - 1,
+               "pnl": 0.0, "gross": -255.0, "approx": False, "late": True, "fills": True, "exit_kind": "stop"}
+        with st._pnl_lock:
+            day = st._pnl_hot(self.D[:7])[self.D]
+            day["trades"] = [t for t in day["trades"] if t["account"] != "SimTEST"] + [old]
+        st._pnl_recent["SimTEST"] = (self.D, [old])
+        st._fills_wait["SimTEST"] = [(x_out, old)]
+        st._fills_last_row[("SimTEST", "NQ")] = ("652eb616f5fe4236bebcd9f2c18250c5", old)
+        ok, msg, reports = st._pnl_rebuild_range(self.D, self.D)
+        assert ok
+        (new,) = [t for t in self.day()["trades"] if t["account"] == "SimTEST"]
+        assert new is not old and new["pnl"] == -259.36
+        assert st._pnl_recent["SimTEST"][1] == [new] and st._pnl_recent["SimTEST"][1][0] is new
+        assert st._fills_wait["SimTEST"] == [(x_out, new)] and st._fills_wait["SimTEST"][0][1] is new
+        assert st._fills_last_row[("SimTEST", "NQ")][1] is new
+        # Late money now reaches the row in the record, once.
+        trades = self.day()["trades"]
+        assert st._pnl_settle_late("SimTEST", -4.36, self.D, trades, x_out + 30, {})
+        assert new["pnl"] == round(-259.36 - 4.36, 2)
+
+    def test_rebuilding_a_past_month_leaves_the_live_month_in_place(self, monkeypatch):
+        """Rebuilding last month used to hot-load it, which swapped the live
+        month out and back in as new dicts: every row the engine still
+        referred to was then outside the record."""
+        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: "2026-12-03")
+        live_row = {"ts": 1796000000.0, "account": "SimTEST", "symbol": "NQ", "side": "LONG", "qty": 1,
+                    "strategy": "X", "entry": 1.0, "exit": 2.0, "opened_ts": 1795999990.0,
+                    "pnl": 20.0, "approx": False, "fills": True}
+        with st._pnl_lock:
+            dec = st._pnl_hot("2026-12")                      # December is live, November is on disk
+        with st._pnl_lock:
+            dec["2026-12-03"] = {"accounts": {"SimTEST": {"start": 1.0, "last": 21.0}}, "trades": [live_row]}
+        st._pnl_recent["SimTEST"] = ("2026-12-03", [live_row])
+        ok, msg, reports = st._pnl_rebuild_range(self.D, self.D)
+        assert ok and reports[0]["rows"] == 1
+        with st._pnl_lock:
+            assert st._pnl_hot_month == "2026-12"
+            assert st._pnl_history["days"]["2026-12-03"]["trades"][0] is live_row
+        nov = st._pnl_month("2026-11")["days"][self.D]["trades"]
+        assert any(t["account"] == "SimTEST" and t.get("fills") and t["pnl"] == -259.36 for t in nov)
+        st._pnl_save(force=True)                               # the rebuilt month reaches disk
+        on_disk = st._pnl_read_shard("2026-11")[self.D]["trades"]
+        assert any(t["account"] == "SimTEST" and t.get("fills") for t in on_disk)
+
+    def test_a_row_cut_while_the_replay_runs_is_not_erased(self, monkeypatch):
+        monkeypatch.setattr(st, "get_session_id", lambda now_et=None: self.D)
+        during = {"ts": 1793880000.0, "account": "SimAI", "symbol": "NQ", "side": "LONG", "qty": 1,
+                  "strategy": "Y", "entry": 1.0, "exit": 2.0, "opened_ts": 1793879990.0,
+                  "pnl": 20.0, "approx": False, "fills": True}
+        real = st._fills_replay_line
+
+        def slow(line, S):                                     # the live engine cuts a row mid-replay
+            with st._pnl_lock:
+                day = st._pnl_hot(self.D[:7])[self.D]
+                if during not in day["trades"]:
+                    day["trades"].append(during)
+            return real(line, S)
+        monkeypatch.setattr(st, "_fills_replay_line", slow)
+        ok, msg, reports = st._pnl_rebuild_range(self.D, self.D)
+        assert ok
+        assert any(t is during for t in self.day()["trades"])
+
+    def test_two_rebuilds_do_not_run_at_once(self, monkeypatch):
+        assert st._pnl_rebuild_lock.acquire(blocking=False)
+        try:
+            ok, msg, _ = st._pnl_rebuild_range(self.D, self.D)
+            assert not ok and "already running" in msg
+        finally:
+            st._pnl_rebuild_lock.release()
 
     def test_kept_live_rows_are_taken_out_of_what_the_rebuilt_rows_explain(self, monkeypatch):
         """An exact live row the log has no twin for (another market) stays,
@@ -10789,6 +11098,8 @@ class TestLedgerPruneOnFlat:
             st._pnl_observe(held, now=100.0 + i * 0.1, session_date="2026-10-16")
         assert st._ledger_entries("PruneAcct", "NQ 12-26")
         st._pnl_observe(flat, now=130.0, session_date="2026-10-16")
+        assert st._ledger_entries("PruneAcct", "NQ 12-26")             # the tail gets the grace first
+        st._pnl_observe(flat, now=130.0 + st.FILLS_BOOK_GRACE_S + 1, session_date="2026-10-16")
         assert st._ledger_entries("PruneAcct", "NQ 12-26") == []
         st._ledger_clear("PruneAcct")
 
