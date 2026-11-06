@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.5rc5 — 2026-11-06 (pre-release)
 
 ### Added
 - **`GET /api/log`** — the last lines of SocketTrader's own log (`?n=`, up
@@ -11,6 +11,38 @@
   where a helper cannot be handed it.
 
 ### Fixed
+- **A trade could leave no row at all.** A mismatch between the lots and
+  the snapshot that began at an exit (the bridge shows flat a second
+  before the tail reads the fill) ended with the lot closed, not with an
+  equal poll, so its start time was never cleared. The next entry on
+  that root met a one-second-old (still flat) snapshot and was judged
+  "flat for ten minutes" — dropped at once; its exit then had nothing
+  to close, the trade left no row, and its dollars went `late` onto the
+  previous one (SimAI 2026-11-05 22:50 −$304 onto the 22:40 row; SAS
+  2026-11-06 08:12 +$1,640 onto the 06:06 row). A root flat on both
+  sides now clears its mismatch like an equal poll does.
+- **Hand-traded accounts are in the calendar.** The operator sets a
+  follower to OFF while trading it by hand so the copier does not
+  interfere, and back on when done — or not, when done for the day.
+  Those trades were exactly the ones dropped: the calendar and the
+  fills engine followed only the copy set, so PTLOP's 12:53–13:04
+  scalps (Nov 5) and 1632306's first two trades (Nov 6) were invisible
+  until the role came back, then glued onto an old row as a lump. Both
+  now follow every account the balance monitor knows this session (it
+  reports every account on the connection) that is not folded away in
+  the web UI; an account with a ~$0.00 balance never gets a record.
+- **An account that joins mid-session carries its whole session.** Its
+  baseline was the cash at first sight, so 1632306's day read +$1,285.56
+  (the six trades after it joined at 00:04) against NinjaTrader's
+  +$614.08 (all eight). The baseline is now the balance the session
+  opened with, which the monitor holds for every account — the same
+  number the dashboard tile already used — with transfers booked before
+  the join carried across and the realized baseline set so the transfer
+  identity holds from the first poll. A record seeded by the old rule is
+  rebased once (recognised by its signature: the realized baseline
+  equals the balance move since the open), on the next poll or on
+  REBUILD of the live session, and REBUILD then re-cuts the pre-join
+  trades from the log.
 - **The account modal reopened on stale limits.** SAVE LIMITS saved (the
   API and the balance monitor had the new target and stop at once), but
   clicking the account again showed the old numbers — "0 / 0" when that
