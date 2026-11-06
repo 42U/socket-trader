@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.5rc6 — 2026-11-06 (pre-release)
+
+### Fixed
+- **Seventy empty names in the ACCOUNT list.** rc5's "follow every account
+  the monitor knows" also minted an empty record for each dormant prop
+  account the connection reports at $0.00. An account now needs money as
+  well as a name to be followed, no record exists until it has a
+  baseline, and any empty record that slipped in is dropped.
+
 ## 1.0.5rc5 — 2026-11-06 (pre-release)
 
 ### Added
